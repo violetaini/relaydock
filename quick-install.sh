@@ -16,4 +16,4 @@ else
 fi
 
 bash -n "$TMP_DIR/install.sh"
-exec bash "$TMP_DIR/install.sh" "$@"
+bash "$TMP_DIR/install.sh" "$@"

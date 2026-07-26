@@ -214,9 +214,25 @@ check_architecture() {
 
 # 安装依赖
 install_dependencies() {
-    echo_info "检查并安装依赖..."
+    local packages=()
+    command -v wget >/dev/null 2>&1 || packages+=(wget)
+    command -v curl >/dev/null 2>&1 || packages+=(curl)
+    command -v jq >/dev/null 2>&1 || packages+=(jq)
+    command -v systemctl >/dev/null 2>&1 || packages+=(systemd)
+    command -v sha256sum >/dev/null 2>&1 || packages+=(coreutils)
+
+    if [ "${#packages[@]}" -eq 0 ]; then
+        echo_info "安装依赖已就绪"
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo_error "缺少依赖且当前系统没有 apt: ${packages[*]}"
+        return 1
+    fi
+
+    echo_info "安装缺少的依赖: ${packages[*]}"
     apt-get update -qq
-    apt-get install -y wget curl jq systemd coreutils >/dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" >/dev/null 2>&1
 }
 
 # 获取最新版本号

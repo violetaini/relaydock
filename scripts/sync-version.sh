@@ -16,7 +16,5 @@ fi
 
 sed -i "s/const Version = \".*\"/const Version = \"$VERSION\"/" \
     "$PROJECT_ROOT/internal/version/version.go"
-sed -i "s/VERSION=\"v.*\"/VERSION=\"v$VERSION\"/" \
-    "$PROJECT_ROOT/quick-install.sh"
 
 echo "RelayDock Backend version synchronized: $VERSION"

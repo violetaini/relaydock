@@ -20,15 +20,16 @@ RelayDock 面向合租节点和小型代理服务运营场景。管理员集中�
 
 ## 核心功能
 
-- 多服务器集中管理、运行状态、延迟与测速
-- 按用户授权可用服务器，并为每台服务器设置独立有效期
-- 用户在授权范围内自助创建和管理节点
-- 管理员编排 1 至 8 跳 TCP 隧道，按用户授权期限、数量与流量；用户自助创建转发
-- VLESS、VMess、Trojan、Shadowsocks、Hysteria2、SOCKS5、HTTP 等常见协议
-- TCP、WebSocket、TLS、REALITY 等常用传输与安全组合
-- 用户、套餐、订阅、模板、规则、证书和 DDNS 管理
+- 多服务器集中管理，以及入站、出站、路由、Xray 配置和服务控制
+- 按用户授权可用服务器、有效期和具体协议组合；用户在授权范围内自助创建节点
+- VLESS、VMess、Trojan、Shadowsocks 2022、Hysteria2、SOCKS5、HTTP、WireGuard 等常见协议
+- TCP、WebSocket、gRPC、TLS、REALITY 等常用组合，并兼容 AnyTLS、Snell 等订阅节点
+- 直接创建 WireGuard 入站并一次性生成客户端配置
+- 1 至 8 跳 TCP/UDP 隧道和 Tunnel（任意门），各跳可使用相同端口
+- 主控和受管服务器均可安装、控制并运行 Ookla Speedtest CLI
+- 用户、套餐、订阅、模板、规则、可编辑 DNS 凭据、证书和 DDNS 管理
 - 上传、下载或双向流量计费，以及流量、速率和设备限制
-- 节点 Agent、到期守卫、服务控制、日志与通知
+- 节点 Agent、到期守卫、端口防火墙同步、日志与通知
 - 内嵌 RelayDock Console，单个后端即可提供完整管理界面
 
 ## 运行环境
@@ -49,7 +50,7 @@ RelayDock 面向合租节点和小型代理服务运营场景。管理员集中�
 安装器会从 GitHub Release 下载对应架构的二进制和节点到期守卫，并使用 Release 中发布的 SHA-256 清单完成校验后再替换文件。
 
 ```bash
-(set -eu; f="$(mktemp)"; trap 'rm -f "$f"' EXIT; curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh -o "$f"; sudo bash "$f")
+curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash
 ```
 
 安装完成后访问：
@@ -63,29 +64,35 @@ http://SERVER_IP:12889
 自定义面板端口：
 
 ```bash
-(set -eu; f="$(mktemp)"; trap 'rm -f "$f"' EXIT; curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh -o "$f"; sudo env PORT=18080 bash "$f")
+curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo env PORT=18080 bash
 ```
 
 ### 更新、重装与卸载
 
-以下命令都会先把脚本下载到临时文件，再从当前终端执行，以保留端口和数据确认提示。不要把重装或卸载命令改写成 `curl ... | sudo bash`。
+以下命令采用安全的非交互默认值：更新和重装保留当前端口，卸载保留 `/etc/arcway` 数据。
 
 更新到最新 Release：
 
 ```bash
-(set -eu; f="$(mktemp)"; trap 'rm -f "$f"' EXIT; curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh -o "$f"; sudo bash "$f" update)
+curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash -s -- update
 ```
 
-覆盖重装会保留现有数据，并把当前 systemd 端口作为默认值再次确认。执行前仍应先备份：
+覆盖重装会保留现有数据和当前 systemd 端口。执行前仍应先备份：
 
 ```bash
-(set -eu; f="$(mktemp)"; trap 'rm -f "$f"' EXIT; curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh -o "$f"; sudo bash "$f" reinstall)
+curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash -s -- reinstall
 ```
 
-卸载前请先备份。以下命令会交互询问是否保留 `/etc/arcway`，默认选择为保留数据；请确认选项后再继续：
+卸载程序但保留数据：
 
 ```bash
-(set -eu; f="$(mktemp)"; trap 'rm -f "$f"' EXIT; curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh -o "$f"; sudo bash "$f" uninstall)
+curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash -s -- uninstall
+```
+
+彻底卸载并删除 `/etc/arcway` 前请先备份：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo env ARCWAY_KEEP_DATA=false bash -s -- uninstall
 ```
 
 常用运维命令：
@@ -123,7 +130,7 @@ docker compose logs -f arcway
 | 面板 HTTP/API | TCP `12889` | 可在安装时修改，生产环境建议经 HTTPS 反向代理访问 |
 | HTTPS / ACME | TCP `80`、`443` | 仅在启用证书、HTTP-01 或内置 Nginx 时需要 |
 | 节点与 Agent | 按配置分配 | 在面板创建服务器和节点时确定，按实际协议开放 TCP/UDP |
-| 用户转发端口池 | TCP `39000-40000` | 转发管理自动分配；中间跳由节点守卫限制为仅接受上一跳来源 |
+| 用户转发端口 | 模板指定的 TCP/UDP 范围 | 范围只限制可选端口，不会预占；各跳可以使用同一个端口 |
 
 裸机安装的数据库、订阅和运行数据都位于 `/etc/arcway/`。推荐使用面板的加密备份功能；进行系统迁移或人工备份时，应先停止服务再复制整个目录：
 
@@ -165,6 +172,38 @@ PORT=12889 DATABASE_PATH=./data/arcway.db ./arcway
 - [relaydock-frontend](https://github.com/violetaini/relaydock-frontend) 是独立的 React / TypeScript 前端源码。
 
 发布新前端时，先在前端仓库执行 `npm ci --include=dev && npm run build`，再用生成的 `dist/` 整体替换本仓库的 `internal/web/dist/`。不要手工编辑已构建的哈希资源。
+
+### 前端快速发布
+
+生产主控可通过 `ARCWAY_WEB_ROOT` 从磁盘加载完整前端版本；目录不可用或校验失败时会自动回退二进制内嵌页面。推荐使用不可变版本目录和一个稳定软链：
+
+```text
+/opt/arcway/web/
+├── releases/<release-id>/
+├── previous -> releases/<previous-release-id>
+└── current  -> releases/<release-id>
+```
+
+在 systemd 的环境文件中配置一次并重启主控：
+
+```bash
+ARCWAY_WEB_ROOT=/opt/arcway/web/current
+systemctl restart arcway
+```
+
+此后界面更新不再需要重新编译 Go 后端或重启服务。在后端仓库运行：
+
+```bash
+./scripts/deploy-frontend.sh --host CONTROL_PLANE --port 22
+```
+
+脚本会执行前端生产构建、上传并校验完整版本，然后原子切换 `current`。旧版本会保留；回滚同样不重启服务：
+
+```bash
+./scripts/deploy-frontend.sh rollback --host CONTROL_PLANE --port 22
+```
+
+可通过 `ARCWAY_DEPLOY_HOST`、`ARCWAY_DEPLOY_PORT`、`ARCWAY_DEPLOY_USER`、`ARCWAY_FRONTEND_DIR` 和 `ARCWAY_WEB_DEPLOY_ROOT` 设置发布脚本的默认参数。主控进程的 `ARCWAY_WEB_ROOT` 则指向版本根目录下的 `current` 软链。
 
 ## 许可与致谢
 

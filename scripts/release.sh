@@ -17,7 +17,7 @@ case "$BUMP" in
 esac
 
 bash scripts/sync-version.sh "$NEW_VERSION"
-git add internal/version/version.go quick-install.sh
+git add internal/version/version.go
 git commit -m "release: v$NEW_VERSION"
 git tag "v$NEW_VERSION"
 git push origin main
