@@ -30,6 +30,10 @@ const (
 	ForwardObservedSuspended      = "suspended"
 	ForwardObservedCleanupPending = "cleanup_pending"
 	ForwardObservedError          = "error"
+
+	ForwardNetworkTCP    = "tcp"
+	ForwardNetworkUDP    = "udp"
+	ForwardNetworkTCPUDP = "tcp_udp"
 )
 
 var (
@@ -136,6 +140,7 @@ type UserForwardRule struct {
 	TargetPort                     int              `json:"target_port"`
 	Network                        string           `json:"network"`
 	SourceCIDRs                    []string         `json:"source_cidrs"`
+	RequestedEntryPort             int              `json:"requested_entry_port"`
 	AllocatedEntryPort             int              `json:"allocated_entry_port"`
 	DesiredState                   string           `json:"desired_state"`
 	ObservedState                  string           `json:"observed_state"`
@@ -206,14 +211,14 @@ CREATE TABLE IF NOT EXISTS tunnel_templates (
  id INTEGER PRIMARY KEY AUTOINCREMENT, public_id TEXT NOT NULL UNIQUE,
  name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
  state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','draining','suspended')),
- network TEXT NOT NULL DEFAULT 'tcp' CHECK(network = 'tcp'),
+ network TEXT NOT NULL DEFAULT 'tcp_udp' CHECK(network IN ('tcp','tcp_udp')),
  billing_mode TEXT NOT NULL DEFAULT 'both' CHECK(billing_mode IN ('download','both')),
  traffic_multiplier_milli INTEGER NOT NULL DEFAULT 1000 CHECK(traffic_multiplier_milli > 0),
  max_total_forwards INTEGER NOT NULL DEFAULT 0 CHECK(max_total_forwards >= 0),
  allow_managed_target INTEGER NOT NULL DEFAULT 1 CHECK(allow_managed_target IN (0,1)),
  allow_custom_public_target INTEGER NOT NULL DEFAULT 0 CHECK(allow_custom_public_target = 0),
-	port_range_start INTEGER NOT NULL DEFAULT 39000 CHECK(port_range_start BETWEEN 39000 AND 40000),
-	port_range_end INTEGER NOT NULL DEFAULT 40000 CHECK(port_range_end BETWEEN 39000 AND 40000),
+	port_range_start INTEGER NOT NULL DEFAULT 1024 CHECK(port_range_start BETWEEN 1024 AND 65535),
+	port_range_end INTEGER NOT NULL DEFAULT 65535 CHECK(port_range_end BETWEEN 1024 AND 65535),
  version INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL,
  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -248,8 +253,9 @@ CREATE TABLE IF NOT EXISTS user_forward_rules (
  grant_id INTEGER NOT NULL, username TEXT NOT NULL, name TEXT NOT NULL,
  target_type TEXT NOT NULL CHECK(target_type = 'managed_node'), target_node_id INTEGER NOT NULL,
  target_host TEXT NOT NULL, target_port INTEGER NOT NULL CHECK(target_port BETWEEN 1 AND 65535),
- network TEXT NOT NULL DEFAULT 'tcp' CHECK(network = 'tcp'),
+ network TEXT NOT NULL DEFAULT 'tcp_udp' CHECK(network IN ('tcp','tcp_udp')),
  source_cidrs TEXT NOT NULL DEFAULT '[]',
+	requested_entry_port INTEGER NOT NULL DEFAULT 0 CHECK(requested_entry_port = 0 OR requested_entry_port BETWEEN 1024 AND 65535),
  allocated_entry_port INTEGER NOT NULL DEFAULT 0,
  desired_state TEXT NOT NULL DEFAULT 'active' CHECK(desired_state IN ('active','inactive','deleted')),
  observed_state TEXT NOT NULL DEFAULT 'pending' CHECK(observed_state IN ('pending','provisioning','active','suspended','cleanup_pending','error')),
@@ -303,6 +309,9 @@ CREATE INDEX IF NOT EXISTS idx_tunnel_audit_entity ON tunnel_audit_events(entity
 	if err := r.ensureTableColumn("user_forward_rules", "source_cidrs", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return fmt.Errorf("migrate user_forward_rules.source_cidrs: %w", err)
 	}
+	if err := r.migrateForwardingChecks(); err != nil {
+		return err
+	}
 	if err := r.ensureTableColumn("user_forward_hops", "resource_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("migrate user_forward_hops.resource_id: %w", err)
 	}
@@ -310,6 +319,161 @@ CREATE INDEX IF NOT EXISTS idx_tunnel_audit_entity ON tunnel_audit_events(entity
 		return fmt.Errorf("migrate user_forward_hops.resource_id index: %w", err)
 	}
 	return nil
+}
+
+func (r *TrafficRepository) migrateForwardingChecks() error {
+	ctx := context.Background()
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire forwarding migration connection: %w", err)
+	}
+	defer conn.Close()
+	if err := beginForwardingImmediate(ctx, conn); err != nil {
+		return fmt.Errorf("begin forwarding constraint migration: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+
+	var templateSQL, forwardSQL string
+	if err := conn.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='tunnel_templates'`).Scan(&templateSQL); err != nil {
+		return fmt.Errorf("inspect tunnel_templates: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='user_forward_rules'`).Scan(&forwardSQL); err != nil {
+		return fmt.Errorf("inspect user_forward_rules: %w", err)
+	}
+	templateSQL = strings.ToLower(templateSQL)
+	forwardSQL = strings.ToLower(forwardSQL)
+	needsTemplateRebuild := !strings.Contains(templateSQL, ForwardNetworkTCPUDP) || strings.Contains(templateSQL, "between 39000 and 40000")
+	hasRequestedEntryPort := strings.Contains(forwardSQL, "requested_entry_port")
+	needsForwardRebuild := !strings.Contains(forwardSQL, ForwardNetworkTCPUDP) || !hasRequestedEntryPort
+
+	if needsTemplateRebuild {
+		if _, err := conn.ExecContext(ctx, `DROP TABLE IF EXISTS tunnel_templates_forwarding_new;
+CREATE TABLE tunnel_templates_forwarding_new (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, public_id TEXT NOT NULL UNIQUE,
+ name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+ state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','draining','suspended')),
+ network TEXT NOT NULL DEFAULT 'tcp_udp' CHECK(network IN ('tcp','tcp_udp')),
+ billing_mode TEXT NOT NULL DEFAULT 'both' CHECK(billing_mode IN ('download','both')),
+ traffic_multiplier_milli INTEGER NOT NULL DEFAULT 1000 CHECK(traffic_multiplier_milli > 0),
+ max_total_forwards INTEGER NOT NULL DEFAULT 0 CHECK(max_total_forwards >= 0),
+ allow_managed_target INTEGER NOT NULL DEFAULT 1 CHECK(allow_managed_target IN (0,1)),
+ allow_custom_public_target INTEGER NOT NULL DEFAULT 0 CHECK(allow_custom_public_target = 0),
+ port_range_start INTEGER NOT NULL DEFAULT 1024 CHECK(port_range_start BETWEEN 1024 AND 65535),
+ port_range_end INTEGER NOT NULL DEFAULT 65535 CHECK(port_range_end BETWEEN 1024 AND 65535),
+ version INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL,
+ created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ CHECK(port_range_start <= port_range_end)
+);
+INSERT INTO tunnel_templates_forwarding_new(id,public_id,name,description,state,network,billing_mode,traffic_multiplier_milli,max_total_forwards,allow_managed_target,allow_custom_public_target,port_range_start,port_range_end,version,created_by,created_at,updated_at)
+SELECT id,public_id,name,description,state,network,billing_mode,traffic_multiplier_milli,max_total_forwards,allow_managed_target,allow_custom_public_target,port_range_start,port_range_end,version,created_by,created_at,updated_at FROM tunnel_templates;
+DROP TABLE tunnel_templates;
+ALTER TABLE tunnel_templates_forwarding_new RENAME TO tunnel_templates;`); err != nil {
+			return fmt.Errorf("rebuild tunnel_templates constraints: %w", err)
+		}
+	}
+
+	if needsForwardRebuild {
+		requestedEntryPortSelect := "0"
+		if hasRequestedEntryPort {
+			requestedEntryPortSelect = "requested_entry_port"
+		}
+		forwardRebuildSQL := fmt.Sprintf(`DROP TABLE IF EXISTS user_forward_rules_forwarding_new;
+CREATE TABLE user_forward_rules_forwarding_new (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, public_id TEXT NOT NULL UNIQUE,
+ grant_id INTEGER NOT NULL, username TEXT NOT NULL, name TEXT NOT NULL,
+ target_type TEXT NOT NULL CHECK(target_type = 'managed_node'), target_node_id INTEGER NOT NULL,
+ target_host TEXT NOT NULL, target_port INTEGER NOT NULL CHECK(target_port BETWEEN 1 AND 65535),
+ network TEXT NOT NULL DEFAULT 'tcp_udp' CHECK(network IN ('tcp','tcp_udp')),
+ source_cidrs TEXT NOT NULL DEFAULT '[]',
+ requested_entry_port INTEGER NOT NULL DEFAULT 0 CHECK(requested_entry_port = 0 OR requested_entry_port BETWEEN 1024 AND 65535),
+ allocated_entry_port INTEGER NOT NULL DEFAULT 0,
+ desired_state TEXT NOT NULL DEFAULT 'active' CHECK(desired_state IN ('active','inactive','deleted')),
+ observed_state TEXT NOT NULL DEFAULT 'pending' CHECK(observed_state IN ('pending','provisioning','active','suspended','cleanup_pending','error')),
+ suspend_reason TEXT NOT NULL DEFAULT 'none', generation INTEGER NOT NULL DEFAULT 1,
+ applied_generation INTEGER NOT NULL DEFAULT 0, effective_expires_at TIMESTAMP,
+ billing_mode_snapshot TEXT NOT NULL, traffic_multiplier_milli_snapshot INTEGER NOT NULL,
+ last_error_code TEXT NOT NULL DEFAULT '', last_error_detail TEXT NOT NULL DEFAULT '',
+ created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO user_forward_rules_forwarding_new(id,public_id,grant_id,username,name,target_type,target_node_id,target_host,target_port,network,source_cidrs,requested_entry_port,allocated_entry_port,desired_state,observed_state,suspend_reason,generation,applied_generation,effective_expires_at,billing_mode_snapshot,traffic_multiplier_milli_snapshot,last_error_code,last_error_detail,created_at,updated_at)
+SELECT id,public_id,grant_id,username,name,target_type,target_node_id,target_host,target_port,network,source_cidrs,%s,allocated_entry_port,desired_state,observed_state,suspend_reason,generation,applied_generation,effective_expires_at,billing_mode_snapshot,traffic_multiplier_milli_snapshot,last_error_code,last_error_detail,created_at,updated_at FROM user_forward_rules;
+DROP TABLE user_forward_rules;
+ALTER TABLE user_forward_rules_forwarding_new RENAME TO user_forward_rules;
+CREATE INDEX IF NOT EXISTS idx_forwards_user ON user_forward_rules(username, desired_state);
+CREATE INDEX IF NOT EXISTS idx_forwards_grant ON user_forward_rules(grant_id, desired_state);`, requestedEntryPortSelect)
+		if _, err := conn.ExecContext(ctx, forwardRebuildSQL); err != nil {
+			return fmt.Errorf("rebuild user_forward_rules constraints: %w", err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE user_forward_hops
+SET generation=generation+1, applied_generation=0, observed_state='pending', last_error='', updated_at=CURRENT_TIMESTAMP
+WHERE forward_id IN (
+  SELECT id FROM user_forward_rules WHERE network='tcp' AND desired_state='active'
+);
+UPDATE user_forward_rules
+SET network='tcp_udp',
+    generation=CASE WHEN desired_state='active' THEN generation+1 ELSE generation END,
+    applied_generation=CASE WHEN desired_state='active' THEN 0 ELSE applied_generation END,
+    observed_state=CASE WHEN desired_state='active' THEN 'pending' ELSE observed_state END,
+    last_error_code=CASE WHEN desired_state='active' THEN '' ELSE last_error_code END,
+    last_error_detail=CASE WHEN desired_state='active' THEN '' ELSE last_error_detail END,
+    updated_at=CURRENT_TIMESTAMP
+WHERE network='tcp';
+UPDATE tunnel_templates SET network='tcp_udp',updated_at=CURRENT_TIMESTAMP WHERE network='tcp';`); err != nil {
+		return fmt.Errorf("canonicalize forwarding networks: %w", err)
+	}
+	for _, network := range []string{ForwardNetworkTCP, ForwardNetworkUDP} {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO server_port_allocations(server_id,network,port,owner_type,owner_id)
+SELECT h.server_id,?,h.listen_port,'forward_hop',h.id
+FROM user_forward_hops h
+JOIN user_forward_rules f ON f.id=h.forward_id
+WHERE f.network=?
+  AND NOT EXISTS (
+    SELECT 1 FROM server_port_allocations a
+    WHERE a.owner_type='forward_hop' AND a.owner_id=h.id AND a.network=?
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM server_port_allocations a
+    WHERE a.server_id=h.server_id AND a.network=? AND a.port=h.listen_port
+  )`, network, ForwardNetworkTCPUDP, network, network); err != nil {
+			return fmt.Errorf("backfill %s forwarding port allocations: %w", network, err)
+		}
+	}
+
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return fmt.Errorf("commit forwarding constraint migration: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func beginForwardingImmediate(ctx context.Context, conn *sql.Conn) error {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if _, err = conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err == nil {
+			return nil
+		}
+		message := strings.ToLower(err.Error())
+		if !strings.Contains(message, "busy") && !strings.Contains(message, "locked") {
+			return err
+		}
+		delay := time.Duration(attempt+1) * 25 * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
 }
 
 func forwardingInitialized(r *TrafficRepository) error {
@@ -328,8 +492,8 @@ func normalizeTemplate(t *TunnelTemplate) error {
 	if t.State == "" {
 		t.State = TunnelStateActive
 	}
-	if t.Network == "" {
-		t.Network = "tcp"
+	if t.Network == "" || t.Network == ForwardNetworkTCP {
+		t.Network = ForwardNetworkTCPUDP
 	}
 	if t.BillingMode == "" {
 		t.BillingMode = ManagedBillingBoth
@@ -338,15 +502,15 @@ func normalizeTemplate(t *TunnelTemplate) error {
 		t.TrafficMultiplierMilli = 1000
 	}
 	if t.PortRangeStart == 0 {
-		t.PortRangeStart = 39000
+		t.PortRangeStart = 1024
 	}
 	if t.PortRangeEnd == 0 {
-		t.PortRangeEnd = 40000
+		t.PortRangeEnd = 65535
 	}
 	if t.State != TunnelStateActive && t.State != TunnelStateDraining && t.State != TunnelStateSuspended ||
-		t.Network != "tcp" || (t.BillingMode != ManagedBillingDownload && t.BillingMode != ManagedBillingBoth) ||
-		t.TrafficMultiplierMilli <= 0 || t.MaxTotalForwards < 0 || t.PortRangeStart < 39000 ||
-		t.PortRangeEnd > 40000 || t.PortRangeStart > t.PortRangeEnd || t.AllowCustomPublicTarget {
+		t.Network != ForwardNetworkTCPUDP || (t.BillingMode != ManagedBillingDownload && t.BillingMode != ManagedBillingBoth) ||
+		t.TrafficMultiplierMilli <= 0 || t.MaxTotalForwards < 0 || t.PortRangeStart < 1024 ||
+		t.PortRangeEnd > 65535 || t.PortRangeStart > t.PortRangeEnd || t.AllowCustomPublicTarget {
 		return ErrForwardingInvalid
 	}
 	t.AllowManagedTarget = true
@@ -527,7 +691,7 @@ func (r *TrafficRepository) UpdateTunnelTemplate(ctx context.Context, publicID s
 	if err := validateTunnelServersTx(ctx, tx, in.Hops); err != nil {
 		return nil, err
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE tunnel_templates SET name=?,description=?,state=?,billing_mode=?,traffic_multiplier_milli=?,max_total_forwards=?,port_range_start=?,port_range_end=?,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=?`, in.Name, in.Description, in.State, in.BillingMode, in.TrafficMultiplierMilli, in.MaxTotalForwards, in.PortRangeStart, in.PortRangeEnd, current.ID, expectedVersion)
+	res, err := tx.ExecContext(ctx, `UPDATE tunnel_templates SET name=?,description=?,state=?,network=?,billing_mode=?,traffic_multiplier_milli=?,max_total_forwards=?,port_range_start=?,port_range_end=?,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=?`, in.Name, in.Description, in.State, in.Network, in.BillingMode, in.TrafficMultiplierMilli, in.MaxTotalForwards, in.PortRangeStart, in.PortRangeEnd, current.ID, expectedVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -535,7 +699,7 @@ func (r *TrafficRepository) UpdateTunnelTemplate(ctx context.Context, publicID s
 	if n != 1 {
 		return nil, ErrForwardingConflict
 	}
-	pathChanged := len(current.Hops) != len(in.Hops)
+	pathChanged := current.Network != in.Network || len(current.Hops) != len(in.Hops)
 	if !pathChanged {
 		for i := range in.Hops {
 			if in.Hops[i].ServerID != current.Hops[i].ServerID {
@@ -847,6 +1011,7 @@ type CreateUserForwardInput struct {
 	Username, Name, GrantPublicID, TargetHost string
 	TargetNodeID                              int64
 	TargetPort                                int
+	RequestedEntryPort                        int
 	SourceCIDRs                               []string
 	TunnelVersion                             int64
 	EffectiveExpiresAt                        *time.Time
@@ -857,7 +1022,7 @@ func (r *TrafficRepository) CreateUserForward(ctx context.Context, in CreateUser
 	in.Username = strings.TrimSpace(in.Username)
 	in.Name = strings.TrimSpace(in.Name)
 	in.TargetHost = strings.TrimSpace(in.TargetHost)
-	if in.Username == "" || in.Name == "" || in.TargetNodeID <= 0 || in.TargetHost == "" || in.TargetPort < 1 || in.TargetPort > 65535 {
+	if in.Username == "" || in.Name == "" || in.TargetNodeID <= 0 || in.TargetHost == "" || in.TargetPort < 1 || in.TargetPort > 65535 || in.RequestedEntryPort < 0 || in.RequestedEntryPort > 65535 {
 		return nil, ErrForwardingInvalid
 	}
 	r.managedNodeMu.Lock()
@@ -880,6 +1045,10 @@ func (r *TrafficRepository) CreateUserForward(ctx context.Context, in CreateUser
 	}
 	if in.TunnelVersion > 0 && t.Version != in.TunnelVersion {
 		return nil, ErrForwardingConflict
+	}
+	forwardNetwork := ForwardNetworkTCPUDP
+	if in.RequestedEntryPort != 0 && (in.RequestedEntryPort < t.PortRangeStart || in.RequestedEntryPort > t.PortRangeEnd) {
+		return nil, ErrForwardingInvalid
 	}
 	var userEnabled int
 	if err := tx.QueryRowContext(ctx, `SELECT is_active FROM users WHERE username=?`, in.Username).Scan(&userEnabled); err != nil {
@@ -950,20 +1119,26 @@ COALESCE((SELECT SUM((CASE WHEN f.billing_mode_snapshot='both' THEN u.uplink_byt
 	if err != nil {
 		return nil, ErrForwardingInvalid
 	}
-	res, err := tx.ExecContext(ctx, `INSERT INTO user_forward_rules(public_id,grant_id,username,name,target_type,target_node_id,target_host,target_port,network,source_cidrs,effective_expires_at,billing_mode_snapshot,traffic_multiplier_milli_snapshot) VALUES(?,?,?,?, 'managed_node',?,?,?,'tcp',?,?,?,?)`, publicID, g.ID, in.Username, in.Name, in.TargetNodeID, in.TargetHost, in.TargetPort, string(sourceCIDRs), in.EffectiveExpiresAt, billing, t.TrafficMultiplierMilli)
+	res, err := tx.ExecContext(ctx, `INSERT INTO user_forward_rules(public_id,grant_id,username,name,target_type,target_node_id,target_host,target_port,network,source_cidrs,requested_entry_port,effective_expires_at,billing_mode_snapshot,traffic_multiplier_milli_snapshot) VALUES(?,?,?,?, 'managed_node',?,?,?,?,?,?,?,?,?)`, publicID, g.ID, in.Username, in.Name, in.TargetNodeID, in.TargetHost, in.TargetPort, forwardNetwork, string(sourceCIDRs), in.RequestedEntryPort, in.EffectiveExpiresAt, billing, t.TrafficMultiplierMilli)
 	if err != nil {
 		return nil, err
 	}
 	forwardID, _ := res.LastInsertId()
-	ports := make([]int, len(seeds))
+	serverIDs := make([]int64, len(seeds))
+	for i := range seeds {
+		serverIDs[i] = seeds[i].sid
+	}
+	port, err := findCommonForwardPortTx(ctx, tx, serverIDs, forwardNetwork, t.PortRangeStart, t.PortRangeEnd, in.RequestedEntryPort, nil)
+	if err != nil {
+		return nil, err
+	}
 	hopIDs := make([]int64, len(seeds))
 	resourceTags := make([]string, len(seeds))
 	for i, s := range seeds {
-		port, allocationID, err := allocateForwardPortTx(ctx, tx, s.sid, t.PortRangeStart, t.PortRangeEnd)
+		allocationIDs, err := reserveForwardPortTx(ctx, tx, s.sid, forwardNetwork, port)
 		if err != nil {
 			return nil, err
 		}
-		ports[i] = port
 		resourceID := fmt.Sprintf("rd_%s_h%d", strings.TrimPrefix(publicID, "fwd_"), i)
 		resourceTags[i] = tunnelidentity.Tag(resourceID)
 		hopIDRes, err := tx.ExecContext(ctx, `INSERT INTO user_forward_hops(forward_id,template_hop_id,position,server_id,resource_id,resource_tag,listen_port,next_host,next_port) VALUES(?,?,?,?,?,?,?,?,?)`, forwardID, s.id, s.pos, s.sid, resourceID, resourceTags[i], port, "", 0)
@@ -971,20 +1146,22 @@ COALESCE((SELECT SUM((CASE WHEN f.billing_mode_snapshot='both' THEN u.uplink_byt
 			return nil, err
 		}
 		hopIDs[i], _ = hopIDRes.LastInsertId()
-		if _, err = tx.ExecContext(ctx, `UPDATE server_port_allocations SET owner_id=? WHERE id=?`, hopIDs[i], allocationID); err != nil {
-			return nil, err
+		for _, allocationID := range allocationIDs {
+			if _, err = tx.ExecContext(ctx, `UPDATE server_port_allocations SET owner_id=? WHERE id=?`, hopIDs[i], allocationID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	for i := range seeds {
 		nextHost, nextPort := in.TargetHost, in.TargetPort
 		if i < len(seeds)-1 {
-			nextHost, nextPort = seeds[i+1].host, ports[i+1]
+			nextHost, nextPort = seeds[i+1].host, port
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE user_forward_hops SET next_host=?,next_port=? WHERE id=?`, nextHost, nextPort, hopIDs[i]); err != nil {
 			return nil, err
 		}
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE user_forward_rules SET allocated_entry_port=? WHERE id=?`, ports[0], forwardID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE user_forward_rules SET allocated_entry_port=? WHERE id=?`, port, forwardID); err != nil {
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO user_forward_usage(forward_id,cycle_started_at) VALUES(?,?)`, forwardID, time.Now().UTC()); err != nil {
@@ -1007,14 +1184,60 @@ ON CONFLICT(server_id,tag,type) DO NOTHING`, seeds[0].sid, resourceTags[0]); err
 	return r.GetUserForward(ctx, publicID, in.Username)
 }
 
-func allocateForwardPortTx(ctx context.Context, tx *sql.Tx, serverID int64, start, end int) (int, int64, error) {
-	return allocateForwardPortExcludingTx(ctx, tx, serverID, start, end, nil)
+func forwardReservationNetworks(network string) ([]string, []string, error) {
+	switch network {
+	case ForwardNetworkTCP:
+		return []string{ForwardNetworkTCP}, []string{ForwardNetworkTCP, ForwardNetworkTCPUDP}, nil
+	case ForwardNetworkTCPUDP:
+		return []string{ForwardNetworkTCP, ForwardNetworkUDP}, []string{ForwardNetworkTCP, ForwardNetworkUDP, ForwardNetworkTCPUDP}, nil
+	default:
+		return nil, nil, ErrForwardingInvalid
+	}
 }
 
-func allocateForwardPortExcludingTx(ctx context.Context, tx *sql.Tx, serverID int64, start, end int, excluded map[int]bool) (int, int64, error) {
+func findCommonForwardPortTx(ctx context.Context, tx *sql.Tx, serverIDs []int64, network string, start, end, requested int, excluded map[int]bool) (int, error) {
 	span := end - start + 1
-	if span <= 0 {
-		return 0, 0, ErrForwardingInvalid
+	if len(serverIDs) == 0 || start < 1024 || end > 65535 || span <= 0 || requested < 0 || requested > 65535 {
+		return 0, ErrForwardingInvalid
+	}
+	_, conflictNetworks, err := forwardReservationNetworks(network)
+	if err != nil {
+		return 0, err
+	}
+	serverPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(serverIDs)), ",")
+	networkPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(conflictNetworks)), ",")
+	args := make([]any, 0, len(serverIDs)+len(conflictNetworks)+2)
+	for _, serverID := range serverIDs {
+		args = append(args, serverID)
+	}
+	for _, value := range conflictNetworks {
+		args = append(args, value)
+	}
+	args = append(args, start, end)
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT port FROM server_port_allocations WHERE server_id IN (`+serverPlaceholders+`) AND network IN (`+networkPlaceholders+`) AND port BETWEEN ? AND ?`, args...)
+	if err != nil {
+		return 0, err
+	}
+	used := make(map[int]bool)
+	for rows.Next() {
+		var port int
+		if err := rows.Scan(&port); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		used[port] = true
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if requested != 0 {
+		if requested < start || requested > end {
+			return 0, ErrForwardingInvalid
+		}
+		if used[requested] || excluded[requested] {
+			return 0, ErrForwardingConflict
+		}
+		return requested, nil
 	}
 	seedBytes := make([]byte, 2)
 	_, _ = rand.Read(seedBytes)
@@ -1024,20 +1247,32 @@ func allocateForwardPortExcludingTx(ctx context.Context, tx *sql.Tx, serverID in
 	}
 	for i := 0; i < span; i++ {
 		port := start + (seed+i)%span
-		if excluded[port] {
+		if excluded[port] || used[port] {
 			continue
 		}
-		res, err := tx.ExecContext(ctx, `INSERT INTO server_port_allocations(server_id,network,port,owner_type,owner_id) VALUES(?,'tcp',?,'forward_hop',0)`, serverID, port)
+		return port, nil
+	}
+	return 0, ErrForwardingLimit
+}
+
+func reserveForwardPortTx(ctx context.Context, tx *sql.Tx, serverID int64, network string, port int) ([]int64, error) {
+	reservationNetworks, _, err := forwardReservationNetworks(network)
+	if err != nil {
+		return nil, err
+	}
+	allocationIDs := make([]int64, 0, len(reservationNetworks))
+	for _, value := range reservationNetworks {
+		res, err := tx.ExecContext(ctx, `INSERT INTO server_port_allocations(server_id,network,port,owner_type,owner_id) VALUES(?,?,?,'forward_hop',0)`, serverID, value, port)
 		if err != nil {
-			if strings.Contains(err.Error(), "UNIQUE") {
-				continue
+			if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
+				return nil, ErrForwardingConflict
 			}
-			return 0, 0, err
+			return nil, err
 		}
 		id, _ := res.LastInsertId()
-		return port, id, nil
+		allocationIDs = append(allocationIDs, id)
 	}
-	return 0, 0, ErrForwardingLimit
+	return allocationIDs, nil
 }
 
 // ReallocateUserForwardPorts replaces every per-hop identity and port in one
@@ -1046,24 +1281,49 @@ func allocateForwardPortExcludingTx(ctx context.Context, tx *sql.Tx, serverID in
 func (r *TrafficRepository) ReallocateUserForwardPorts(ctx context.Context, publicID, username string) (*UserForwardRule, error) {
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
-	forward, err := r.GetUserForward(ctx, publicID, username)
-	if err != nil {
-		return nil, err
-	}
-	if forward.DesiredState != ForwardDesiredActive || len(forward.Hops) == 0 {
-		return nil, ErrForwardingConflict
-	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	identityWhere := `public_id=?`
+	identityArgs := []any{strings.TrimSpace(publicID)}
+	if strings.TrimSpace(username) != "" {
+		identityWhere += ` AND username=?`
+		identityArgs = append(identityArgs, strings.TrimSpace(username))
+	}
+	checkArgs := append([]any(nil), identityArgs...)
+	res, err := tx.ExecContext(ctx, `UPDATE user_forward_rules SET updated_at=updated_at WHERE `+identityWhere+` AND desired_state='active' AND requested_entry_port=0`, checkArgs...)
+	if err != nil {
+		return nil, err
+	}
+	matched, _ := res.RowsAffected()
+	if matched != 1 {
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_forward_rules WHERE `+identityWhere, identityArgs...).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if exists == 0 {
+			return nil, ErrUserForwardNotFound
+		}
+		return nil, ErrForwardingConflict
+	}
+	forward, err := scanUserForward(tx.QueryRowContext(ctx, selectUserForward+` WHERE `+identityWhere, identityArgs...))
+	if err != nil {
+		return nil, err
+	}
+	if err := loadForwardHopsFrom(ctx, tx, &forward); err != nil {
+		return nil, err
+	}
+	if len(forward.Hops) == 0 {
+		return nil, ErrForwardingConflict
+	}
 	var portStart, portEnd int
 	if err := tx.QueryRowContext(ctx, `SELECT t.port_range_start,t.port_range_end
 FROM user_forward_rules f
 JOIN user_tunnel_grants g ON g.id=f.grant_id
 JOIN tunnel_templates t ON t.id=g.tunnel_id
-WHERE f.id=?`, forward.ID).Scan(&portStart, &portEnd); err != nil {
+	WHERE f.id=?`, forward.ID).Scan(&portStart, &portEnd); err != nil {
 		return nil, err
 	}
 	for _, hop := range forward.Hops {
@@ -1071,29 +1331,39 @@ WHERE f.id=?`, forward.ID).Scan(&portStart, &portEnd); err != nil {
 			return nil, err
 		}
 	}
-	ports := make([]int, len(forward.Hops))
+	serverIDs := make([]int64, len(forward.Hops))
+	excluded := make(map[int]bool, len(forward.Hops))
+	for i, hop := range forward.Hops {
+		serverIDs[i] = hop.ServerID
+		excluded[hop.ListenPort] = true
+	}
+	port, err := findCommonForwardPortTx(ctx, tx, serverIDs, ForwardNetworkTCPUDP, portStart, portEnd, 0, excluded)
+	if err != nil {
+		return nil, err
+	}
 	resourceTags := make([]string, len(forward.Hops))
 	for i, hop := range forward.Hops {
-		port, allocationID, err := allocateForwardPortExcludingTx(ctx, tx, hop.ServerID, portStart, portEnd, map[int]bool{hop.ListenPort: true})
+		allocationIDs, err := reserveForwardPortTx(ctx, tx, hop.ServerID, ForwardNetworkTCPUDP, port)
 		if err != nil {
 			return nil, err
 		}
-		ports[i] = port
 		resourceID := forwardingID("rhop_")
 		resourceTags[i] = tunnelidentity.Tag(resourceID)
 		if _, err := tx.ExecContext(ctx, `UPDATE user_forward_hops SET resource_id=?,resource_tag=?,listen_port=?,generation=generation+1,applied_generation=0,observed_state='pending',last_error='',updated_at=CURRENT_TIMESTAMP WHERE id=?`, resourceID, resourceTags[i], port, hop.ID); err != nil {
 			return nil, err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE server_port_allocations SET owner_id=? WHERE id=?`, hop.ID, allocationID); err != nil {
-			return nil, err
+		for _, allocationID := range allocationIDs {
+			if _, err := tx.ExecContext(ctx, `UPDATE server_port_allocations SET owner_id=? WHERE id=?`, hop.ID, allocationID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	for i := 0; i < len(forward.Hops)-1; i++ {
-		if _, err := tx.ExecContext(ctx, `UPDATE user_forward_hops SET next_port=? WHERE id=?`, ports[i+1], forward.Hops[i].ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE user_forward_hops SET next_port=? WHERE id=?`, port, forward.Hops[i].ID); err != nil {
 			return nil, err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE user_forward_rules SET allocated_entry_port=?,observed_state='pending',generation=generation+1,applied_generation=0,last_error_code='',last_error_detail='',updated_at=CURRENT_TIMESTAMP WHERE id=?`, ports[0], forward.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE user_forward_rules SET network=?,allocated_entry_port=?,observed_state='pending',generation=generation+1,applied_generation=0,last_error_code='',last_error_detail='',updated_at=CURRENT_TIMESTAMP WHERE id=?`, ForwardNetworkTCPUDP, port, forward.ID); err != nil {
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE user_forward_usage SET last_raw_uplink=0,last_raw_downlink=0,updated_at=CURRENT_TIMESTAMP WHERE forward_id=?`, forward.ID); err != nil {
@@ -1110,19 +1380,24 @@ ON CONFLICT(server_id,tag,type) DO NOTHING`, forward.Hops[0].ServerID, resourceT
 	return r.GetUserForward(ctx, publicID, username)
 }
 
-const selectUserForward = `SELECT id,public_id,grant_id,username,name,target_type,target_node_id,target_host,target_port,network,source_cidrs,allocated_entry_port,desired_state,observed_state,suspend_reason,generation,applied_generation,effective_expires_at,billing_mode_snapshot,traffic_multiplier_milli_snapshot,last_error_code,last_error_detail,created_at,updated_at FROM user_forward_rules`
+const selectUserForward = `SELECT id,public_id,grant_id,username,name,target_type,target_node_id,target_host,target_port,network,source_cidrs,requested_entry_port,allocated_entry_port,desired_state,observed_state,suspend_reason,generation,applied_generation,effective_expires_at,billing_mode_snapshot,traffic_multiplier_milli_snapshot,last_error_code,last_error_detail,created_at,updated_at FROM user_forward_rules`
 
 func scanUserForward(s rowScanner) (UserForwardRule, error) {
 	var f UserForwardRule
 	var expiry sql.NullString
 	var sourceCIDRs string
-	err := s.Scan(&f.ID, &f.PublicID, &f.GrantID, &f.Username, &f.Name, &f.TargetType, &f.TargetNodeID, &f.TargetHost, &f.TargetPort, &f.Network, &sourceCIDRs, &f.AllocatedEntryPort, &f.DesiredState, &f.ObservedState, &f.SuspendReason, &f.Generation, &f.AppliedGeneration, &expiry, &f.BillingModeSnapshot, &f.TrafficMultiplierMilliSnapshot, &f.LastErrorCode, &f.LastErrorDetail, &f.CreatedAt, &f.UpdatedAt)
+	err := s.Scan(&f.ID, &f.PublicID, &f.GrantID, &f.Username, &f.Name, &f.TargetType, &f.TargetNodeID, &f.TargetHost, &f.TargetPort, &f.Network, &sourceCIDRs, &f.RequestedEntryPort, &f.AllocatedEntryPort, &f.DesiredState, &f.ObservedState, &f.SuspendReason, &f.Generation, &f.AppliedGeneration, &expiry, &f.BillingModeSnapshot, &f.TrafficMultiplierMilliSnapshot, &f.LastErrorCode, &f.LastErrorDetail, &f.CreatedAt, &f.UpdatedAt)
 	f.EffectiveExpiresAt = managedParseNullTime(expiry)
 	_ = json.Unmarshal([]byte(sourceCIDRs), &f.SourceCIDRs)
 	return f, err
 }
-func (r *TrafficRepository) loadForwardHops(ctx context.Context, f *UserForwardRule) error {
-	rows, err := r.db.QueryContext(ctx, `SELECT h.id,h.forward_id,h.template_hop_id,h.position,h.server_id,COALESCE(rs.name,''),h.resource_id,h.resource_tag,h.listen_port,h.next_host,h.next_port,h.desired_state,h.observed_state,h.generation,h.applied_generation,h.retry_count,h.last_error,h.updated_at FROM user_forward_hops h LEFT JOIN remote_servers rs ON rs.id=h.server_id WHERE h.forward_id=? ORDER BY h.position`, f.ID)
+
+type forwardingRowsQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func loadForwardHopsFrom(ctx context.Context, queryer forwardingRowsQueryer, f *UserForwardRule) error {
+	rows, err := queryer.QueryContext(ctx, `SELECT h.id,h.forward_id,h.template_hop_id,h.position,h.server_id,COALESCE(rs.name,''),h.resource_id,h.resource_tag,h.listen_port,h.next_host,h.next_port,h.desired_state,h.observed_state,h.generation,h.applied_generation,h.retry_count,h.last_error,h.updated_at FROM user_forward_hops h LEFT JOIN remote_servers rs ON rs.id=h.server_id WHERE h.forward_id=? ORDER BY h.position`, f.ID)
 	if err != nil {
 		return err
 	}
@@ -1135,6 +1410,10 @@ func (r *TrafficRepository) loadForwardHops(ctx context.Context, f *UserForwardR
 		f.Hops = append(f.Hops, h)
 	}
 	return rows.Err()
+}
+
+func (r *TrafficRepository) loadForwardHops(ctx context.Context, f *UserForwardRule) error {
+	return loadForwardHopsFrom(ctx, r.db, f)
 }
 func (r *TrafficRepository) GetUserForward(ctx context.Context, publicID, username string) (*UserForwardRule, error) {
 	q := selectUserForward + ` WHERE public_id=?`
@@ -1292,6 +1571,8 @@ WHERE id=? AND desired_state='active'`, observed, reason, code, detail, id)
 }
 
 func (r *TrafficRepository) PrepareUserForwardSystemSuspend(ctx context.Context, publicID, username, reason string) (*UserForwardRule, error) {
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
 	forward, err := r.GetUserForward(ctx, publicID, username)
 	if err != nil {
 		return nil, err
@@ -1320,6 +1601,8 @@ func (r *TrafficRepository) PrepareUserForwardSystemSuspend(ctx context.Context,
 }
 
 func (r *TrafficRepository) PrepareUserForwardSystemApply(ctx context.Context, publicID, username string) (*UserForwardRule, error) {
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
 	forward, err := r.GetUserForward(ctx, publicID, username)
 	if err != nil {
 		return nil, err
@@ -1355,6 +1638,8 @@ func (r *TrafficRepository) SetUserForwardDesired(ctx context.Context, publicID,
 	if desired != ForwardDesiredActive && desired != ForwardDesiredInactive && desired != ForwardDesiredDeleted {
 		return nil, ErrForwardingInvalid
 	}
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
 	f, err := r.GetUserForward(ctx, publicID, username)
 	if err != nil {
 		return nil, err
@@ -1377,6 +1662,8 @@ func (r *TrafficRepository) SetUserForwardDesired(ctx context.Context, publicID,
 	return r.GetUserForward(ctx, publicID, username)
 }
 func (r *TrafficRepository) FinalizeUserForwardDelete(ctx context.Context, id int64) error {
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err

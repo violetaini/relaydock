@@ -25,6 +25,19 @@ type TunnelsHandler struct {
 	remoteManage *RemoteManageHandler
 }
 
+func isTunnelProtocol(protocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "tunnel", "dokodemo-door":
+		return true
+	default:
+		return false
+	}
+}
+
+func isManagedForwardingTunnelTag(tag string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(tag)), "rd-tun-")
+}
+
 func NewTunnelsHandler(repo *storage.TrafficRepository, rm *RemoteManageHandler) *TunnelsHandler {
 	return &TunnelsHandler{repo: repo, remoteManage: rm}
 }
@@ -47,6 +60,7 @@ type tunnelInfo struct {
 	MatchDomain   []string `json:"match_domain,omitempty"` // routed: rule.domain
 	MatchIP       []string `json:"match_ip,omitempty"`     // routed: rule.ip
 	RuleIndex     int      `json:"rule_index,omitempty"`   // routed: 删除时按 index 调 remove_rule(以拉取时为准,删前主控再 GET 一次校对)
+	ServerHosts   []string `json:"-"`                      // chain grouping: aliases that may be used by the previous hop
 }
 
 func (h *TunnelsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -103,13 +117,16 @@ func (h *TunnelsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			tag, _ := ib["tag"].(string)
 			inboundByTag[tag] = ib
-			if p, _ := ib["protocol"].(string); p != "tunnel" {
+			if p, _ := ib["protocol"].(string); !isTunnelProtocol(p) {
 				continue
 			}
-			if tag == "tunnel-in" || tag == "api" {
+			if tag == "tunnel-in" || tag == "api" || isManagedForwardingTunnelTag(tag) {
 				continue
 			}
-			ti := tunnelInfo{Kind: "inbound", ServerID: s.ID, ServerName: s.Name, IsFederated: isFed, Tag: tag}
+			ti := tunnelInfo{
+				Kind: "inbound", ServerID: s.ID, ServerName: s.Name, IsFederated: isFed, Tag: tag,
+				ServerHosts: []string{s.IPAddress, s.IPAddressV6, s.Domain, s.PullAddress},
+			}
 			ti.ListenPort = toInt(ib["port"])
 			if settings, ok := ib["settings"].(map[string]any); ok {
 				ti.TargetAddress, _ = settings["address"].(string)
@@ -185,6 +202,7 @@ type tunnelChainHop struct {
 }
 
 type tunnelChain struct {
+	ID          string           `json:"id"`
 	Label       string           `json:"label"`
 	Hops        []tunnelChainHop `json:"hops"`         // 按跳顺序(h0=入口 … 末=出口)
 	EntryServer int64            `json:"entry_server"` // 入口服务器 id(前端据此取可达地址 + relay 切换)
@@ -207,29 +225,101 @@ func groupTunnelChains(tunnels []tunnelInfo) ([]tunnelChain, []tunnelInfo) {
 	}
 	chains := make([]tunnelChain, 0, len(byLabel))
 	for label, hops := range byLabel {
-		// 按 tag 里的 hop index 排序
-		sort.Slice(hops, func(a, b int) bool {
-			_, ia, _ := parseChainTag(hops[a].Tag)
-			_, ib, _ := parseChainTag(hops[b].Tag)
-			return ia < ib
-		})
-		ch := tunnelChain{Label: label}
-		for _, hp := range hops {
-			ch.Hops = append(ch.Hops, tunnelChainHop{
-				ServerID: hp.ServerID, ServerName: hp.ServerName, Tag: hp.Tag,
-				ListenPort: hp.ListenPort, TargetAddress: hp.TargetAddress, TargetPort: hp.TargetPort,
-			})
+		for _, instance := range splitTunnelChainInstances(hops) {
+			ch := tunnelChain{ID: tunnelChainInstanceID(label, instance), Label: label}
+			for _, hp := range instance {
+				ch.Hops = append(ch.Hops, tunnelChainHop{
+					ServerID: hp.ServerID, ServerName: hp.ServerName, Tag: hp.Tag,
+					ListenPort: hp.ListenPort, TargetAddress: hp.TargetAddress, TargetPort: hp.TargetPort,
+				})
+			}
+			if len(ch.Hops) > 0 {
+				ch.EntryServer = ch.Hops[0].ServerID
+				ch.EntryPort = ch.Hops[0].ListenPort
+				last := ch.Hops[len(ch.Hops)-1]
+				ch.FinalTarget = fmt.Sprintf("%s:%d", last.TargetAddress, last.TargetPort)
+			}
+			chains = append(chains, ch)
 		}
-		if len(ch.Hops) > 0 {
-			ch.EntryServer = ch.Hops[0].ServerID
-			ch.EntryPort = ch.Hops[0].ListenPort
-			last := ch.Hops[len(ch.Hops)-1]
-			ch.FinalTarget = fmt.Sprintf("%s:%d", last.TargetAddress, last.TargetPort)
-		}
-		chains = append(chains, ch)
 	}
-	sort.Slice(chains, func(a, b int) bool { return chains[a].Label < chains[b].Label })
+	sort.Slice(chains, func(a, b int) bool {
+		if chains[a].Label == chains[b].Label {
+			return chains[a].ID < chains[b].ID
+		}
+		return chains[a].Label < chains[b].Label
+	})
 	return chains, flat
+}
+
+func splitTunnelChainInstances(hops []tunnelInfo) [][]tunnelInfo {
+	sort.Slice(hops, func(a, b int) bool {
+		_, ia, _ := parseChainTag(hops[a].Tag)
+		_, ib, _ := parseChainTag(hops[b].Tag)
+		if ia != ib {
+			return ia < ib
+		}
+		if hops[a].ServerID != hops[b].ServerID {
+			return hops[a].ServerID < hops[b].ServerID
+		}
+		return hops[a].Tag < hops[b].Tag
+	})
+
+	// A label is not sufficient to identify a legacy chain: stale or manually
+	// created hops can share a label even when every hop index is unique. Build
+	// each instance only through the actual target -> next-hop relationship.
+	// Hops without a connected successor deliberately remain singleton instances
+	// so deleting one returned chain cannot remove unrelated resources.
+	remaining := append([]tunnelInfo(nil), hops...)
+	instances := make([][]tunnelInfo, 0, len(remaining))
+	for len(remaining) > 0 {
+		current := remaining[0]
+		remaining = remaining[1:]
+		instance := []tunnelInfo{current}
+		for {
+			_, currentIndex, _ := parseChainTag(current.Tag)
+			next := -1
+			for i := range remaining {
+				_, candidateIndex, _ := parseChainTag(remaining[i].Tag)
+				if candidateIndex != currentIndex+1 || !tunnelHopTargetsServer(current, remaining[i]) {
+					continue
+				}
+				next = i
+				break
+			}
+			if next < 0 {
+				break
+			}
+			current = remaining[next]
+			remaining = append(remaining[:next], remaining[next+1:]...)
+			instance = append(instance, current)
+		}
+		instances = append(instances, instance)
+	}
+	return instances
+}
+
+func tunnelHopTargetsServer(hop, candidate tunnelInfo) bool {
+	if hop.TargetPort != candidate.ListenPort {
+		return false
+	}
+	target := strings.Trim(strings.ToLower(strings.TrimSpace(hop.TargetAddress)), "[]")
+	if target == "" {
+		return false
+	}
+	for _, host := range candidate.ServerHosts {
+		if strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]") == target {
+			return true
+		}
+	}
+	return false
+}
+
+func tunnelChainInstanceID(label string, hops []tunnelInfo) string {
+	parts := make([]string, 0, len(hops))
+	for _, hop := range hops {
+		parts = append(parts, fmt.Sprintf("%d/%s", hop.ServerID, hop.Tag))
+	}
+	return label + ":" + strings.Join(parts, ",")
 }
 
 // parseChainTag 解析 `tunnel-<label>-h<i>`;返回 label、hop 索引、是否匹配。

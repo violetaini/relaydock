@@ -20,6 +20,8 @@ func effectiveManagedNodeIDs(ctx context.Context, repo *storage.TrafficRepositor
 	for _, entry := range entries {
 		if !entry.Offer.Enabled || entry.Selection == nil || !entry.Selection.DesiredEnabled ||
 			entry.GrantStatus != storage.ManagedGrantActive || entry.AccessSource == nil ||
+			entry.AccessSource.NodeID != entry.Offer.NodeID || entry.AccessSource.ServerID != entry.Offer.ServerID ||
+			entry.AccessSource.InboundTag != entry.Offer.InboundTag ||
 			entry.AccessSource.DesiredState != storage.ManagedDesiredActive ||
 			entry.AccessSource.ObservedState != storage.ManagedObservedActive ||
 			entry.AccessSource.Generation != entry.AccessSource.AppliedGeneration ||
@@ -27,7 +29,17 @@ func effectiveManagedNodeIDs(ctx context.Context, repo *storage.TrafficRepositor
 			continue
 		}
 		node, nodeErr := repo.GetNodeByID(ctx, entry.Offer.NodeID)
-		if nodeErr != nil || !node.Enabled {
+		server, serverErr := repo.GetRemoteServer(ctx, entry.Offer.ServerID)
+		if nodeErr != nil || serverErr != nil || !entry.Grant.AllowsNodeProtocol(node.Protocol, node.ClashConfig) ||
+			!storage.SelfServiceNodeOfferAvailable(entry.Offer, node, *server) {
+			continue
+		}
+		if entry.Selection.CredentialConfigID == nil {
+			continue
+		}
+		credential, credentialErr := repo.GetUserInboundConfig(ctx, username, entry.Offer.ServerID, entry.Offer.InboundTag)
+		if credentialErr != nil || credential.ID != *entry.Selection.CredentialConfigID ||
+			!storage.SelfServiceCredentialProtocolMatches(credential.Protocol, node.Protocol) {
 			continue
 		}
 		seen[entry.Offer.NodeID] = true

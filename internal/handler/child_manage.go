@@ -24,17 +24,23 @@ import (
 
 // ChildManageHandler 处理子服务器的管理 API 请求
 type ChildManageHandler struct {
-	configToken            string // 用于身份验证的令牌
-	inboundsMu             sync.Mutex
-	clientExpiryMu         sync.Mutex
-	clientExpirations      map[string]managedClientExpiration
-	clientExpiryConfigPath string
-	clientExpiryWake       chan struct{}
+	configToken                 string // 用于身份验证的令牌
+	inboundsMu                  sync.Mutex
+	inboundMutationFencePath    string
+	inboundMutationFencesLoaded bool
+	inboundMutationFences       map[string]inboundMutationFenceState
+	clientExpiryMu              sync.Mutex
+	clientExpirations           map[string]managedClientExpiration
+	clientExpiryConfigPath      string
+	clientExpiryWake            chan struct{}
+	inboundFirewallSync         func(context.Context) error
 }
 
 const (
 	managedClientExpiryVersion     = 1
 	managedClientExpirySidecarName = ".mmwx-managed-client-expirations.json"
+	arcwayFirewallHelperPath       = "/usr/local/sbin/arcway-agent-firewall"
+	arcwayFirewallEnvironmentPath  = "/etc/arcway-port-firewall.env"
 )
 
 type managedClientExpiration struct {
@@ -53,9 +59,11 @@ type managedClientExpirationFile struct {
 // 创建一个新的子管理处理程序
 func NewChildManageHandler(configToken string) *ChildManageHandler {
 	h := &ChildManageHandler{
-		configToken:       configToken,
-		clientExpirations: make(map[string]managedClientExpiration),
-		clientExpiryWake:  make(chan struct{}, 1),
+		configToken:           configToken,
+		inboundMutationFences: make(map[string]inboundMutationFenceState),
+		clientExpirations:     make(map[string]managedClientExpiration),
+		clientExpiryWake:      make(chan struct{}, 1),
+		inboundFirewallSync:   syncArcwayInboundFirewall,
 	}
 	if configPath := h.findXrayConfigPath(); configPath != "" {
 		h.clientExpiryMu.Lock()
@@ -66,6 +74,54 @@ func NewChildManageHandler(configToken string) *ChildManageHandler {
 	}
 	go h.runManagedClientExpiryScheduler()
 	return h
+}
+
+func syncArcwayInboundFirewall(ctx context.Context) error {
+	return syncArcwayInboundFirewallPaths(ctx, arcwayFirewallHelperPath, arcwayFirewallEnvironmentPath)
+}
+
+func syncArcwayInboundFirewallPaths(ctx context.Context, helperPath, environmentPath string) error {
+	info, err := os.Stat(helperPath)
+	if errors.Is(err, os.ErrNotExist) {
+		if _, envErr := os.Stat(environmentPath); envErr == nil {
+			return fmt.Errorf("Arcway firewall helper is missing; rerun the node installation")
+		}
+		// Local development and legacy unmanaged child-mode installations do not
+		// have an Arcway-owned host firewall to reconcile.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect Arcway firewall helper: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+		return fmt.Errorf("Arcway firewall helper is not executable")
+	}
+	helper, err := os.ReadFile(helperPath)
+	if err != nil {
+		return fmt.Errorf("read Arcway firewall helper: %w", err)
+	}
+	if !bytes.Contains(helper, []byte("PUBLIC_RULES_RAW=")) || !bytes.Contains(helper, []byte("-arcway-firewall-rules=")) {
+		return fmt.Errorf("Arcway firewall helper is outdated; rerun the node installation before changing inbounds")
+	}
+	command := exec.CommandContext(ctx, helperPath)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
+		}
+		return fmt.Errorf("reconcile Arcway inbound firewall: %s", message)
+	}
+	return nil
+}
+
+func (h *ChildManageHandler) reconcileInboundFirewall() error {
+	if h.inboundFirewallSync == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	return h.inboundFirewallSync(ctx)
 }
 
 // 验证检查请求是否被授权
@@ -1401,11 +1457,12 @@ func (h *ChildManageHandler) saveNginxConfigFile(w http.ResponseWriter, r *http.
 
 // ChildInboundRequest 表示入站管理请求
 type ChildInboundRequest struct {
-	Action   string                 `json:"action"` // “添加”、“删除”、“列表”
-	Inbound  map[string]interface{} `json:"inbound,omitempty"`
-	Tag      string                 `json:"tag,omitempty"`
-	Client   map[string]interface{} `json:"client,omitempty"`
-	NotAfter *time.Time             `json:"not_after,omitempty"`
+	Action     string                 `json:"action"` // “添加”、“删除”、“列表”
+	Inbound    map[string]interface{} `json:"inbound,omitempty"`
+	Tag        string                 `json:"tag,omitempty"`
+	MutationID string                 `json:"mutation_id,omitempty"`
+	Client     map[string]interface{} `json:"client,omitempty"`
+	NotAfter   *time.Time             `json:"not_after,omitempty"`
 }
 
 // HandleInbounds 处理子服务器的入站管理
@@ -2190,6 +2247,17 @@ func (h *ChildManageHandler) manageInbound(w http.ResponseWriter, r *http.Reques
 	// prevents concurrent package or self-service requests from losing clients.
 	h.inboundsMu.Lock()
 	defer h.inboundsMu.Unlock()
+	if skipRemove, err := h.beginInboundMutationLocked(action, &req); err != nil {
+		childWriteError(w, http.StatusConflict, err.Error())
+		return
+	} else if skipRemove {
+		response := map[string]interface{}{"success": true, "message": "Inbound removal superseded by a newer mutation"}
+		if req.MutationID != "" {
+			response["mutation_id"] = req.MutationID
+		}
+		childWriteJSON(w, http.StatusOK, response)
+		return
+	}
 
 	// 连接到本地 Xray gRPC API
 	apiPort := h.findXrayAPIPort()
@@ -2313,33 +2381,127 @@ func (h *ChildManageHandler) manageInbound(w http.ResponseWriter, r *http.Reques
 			childWriteError(w, http.StatusBadRequest, "Inbound payload is required")
 			return
 		}
+		tag, _ := req.Inbound["tag"].(string)
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			childWriteError(w, http.StatusBadRequest, "Inbound tag is required")
+			return
+		}
+		configPath := h.findXrayConfigPath()
+		if configPath == "" {
+			childWriteError(w, http.StatusInternalServerError, "Xray config file not found")
+			return
+		}
+		original, err := h.getInboundFromConfig(tag)
+		if err != nil {
+			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to inspect existing inbound: %v", err))
+			return
+		}
+		if original != nil {
+			original, err = cloneInboundConfig(original)
+			if err != nil {
+				childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to clone existing inbound: %v", err))
+				return
+			}
+		}
 
 		// 通过 gRPC 添加
 		if err := h.addInbound(ctx, clients.Handler, req.Inbound); err != nil {
+			if original != nil {
+				if rollbackErr := h.addInbound(ctx, clients.Handler, original); rollbackErr != nil {
+					childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to add inbound: %v; failed to restore previous runtime inbound: %v", err, rollbackErr))
+					return
+				}
+			}
 			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to add inbound: %v", err))
 			return
 		}
 
-		// Persist to config file - 失败时返回警告
+		// Only acknowledge the mutation after the on-disk config is durable. If
+		// persistence fails, restore the prior runtime state before returning an
+		// error so callers never mistake a restart-unsafe mutation for success.
 		if err := h.persistInbound(req.Inbound); err != nil {
-			log.Printf("[Child Manage] Error: Failed to persist inbound to config: %v", err)
-			childWriteJSON(w, http.StatusOK, map[string]interface{}{
-				"success": true,
-				"message": "入站已添加到运行时，但写入配置文件失败: " + err.Error(),
-				"warning": "persist_failed",
-			})
+			var rollbackErr error
+			if original != nil {
+				rollbackErr = h.addInbound(ctx, clients.Handler, original)
+			} else {
+				rollbackErr = h.removeInbound(ctx, clients.Handler, tag)
+			}
+			if rollbackErr != nil {
+				childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist inbound: %v; failed to restore runtime state: %v", err, rollbackErr))
+				return
+			}
+			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist inbound: %v; runtime state restored", err))
+			return
+		}
+		if firewallErr := h.reconcileInboundFirewall(); firewallErr != nil {
+			rollbackFailures := make([]string, 0, 3)
+			var configRollbackErr error
+			if original != nil {
+				configRollbackErr = upsertInboundConfigFile(configPath, original)
+			} else {
+				configRollbackErr = removeInboundConfigFile(configPath, tag)
+			}
+			if configRollbackErr != nil {
+				rollbackFailures = append(rollbackFailures, "config: "+configRollbackErr.Error())
+			}
+
+			rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			var runtimeRollbackErr error
+			if original != nil {
+				runtimeRollbackErr = h.addInbound(rollbackCtx, clients.Handler, original)
+			} else {
+				runtimeRollbackErr = h.removeInbound(rollbackCtx, clients.Handler, tag)
+			}
+			rollbackCancel()
+			if runtimeRollbackErr != nil {
+				rollbackFailures = append(rollbackFailures, "runtime: "+runtimeRollbackErr.Error())
+			}
+			if configRollbackErr == nil {
+				if rollbackFirewallErr := h.reconcileInboundFirewall(); rollbackFirewallErr != nil {
+					rollbackFailures = append(rollbackFailures, "firewall: "+rollbackFirewallErr.Error())
+				}
+			}
+			message := fmt.Sprintf("Failed to synchronize inbound firewall: %v", firewallErr)
+			if len(rollbackFailures) == 0 {
+				message += "; runtime, config, and firewall state restored"
+			} else {
+				message += "; rollback failures: " + strings.Join(rollbackFailures, "; ")
+			}
+			childWriteError(w, http.StatusInternalServerError, message)
 			return
 		}
 
-		childWriteJSON(w, http.StatusOK, map[string]interface{}{
+		response := map[string]interface{}{
 			"success": true,
 			"message": "Inbound added successfully",
-		})
+		}
+		if req.MutationID != "" {
+			response["mutation_id"] = req.MutationID
+		}
+		childWriteJSON(w, http.StatusOK, response)
 
 	case "remove":
 		if req.Tag == "" {
 			childWriteError(w, http.StatusBadRequest, "Tag is required for remove action")
 			return
+		}
+		configPath := h.findXrayConfigPath()
+		if configPath == "" {
+			childWriteError(w, http.StatusInternalServerError, "Xray config file not found")
+			return
+		}
+		original, err := h.getInboundFromConfig(req.Tag)
+		if err != nil {
+			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to inspect inbound before removal: %v", err))
+			return
+		}
+		if original != nil {
+			original, err = cloneInboundConfig(original)
+			if err != nil {
+				childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to clone inbound before removal: %v", err))
+				return
+			}
 		}
 
 		// 通过 gRPC 删除
@@ -2350,18 +2512,70 @@ func (h *ChildManageHandler) manageInbound(w http.ResponseWriter, r *http.Reques
 
 		// 从配置文件中删除
 		if err := h.removeInboundFromConfig(req.Tag); err != nil {
-			log.Printf("[Child Manage] Warning: Failed to remove inbound from config: %v", err)
-		}
-		if configPath := h.findXrayConfigPath(); configPath != "" {
-			if err := h.removeClientExpirationsForTag(configPath, req.Tag); err != nil {
-				log.Printf("[Child Manage] Warning: Failed to clear expirations for removed inbound %s: %v", req.Tag, err)
+			var rollbackErr error
+			if original != nil {
+				rollbackErr = h.addInbound(ctx, clients.Handler, original)
 			}
+			if rollbackErr != nil {
+				childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist inbound removal: %v; failed to restore runtime inbound: %v", err, rollbackErr))
+				return
+			}
+			if original == nil {
+				childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist inbound removal: %v; runtime inbound was removed but no persisted definition was available to restore", err))
+				return
+			}
+			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist inbound removal: %v; runtime state restored", err))
+			return
+		}
+		if firewallErr := h.reconcileInboundFirewall(); firewallErr != nil {
+			rollbackFailures := make([]string, 0, 3)
+			var configRollbackErr error
+			if original != nil {
+				configRollbackErr = upsertInboundConfigFile(configPath, original)
+			}
+			if configRollbackErr != nil {
+				rollbackFailures = append(rollbackFailures, "config: "+configRollbackErr.Error())
+			}
+
+			var runtimeRollbackErr error
+			if original != nil {
+				rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				runtimeRollbackErr = h.addInbound(rollbackCtx, clients.Handler, original)
+				rollbackCancel()
+			}
+			if runtimeRollbackErr != nil {
+				rollbackFailures = append(rollbackFailures, "runtime: "+runtimeRollbackErr.Error())
+			}
+			if configRollbackErr == nil {
+				if rollbackFirewallErr := h.reconcileInboundFirewall(); rollbackFirewallErr != nil {
+					rollbackFailures = append(rollbackFailures, "firewall: "+rollbackFirewallErr.Error())
+				}
+			}
+			message := fmt.Sprintf("Failed to synchronize inbound firewall removal: %v", firewallErr)
+			if len(rollbackFailures) == 0 {
+				message += "; runtime, config, and firewall state restored"
+			} else {
+				message += "; rollback failures: " + strings.Join(rollbackFailures, "; ")
+			}
+			childWriteError(w, http.StatusInternalServerError, message)
+			return
+		}
+		if err := h.removeClientExpirationsForTag(configPath, req.Tag); err != nil {
+			log.Printf("[Child Manage] Warning: Failed to clear expirations for removed inbound %s: %v", req.Tag, err)
+		}
+		if err := h.completeInboundMutationRemovalLocked(req.Tag, req.MutationID); err != nil {
+			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist inbound mutation fence: %v", err))
+			return
 		}
 
-		childWriteJSON(w, http.StatusOK, map[string]interface{}{
+		response := map[string]interface{}{
 			"success": true,
 			"message": "Inbound removed successfully",
-		})
+		}
+		if req.MutationID != "" {
+			response["mutation_id"] = req.MutationID
+		}
+		childWriteJSON(w, http.StatusOK, response)
 
 	default:
 		childWriteError(w, http.StatusBadRequest, "Invalid action. Must be 'add', 'remove', 'add-client', or 'remove-client'")
@@ -2792,7 +3006,15 @@ func (h *ChildManageHandler) persistInbound(inbound map[string]interface{}) erro
 	if configPath == "" {
 		return fmt.Errorf("config file not found")
 	}
+	return upsertInboundConfigFile(configPath, inbound)
+}
 
+func upsertInboundConfigFile(configPath string, inbound map[string]interface{}) error {
+	tag, _ := inbound["tag"].(string)
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return fmt.Errorf("inbound tag is required")
+	}
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("failed to read config: %w", err)
@@ -2804,15 +3026,30 @@ func (h *ChildManageHandler) persistInbound(inbound map[string]interface{}) erro
 	}
 
 	inbounds, _ := config["inbounds"].([]interface{})
-	inbounds = append(inbounds, inbound)
-	config["inbounds"] = inbounds
-
-	newContent, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
+	updated := make([]interface{}, 0, len(inbounds)+1)
+	replaced := false
+	for _, raw := range inbounds {
+		current, _ := raw.(map[string]interface{})
+		currentTag, _ := current["tag"].(string)
+		if currentTag != tag {
+			updated = append(updated, raw)
+			continue
+		}
+		if !replaced {
+			updated = append(updated, inbound)
+			replaced = true
+		}
+		// Drop any additional definitions for the same tag while repairing
+		// configurations written by the historical append-only implementation.
 	}
-
-	return os.WriteFile(configPath, newContent, 0644)
+	if !replaced {
+		updated = append(updated, inbound)
+	}
+	config["inbounds"] = updated
+	if err := writeJSONFileAtomic(configPath, config); err != nil {
+		return fmt.Errorf("failed to write config: %w", err)
+	}
+	return nil
 }
 
 func (h *ChildManageHandler) replaceInboundInConfig(inbound map[string]interface{}) error {
@@ -2915,7 +3152,14 @@ func (h *ChildManageHandler) removeInboundFromConfig(tag string) error {
 	if configPath == "" {
 		return fmt.Errorf("config file not found")
 	}
+	return removeInboundConfigFile(configPath, tag)
+}
 
+func removeInboundConfigFile(configPath, tag string) error {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return fmt.Errorf("inbound tag is required")
+	}
 	content, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("failed to read config: %w", err)
@@ -2940,13 +3184,10 @@ func (h *ChildManageHandler) removeInboundFromConfig(tag string) error {
 		}
 	}
 	config["inbounds"] = newInbounds
-
-	newContent, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
+	if err := writeJSONFileAtomic(configPath, config); err != nil {
+		return fmt.Errorf("failed to write config: %w", err)
 	}
-
-	return os.WriteFile(configPath, newContent, 0644)
+	return nil
 }
 
 func (h *ChildManageHandler) persistOutbound(outbound map[string]interface{}) error {

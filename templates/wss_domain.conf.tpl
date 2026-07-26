@@ -1,8 +1,7 @@
     # 自动生成,妙妙屋X WSS 入站 nginx 反代配置。多个 WSS 入站合并渲染。
     server {
-        listen                     443 ssl;
-        listen                     [::]:443 ssl;
-        http2                      on;
+        listen                     443 ssl http2;
+        listen                     [::]:443 ssl http2;
         server_name                {{.Domain}};
 
         ssl_certificate            /usr/local/nginx/cert/{{.CertName}}.pem;

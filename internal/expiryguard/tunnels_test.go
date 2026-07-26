@@ -174,7 +174,7 @@ func validTunnelRequest(id string, port int) TunnelApplyRequest {
 		ListenPort:   port,
 		TargetIP:     "198.51.100.20",
 		TargetPort:   443,
-		Network:      "tcp",
+		Network:      tunnelNetworkTCPUDP,
 		HardNotAfter: now.Add(time.Hour),
 		LeaseUntil:   now.Add(5 * time.Minute),
 	}
@@ -186,6 +186,101 @@ func apiErrorCode(err error) string {
 		return typed.code
 	}
 	return ""
+}
+
+func TestTunnelNetworkNormalizationAndPersistedCompatibility(t *testing.T) {
+	now := time.Now().UTC()
+	for _, network := range []string{"", tunnelNetworkTCP, tunnelNetworkTCPUDP, "TCP_UDP"} {
+		request := validTunnelRequest("forward_hop_network_1", 24010)
+		request.Network = network
+		resource, err := normalizeTunnelApply(request, now)
+		if err != nil {
+			t.Fatalf("normalize network %q: %v", network, err)
+		}
+		if resource.Network != tunnelNetworkTCPUDP {
+			t.Fatalf("normalize network %q = %q, want %q", network, resource.Network, tunnelNetworkTCPUDP)
+		}
+	}
+
+	request := validTunnelRequest("forward_hop_network_2", 24011)
+	request.Network = tunnelNetworkUDP
+	if _, err := normalizeTunnelApply(request, now); apiErrorCode(err) != "unsupported_network" {
+		t.Fatalf("new udp-only request error = %v", err)
+	}
+
+	resource, err := normalizeTunnelApply(validTunnelRequest("forward_hop_network_3", 24012), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, network := range []string{tunnelNetworkTCP, tunnelNetworkUDP, tunnelNetworkTCPUDP} {
+		persisted := resource
+		persisted.Network = network
+		if err := validatePersistedTunnelResource(persisted); err != nil {
+			t.Fatalf("persisted network %q rejected: %v", network, err)
+		}
+		candidate := resource
+		candidate.ResourceID = "forward_hop_network_candidate"
+		candidate.Tag = tunnelTag(candidate.ResourceID)
+		guard := &Guard{tunnels: map[string]TunnelResource{persisted.ResourceID: persisted}}
+		if err := guard.checkDurablePort(candidate); apiErrorCode(err) != "port_reserved" {
+			t.Fatalf("persisted network %q did not reserve combined port: %v", network, err)
+		}
+		if network == tunnelNetworkTCPUDP {
+			if !sameTunnelSpec(persisted, resource) {
+				t.Fatal("canonical same-generation network was not idempotent")
+			}
+			continue
+		}
+		if sameTunnelSpec(persisted, resource) {
+			t.Fatalf("legacy network %q was accepted as a same-generation tcp_udp spec", network)
+		}
+		upgrade := resource
+		upgrade.Generation++
+		if !sameTunnelDefinition(persisted, upgrade) {
+			t.Fatalf("persisted network %q is not upgrade-compatible with tcp_udp", network)
+		}
+	}
+}
+
+func TestTunnelLegacyNetworkRequiresNewGenerationAndReappliesCombinedInbound(t *testing.T) {
+	agent := newFakeTunnelAgent()
+	guard, _, _ := newTunnelGuard(t, agent, &fakeNFTRunner{available: true})
+	request := validTunnelRequest("forward_hop_legacy_network", 24013)
+	now := time.Now().UTC()
+	persisted, err := normalizeTunnelApply(request, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted.Network = tunnelNetworkTCP
+	persisted.State = TunnelStateActive
+	if err := guard.storeTunnel(persisted); err != nil {
+		t.Fatal(err)
+	}
+	legacyInbound := tunnelInbound(persisted)
+	legacyInbound["settings"].(map[string]interface{})["network"] = tunnelNetworkTCP
+	agent.inbounds[persisted.Tag] = legacyInbound
+
+	request.LeaseUntil = request.LeaseUntil.Add(time.Minute)
+	if _, _, err := guard.ApplyTunnel(context.Background(), request); apiErrorCode(err) != "generation_conflict" {
+		t.Fatalf("same-generation legacy network error = %v", err)
+	}
+	agent.mu.Lock()
+	if agent.addCalls != 0 {
+		t.Fatalf("same-generation legacy resource was reapplied %d time(s)", agent.addCalls)
+	}
+	agent.mu.Unlock()
+
+	request.Generation++
+	upgraded, changed, err := guard.ApplyTunnel(context.Background(), request)
+	if err != nil || !changed || upgraded.State != TunnelStateActive || upgraded.Network != tunnelNetworkTCPUDP {
+		t.Fatalf("legacy network upgrade = %#v changed=%v err=%v", upgraded, changed, err)
+	}
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	settings, _ := agent.lastAdd["settings"].(map[string]interface{})
+	if agent.addCalls != 1 || settings["network"] != xrayNetworkTCPUDP {
+		t.Fatalf("legacy upgrade apply calls=%d settings=%#v", agent.addCalls, settings)
+	}
 }
 
 func TestTunnelApplyIsDurableIdempotentAndInstallsSourceACL(t *testing.T) {
@@ -209,6 +304,10 @@ func TestTunnelApplyIsDurableIdempotentAndInstallsSourceACL(t *testing.T) {
 	if agent.lastAdd["protocol"] != "dokodemo-door" || intFromJSON(agent.lastAdd["port"]) != request.ListenPort {
 		t.Fatalf("unexpected inbound = %#v", agent.lastAdd)
 	}
+	settings, _ := agent.lastAdd["settings"].(map[string]interface{})
+	if settings["network"] != xrayNetworkTCPUDP {
+		t.Fatalf("dokodemo network = %#v, want %q", settings["network"], xrayNetworkTCPUDP)
+	}
 	agent.mu.Unlock()
 
 	runner.mu.Lock()
@@ -218,8 +317,11 @@ func TestTunnelApplyIsDurableIdempotentAndInstallsSourceACL(t *testing.T) {
 		"table inet arcway_forwarding",
 		"type filter hook input priority -20; policy accept;",
 		"ip saddr { 203.0.113.7/32 } tcp dport 24001 accept",
+		"ip saddr { 203.0.113.7/32 } udp dport 24001 accept",
 		"ip6 saddr { 2001:db8::/64 } tcp dport 24001 accept",
+		"ip6 saddr { 2001:db8::/64 } udp dport 24001 accept",
 		"tcp dport 24001 drop",
+		"udp dport 24001 drop",
 	} {
 		if !strings.Contains(combinedRules, fragment) {
 			t.Fatalf("nft rules do not contain %q:\n%s", fragment, combinedRules)
@@ -439,6 +541,10 @@ func TestTunnelHTTPContractAndCapabilities(t *testing.T) {
 	}
 	if advertised["managed_tunnel_v1"] != true || advertised["inbound_expiry_v1"] != true || advertised["inbound_acl_v1"] != true || advertised["inbound_limiter_v1"] != false {
 		t.Fatalf("capabilities = %#v", advertised)
+	}
+	networks, _ := advertised["tunnel_networks"].([]interface{})
+	if len(networks) != 1 || networks[0] != tunnelNetworkTCPUDP {
+		t.Fatalf("tunnel networks = %#v", advertised["tunnel_networks"])
 	}
 
 	apply := signedGuardRequest(t, server.Client(), http.MethodPut, server.URL, "/v1/tunnels/apply", validTunnelRequest("forward_hop_0007", 24007))

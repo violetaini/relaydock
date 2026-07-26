@@ -509,6 +509,7 @@ func TestAdminManagedNodeLimitsQueuesRetryWithoutLimiterACK(t *testing.T) {
 		t.Fatalf("update fake Agent port: %v", err)
 	}
 
+	linkManagedHandlerCredentialForTest(t, fixture, "alice", "vless")
 	baseline, err := fixture.repo.MarkUserInboundAccessSourceApplied(ctx, fixture.activation.Source.ID,
 		fixture.activation.Source.Generation, storage.ManagedObservedActive, time.Now().UTC())
 	if err != nil {

@@ -58,6 +58,7 @@ var (
 	ErrManagedActiveNodeLimit       = errors.New("managed active node limit reached")
 	ErrManagedTrafficLimit          = errors.New("managed traffic limit reached")
 	ErrManagedGrantInactive         = errors.New("managed server grant is not active")
+	ErrManagedProtocolNotAllowed    = errors.New("managed node protocol is not allowed by server grant")
 	ErrManagedAccessConflict        = errors.New("package and managed node access overlap")
 	ErrManagedBillingModeConflict   = errors.New("billing mode cannot change after usage is recorded")
 	ErrManagedResourceInUse         = errors.New("managed resource is in use")
@@ -77,25 +78,27 @@ type SelfServiceNodeOffer struct {
 }
 
 type UserServerGrant struct {
-	ID                int64      `json:"id"`
-	Username          string     `json:"username"`
-	ServerID          int64      `json:"server_id"`
-	Enabled           bool       `json:"enabled"`
-	StartsAt          time.Time  `json:"starts_at"`
-	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
-	MaxActiveNodes    int        `json:"max_active_nodes"`
-	SpeedLimitMbps    float64    `json:"speed_limit_mbps"`
-	ConnectionLimit   int        `json:"connection_limit"`
-	TrafficLimitBytes int64      `json:"traffic_limit_bytes"`
-	BillingMode       string     `json:"billing_mode"`
-	ResetPolicy       string     `json:"reset_policy"`
-	ResetDay          int        `json:"reset_day"`
-	BillingTimezone   string     `json:"billing_timezone"`
-	NextResetAt       *time.Time `json:"next_reset_at,omitempty"`
-	Version           int64      `json:"version"`
-	CreatedBy         string     `json:"created_by"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+	ID                      int64      `json:"id"`
+	Username                string     `json:"username"`
+	ServerID                int64      `json:"server_id"`
+	Enabled                 bool       `json:"enabled"`
+	StartsAt                time.Time  `json:"starts_at"`
+	ExpiresAt               *time.Time `json:"expires_at,omitempty"`
+	MaxActiveNodes          int        `json:"max_active_nodes"`
+	SpeedLimitMbps          float64    `json:"speed_limit_mbps"`
+	ConnectionLimit         int        `json:"connection_limit"`
+	TrafficLimitBytes       int64      `json:"traffic_limit_bytes"`
+	BillingMode             string     `json:"billing_mode"`
+	ResetPolicy             string     `json:"reset_policy"`
+	ResetDay                int        `json:"reset_day"`
+	BillingTimezone         string     `json:"billing_timezone"`
+	NextResetAt             *time.Time `json:"next_reset_at,omitempty"`
+	AllowedProtocols        []string   `json:"allowed_protocols"`
+	AllowedProtocolProfiles []string   `json:"allowed_protocol_profiles"`
+	Version                 int64      `json:"version"`
+	CreatedBy               string     `json:"created_by"`
+	CreatedAt               time.Time  `json:"created_at"`
+	UpdatedAt               time.Time  `json:"updated_at"`
 }
 
 type UserNodeSelection struct {
@@ -169,18 +172,19 @@ type ManagedAccessAudit struct {
 }
 
 type ManagedNodeCatalogEntry struct {
-	Offer        SelfServiceNodeOffer     `json:"offer"`
-	Grant        UserServerGrant          `json:"grant"`
-	Selection    *UserNodeSelection       `json:"selection,omitempty"`
-	AccessSource *UserInboundAccessSource `json:"access_source,omitempty"`
-	NodeName     string                   `json:"node_name"`
-	Protocol     string                   `json:"protocol"`
-	ServerName   string                   `json:"server_name"`
-	ServerStatus string                   `json:"server_status"`
-	GrantStatus  string                   `json:"grant_status"`
-	UsageBytes   int64                    `json:"usage_bytes"`
-	CanCreate    bool                     `json:"can_create"`
-	DenyReason   string                   `json:"deny_reason,omitempty"`
+	Offer           SelfServiceNodeOffer     `json:"offer"`
+	Grant           UserServerGrant          `json:"grant"`
+	Selection       *UserNodeSelection       `json:"selection,omitempty"`
+	AccessSource    *UserInboundAccessSource `json:"access_source,omitempty"`
+	NodeName        string                   `json:"node_name"`
+	Protocol        string                   `json:"protocol"`
+	ProtocolProfile string                   `json:"protocol_profile"`
+	ServerName      string                   `json:"server_name"`
+	ServerStatus    string                   `json:"server_status"`
+	GrantStatus     string                   `json:"grant_status"`
+	UsageBytes      int64                    `json:"usage_bytes"`
+	CanCreate       bool                     `json:"can_create"`
+	DenyReason      string                   `json:"deny_reason,omitempty"`
 }
 
 type SelectionActivationResult struct {
@@ -221,6 +225,8 @@ CREATE TABLE IF NOT EXISTS user_server_grants (
     reset_day INTEGER NOT NULL DEFAULT 1 CHECK(reset_day BETWEEN 1 AND 28),
     billing_timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
     next_reset_at TIMESTAMP,
+    allowed_protocols_json TEXT NOT NULL DEFAULT '[]',
+    allowed_protocol_profiles_json TEXT NOT NULL DEFAULT '[]',
     version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
     created_by TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -314,6 +320,12 @@ CREATE TABLE IF NOT EXISTS remote_server_guard_secrets (
 `
 	if _, err := r.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate managed nodes: %w", err)
+	}
+	if err := r.ensureTableColumn("user_server_grants", "allowed_protocols_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return fmt.Errorf("migrate managed grant protocol whitelist: %w", err)
+	}
+	if err := r.ensureTableColumn("user_server_grants", "allowed_protocol_profiles_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return fmt.Errorf("migrate managed grant protocol profile whitelist: %w", err)
 	}
 
 	// Existing credentials cannot be safely attributed to a package or a user selection.
@@ -424,6 +436,272 @@ func managedInitialized(r *TrafficRepository) error {
 	return nil
 }
 
+var managedGrantProtocolAliases = map[string]string{
+	"vless":       "vless",
+	"vmess":       "vmess",
+	"trojan":      "trojan",
+	"shadowsocks": "shadowsocks",
+	"ss":          "shadowsocks",
+	"hysteria":    "hysteria",
+	"hysteria2":   "hysteria",
+	"hy2":         "hysteria",
+	"socks":       "socks",
+	"socks5":      "socks",
+	"http":        "http",
+	"anytls":      "anytls",
+	"snell":       "snell",
+}
+
+var managedGrantProtocolProfileFamilies = map[string]string{
+	"vless-reality": "vless", "vless-tcp-tls": "vless", "vless-grpc-tls": "vless", "vless-wss": "vless", "vless-ws": "vless",
+	"vmess-tcp-none": "vmess", "vmess-tcp-tls": "vmess", "vmess-grpc-tls": "vmess", "vmess-wss": "vmess", "vmess-ws": "vmess",
+	"trojan-tcp-tls": "trojan", "trojan-reality": "trojan", "trojan-grpc-tls": "trojan", "trojan-wss": "trojan",
+	"shadowsocks-2022": "shadowsocks", "hysteria2": "hysteria", "socks5": "socks", "http": "http", "anytls": "anytls", "snell": "snell",
+}
+
+func canonicalManagedGrantProtocol(protocol string) (string, bool) {
+	canonical, ok := managedGrantProtocolAliases[strings.ToLower(strings.TrimSpace(protocol))]
+	return canonical, ok
+}
+
+// NormalizeManagedGrantAllowedProtocols validates the self-service protocol
+// families stored on a server grant. An empty list intentionally means every
+// publishable managed-client protocol, preserving grants created before this
+// policy existed.
+func NormalizeManagedGrantAllowedProtocols(protocols []string) ([]string, error) {
+	normalized := make([]string, 0, len(protocols))
+	seen := make(map[string]struct{}, len(protocols))
+	for _, protocol := range protocols {
+		canonical, ok := canonicalManagedGrantProtocol(protocol)
+		if !ok {
+			return nil, fmt.Errorf("%w: unsupported allowed protocol %q", ErrManagedInvalidArgument, strings.TrimSpace(protocol))
+		}
+		if _, exists := seen[canonical]; exists {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		normalized = append(normalized, canonical)
+	}
+	return normalized, nil
+}
+
+// NormalizeManagedGrantAllowedProtocolProfiles validates the stable protocol
+// combination identifiers stored on a server grant. An empty list adds no
+// combination restriction and preserves the behavior of existing grants.
+func NormalizeManagedGrantAllowedProtocolProfiles(profiles []string) ([]string, error) {
+	normalized := make([]string, 0, len(profiles))
+	seen := make(map[string]struct{}, len(profiles))
+	for _, profile := range profiles {
+		profile = strings.ToLower(strings.TrimSpace(profile))
+		if _, ok := managedGrantProtocolProfileFamilies[profile]; !ok {
+			return nil, fmt.Errorf("%w: unsupported allowed protocol profile %q", ErrManagedInvalidArgument, profile)
+		}
+		if _, exists := seen[profile]; exists {
+			continue
+		}
+		seen[profile] = struct{}{}
+		normalized = append(normalized, profile)
+	}
+	return normalized, nil
+}
+
+func validateManagedGrantProtocolScope(protocols, profiles []string) error {
+	if len(profiles) == 0 {
+		return nil
+	}
+	if len(protocols) == 0 {
+		return fmt.Errorf("%w: allowed_protocols must match allowed_protocol_profiles", ErrManagedInvalidArgument)
+	}
+	profileFamilies := make(map[string]struct{}, len(profiles))
+	for _, profile := range profiles {
+		profileFamilies[managedGrantProtocolProfileFamilies[profile]] = struct{}{}
+	}
+	if len(profileFamilies) != len(protocols) {
+		return fmt.Errorf("%w: allowed_protocols must match allowed_protocol_profiles", ErrManagedInvalidArgument)
+	}
+	for _, protocol := range protocols {
+		if _, exists := profileFamilies[protocol]; !exists {
+			return fmt.Errorf("%w: allowed_protocols must match allowed_protocol_profiles", ErrManagedInvalidArgument)
+		}
+	}
+	return nil
+}
+
+func (g UserServerGrant) AllowsProtocol(protocol string) bool {
+	canonical, publishable := canonicalManagedGrantProtocol(protocol)
+	if !publishable {
+		return false
+	}
+	if len(g.AllowedProtocols) == 0 {
+		return true
+	}
+	for _, allowed := range g.AllowedProtocols {
+		if allowed == canonical {
+			return true
+		}
+	}
+	return false
+}
+
+// SelfServiceNodeProtocolProfile derives the stable client-facing combination
+// represented by a node's Clash configuration. A profile-restricted grant
+// fails closed when the configuration cannot be classified.
+func SelfServiceNodeProtocolProfile(protocolName, clashConfig string) (string, bool) {
+	protocol, ok := canonicalManagedGrantProtocol(protocolName)
+	if !ok {
+		return "", false
+	}
+	var config map[string]interface{}
+	if json.Unmarshal([]byte(clashConfig), &config) != nil || config == nil {
+		return "", false
+	}
+	configType, ok := config["type"].(string)
+	if !ok {
+		return "", false
+	}
+	configType = strings.ToLower(strings.TrimSpace(configType))
+	configFamily, ok := canonicalManagedGrantProtocol(configType)
+	if !ok || configFamily != protocol {
+		return "", false
+	}
+	if protocol == "shadowsocks" {
+		if !SelfServiceNodeProtocolEligible(protocolName, clashConfig) {
+			return "", false
+		}
+		return "shadowsocks-2022", true
+	}
+	switch protocol {
+	case "hysteria":
+		if configType != "hysteria2" {
+			return "", false
+		}
+		return "hysteria2", true
+	case "socks":
+		return "socks5", true
+	case "http":
+		return protocol, true
+	}
+
+	network := ""
+	if value, exists := config["network"]; exists {
+		var valid bool
+		network, valid = value.(string)
+		if !valid {
+			return "", false
+		}
+	}
+	network = strings.ToLower(strings.TrimSpace(network))
+	if network == "" {
+		network = "tcp"
+	}
+	security := ""
+	if value, exists := config["security"]; exists {
+		var valid bool
+		security, valid = value.(string)
+		if !valid {
+			return "", false
+		}
+	}
+	security = strings.ToLower(strings.TrimSpace(security))
+	tls := false
+	if value, exists := config["tls"]; exists {
+		var valid bool
+		tls, valid = value.(bool)
+		if !valid {
+			return "", false
+		}
+	}
+	if security == "tls" || security == "reality" {
+		tls = true
+	}
+	hasRealityOptions := false
+	for _, key := range []string{"reality-opts", "reality_opts"} {
+		if value, exists := config[key]; exists {
+			if _, valid := value.(map[string]interface{}); !valid {
+				return "", false
+			}
+			hasRealityOptions = true
+		}
+	}
+	reality := security == "reality" || hasRealityOptions
+
+	switch protocol {
+	case "anytls":
+		if network == "tcp" && tls && !reality {
+			return "anytls", true
+		}
+		return "", false
+	case "snell":
+		version, valid := config["version"].(float64)
+		if network != "tcp" || !valid || version != 4 && version != 5 {
+			return "", false
+		}
+		return "snell", true
+	}
+
+	switch protocol {
+	case "vless":
+		switch {
+		case network == "tcp" && reality:
+			return "vless-reality", true
+		case network == "tcp" && tls && !reality:
+			return "vless-tcp-tls", true
+		case network == "grpc" && tls && !reality:
+			return "vless-grpc-tls", true
+		case network == "ws" && tls && !reality:
+			return "vless-wss", true
+		case network == "ws" && !tls && !reality:
+			return "vless-ws", true
+		}
+	case "vmess":
+		switch {
+		case network == "tcp" && !tls && !reality:
+			return "vmess-tcp-none", true
+		case network == "tcp" && tls && !reality:
+			return "vmess-tcp-tls", true
+		case network == "grpc" && tls && !reality:
+			return "vmess-grpc-tls", true
+		case network == "ws" && tls && !reality:
+			return "vmess-wss", true
+		case network == "ws" && !tls && !reality:
+			return "vmess-ws", true
+		}
+	case "trojan":
+		switch {
+		case network == "tcp" && reality:
+			return "trojan-reality", true
+		case network == "tcp" && tls && !reality:
+			return "trojan-tcp-tls", true
+		case network == "grpc" && tls && !reality:
+			return "trojan-grpc-tls", true
+		case network == "ws" && tls && !reality:
+			return "trojan-wss", true
+		}
+	}
+	return "", false
+}
+
+// AllowsNodeProtocol applies both grant layers: protocol family first, then
+// the optional exact combination whitelist.
+func (g UserServerGrant) AllowsNodeProtocol(protocol, clashConfig string) bool {
+	if !g.AllowsProtocol(protocol) {
+		return false
+	}
+	if len(g.AllowedProtocolProfiles) == 0 {
+		return true
+	}
+	profile, ok := SelfServiceNodeProtocolProfile(protocol, clashConfig)
+	if !ok {
+		return false
+	}
+	for _, allowed := range g.AllowedProtocolProfiles {
+		if allowed == profile {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeGrant(g UserServerGrant) (UserServerGrant, error) {
 	g.Username = strings.TrimSpace(g.Username)
 	g.CreatedBy = strings.TrimSpace(g.CreatedBy)
@@ -441,6 +719,19 @@ func normalizeGrant(g UserServerGrant) (UserServerGrant, error) {
 	}
 	if g.BillingTimezone == "" {
 		g.BillingTimezone = "Asia/Shanghai"
+	}
+	allowedProtocols, err := NormalizeManagedGrantAllowedProtocols(g.AllowedProtocols)
+	if err != nil {
+		return g, err
+	}
+	g.AllowedProtocols = allowedProtocols
+	allowedProtocolProfiles, err := NormalizeManagedGrantAllowedProtocolProfiles(g.AllowedProtocolProfiles)
+	if err != nil {
+		return g, err
+	}
+	g.AllowedProtocolProfiles = allowedProtocolProfiles
+	if err := validateManagedGrantProtocolScope(g.AllowedProtocols, g.AllowedProtocolProfiles); err != nil {
+		return g, err
 	}
 	g.StartsAt = g.StartsAt.UTC()
 	if g.ExpiresAt != nil {
@@ -522,10 +813,16 @@ WHERE n.id = ?`, serverID, nodeID).Scan(
 	if err != nil {
 		return nil, fmt.Errorf("resolve self-service offer: %w", err)
 	}
-	if nodeEnabled == 0 || nodeType != "physical" || strings.TrimSpace(inboundTag) == "" || originalServer != serverName || xrayMode != "embedded" {
+	node := Node{
+		ID: nodeID, Protocol: nodeProtocol, ClashConfig: clashConfig, Enabled: nodeEnabled != 0,
+		NodeType: nodeType, OriginalServer: originalServer, InboundTag: inboundTag,
+	}
+	server := RemoteServer{ID: serverID, Name: serverName, XrayMode: xrayMode}
+	offer := SelfServiceNodeOffer{NodeID: nodeID, ServerID: serverID, InboundTag: inboundTag, Enabled: true}
+	if !node.Enabled || !SelfServiceNodeOfferStructureValid(offer, node, server) {
 		return nil, ErrManagedServerMismatch
 	}
-	if !selfServiceProtocolEligible(nodeProtocol, clashConfig) {
+	if !SelfServiceNodeOfferProtocolEligible(offer, node) {
 		return nil, fmt.Errorf("%w: protocol does not support isolated managed credentials", ErrManagedInvalidArgument)
 	}
 
@@ -547,7 +844,9 @@ VALUES (?, ?, ?, 1, 0, ?, ?, ?)`, nodeID, serverID, inboundTag, createdBy, now, 
 	return r.GetSelfServiceNodeOffer(ctx, id)
 }
 
-func selfServiceProtocolEligible(protocolName, clashConfig string) bool {
+// SelfServiceNodeProtocolEligible is the single protocol-safety policy used by
+// publishing, activation, read-side access checks, and remote reconciliation.
+func SelfServiceNodeProtocolEligible(protocolName, clashConfig string) bool {
 	protocolName = strings.ToLower(strings.TrimSpace(protocolName))
 	switch protocolName {
 	case "vless", "vmess", "trojan", "anytls", "snell", "socks", "socks5", "http", "hysteria", "hysteria2", "hy2":
@@ -558,11 +857,53 @@ func selfServiceProtocolEligible(protocolName, clashConfig string) bool {
 			return false
 		}
 		cipher, _ := config["cipher"].(string)
+		if strings.TrimSpace(cipher) == "" {
+			cipher, _ = config["method"].(string)
+		}
 		cipher = strings.ToLower(strings.TrimSpace(cipher))
 		return cipher == "2022-blake3-aes-128-gcm" || cipher == "2022-blake3-aes-256-gcm"
 	default:
 		return false
 	}
+}
+
+// SelfServiceCredentialProtocolMatches verifies that a stored credential was
+// generated for the same protocol family as the current node. Aliases such as
+// ss/shadowsocks and hy2/hysteria2 intentionally compare equal.
+func SelfServiceCredentialProtocolMatches(credentialProtocol, nodeProtocol string) bool {
+	credentialFamily, credentialOK := canonicalManagedGrantProtocol(credentialProtocol)
+	nodeFamily, nodeOK := canonicalManagedGrantProtocol(nodeProtocol)
+	return credentialOK && nodeOK && credentialFamily == nodeFamily
+}
+
+func selfServiceProtocolEligible(protocolName, clashConfig string) bool {
+	return SelfServiceNodeProtocolEligible(protocolName, clashConfig)
+}
+
+func SelfServiceNodeOfferProtocolEligible(offer SelfServiceNodeOffer, node Node) bool {
+	return !strings.HasPrefix(strings.ToLower(strings.TrimSpace(offer.InboundTag)), "anydoor-") &&
+		!strings.HasPrefix(strings.ToLower(strings.TrimSpace(node.InboundTag)), "anydoor-") &&
+		SelfServiceNodeProtocolEligible(node.Protocol, node.ClashConfig)
+}
+
+// SelfServiceNodeOfferStructureValid verifies that the offer still points to
+// the same physical inbound on the same embedded-Xray server. Enabled flags and
+// protocol policy are intentionally separate so temporary suspension does not
+// erase a user's selection intent.
+func SelfServiceNodeOfferStructureValid(offer SelfServiceNodeOffer, node Node, server RemoteServer) bool {
+	nodeType := strings.ToLower(strings.TrimSpace(node.NodeType))
+	if nodeType == "" {
+		nodeType = "physical"
+	}
+	return offer.NodeID > 0 && offer.NodeID == node.ID && offer.ServerID > 0 && offer.ServerID == server.ID &&
+		strings.TrimSpace(offer.InboundTag) != "" && offer.InboundTag == node.InboundTag &&
+		nodeType == "physical" && node.OriginalServer == server.Name && strings.TrimSpace(server.Name) != "" &&
+		strings.EqualFold(strings.TrimSpace(server.XrayMode), "embedded")
+}
+
+func SelfServiceNodeOfferAvailable(offer SelfServiceNodeOffer, node Node, server RemoteServer) bool {
+	return offer.Enabled && node.Enabled && SelfServiceNodeOfferStructureValid(offer, node, server) &&
+		SelfServiceNodeOfferProtocolEligible(offer, node)
 }
 
 func (r *TrafficRepository) GetSelfServiceNodeOffer(ctx context.Context, id int64) (*SelfServiceNodeOffer, error) {
@@ -670,20 +1011,43 @@ func scanUserServerGrant(s rowScanner) (UserServerGrant, error) {
 	var grant UserServerGrant
 	var enabled int
 	var expires, nextReset sql.NullString
+	var allowedProtocolsJSON, allowedProtocolProfilesJSON string
 	err := s.Scan(&grant.ID, &grant.Username, &grant.ServerID, &enabled, &grant.StartsAt, &expires,
 		&grant.MaxActiveNodes, &grant.SpeedLimitMbps, &grant.ConnectionLimit, &grant.TrafficLimitBytes,
 		&grant.BillingMode, &grant.ResetPolicy, &grant.ResetDay, &grant.BillingTimezone, &nextReset,
-		&grant.Version, &grant.CreatedBy, &grant.CreatedAt, &grant.UpdatedAt)
+		&allowedProtocolsJSON, &allowedProtocolProfilesJSON, &grant.Version, &grant.CreatedBy, &grant.CreatedAt, &grant.UpdatedAt)
+	if err != nil {
+		return grant, err
+	}
 	grant.Enabled = enabled != 0
 	grant.ExpiresAt = managedParseNullTime(expires)
 	grant.NextResetAt = managedParseNullTime(nextReset)
-	return grant, err
+	if err := json.Unmarshal([]byte(allowedProtocolsJSON), &grant.AllowedProtocols); err != nil {
+		return grant, fmt.Errorf("decode managed grant allowed protocols: %w", err)
+	}
+	allowedProtocols, err := NormalizeManagedGrantAllowedProtocols(grant.AllowedProtocols)
+	if err != nil {
+		return grant, fmt.Errorf("decode managed grant allowed protocols: %w", err)
+	}
+	grant.AllowedProtocols = allowedProtocols
+	if err := json.Unmarshal([]byte(allowedProtocolProfilesJSON), &grant.AllowedProtocolProfiles); err != nil {
+		return grant, fmt.Errorf("decode managed grant allowed protocol profiles: %w", err)
+	}
+	allowedProtocolProfiles, err := NormalizeManagedGrantAllowedProtocolProfiles(grant.AllowedProtocolProfiles)
+	if err != nil {
+		return grant, fmt.Errorf("decode managed grant allowed protocol profiles: %w", err)
+	}
+	grant.AllowedProtocolProfiles = allowedProtocolProfiles
+	if err := validateManagedGrantProtocolScope(grant.AllowedProtocols, grant.AllowedProtocolProfiles); err != nil {
+		return grant, fmt.Errorf("decode managed grant protocol scope: %w", err)
+	}
+	return grant, nil
 }
 
 const selectUserServerGrant = `SELECT id, username, server_id, enabled, starts_at, expires_at,
        max_active_nodes, speed_limit_mbps, connection_limit, traffic_limit_bytes,
        billing_mode, reset_policy, reset_day, billing_timezone, next_reset_at,
-       version, created_by, created_at, updated_at
+       allowed_protocols_json, allowed_protocol_profiles_json, version, created_by, created_at, updated_at
 FROM user_server_grants`
 
 func (r *TrafficRepository) CreateUserServerGrant(ctx context.Context, grant UserServerGrant) (*UserServerGrant, error) {
@@ -721,17 +1085,26 @@ EXISTS(SELECT 1 FROM remote_servers WHERE id = ?)`, grant.Username, grant.Server
 		return nil, fmt.Errorf("begin create user server grant: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	allowedProtocolsJSON, err := json.Marshal(grant.AllowedProtocols)
+	if err != nil {
+		return nil, fmt.Errorf("encode managed grant allowed protocols: %w", err)
+	}
+	allowedProtocolProfilesJSON, err := json.Marshal(grant.AllowedProtocolProfiles)
+	if err != nil {
+		return nil, fmt.Errorf("encode managed grant allowed protocol profiles: %w", err)
+	}
 	result, err := tx.ExecContext(ctx, `
 INSERT INTO user_server_grants (
     username, server_id, enabled, starts_at, expires_at, max_active_nodes,
     speed_limit_mbps, connection_limit, traffic_limit_bytes, billing_mode,
-    reset_policy, reset_day, billing_timezone, next_reset_at, version,
+    reset_policy, reset_day, billing_timezone, next_reset_at, allowed_protocols_json,
+    allowed_protocol_profiles_json, version,
     created_by, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
 		grant.Username, grant.ServerID, boolInt(grant.Enabled), grant.StartsAt, managedNullTime(grant.ExpiresAt),
 		grant.MaxActiveNodes, grant.SpeedLimitMbps, grant.ConnectionLimit, grant.TrafficLimitBytes,
 		grant.BillingMode, grant.ResetPolicy, grant.ResetDay, grant.BillingTimezone,
-		managedNullTime(grant.NextResetAt), grant.CreatedBy, now, now)
+		managedNullTime(grant.NextResetAt), string(allowedProtocolsJSON), string(allowedProtocolProfilesJSON), grant.CreatedBy, now, now)
 	if managedUniqueViolation(err) {
 		return nil, ErrUserServerGrantExists
 	}
@@ -745,6 +1118,9 @@ INSERT INTO user_server_grants (
 	if err := appendManagedAccessAuditTx(ctx, tx, ManagedAccessAudit{
 		Actor: grant.CreatedBy, Action: "grant.created", EntityType: "server_grant", EntityID: id,
 		Username: grant.Username, ServerID: grant.ServerID,
+		Details: map[string]any{
+			"allowed_protocols": grant.AllowedProtocols, "allowed_protocol_profiles": grant.AllowedProtocolProfiles,
+		},
 	}); err != nil {
 		return nil, err
 	}
@@ -886,9 +1262,52 @@ FROM user_node_selection_usage WHERE grant_id = ?`, grant.ID).Scan(&recorded); e
 	}
 	existingState := existing.StateAt(now, existingUserEnabled != 0, existingBilled)
 
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin update user server grant: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Narrowing the whitelist is a revocation, not a presentation-only filter.
+	// Mark disallowed selections inactive before refreshing their access sources;
+	// widening the policy later deliberately requires the user to opt in again.
+	disallowedSelectionIDs := make([]int64, 0)
+	rows, err := tx.QueryContext(ctx, `SELECT s.id, COALESCE(n.protocol, ''), COALESCE(n.clash_config, ''), COALESCE(o.inbound_tag, '')
+FROM user_node_selections s
+JOIN self_service_node_offers o ON o.id = s.offer_id
+JOIN nodes n ON n.id = o.node_id
+WHERE s.grant_id = ? AND s.desired_enabled = 1`, grant.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list managed selections for protocol policy: %w", err)
+	}
+	for rows.Next() {
+		var selectionID int64
+		var protocol, clashConfig, inboundTag string
+		if err := rows.Scan(&selectionID, &protocol, &clashConfig, &inboundTag); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan managed selection protocol: %w", err)
+		}
+		if !grant.AllowsNodeProtocol(protocol, clashConfig) || !SelfServiceNodeProtocolEligible(protocol, clashConfig) ||
+			strings.HasPrefix(strings.ToLower(strings.TrimSpace(inboundTag)), "anydoor-") {
+			disallowedSelectionIDs = append(disallowedSelectionIDs, selectionID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("list managed selection protocols: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close managed selection protocol rows: %w", err)
+	}
+	for _, selectionID := range disallowedSelectionIDs {
+		if _, err := tx.ExecContext(ctx, `UPDATE user_node_selections
+SET desired_enabled = 0, updated_at = ? WHERE id = ? AND desired_enabled = 1`, now, selectionID); err != nil {
+			return nil, fmt.Errorf("deactivate protocol-restricted managed selection: %w", err)
+		}
+	}
 	if grant.MaxActiveNodes > 0 {
 		var active int
-		if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_node_selections
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_node_selections
 WHERE grant_id = ? AND desired_enabled = 1`, grant.ID).Scan(&active); err != nil {
 			return nil, fmt.Errorf("count active managed selections: %w", err)
 		}
@@ -896,21 +1315,24 @@ WHERE grant_id = ? AND desired_enabled = 1`, grant.ID).Scan(&active); err != nil
 			return nil, ErrManagedActiveNodeLimit
 		}
 	}
-
-	tx, err := r.db.BeginTx(ctx, nil)
+	allowedProtocolsJSON, err := json.Marshal(grant.AllowedProtocols)
 	if err != nil {
-		return nil, fmt.Errorf("begin update user server grant: %w", err)
+		return nil, fmt.Errorf("encode managed grant allowed protocols: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	allowedProtocolProfilesJSON, err := json.Marshal(grant.AllowedProtocolProfiles)
+	if err != nil {
+		return nil, fmt.Errorf("encode managed grant allowed protocol profiles: %w", err)
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE user_server_grants SET
     enabled = ?, starts_at = ?, expires_at = ?, max_active_nodes = ?,
     speed_limit_mbps = ?, connection_limit = ?, traffic_limit_bytes = ?,
     billing_mode = ?, reset_policy = ?, reset_day = ?, billing_timezone = ?,
-    next_reset_at = ?, version = version + 1, updated_at = ?
+    next_reset_at = ?, allowed_protocols_json = ?, allowed_protocol_profiles_json = ?,
+    version = version + 1, updated_at = ?
 WHERE id = ? AND version = ?`, boolInt(grant.Enabled), grant.StartsAt, managedNullTime(grant.ExpiresAt),
 		grant.MaxActiveNodes, grant.SpeedLimitMbps, grant.ConnectionLimit, grant.TrafficLimitBytes,
 		grant.BillingMode, grant.ResetPolicy, grant.ResetDay, grant.BillingTimezone,
-		managedNullTime(grant.NextResetAt), now, grant.ID, expectedVersion)
+		managedNullTime(grant.NextResetAt), string(allowedProtocolsJSON), string(allowedProtocolProfilesJSON), now, grant.ID, expectedVersion)
 	if err != nil {
 		return nil, fmt.Errorf("update user server grant: %w", err)
 	}
@@ -963,10 +1385,21 @@ WHERE source_type = ? AND source_id IN (
 		managedNullTime(grant.ExpiresAt), now, ManagedSourceSelection, grant.ID); err != nil {
 		return nil, fmt.Errorf("refresh grant access sources: %w", err)
 	}
+	for _, selectionID := range disallowedSelectionIDs {
+		if _, err := tx.ExecContext(ctx, `UPDATE user_inbound_access_sources
+SET suspend_reason = ? WHERE source_type = ? AND source_id = ?`,
+			ManagedSuspendAdminDisabled, ManagedSourceSelection, selectionID); err != nil {
+			return nil, fmt.Errorf("mark protocol-restricted managed source: %w", err)
+		}
+	}
 	if err := appendManagedAccessAuditTx(ctx, tx, ManagedAccessAudit{
 		Actor: actor, Action: "grant.updated", EntityType: "server_grant", EntityID: grant.ID,
 		Username: grant.Username, ServerID: grant.ServerID,
-		Details: map[string]any{"expected_version": expectedVersion, "enabled": grant.Enabled},
+		Details: map[string]any{
+			"expected_version": expectedVersion, "enabled": grant.Enabled,
+			"allowed_protocols": grant.AllowedProtocols, "allowed_protocol_profiles": grant.AllowedProtocolProfiles,
+			"deactivated_selection_ids": disallowedSelectionIDs,
+		},
 	}); err != nil {
 		return nil, err
 	}

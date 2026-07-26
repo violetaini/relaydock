@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"net/http/httptest"
 	"path/filepath"
@@ -26,6 +27,8 @@ type fakeForwardTunnelDeployer struct {
 	portConflictOnce   bool
 	failRemoveResource string
 	failRemoveOnce     bool
+	specs              []ForwardTunnelSpec
+	operations         []string
 }
 
 func newFakeForwardTunnelDeployer() *fakeForwardTunnelDeployer {
@@ -38,6 +41,8 @@ func (d *fakeForwardTunnelDeployer) Apply(_ context.Context, spec ForwardTunnelS
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.applyCalls++
+	d.specs = append(d.specs, spec)
+	d.operations = append(d.operations, "apply:"+spec.ResourceID)
 	if d.portConflictOnce && d.portConflictServer == spec.ServerID {
 		d.portConflictOnce = false
 		return ErrForwardTunnelPortInUse
@@ -74,6 +79,7 @@ func (d *fakeForwardTunnelDeployer) Remove(_ context.Context, _ int64, resourceI
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.removeCalls++
+	d.operations = append(d.operations, "remove:"+resourceID)
 	if d.failRemoveOnce && d.failRemoveResource == resourceID {
 		d.failRemoveOnce = false
 		return errors.New("temporary remove failure")
@@ -93,11 +99,13 @@ type forwardingHandlerFixture struct {
 	forward     *storage.UserForwardRule
 	nodeID      int64
 	selectionID int64
+	dbPath      string
 }
 
 func newForwardingHandlerFixture(t *testing.T) forwardingHandlerFixture {
 	t.Helper()
-	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "forwarding-handler.db"))
+	dbPath := filepath.Join(t.TempDir(), "forwarding-handler.db")
+	repo, err := storage.NewTrafficRepository(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,6 +160,13 @@ func newForwardingHandlerFixture(t *testing.T) forwardingHandlerFixture {
 	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{Username: "alice", ServerID: servers[1].ID, InboundTag: node.InboundTag, Protocol: "vless", CredentialJSON: `{"id":"alice-user-id"}`}); err != nil {
 		t.Fatal(err)
 	}
+	credential, err := repo.GetUserInboundConfig(ctx, "alice", servers[1].ID, node.InboundTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetUserNodeSelectionCredential(ctx, activation.Selection.ID, credential.ID); err != nil {
+		t.Fatal(err)
+	}
 	tunnel, err := repo.CreateTunnelTemplate(ctx, storage.TunnelTemplate{Name: "two hop", State: storage.TunnelStateActive, BillingMode: storage.ManagedBillingDownload, TrafficMultiplierMilli: 1000, CreatedBy: "admin", Hops: []storage.TunnelTemplateHop{{ServerID: servers[0].ID}, {ServerID: servers[1].ID}}})
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +189,7 @@ func newForwardingHandlerFixture(t *testing.T) forwardingHandlerFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return forwardingHandlerFixture{repo: repo, handler: handler, deployer: deployer, grant: grant, forward: forward, nodeID: node.ID, selectionID: activation.Selection.ID}
+	return forwardingHandlerFixture{repo: repo, handler: handler, deployer: deployer, grant: grant, forward: forward, nodeID: node.ID, selectionID: activation.Selection.ID, dbPath: dbPath}
 }
 
 func TestForwardingReconcileGenerationSuspendResumeAndHealthyRenew(t *testing.T) {
@@ -315,6 +330,239 @@ func TestForwardingPortConflictReallocatesIdentityAndRetries(t *testing.T) {
 	}
 }
 
+func TestForwardNeedsPortConvergence(t *testing.T) {
+	base := []storage.UserForwardHop{
+		{ListenPort: 2033, NextPort: 2033},
+		{ListenPort: 2033, NextPort: 443},
+	}
+	tests := []struct {
+		name string
+		hops []storage.UserForwardHop
+		want bool
+	}{
+		{name: "common route", hops: base},
+		{name: "different listen port", hops: []storage.UserForwardHop{{ListenPort: 2033, NextPort: 2034}, {ListenPort: 2034, NextPort: 443}}, want: true},
+		{name: "different intermediate next port", hops: []storage.UserForwardHop{{ListenPort: 2033, NextPort: 2040}, {ListenPort: 2033, NextPort: 443}}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := forwardNeedsPortConvergence(&storage.UserForwardRule{Hops: test.hops}); got != test.want {
+				t.Fatalf("forwardNeedsPortConvergence()=%t want=%t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestForwardingLegacyRouteConvergesBeforeDeploymentAndCleansOldIdentities(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	ctx := context.Background()
+	oldPort := fixture.forward.Hops[0].ListenPort
+	legacyPort := oldPort + 1
+	if legacyPort > 65535 {
+		legacyPort = oldPort - 1
+	}
+	db, err := sql.Open("sqlite", fixture.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE user_forward_hops SET next_port=? WHERE id=?`, legacyPort, fixture.forward.Hops[0].ID); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE user_forward_hops SET listen_port=? WHERE id=?`, legacyPort, fixture.forward.Hops[1].ID); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := fixture.repo.GetUserForward(ctx, fixture.forward.PublicID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !forwardNeedsPortConvergence(legacy) || legacy.RequestedEntryPort != 0 {
+		t.Fatalf("legacy route was not recognized for automatic convergence: %+v", legacy)
+	}
+	oldResourceIDs := make(map[string]bool, len(legacy.Hops))
+	for _, hop := range legacy.Hops {
+		oldResourceIDs[hop.ResourceID] = true
+	}
+	fixture.deployer.mu.Lock()
+	fixture.deployer.applyCalls = 0
+	fixture.deployer.removeCalls = 0
+	fixture.deployer.specs = nil
+	fixture.deployer.operations = nil
+	fixture.deployer.mu.Unlock()
+
+	if err := fixture.handler.deployForward(ctx, legacy); err != nil {
+		t.Fatalf("deploy converged legacy route: %v", err)
+	}
+	updated, err := fixture.repo.GetUserForward(ctx, legacy.PublicID, legacy.Username)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forwardNeedsPortConvergence(updated) {
+		t.Fatalf("route did not converge: %+v", updated.Hops)
+	}
+	commonPort := updated.Hops[0].ListenPort
+	if updated.AllocatedEntryPort != commonPort || commonPort == oldPort || commonPort == legacyPort {
+		t.Fatalf("converged entry port=%d allocated=%d old=%d legacy=%d", commonPort, updated.AllocatedEntryPort, oldPort, legacyPort)
+	}
+	for i, hop := range updated.Hops {
+		if oldResourceIDs[hop.ResourceID] {
+			t.Fatalf("hop %d retained legacy identity %q", i, hop.ResourceID)
+		}
+	}
+
+	fixture.deployer.mu.Lock()
+	defer fixture.deployer.mu.Unlock()
+	seenApply := false
+	removeCount := 0
+	for _, operation := range fixture.deployer.operations {
+		switch {
+		case strings.HasPrefix(operation, "apply:"):
+			seenApply = true
+		case strings.HasPrefix(operation, "remove:"):
+			if seenApply {
+				t.Fatalf("legacy cleanup ran after new deployment: operations=%v", fixture.deployer.operations)
+			}
+			removeCount++
+		}
+	}
+	if removeCount != len(legacy.Hops) || len(fixture.deployer.specs) != len(updated.Hops) {
+		t.Fatalf("cleanup/deploy calls: removes=%d applies=%d operations=%v", removeCount, len(fixture.deployer.specs), fixture.deployer.operations)
+	}
+	for resourceID := range oldResourceIDs {
+		if fixture.deployer.state[resourceID] != "deleted" {
+			t.Fatalf("legacy identity %q state=%q", resourceID, fixture.deployer.state[resourceID])
+		}
+	}
+	for _, spec := range fixture.deployer.specs {
+		if spec.ListenPort != commonPort || fixture.deployer.state[spec.ResourceID] != "active" {
+			t.Fatalf("new deployment was not converged and active: %+v state=%q", spec, fixture.deployer.state[spec.ResourceID])
+		}
+	}
+}
+
+func TestForwardingLegacyRouteDoesNotMoveExplicitPort(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	ctx := context.Background()
+	fixedPort := fixture.forward.Hops[0].ListenPort
+	legacyPort := fixedPort + 1
+	if legacyPort > 65535 {
+		legacyPort = fixedPort - 1
+	}
+	db, err := sql.Open("sqlite", fixture.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE user_forward_rules SET requested_entry_port=? WHERE id=?`, fixedPort, fixture.forward.ID); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE user_forward_hops SET listen_port=? WHERE id=?`, legacyPort, fixture.forward.Hops[1].ID); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := fixture.repo.GetUserForward(ctx, fixture.forward.PublicID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.deployer.mu.Lock()
+	fixture.deployer.operations = nil
+	fixture.deployer.mu.Unlock()
+	if err := fixture.handler.deployForward(ctx, legacy); !errors.Is(err, storage.ErrForwardingConflict) {
+		t.Fatalf("explicit inconsistent route error=%v", err)
+	}
+	latest, err := fixture.repo.GetUserForward(ctx, legacy.PublicID, legacy.Username)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.RequestedEntryPort != fixedPort || latest.Hops[1].ListenPort != legacyPort {
+		t.Fatalf("explicit route was mutated: requested=%d hops=%+v", latest.RequestedEntryPort, latest.Hops)
+	}
+	fixture.deployer.mu.Lock()
+	defer fixture.deployer.mu.Unlock()
+	if len(fixture.deployer.operations) != 0 {
+		t.Fatalf("explicit route performed remote mutations: %v", fixture.deployer.operations)
+	}
+}
+
+func TestForwardingExplicitPortConflictDoesNotChangeRequestedPort(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	ctx := context.Background()
+	forward, err := fixture.repo.CreateUserForward(ctx, storage.CreateUserForwardInput{
+		Username: "alice", Name: "fixed port", GrantPublicID: fixture.grant.PublicID,
+		TargetNodeID: fixture.forward.TargetNodeID, TargetHost: fixture.forward.TargetHost,
+		TargetPort: fixture.forward.TargetPort, RequestedEntryPort: 2033,
+		EffectiveExpiresAt: fixture.grant.ExpiresAt, Actor: "alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.deployer.portConflictServer = forward.Hops[0].ServerID
+	fixture.deployer.portConflictOnce = true
+	if err := fixture.handler.deployForward(ctx, forward); !errors.Is(err, ErrForwardTunnelPortInUse) {
+		t.Fatalf("explicit conflict error=%v", err)
+	}
+	if fixture.deployer.removeCalls != 0 {
+		t.Fatalf("explicit conflict removed fixed identities: remove calls=%d", fixture.deployer.removeCalls)
+	}
+	updated, err := fixture.repo.GetUserForward(ctx, forward.PublicID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.AllocatedEntryPort != 2033 || updated.RequestedEntryPort != 2033 {
+		t.Fatalf("explicit port changed after conflict: requested=%d allocated=%d", updated.RequestedEntryPort, updated.AllocatedEntryPort)
+	}
+}
+
+func TestForwardingExhaustedAutomaticRangeKeepsRetryableIdentity(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	ctx := context.Background()
+	forward, err := fixture.repo.CreateUserForward(ctx, storage.CreateUserForwardInput{
+		Username: "alice", Name: "single candidate", GrantPublicID: fixture.grant.PublicID,
+		TargetNodeID: fixture.forward.TargetNodeID, TargetHost: fixture.forward.TargetHost,
+		TargetPort: fixture.forward.TargetPort, EffectiveExpiresAt: fixture.grant.ExpiresAt, Actor: "alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunnel, err := fixture.repo.GetTunnelTemplateByID(ctx, fixture.grant.TunnelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunnel.PortRangeStart = forward.AllocatedEntryPort
+	tunnel.PortRangeEnd = forward.AllocatedEntryPort
+	if _, err := fixture.repo.UpdateTunnelTemplate(ctx, tunnel.PublicID, *tunnel, tunnel.Version, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	resourceIDs := make([]string, len(forward.Hops))
+	for i := range forward.Hops {
+		resourceIDs[i] = forward.Hops[i].ResourceID
+	}
+	fixture.deployer.portConflictServer = forward.Hops[0].ServerID
+	fixture.deployer.portConflictOnce = true
+	if err := fixture.handler.deployForward(ctx, forward); !errors.Is(err, storage.ErrForwardingLimit) {
+		t.Fatalf("exhausted range error=%v", err)
+	}
+	if fixture.deployer.removeCalls != 0 {
+		t.Fatalf("failed reallocation removed retryable identities: calls=%d", fixture.deployer.removeCalls)
+	}
+	updated, err := fixture.repo.GetUserForward(ctx, forward.PublicID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range updated.Hops {
+		if updated.Hops[i].ResourceID != resourceIDs[i] {
+			t.Fatalf("hop %d identity changed after failed reallocation", i)
+		}
+	}
+}
+
 func TestForwardClientConfigUsesUserCredentialView(t *testing.T) {
 	fixture := newForwardingHandlerFixture(t)
 	response := httptest.NewRecorder()
@@ -371,6 +619,9 @@ func TestTunnelSpecNormalizesPreviousHopHostCIDRs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if spec.Network != "tcp_udp" {
+		t.Fatalf("network=%q", spec.Network)
+	}
 	want := map[string]bool{"192.0.2.9/32": true, "2001:db8::9/128": true}
 	if len(spec.SourceCIDRs) != len(want) {
 		t.Fatalf("source CIDRs=%v", spec.SourceCIDRs)
@@ -378,6 +629,29 @@ func TestTunnelSpecNormalizesPreviousHopHostCIDRs(t *testing.T) {
 	for _, cidr := range spec.SourceCIDRs {
 		if !want[cidr] {
 			t.Fatalf("unexpected normalized CIDR %q in %v", cidr, spec.SourceCIDRs)
+		}
+	}
+}
+
+func TestForwardingAllHopsShareOneTCPUDPPort(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	if len(fixture.forward.Hops) < 2 {
+		t.Fatalf("hops=%d", len(fixture.forward.Hops))
+	}
+	port := fixture.forward.Hops[0].ListenPort
+	for i, hop := range fixture.forward.Hops {
+		if hop.ListenPort != port {
+			t.Fatalf("hop %d listen port=%d want=%d", i, hop.ListenPort, port)
+		}
+		if i+1 < len(fixture.forward.Hops) && hop.NextPort != port {
+			t.Fatalf("hop %d next port=%d want=%d", i, hop.NextPort, port)
+		}
+	}
+	fixture.deployer.mu.Lock()
+	defer fixture.deployer.mu.Unlock()
+	for _, spec := range fixture.deployer.specs {
+		if spec.Network != "tcp_udp" {
+			t.Fatalf("deployed network=%q", spec.Network)
 		}
 	}
 }

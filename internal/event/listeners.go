@@ -53,8 +53,13 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 	if event.Tag == "api" {
 		return
 	}
-	// tunnel:默认跳过(不进节点表);但「转发已有节点」(ForwardNodeID>0)时,克隆源节点生成配套节点
-	if event.Protocol == "tunnel" {
+	// WireGuard is tracked as a management-only inbound resource by the remote
+	// handler. It must never be converted into a nodes-table subscription proxy.
+	if strings.EqualFold(strings.TrimSpace(event.Protocol), "wireguard") {
+		return
+	}
+	// 端口转发入站默认不进节点表；「转发已有节点」才克隆源节点生成配套节点。
+	if isTunnelProtocol(event.Protocol) {
 		if event.ForwardNodeID > 0 {
 			l.createForwardTunnelNode(ctx, event, server)
 		}
@@ -300,13 +305,34 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 	}
 
 	sysOwner := l.repo.GetSystemNodeOwner(ctx)
-	// 撞名(如源节点已有同名 Tunnel 配套)→ 加协议后缀保证唯一,而不是丢弃
-	existingNodes, _ := l.repo.ListNodes(ctx, sysOwner)
-	takenNames := make(map[string]bool, len(existingNodes))
-	for _, n := range existingNodes {
-		takenNames[n.NodeName] = true
+	// 同一个远端入站的事件可能因重试重复送达；命中已有配套节点时原位更新，
+	// 避免每次重试都创建一个带名称后缀的新节点。
+	existingNodes, err := l.repo.ListNodes(ctx, sysOwner)
+	if err != nil {
+		log.Printf("[NodeSync] forward-tunnel: 读取现有节点失败，跳过幂等更新: %v", err)
+		return
 	}
-	nodeName := storage.UniqueNodeName(src.NodeName+" | Tunnel", src.Protocol, takenNames)
+	var existingClone *storage.Node
+	takenNames := make(map[string]bool, len(existingNodes))
+	for i := range existingNodes {
+		n := &existingNodes[i]
+		takenNames[n.NodeName] = true
+		if existingClone == nil && n.OriginalServer == server.Name && n.InboundTag == event.Tag &&
+			(n.NodeType == "" || n.NodeType == "physical") {
+			existingClone = n
+		}
+	}
+	nodeName := ""
+	if existingClone != nil {
+		nodeName = existingClone.NodeName
+	} else {
+		requestedName := strings.TrimSpace(event.NodeName)
+		if requestedName == "" {
+			requestedName = src.NodeName + " | Tunnel"
+		}
+		// 撞名(如源节点已有同名 Tunnel 配套)→ 加协议后缀保证唯一,而不是丢弃。
+		nodeName = storage.UniqueNodeName(requestedName, src.Protocol, takenNames)
+	}
 
 	// 克隆源节点 clash 配置,改 name/server/port(端口取 tunnel 监听端口)
 	var clashMap map[string]any
@@ -315,7 +341,7 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 		return
 	}
 	clashMap["name"] = nodeName
-	clashMap["server"] = server.IPAddress
+	clashMap["server"] = serverHost
 	clashMap["port"] = event.Port
 	clashJSON, err := json.Marshal(clashMap)
 	if err != nil {
@@ -323,6 +349,24 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 		return
 	}
 
+	if existingClone != nil {
+		// Update only fields owned by the forwarding event. Enabled, tags,
+		// chain-proxy selection, relay metadata and other administrator-managed
+		// state remain exactly as configured on the existing clone.
+		node := *existingClone
+		node.NodeName = nodeName
+		node.Protocol = src.Protocol
+		node.ClashConfig = string(clashJSON)
+		node.ParsedConfig = string(clashJSON)
+		node.OriginalServer = server.Name
+		node.InboundTag = event.Tag
+		if _, err := l.repo.UpdateNode(ctx, node); err != nil {
+			log.Printf("[NodeSync] forward-tunnel: 更新配套节点失败: %v", err)
+		} else {
+			log.Printf("[NodeSync] forward-tunnel: 已更新配套节点: %s (-> %s:%d)", nodeName, serverHost, event.Port)
+		}
+		return
+	}
 	node := storage.Node{
 		Username:       sysOwner,
 		NodeName:       nodeName,
@@ -337,7 +381,16 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 	if _, err := l.repo.CreateNode(ctx, node); err != nil {
 		log.Printf("[NodeSync] forward-tunnel: 创建配套节点失败: %v", err)
 	} else {
-		log.Printf("[NodeSync] forward-tunnel: 已创建配套节点: %s (-> %s:%d)", nodeName, server.IPAddress, event.Port)
+		log.Printf("[NodeSync] forward-tunnel: 已创建配套节点: %s (-> %s:%d)", nodeName, serverHost, event.Port)
+	}
+}
+
+func isTunnelProtocol(protocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "tunnel", "dokodemo-door":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -450,6 +503,9 @@ func (l *NodeSyncListener) handleRemoved(ctx context.Context, event InboundEvent
 		log.Printf("[NodeSync] Failed to delete nodes: %v", err)
 	} else {
 		log.Printf("[NodeSync] Deleted nodes for inbound: %s/%s", server.Name, event.Tag)
+	}
+	if _, err := l.repo.DeleteManagedInboundResourceByServerTag(ctx, event.ServerID, event.Tag); err != nil {
+		log.Printf("[NodeSync] Failed to delete managed inbound resource: %v", err)
 	}
 }
 

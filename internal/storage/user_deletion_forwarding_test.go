@@ -196,7 +196,7 @@ func TestUserDeletionWaitsForForwardCleanupAndRetainsPorts(t *testing.T) {
 	if err != nil || grant.Enabled {
 		t.Fatalf("tunnel grant remained enabled: grant=%+v err=%v", grant, err)
 	}
-	assertUserForwardAllocationCount(t, fixture, forward, len(forward.Hops))
+	assertUserForwardAllocationCount(t, fixture, forward, len(forward.Hops)*2)
 
 	// Preparation is repeatable while a Guard is offline: it neither releases
 	// ports nor makes each retry use a different remote generation.
@@ -210,7 +210,7 @@ func TestUserDeletionWaitsForForwardCleanupAndRetainsPorts(t *testing.T) {
 	if repeated.Generation != prepared.Generation || repeated.Hops[0].Generation != prepared.Hops[0].Generation {
 		t.Fatalf("repeat preparation changed cleanup generation: first=%+v second=%+v", prepared, repeated)
 	}
-	assertUserForwardAllocationCount(t, fixture, forward, len(forward.Hops))
+	assertUserForwardAllocationCount(t, fixture, forward, len(forward.Hops)*2)
 
 	ready, err := fixture.repo.IsUserDeletionReady(fixture.ctx, "alice")
 	if err != nil || ready {
@@ -235,7 +235,7 @@ func TestUserDeletionWaitsForForwardCleanupAndRetainsPorts(t *testing.T) {
 		t.Fatalf("fully acknowledged forward cleanup not ready: ready=%v err=%v", ready, err)
 	}
 	// The acknowledged crash window still owns its ports until finalization.
-	assertUserForwardAllocationCount(t, fixture, forward, len(forward.Hops))
+	assertUserForwardAllocationCount(t, fixture, forward, len(forward.Hops)*2)
 }
 
 func TestFinalizeUserDeletionPurgesForwardingStateForReplacement(t *testing.T) {

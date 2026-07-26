@@ -443,13 +443,13 @@ func (r *TrafficRepository) ListManagedNodeCatalog(ctx context.Context, username
 			if !offer.Enabled && !selected {
 				continue
 			}
-			var nodeName, protocol, serverName, serverStatus, originalServer, nodeType, inboundTag, xrayMode string
+			var nodeName, protocol, clashConfig, serverName, serverStatus, originalServer, nodeType, inboundTag, xrayMode string
 			var nodeEnabled int
-			if err := r.db.QueryRowContext(ctx, `SELECT n.node_name, n.protocol, n.enabled,
+			if err := r.db.QueryRowContext(ctx, `SELECT n.node_name, n.protocol, COALESCE(n.clash_config, ''), n.enabled,
        COALESCE(n.original_server, ''), COALESCE(n.node_type, 'physical'),
        COALESCE(n.inbound_tag, ''), rs.name, rs.status, COALESCE(rs.xray_mode, 'external')
 FROM nodes n JOIN remote_servers rs ON rs.id = ? WHERE n.id = ?`, offer.ServerID, offer.NodeID).Scan(
-				&nodeName, &protocol, &nodeEnabled, &originalServer, &nodeType, &inboundTag,
+				&nodeName, &protocol, &clashConfig, &nodeEnabled, &originalServer, &nodeType, &inboundTag,
 				&serverName, &serverStatus, &xrayMode,
 			); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
@@ -461,6 +461,14 @@ FROM nodes n JOIN remote_servers rs ON rs.id = ? WHERE n.id = ?`, offer.ServerID
 				Offer: offer, Grant: grant, NodeName: nodeName, Protocol: protocol,
 				ServerName: serverName, ServerStatus: serverStatus, GrantStatus: grantState,
 			}
+			entry.ProtocolProfile, _ = SelfServiceNodeProtocolProfile(protocol, clashConfig)
+			node := Node{
+				ID: offer.NodeID, Protocol: protocol, ClashConfig: clashConfig, Enabled: nodeEnabled != 0,
+				NodeType: nodeType, OriginalServer: originalServer, InboundTag: inboundTag,
+			}
+			server := RemoteServer{ID: offer.ServerID, Name: serverName, XrayMode: xrayMode}
+			structureValid := SelfServiceNodeOfferStructureValid(offer, node, server)
+			protocolEligible := SelfServiceNodeOfferProtocolEligible(offer, node)
 			if selected {
 				copy := selection
 				entry.Selection = &copy
@@ -486,8 +494,10 @@ FROM nodes n JOIN remote_servers rs ON rs.id = ? WHERE n.id = ?`, offer.ServerID
 				entry.DenyReason = "offer_disabled"
 			case nodeEnabled == 0:
 				entry.DenyReason = "node_disabled"
-			case nodeType != "physical" || originalServer != serverName || inboundTag != offer.InboundTag || xrayMode != "embedded":
+			case !structureValid:
 				entry.DenyReason = "server_mismatch"
+			case !grant.AllowsNodeProtocol(protocol, clashConfig) || !protocolEligible:
+				entry.DenyReason = "protocol_not_allowed"
 			case grantState != ManagedGrantActive:
 				entry.DenyReason = grantState
 			case serverStatus != RemoteServerStatusConnected:

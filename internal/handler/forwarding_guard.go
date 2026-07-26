@@ -14,11 +14,15 @@ import (
 	"miaomiaowux/internal/tunnelidentity"
 )
 
-const forwardingGuardReadyTTL = 2 * time.Minute
+const (
+	forwardingGuardReadyTTL      = 2 * time.Minute
+	forwardingGuardTunnelNetwork = "tcp_udp"
+)
 
 type forwardingGuardReadiness struct {
 	checkedAt time.Time
 	tokenHash [sha256.Size]byte
+	full      bool
 }
 
 // ForwardingGuardDeployer sends tunnel mutations only through the signed,
@@ -56,7 +60,16 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
-func (d *ForwardingGuardDeployer) ensureReady(ctx context.Context, serverID int64) error {
+func forwardingGuardHasRequiredCapabilities(capabilities forwardingGuardCapabilities) bool {
+	return forwardingGuardHasBasicCapabilities(capabilities) && capabilities.InboundACLV1 &&
+		containsString(capabilities.TunnelNetworks, forwardingGuardTunnelNetwork) && capabilities.MaxLeaseSeconds >= 300
+}
+
+func forwardingGuardHasBasicCapabilities(capabilities forwardingGuardCapabilities) bool {
+	return capabilities.ManagedTunnelV1 && capabilities.InboundExpiryV1
+}
+
+func (d *ForwardingGuardDeployer) ensureReady(ctx context.Context, serverID int64, requireFullCapabilities bool) error {
 	if d == nil || d.managed == nil || d.managed.repo == nil {
 		return errors.New("managed tunnel guard is unavailable")
 	}
@@ -69,7 +82,8 @@ func (d *ForwardingGuardDeployer) ensureReady(ctx context.Context, serverID int6
 	d.mu.Lock()
 	cached, ok := d.ready[serverID]
 	d.mu.Unlock()
-	if ok && cached.tokenHash == tokenHash && now.Sub(cached.checkedAt) < forwardingGuardReadyTTL {
+	if ok && cached.tokenHash == tokenHash && now.Sub(cached.checkedAt) < forwardingGuardReadyTTL &&
+		(!requireFullCapabilities || cached.full) {
 		return nil
 	}
 
@@ -81,21 +95,24 @@ func (d *ForwardingGuardDeployer) ensureReady(ctx context.Context, serverID int6
 	if err := json.Unmarshal(body, &capabilities); err != nil {
 		return errors.New("managed tunnel guard returned invalid capabilities")
 	}
-	if !capabilities.ManagedTunnelV1 || !capabilities.InboundExpiryV1 || !capabilities.InboundACLV1 ||
-		!containsString(capabilities.TunnelNetworks, "tcp") || capabilities.MaxLeaseSeconds < 300 {
-		return errors.New("managed tunnel guard lacks required TCP, expiry, or ACL capability")
+	if !forwardingGuardHasBasicCapabilities(capabilities) {
+		return errors.New("managed tunnel guard lacks required tunnel or expiry capability")
 	}
 	if err := d.managed.syncManagedExpiryGuardAgentToken(ctx, serverID, server.Token); err != nil {
 		return errors.New("managed tunnel guard Agent token synchronization failed")
 	}
+	full := forwardingGuardHasRequiredCapabilities(capabilities)
 	d.mu.Lock()
-	d.ready[serverID] = forwardingGuardReadiness{checkedAt: now, tokenHash: tokenHash}
+	d.ready[serverID] = forwardingGuardReadiness{checkedAt: now, tokenHash: tokenHash, full: full}
 	d.mu.Unlock()
+	if requireFullCapabilities && !full {
+		return errors.New("managed tunnel guard lacks required TCP+UDP, expiry, or ACL capability")
+	}
 	return nil
 }
 
 func (d *ForwardingGuardDeployer) Probe(ctx context.Context, serverID int64) error {
-	return d.ensureReady(ctx, serverID)
+	return d.ensureReady(ctx, serverID, true)
 }
 
 func forwardingGuardErrorCode(body []byte) string {
@@ -144,25 +161,29 @@ func validateForwardingGuardACK(body []byte, resourceID, tag string, generation 
 	return nil
 }
 
-func (d *ForwardingGuardDeployer) Apply(ctx context.Context, spec ForwardTunnelSpec) error {
-	if err := d.ensureReady(ctx, spec.ServerID); err != nil {
-		return err
-	}
-	if spec.HardNotAfter == nil {
-		return errors.New("managed tunnel hard expiry is required")
-	}
-	payload := map[string]any{
+func forwardingGuardApplyPayload(spec ForwardTunnelSpec) map[string]any {
+	return map[string]any{
 		"resource_id":    spec.ResourceID,
 		"generation":     spec.Generation,
 		"listen_ip":      "0.0.0.0",
 		"listen_port":    spec.ListenPort,
 		"target_ip":      spec.TargetHost,
 		"target_port":    spec.TargetPort,
-		"network":        "tcp",
+		"network":        forwardingGuardTunnelNetwork,
 		"source_cidrs":   spec.SourceCIDRs,
 		"hard_not_after": spec.HardNotAfter.UTC(),
 		"lease_until":    spec.LeaseUntil.UTC(),
 	}
+}
+
+func (d *ForwardingGuardDeployer) Apply(ctx context.Context, spec ForwardTunnelSpec) error {
+	if err := d.ensureReady(ctx, spec.ServerID, true); err != nil {
+		return err
+	}
+	if spec.HardNotAfter == nil {
+		return errors.New("managed tunnel hard expiry is required")
+	}
+	payload := forwardingGuardApplyPayload(spec)
 	body, err := d.managed.callManagedExpiryGuard(ctx, spec.ServerID, http.MethodPut, "/v1/tunnels/apply", payload)
 	if err != nil {
 		return classifyForwardingGuardError(err)
@@ -171,7 +192,7 @@ func (d *ForwardingGuardDeployer) Apply(ctx context.Context, spec ForwardTunnelS
 }
 
 func (d *ForwardingGuardDeployer) mutate(ctx context.Context, serverID int64, resourceID string, generation int64, method, path string) error {
-	if err := d.ensureReady(ctx, serverID); err != nil {
+	if err := d.ensureReady(ctx, serverID, false); err != nil {
 		return err
 	}
 	body, err := d.managed.callManagedExpiryGuard(ctx, serverID, method, path, map[string]any{

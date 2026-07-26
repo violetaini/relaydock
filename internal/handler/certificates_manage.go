@@ -16,6 +16,7 @@ import (
 
 	"miaomiaowux/internal/acme"
 	"miaomiaowux/internal/auth"
+	"miaomiaowux/internal/dnscredentials"
 	"miaomiaowux/internal/storage"
 )
 
@@ -97,6 +98,7 @@ type CertificateResponse struct {
 	IssueDate        *string  `json:"issue_date"`
 	AutoRenew        bool     `json:"auto_renew"`
 	ChallengeMode    string   `json:"challenge_mode"`
+	WebrootPath      string   `json:"webroot_path,omitempty"`
 	RemoteServerID   int64    `json:"remote_server_id"`
 	RemoteServerName string   `json:"remote_server_name,omitempty"`
 	Message          string   `json:"message,omitempty"`
@@ -135,6 +137,7 @@ func certificateToResponse(cert *storage.Certificate) CertificateResponse {
 		DNSNames:       certificateDNSNames(cert.CertPEM),
 		AutoRenew:      cert.AutoRenew,
 		ChallengeMode:  cert.ChallengeMode,
+		WebrootPath:    cert.WebrootPath,
 		RemoteServerID: cert.RemoteServerID,
 		Message:        cert.Message,
 		DNSProviderID:  cert.DNSProviderID,
@@ -231,6 +234,14 @@ func (h *CertificateHandler) ListCertificates(w http.ResponseWriter, r *http.Req
 
 // 处理 GET /api/admin/certificates/{id}
 func (h *CertificateHandler) GetCertificate(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPut {
+		h.UpdateCertificate(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		respondJSON(w, http.StatusMethodNotAllowed, map[string]any{"success": false, "message": "不支持的请求方法"})
+		return
+	}
 	if !h.requireAdmin(r) {
 		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
 		return
@@ -270,6 +281,149 @@ func (h *CertificateHandler) GetCertificate(w http.ResponseWriter, r *http.Reque
 
 	respondJSON(w, http.StatusOK, SingleCertificateResponse{
 		Success:     true,
+		Certificate: &resp,
+	})
+}
+
+// UpdateCertificate edits certificate automation metadata. It does not issue a
+// certificate; the new provider and challenge settings apply on the next renewal.
+func (h *CertificateHandler) UpdateCertificate(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAdmin(r) {
+		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+		return
+	}
+
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/admin/certificates/")
+	idStr = strings.Split(idStr, "/")[0]
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "无效的证书ID"})
+		return
+	}
+
+	var req CertificateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "无效的请求数据"})
+		return
+	}
+	req.Domain = strings.TrimSpace(req.Domain)
+	req.Email = strings.TrimSpace(req.Email)
+	req.Provider = strings.TrimSpace(req.Provider)
+	req.ChallengeMode = strings.TrimSpace(req.ChallengeMode)
+	req.WebrootPath = strings.TrimSpace(req.WebrootPath)
+	req.DeployTarget = strings.TrimSpace(req.DeployTarget)
+	req.DeployCertPath = strings.TrimSpace(req.DeployCertPath)
+	req.DeployKeyPath = strings.TrimSpace(req.DeployKeyPath)
+
+	if req.Domain == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "域名不能为空"})
+		return
+	}
+	if req.Provider != acme.CALetsEncrypt && req.Provider != acme.CALetsEncryptStaging && req.Provider != "manual" {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "不支持的证书颁发机构"})
+		return
+	}
+	if req.Provider != "manual" && req.Email == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "ACME 证书的联系邮箱不能为空"})
+		return
+	}
+	switch req.ChallengeMode {
+	case storage.CertChallengeDNS:
+		if req.DNSProviderID <= 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "DNS-01 验证必须选择 DNS 提供商"})
+			return
+		}
+	case storage.CertChallengeWebroot:
+		if req.WebrootPath == "" {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "网站根目录不能为空"})
+			return
+		}
+		req.DNSProviderID = 0
+	case storage.CertChallengeStandalone:
+		req.DNSProviderID = 0
+	case "manual":
+		if req.Provider != "manual" {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "ACME 证书不能使用手动验证方式"})
+			return
+		}
+		req.DNSProviderID = 0
+		req.WebrootPath = ""
+		req.AutoRenew = false
+	default:
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "不支持的验证方式"})
+		return
+	}
+	if req.Provider == "manual" && req.ChallengeMode != "manual" {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "手动上传证书不能配置 ACME 验证方式"})
+		return
+	}
+	if req.Provider != "manual" && strings.Contains(req.Domain, "*") && req.ChallengeMode != storage.CertChallengeDNS {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "泛域名证书必须使用 DNS-01 验证"})
+		return
+	}
+	switch req.DeployTarget {
+	case "", "none":
+		req.DeployTarget = "none"
+		req.DeployCertPath = ""
+		req.DeployKeyPath = ""
+		req.AutoDeploy = false
+	case "nginx", "xray", "both":
+		if req.DeployCertPath == "" || req.DeployKeyPath == "" {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "自动部署必须填写证书和私钥路径"})
+			return
+		}
+	default:
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "不支持的部署目标"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	cert, err := h.repo.GetCertificate(ctx, id)
+	if err != nil {
+		respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
+		return
+	}
+	if cert.CertPEM != "" {
+		if req.Domain != cert.Domain {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "已签发证书不能修改域名，请为新域名单独申请证书"})
+			return
+		}
+		if req.Provider != cert.Provider {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "已签发证书不能直接修改颁发机构；可在重新申请时选择其他机构"})
+			return
+		}
+	}
+	if req.ChallengeMode == storage.CertChallengeDNS {
+		if _, err := h.repo.GetDNSProvider(ctx, req.DNSProviderID); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "所选 DNS 提供商不存在，请重新选择"})
+			return
+		}
+	}
+
+	cert.Domain = req.Domain
+	cert.Email = req.Email
+	cert.Provider = req.Provider
+	cert.AutoRenew = req.AutoRenew
+	cert.ChallengeMode = req.ChallengeMode
+	cert.WebrootPath = req.WebrootPath
+	cert.DNSProviderID = req.DNSProviderID
+	cert.DeployTarget = req.DeployTarget
+	cert.DeployCertPath = req.DeployCertPath
+	cert.DeployKeyPath = req.DeployKeyPath
+	cert.AutoDeploy = req.AutoDeploy
+	if err := h.repo.UpdateCertificate(ctx, cert); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint") {
+			respondJSON(w, http.StatusConflict, map[string]any{"success": false, "message": "该域名的证书记录已存在"})
+			return
+		}
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "更新证书记录失败"})
+		return
+	}
+	resp := certificateToResponse(cert)
+	respondJSON(w, http.StatusOK, SingleCertificateResponse{
+		Success:     true,
+		Message:     "证书设置已更新，将在下次续期或部署时生效",
 		Certificate: &resp,
 	})
 }
@@ -1148,8 +1302,9 @@ type DNSProviderRequest struct {
 	Credentials  string `json:"credentials"` // JSON 字符串
 }
 
-// dnsProviderResponse deliberately excludes Credentials. DNS API secrets are
-// write-only and must never be serialized back to the browser or API clients.
+// dnsProviderResponse deliberately excludes Credentials. Routine list/create
+// responses must never expose DNS API secrets; admins can explicitly retrieve
+// one provider's credentials through RevealDNSProviderCredentials.
 type dnsProviderResponse struct {
 	ID                    int64     `json:"id"`
 	Name                  string    `json:"name"`
@@ -1193,6 +1348,56 @@ func (h *CertificateHandler) ListDNSProviders(w http.ResponseWriter, r *http.Req
 	respondJSON(w, http.StatusOK, map[string]any{"success": true, "providers": publicProviders})
 }
 
+// RevealDNSProviderCredentials handles
+// GET /api/admin/dns-providers/{id}/credentials. The endpoint is intentionally
+// separate from routine provider reads so secret material is only returned
+// after an explicit admin action.
+func (h *CertificateHandler) RevealDNSProviderCredentials(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	if r.Method != http.MethodGet {
+		respondJSON(w, http.StatusMethodNotAllowed, map[string]any{"success": false, "message": "不支持的请求方法"})
+		return
+	}
+	if !h.requireAdmin(r) {
+		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+		return
+	}
+
+	const prefix = "/api/admin/dns-providers/"
+	path := strings.TrimPrefix(r.URL.Path, prefix)
+	idText, found := strings.CutSuffix(path, "/credentials")
+	if !found || idText == "" || strings.Contains(idText, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	id, err := strconv.ParseInt(idText, 10, 64)
+	if err != nil || id <= 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "无效的ID"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	provider, err := h.repo.GetDNSProvider(ctx, id)
+	if err != nil {
+		respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "DNS 提供商不存在"})
+		return
+	}
+
+	credentials := make(map[string]string)
+	if strings.TrimSpace(provider.Credentials) != "" {
+		if err := json.Unmarshal([]byte(provider.Credentials), &credentials); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "DNS 提供商凭据格式无效"})
+			return
+		}
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"success": true, "credentials": credentials})
+}
+
 // 处理 POST /api/admin/dns-providers
 func (h *CertificateHandler) CreateDNSProvider(w http.ResponseWriter, r *http.Request) {
 	if !h.requireAdmin(r) {
@@ -1206,10 +1411,18 @@ func (h *CertificateHandler) CreateDNSProvider(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if req.Name == "" || req.ProviderType == "" || req.Credentials == "" {
+	req.Name = strings.TrimSpace(req.Name)
+	req.ProviderType = strings.ToLower(strings.TrimSpace(req.ProviderType))
+	if req.Name == "" || req.ProviderType == "" || strings.TrimSpace(req.Credentials) == "" {
 		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "名称、类型和凭证不能为空"})
 		return
 	}
+	normalized, err := normalizeDNSProviderCredentials(req.ProviderType, req.Credentials)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
+		return
+	}
+	req.Credentials = normalized
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
@@ -1250,12 +1463,29 @@ func (h *CertificateHandler) UpdateDNSProvider(w http.ResponseWriter, r *http.Re
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	existing, err := h.repo.GetDNSProvider(ctx, id)
+	if err != nil {
+		respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "DNS 提供商不存在"})
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	req.ProviderType = strings.ToLower(strings.TrimSpace(req.ProviderType))
+	if req.Name == "" || req.ProviderType == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "名称和提供商类型不能为空"})
+		return
+	}
+	credentials, err := dnsProviderCredentialsForUpdate(*existing, req.ProviderType, req.Credentials)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
+		return
+	}
 
 	p := &storage.DNSProvider{
 		ID:           id,
 		Name:         req.Name,
 		ProviderType: req.ProviderType,
-		Credentials:  req.Credentials,
+		Credentials:  credentials,
 	}
 
 	if err := h.repo.UpdateDNSProvider(ctx, p); err != nil {
@@ -1264,6 +1494,70 @@ func (h *CertificateHandler) UpdateDNSProvider(w http.ResponseWriter, r *http.Re
 	}
 
 	respondJSON(w, http.StatusOK, map[string]any{"success": true, "message": "更新成功"})
+}
+
+func dnsProviderCredentialsForUpdate(existing storage.DNSProvider, providerType, raw string) (string, error) {
+	provided, err := dnsProviderCredentialsProvided(raw)
+	if err != nil {
+		return "", err
+	}
+	if !provided {
+		if !strings.EqualFold(providerType, strings.TrimSpace(existing.ProviderType)) {
+			return "", errors.New("切换 DNS 提供商时必须输入新提供商的 API 凭据")
+		}
+		return existing.Credentials, nil
+	}
+	return normalizeDNSProviderCredentials(providerType, raw)
+}
+
+func dnsProviderCredentialsProvided(raw string) (bool, error) {
+	if strings.TrimSpace(raw) == "" {
+		return false, nil
+	}
+	var input map[string]string
+	if err := json.Unmarshal([]byte(raw), &input); err != nil {
+		return false, errors.New("DNS 凭据格式无效")
+	}
+	for _, value := range input {
+		if strings.TrimSpace(value) != "" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func normalizeDNSProviderCredentials(providerType, raw string) (string, error) {
+	keys, ok := acme.DNSProviderEnvKeys[providerType]
+	if !ok {
+		return "", fmt.Errorf("不支持的 DNS 提供商：%s", providerType)
+	}
+	var input map[string]string
+	if err := json.Unmarshal([]byte(raw), &input); err != nil {
+		return "", errors.New("DNS 凭据格式无效")
+	}
+
+	var normalized map[string]string
+	if providerType == "cloudflare" {
+		var err error
+		normalized, err = dnscredentials.NormalizeCloudflare(input)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		normalized = make(map[string]string, len(keys))
+		for _, key := range keys {
+			value := strings.TrimSpace(input[key])
+			if value == "" {
+				return "", fmt.Errorf("DNS 凭据缺少 %s", key)
+			}
+			normalized[key] = value
+		}
+	}
+	payload, err := json.Marshal(normalized)
+	if err != nil {
+		return "", errors.New("DNS 凭据保存失败")
+	}
+	return string(payload), nil
 }
 
 // 处理 DELETE /api/admin/dns-providers/{id}

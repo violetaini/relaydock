@@ -28,6 +28,11 @@ const (
 	TunnelStateExpired        = "expired"
 
 	maxTunnelLease = 10 * time.Minute
+
+	tunnelNetworkTCP    = "tcp"
+	tunnelNetworkUDP    = "udp"
+	tunnelNetworkTCPUDP = "tcp_udp"
+	xrayNetworkTCPUDP   = "tcp,udp"
 )
 
 // CommandRunner is injectable so nftables transactions can be verified without
@@ -170,6 +175,38 @@ func normalizeSourceCIDRs(values []string) ([]string, error) {
 	return result, nil
 }
 
+func validPersistedTunnelNetwork(network string) bool {
+	switch network {
+	case tunnelNetworkTCP, tunnelNetworkUDP, tunnelNetworkTCPUDP:
+		return true
+	default:
+		return false
+	}
+}
+
+// All managed tunnel inbounds are installed as combined TCP+UDP listeners.
+// "tcp" remains an apply-time alias for controllers deployed before tcp_udp
+// became the canonical control-plane value.
+func normalizeTunnelApplyNetwork(network string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(network)) {
+	case "", tunnelNetworkTCP, tunnelNetworkTCPUDP:
+		return tunnelNetworkTCPUDP, true
+	default:
+		return "", false
+	}
+}
+
+func tunnelNetworksConflict(left, right string) bool {
+	return validPersistedTunnelNetwork(left) && validPersistedTunnelNetwork(right)
+}
+
+func canUpgradeTunnelNetwork(current, requested string) bool {
+	if current == requested {
+		return true
+	}
+	return (current == tunnelNetworkTCP || current == tunnelNetworkUDP) && requested == tunnelNetworkTCPUDP
+}
+
 func normalizeTunnelApply(request TunnelApplyRequest, now time.Time) (TunnelResource, error) {
 	request.ResourceID = strings.TrimSpace(request.ResourceID)
 	if !validResourceID(request.ResourceID) {
@@ -189,12 +226,9 @@ func normalizeTunnelApply(request TunnelApplyRequest, now time.Time) (TunnelReso
 	if err != nil || net.ParseIP(targetIP).IsUnspecified() {
 		return TunnelResource{}, tunnelErr(http.StatusUnprocessableEntity, "invalid_target_ip", "target_ip must be a non-unspecified IP literal")
 	}
-	network := strings.ToLower(strings.TrimSpace(request.Network))
-	if network == "" {
-		network = "tcp"
-	}
-	if network != "tcp" {
-		return TunnelResource{}, tunnelErr(http.StatusUnprocessableEntity, "unsupported_network", "managed_tunnel_v1 currently supports TCP only")
+	network, supported := normalizeTunnelApplyNetwork(request.Network)
+	if !supported {
+		return TunnelResource{}, tunnelErr(http.StatusUnprocessableEntity, "unsupported_network", "managed_tunnel_v1 requires tcp_udp (legacy tcp requests are accepted)")
 	}
 	sourceCIDRs, err := normalizeSourceCIDRs(request.SourceCIDRs)
 	if err != nil {
@@ -248,8 +282,8 @@ func validatePersistedTunnelResource(resource TunnelResource) error {
 	if resource.ListenPort < 1024 || resource.ListenPort > 65535 || resource.TargetPort < 1 || resource.TargetPort > 65535 {
 		return errors.New("invalid port")
 	}
-	if net.ParseIP(resource.ListenIP) == nil || net.ParseIP(resource.TargetIP) == nil || resource.Network != "tcp" {
-		return errors.New("invalid TCP endpoint")
+	if net.ParseIP(resource.ListenIP) == nil || net.ParseIP(resource.TargetIP) == nil || !validPersistedTunnelNetwork(resource.Network) {
+		return errors.New("invalid TCP/UDP endpoint")
 	}
 	if resource.HardNotAfter.IsZero() || resource.LeaseUntil.IsZero() || resource.UpdatedAt.IsZero() || !validTunnelState(resource.State) {
 		return errors.New("invalid lifecycle state")
@@ -297,7 +331,7 @@ func sameTunnelSpec(left, right TunnelResource) bool {
 func sameTunnelDefinition(left, right TunnelResource) bool {
 	return left.ResourceID == right.ResourceID && left.Tag == right.Tag && left.ListenIP == right.ListenIP &&
 		left.ListenPort == right.ListenPort && left.TargetIP == right.TargetIP && left.TargetPort == right.TargetPort &&
-		left.Network == right.Network && strings.Join(left.SourceCIDRs, "\x00") == strings.Join(right.SourceCIDRs, "\x00")
+		canUpgradeTunnelNetwork(left.Network, right.Network) && strings.Join(left.SourceCIDRs, "\x00") == strings.Join(right.SourceCIDRs, "\x00")
 }
 
 func (g *Guard) SetCommandRunner(runner CommandRunner) {
@@ -345,8 +379,9 @@ func (g *Guard) checkDurablePort(resource TunnelResource) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, other := range g.tunnels {
-		if other.ResourceID != resource.ResourceID && other.reservesPort() && other.Network == resource.Network && other.ListenPort == resource.ListenPort {
-			return tunnelErr(http.StatusConflict, "port_reserved", fmt.Sprintf("TCP port %d is reserved by another managed resource", resource.ListenPort))
+		if other.ResourceID != resource.ResourceID && other.reservesPort() &&
+			tunnelNetworksConflict(other.Network, resource.Network) && other.ListenPort == resource.ListenPort {
+			return tunnelErr(http.StatusConflict, "port_reserved", fmt.Sprintf("TCP/UDP port %d is reserved by another managed resource", resource.ListenPort))
 		}
 	}
 	return nil
@@ -436,7 +471,7 @@ func tunnelInbound(resource TunnelResource) map[string]interface{} {
 		"settings": map[string]interface{}{
 			"address":        resource.TargetIP,
 			"port":           resource.TargetPort,
-			"network":        "tcp",
+			"network":        xrayNetworkTCPUDP,
 			"followRedirect": false,
 		},
 		"sniffing": map[string]interface{}{"enabled": false},
@@ -566,11 +601,14 @@ func buildNFTablesRules(resources []TunnelResource, tableExists bool) string {
 		}
 		if len(v4) > 0 {
 			fmt.Fprintf(&builder, "    ip saddr { %s } tcp dport %d accept\n", strings.Join(v4, ", "), resource.ListenPort)
+			fmt.Fprintf(&builder, "    ip saddr { %s } udp dport %d accept\n", strings.Join(v4, ", "), resource.ListenPort)
 		}
 		if len(v6) > 0 {
 			fmt.Fprintf(&builder, "    ip6 saddr { %s } tcp dport %d accept\n", strings.Join(v6, ", "), resource.ListenPort)
+			fmt.Fprintf(&builder, "    ip6 saddr { %s } udp dport %d accept\n", strings.Join(v6, ", "), resource.ListenPort)
 		}
 		fmt.Fprintf(&builder, "    tcp dport %d drop\n", resource.ListenPort)
+		fmt.Fprintf(&builder, "    udp dport %d drop\n", resource.ListenPort)
 	}
 	builder.WriteString("  }\n")
 	builder.WriteString("}\n")
@@ -734,7 +772,7 @@ func (g *Guard) ApplyTunnel(ctx context.Context, request TunnelApplyRequest) (Tu
 		return TunnelResource{}, false, tunnelErr(http.StatusBadGateway, "agent_preflight_failed", "Agent inbound state is unavailable; port allocation failed closed")
 	}
 	if portConflicts(inbounds, resource) {
-		return TunnelResource{}, false, tunnelErr(http.StatusConflict, "port_in_use", fmt.Sprintf("TCP port %d is already used by an Agent inbound", resource.ListenPort))
+		return TunnelResource{}, false, tunnelErr(http.StatusConflict, "port_in_use", fmt.Sprintf("TCP/UDP port %d is already used by an Agent inbound", resource.ListenPort))
 	}
 	resource.CleanupTerminal = TunnelStateSuspended
 	if err := g.storeTunnel(resource); err != nil {
@@ -997,7 +1035,7 @@ func (g *Guard) tunnelCapabilities(ctx context.Context) map[string]interface{} {
 		"inbound_acl_v1":     acl,
 		"inbound_limiter_v1": false,
 		"inbound_stats_v1":   false,
-		"tunnel_networks":    []string{"tcp"},
+		"tunnel_networks":    []string{tunnelNetworkTCPUDP},
 		"max_lease_seconds":  int(maxTunnelLease.Seconds()),
 		"stats_semantics":    "best_effort; counters can reset with Xray",
 		"tunnel_operations":  []string{"apply", "status", "suspend", "remove"},

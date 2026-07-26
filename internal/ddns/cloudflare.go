@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"miaomiaowux/internal/dnscredentials"
 )
 
 // cloudflareProvider 直接调 CF v4 HTTP API,不依赖 lego internal 包(lego 的 cloudflare client 在
@@ -28,29 +29,15 @@ type cloudflareProvider struct {
 }
 
 func newCloudflareProvider(creds map[string]string) (*cloudflareProvider, error) {
-	token := strings.TrimSpace(creds["CF_DNS_API_TOKEN"])
-	email := strings.TrimSpace(creds["CF_API_EMAIL"])
-	key := strings.TrimSpace(creds["CF_API_KEY"])
-	if token == "" && (email == "" || key == "") {
-		return nil, errors.New("cloudflare: missing credentials — need CF_DNS_API_TOKEN or (CF_API_EMAIL + CF_API_KEY)")
-	}
-
-	var auth func(req *http.Request)
-	if token != "" {
-		auth = func(req *http.Request) {
-			req.Header.Set("Authorization", "Bearer "+token)
-		}
-	} else {
-		auth = func(req *http.Request) {
-			req.Header.Set("X-Auth-Email", email)
-			req.Header.Set("X-Auth-Key", key)
-		}
+	auth, err := dnscredentials.ResolveCloudflare(creds)
+	if err != nil {
+		return nil, fmt.Errorf("cloudflare: %w", err)
 	}
 
 	return &cloudflareProvider{
 		httpClient: &http.Client{Timeout: 15 * time.Second},
 		baseURL:    "https://api.cloudflare.com/client/v4",
-		authHeader: auth,
+		authHeader: auth.Apply,
 	}, nil
 }
 
@@ -197,7 +184,7 @@ func (p *cloudflareProvider) doJSON(ctx context.Context, method, url string, bod
 		if len(msgs) == 0 {
 			msgs = append(msgs, fmt.Sprintf("HTTP %d", resp.StatusCode))
 		}
-		return fmt.Errorf("cloudflare API: %s", strings.Join(msgs, "; "))
+		return dnscredentials.FriendlyCloudflareError(fmt.Errorf("cloudflare API: %s", strings.Join(msgs, "; ")))
 	}
 	if out != nil && len(cfResp.Result) > 0 {
 		if err := json.Unmarshal(cfResp.Result, out); err != nil {

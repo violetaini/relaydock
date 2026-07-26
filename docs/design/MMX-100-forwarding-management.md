@@ -18,7 +18,7 @@
         ↓
 用户选择获授权隧道和最终目标，创建转发
         ↓
-RelayDock 为该转发分配端口并逐跳下发
+RelayDock 为该转发选择一个路线端口并逐跳下发
         ↓
 用户使用“入口地址:端口”连接最终服务
 ```
@@ -33,7 +33,7 @@ RelayDock 为该转发分配端口并逐跳下发
 HK-01 → JP-02 → US-01
 ```
 
-模板本身不绑定用户、不绑定最终目标，也不预先占用转发端口。它定义可用路线、网络类型、计费规则和安全上限。
+模板本身不绑定用户、不绑定最终目标，也不预先占用转发端口。它定义可用路线、网络类型、计费规则和安全上限。模板端口范围只约束创建转发时的候选端口，不代表整段端口归隧道独占。
 
 首版允许 1 至 8 台服务器；后端保留可配置上限，但不允许无限跳数：
 
@@ -51,12 +51,20 @@ HK-01 → JP-02 → US-01
 用户在一条有效隧道授权上创建的实际转发实例，包含：
 
 - 最终目标。
-- 网络类型；首版固定为 TCP，后续开放 UDP 和 TCP+UDP。
-- 入口端口。
-- 每一跳实际监听端口。
+- 网络类型；控制面固定为同时转发 TCP+UDP 的 `tcp_udp`。
+- 路线端口；可自动选择，也可通过 `requested_entry_port` 显式请求。
+- 每一跳实际监听端口；同一条路线的所有 hop 使用同一个路线端口。
 - 生效状态、用量和到期时间。
 
 每个用户转发沿路线拥有独立的入站和端口，用户之间不共享可修改的 Xray 配置。
+
+例如显式请求端口 2033 的三跳路线固定为：
+
+```text
+A:2033 -> B:2033 -> C:2033 -> 最终目标:目标端口
+```
+
+控制面和数据库使用规范值 `tcp_udp`；下发到 Xray `dokodemo-door` 时使用 `settings.network = "tcp,udp"`。
 
 ## 3. 权限矩阵
 
@@ -80,8 +88,8 @@ HK-01 → JP-02 → US-01
 
 1. 管理员创建、停止新建、紧急停用和查看 1 至 8 跳隧道模板。
 2. 管理员按“用户 × 隧道”创建、续期、暂停和撤销授权。
-3. 用户在自己的有效授权上创建、暂停、恢复和删除 TCP 转发。
-4. 入口与中间端口自动分配，并在数据库中强一致预留。
+3. 用户在自己的有效授权上创建、暂停、恢复和删除 TCP+UDP 同时转发。
+4. 在模板端口范围内自动选择或显式请求一个路线端口，全部 hop 使用该端口，并在数据库中按实际 hop 强一致预留。
 5. 支持把用户已有且符合首版安全条件的受管物理节点作为目标。
 6. 按用户转发执行有效期、授权总流量限制和上传+下载/仅下载计费；首版节点守卫不具备可靠的每转发速率与连接数限制，因此 API 拒绝非零值，界面保持禁用。
 7. 控制端或 Agent 离线时保留期望状态，恢复后自动补偿或清理。
@@ -89,9 +97,7 @@ HK-01 → JP-02 → US-01
 
 ### 4.2 后续版本
 
-- UDP 和 TCP+UDP 转发。
 - 用户自定义公网 IP、域名和端口目标。
-- 手动选择入口端口。
 - 多目标和负载均衡。
 - 跨主控联邦服务器路线。
 - 隧道跳间的独立 TLS/WSS 等封装。
@@ -106,7 +112,7 @@ HK-01 → JP-02 → US-01
 2. 用户创建转发时只提交 `tunnel_grant_id`，后端必须重新解析授权、模板和服务器路线，不能接受用户提交的 `server_ids`。
 3. 服务器授权、节点授权和隧道授权是三类独立权限，任何一类都不能隐式推导另一类。
 4. 隧道模板的限制是上限；用户授权只能继承或收紧，不能放宽模板策略。
-5. 一个用户转发的每一跳都必须有本地主记录、端口预留和期望状态，不能再依靠远端 Tag 反推业务数据。
+5. 一个用户转发的每一跳都必须有本地主记录、同一路线端口的实际预留和期望状态，不能再依靠远端 Tag 反推业务数据。
 6. 用户只有在所有跳都确认生效后才能获得可用入口。
 7. 下发顺序固定为出口到入口，入口最后启用；删除顺序固定为入口到出口，先切断新流量。
 8. 授权撤销、到期、超额或用户停用后，本地 API 和配置输出立即拒绝；运行中的远端入口通过短期可续租约在有界时间内停用，不能只等主控在线清理。
@@ -126,7 +132,7 @@ HK-01 → JP-02 → US-01
 | `name` | TEXT NOT NULL | 管理员可读名称 |
 | `description` | TEXT NOT NULL DEFAULT '' | 备注 |
 | `state` | TEXT NOT NULL DEFAULT 'active' | `active/draining/suspended/deleted` |
-| `network` | TEXT NOT NULL DEFAULT 'tcp' | `tcp`、后续 `udp/tcp_udp` |
+| `network` | TEXT NOT NULL DEFAULT 'tcp_udp' | TCP+UDP 同时转发的控制面规范值 `tcp_udp` |
 | `billing_mode` | TEXT NOT NULL DEFAULT 'both' | `download` 或 `both` |
 | `traffic_multiplier_milli` | INTEGER NOT NULL DEFAULT 1000 | 流量倍率，1000 表示 1.0 倍 |
 | `max_total_forwards` | INTEGER NOT NULL DEFAULT 0 | 模板总转发数，0 表示不限 |
@@ -144,6 +150,8 @@ HK-01 → JP-02 → US-01
 约束：
 
 - `port_range_start/end` 必须在 1024 至 65535，且起点不大于终点。
+- 端口范围只限制自动选择和 `requested_entry_port` 的候选值；创建或编辑模板不会向 `server_port_allocations` 写入整段预留。
+- 节点管理和其他受管入站可以使用范围内端口。创建实际转发时，分配器只排除数据库中已登记的实际占用；Guard 下发时还会按每台服务器的实时 Xray 入站做最终冲突检查。
 - 倍率使用整数存储，避免浮点累计误差。
 - 首版忽略并强制保持 `allow_custom_public_target = 0`，直到固定拨号地址策略通过安全回归。
 - `active`：允许创建、恢复和自动修复转发。
@@ -189,7 +197,6 @@ HK-01 → JP-02 → US-01
 | `billing_mode_override` | TEXT NULL | NULL 继承模板 |
 | `allow_managed_target` | INTEGER NOT NULL DEFAULT 1 | 授权是否允许已有节点目标 |
 | `allow_custom_public_target` | INTEGER NOT NULL DEFAULT 0 | 授权是否允许自填公网目标 |
-| `allow_manual_entry_port` | INTEGER NOT NULL DEFAULT 0 | 后续开放的手动端口权限 |
 | `reset_policy` | TEXT NOT NULL DEFAULT 'none' | `none/monthly` |
 | `reset_day` | INTEGER NOT NULL DEFAULT 1 | 月度重置日 1 至 28 |
 | `billing_timezone` | TEXT NOT NULL DEFAULT 'Asia/Shanghai' | 周期时区 |
@@ -231,9 +238,9 @@ HK-01 → JP-02 → US-01
 | `target_node_id` | INTEGER NULL | 已有节点目标 |
 | `target_host` | TEXT NOT NULL | 规范化后的目标地址快照 |
 | `target_port` | INTEGER NOT NULL | 最终目标端口 |
-| `network` | TEXT NOT NULL DEFAULT 'tcp' | 实际网络类型 |
-| `requested_entry_port` | INTEGER NULL | 后续手动端口请求 |
-| `allocated_entry_port` | INTEGER NULL | 已分配入口端口 |
+| `network` | TEXT NOT NULL DEFAULT 'tcp_udp' | 实际网络类型，固定为 `tcp_udp` |
+| `requested_entry_port` | INTEGER NOT NULL DEFAULT 0 | 显式请求的路线端口；0 表示自动选择 |
+| `allocated_entry_port` | INTEGER NULL | 已分配的路线公共端口，所有 hop 相同 |
 | `source_cidrs` | TEXT NOT NULL DEFAULT '[]' | 入口来源白名单，规范化 JSON |
 | `desired_state` | TEXT NOT NULL | `active/inactive/deleted` |
 | `observed_state` | TEXT NOT NULL | 实际状态 |
@@ -270,9 +277,9 @@ HK-01 → JP-02 → US-01
 | `position` | INTEGER NOT NULL | 路线顺序 |
 | `server_id` | INTEGER NOT NULL | 实际服务器 |
 | `resource_tag` | TEXT NOT NULL UNIQUE | 不含用户名的随机 Tag |
-| `listen_port` | INTEGER NOT NULL | 本跳监听端口 |
+| `listen_port` | INTEGER NOT NULL | 本跳监听端口；同一转发所有 hop 相同 |
 | `next_host` | TEXT NOT NULL | 下一跳或最终目标 |
-| `next_port` | INTEGER NOT NULL | 下一跳或目标端口 |
+| `next_port` | INTEGER NOT NULL | 下一跳使用同一路线端口；最后一跳使用目标端口 |
 | `desired_state` | TEXT NOT NULL | 期望状态 |
 | `observed_state` | TEXT NOT NULL | Agent 观察状态 |
 | `generation` | INTEGER NOT NULL DEFAULT 1 | 期望版本 |
@@ -282,7 +289,7 @@ HK-01 → JP-02 → US-01
 | `last_error` | TEXT NOT NULL DEFAULT '' | 脱敏错误 |
 | `updated_at` | TIMESTAMP NOT NULL | 更新时间 |
 
-Tag 使用 `rd-fwd-<opaque-id>-h<position>`，不能包含用户名、目标域名或其他隐私信息。
+Tag 由随机 `resource_id` 确定性派生为 `rd-tun-<digest>`，不能包含用户名、目标域名或其他隐私信息。
 
 ### 6.6 `server_port_allocations`
 
@@ -292,7 +299,7 @@ Tag 使用 `rd-fwd-<opaque-id>-h<position>`，不能包含用户名、目标域�
 |---|---|---|
 | `id` | INTEGER PK | 预留 ID |
 | `server_id` | INTEGER NOT NULL | 服务器 |
-| `network` | TEXT NOT NULL | `tcp/udp` |
+| `network` | TEXT NOT NULL | 套接字占用维度 `tcp` 或 `udp`；`tcp_udp` 转发同时写入两条预留 |
 | `port` | INTEGER NOT NULL | 端口 |
 | `owner_type` | TEXT NOT NULL | `node/forward_hop/legacy_external/system` |
 | `owner_id` | INTEGER NOT NULL | 所属资源 ID |
@@ -300,7 +307,7 @@ Tag 使用 `rd-fwd-<opaque-id>-h<position>`，不能包含用户名、目标域�
 | `remote_revision` | TEXT NULL | Agent 确认时的配置版本 |
 | `created_at` | TIMESTAMP NOT NULL | 创建时间 |
 
-约束：`UNIQUE(server_id, network, port)` 和 `UNIQUE(owner_type, owner_id, network)`。配额计数、业务记录和端口预留必须在同一个短事务中原子提交。
+约束：`UNIQUE(server_id, network, port)` 和 `UNIQUE(owner_type, owner_id, network)`。配额计数、业务记录和实际 hop 端口预留必须在同一个短事务中原子提交。模板端口范围本身不产生预留；只有创建具体转发后，才为路线中每台服务器的同一端口分别写入 TCP、UDP 所有权记录。
 
 升级时扫描所有可读远端入站并回填 `legacy_external` 占用。端口分配失败必须整体回滚本地事务，不能依赖“随机碰撞后让 Agent 报错”。读取远端配置失败时应失败关闭；Agent 仍须在原子应用操作中检查实时配置版本和端口占用，因为数据库无法约束用户在服务器上手工修改 Xray。
 
@@ -342,8 +349,8 @@ Tag 使用 `rd-fwd-<opaque-id>-h<position>`，不能包含用户名、目标域�
 首版基于 Xray `dokodemo-door` 的链式端口转发，负责搬运字节，不等于自动加密的站点到站点隧道：
 
 - 目标协议本身使用 Reality/TLS 时，其端到端数据仍由目标协议加密。
-- 自定义明文 TCP 服务不会因为经过 RelayDock 转发而自动变成加密流量。
-- UI 使用“TCP 转发/多跳转发”，不能把直连转发宣传为“加密隧道”。
+- 自定义明文 TCP 或 UDP 服务不会因为经过 RelayDock 转发而自动变成加密流量。
+- UI 使用“TCP+UDP 转发/多跳转发”，不能把直连转发宣传为“加密隧道”。
 
 ## 8. 下发、回滚与恢复
 
@@ -351,10 +358,10 @@ Tag 使用 `rd-fwd-<opaque-id>-h<position>`，不能包含用户名、目标域�
 
 1. 在一个数据库事务内锁定授权和模板，重新计算有效权限与配额。
 2. 为全部服务器按稳定的 `server_id` 顺序取得真正的独占配置变更锁；安装器、节点管理和旧版 Tunnel 等其他入站写接口必须共享同一把锁。现有只阻断安装流程的 mutation lease 不满足该要求，实施时必须替换。
-3. 从全局端口所有权表预留每一跳端口，并读取 Agent 当前配置做冲突预检；任一步不可读即停止。Agent 使用配置 revision/CAS 原子检查和写入，再次拒绝占用端口，消除预检到下发之间的竞态。
+3. 在模板定义的候选范围内选择一个对所有 hop 都没有数据库占用的公共端口；范围起止必须位于 1024 至 65535。若请求包含 `requested_entry_port`，只验证该端口。随后为每台 hop 服务器的同一端口分别预留 TCP 和 UDP；Guard 应用资源时读取 Agent 当前入站并再次拒绝实时占用。自动选择遇到实时冲突时换用新的公共端口和资源身份，显式端口冲突则直接返回。
 4. 写入 `user_forward_rules`、`user_forward_hops` 和 outbox 任务后提交事务。
 5. Worker 从出口跳向入口跳依次应用，入口最后启用。
-6. 每个 Agent 请求携带 `resource_id + generation + hard_not_after + lease_until`，重复请求必须幂等。
+6. 每个 Agent 请求携带 `resource_id + generation + network=tcp_udp + hard_not_after + lease_until`，重复请求必须幂等；Guard 生成的 Xray `dokodemo-door` 入站固定使用 `settings.network = "tcp,udp"`。
 7. 全部确认后标记 `active`，此时用户才可复制入口或生成配置。
 
 ### 8.2 失败回滚
@@ -383,7 +390,8 @@ Tag 使用 `rd-fwd-<opaque-id>-h<position>`，不能包含用户名、目标域�
 
 - `managed_tunnel_v1`：按资源 ID 和 generation 幂等应用、查询、停用和删除转发入站。
 - `inbound_expiry_v1`：Agent 持久化绝对 `hard_not_after` 和短期 `lease_until`，任一个到期都本地停用，重启后不能恢复过期资源。
-- `inbound_acl_v1`：限制中间跳只接受上一跳服务器实际出口地址，并支持入口来源 CIDR。
+- `inbound_acl_v1`：限制中间跳只接受上一跳服务器实际出口地址，并支持入口来源 CIDR；允许和默认拒绝规则必须同时覆盖 TCP、UDP。
+- `tunnel_networks`：必须包含控制面规范值 `tcp_udp`；只广告 `tcp` 的旧 Guard 不满足当前转发要求。
 - `inbound_limiter_v1`：按转发入站执行速率和连接数限制。
 - `inbound_stats_v1`：返回稳定的入站上下行计数和计数代次。
 
@@ -488,10 +496,13 @@ both：（用户发往入口 + 入口发往用户）× 模板倍率
     "type": "managed_node",
     "node_id": 42
   },
-  "network": "tcp",
+  "network": "tcp_udp",
+  "requested_entry_port": 2033,
   "source_cidrs": []
 }
 ```
+
+`network` 的规范值为 `tcp_udp`；为兼容旧客户端，后端仍接受 `tcp` 并归一化为 `tcp_udp`。`requested_entry_port` 可省略或设为 0 以自动选择，也可显式设为 2033 等模板范围内的 1024 至 65535 端口；成功后 A-B-C 等全部 hop 都监听该端口。
 
 响应只有在 `observed_state = active` 后才返回可用入口。异步创建返回任务 ID，前端轮询或通过事件流更新状态。
 
@@ -517,8 +528,8 @@ both：（用户发往入口 + 入口发往用户）× 模板倍率
 
 1. 选择已授权隧道。
 2. 选择已有受管节点目标；后续版本在获准时可填写公网目标。
-3. 设置名称、网络类型和来源白名单。
-4. 预检并确认：展示路线、最终入口、有效期、限速、连接数、计费方向和倍率。
+3. 设置名称、可选路线端口和来源白名单；网络类型固定展示为 TCP+UDP。
+4. 预检并确认：展示路线、所有 hop 共用的端口、最终入口、有效期、限速、连接数、计费方向和倍率。
 
 转发未完全生效前，复制按钮和客户端配置按钮必须禁用。已有节点目标生效后，可直接生成替换了地址和端口的完整客户端配置。
 
@@ -540,6 +551,12 @@ both：（用户发往入口 + 入口发往用户）× 模板倍率
 
 用户管理中的“隧道授权”作为同一授权编辑器的快捷入口，保存后回到用户设置，不另造独立数据模型。
 
+### 12.3 节点任意门
+
+管理员可在节点管理的单行操作菜单中选择“任意门转发”，选择一台在线受管服务器和监听端口。控制端创建同时监听 TCP、UDP 的 `dokodemo-door` 入站，并克隆原节点客户端配置，只把连接地址和端口替换为任意门入口；重复的同服务器、同入站 Tag 事件必须更新已有克隆，不能产生重复节点。
+
+任意门端口可以位于某个隧道模板的候选范围内。模板范围本身不产生占用，只有具体任意门或具体用户转发实际创建时才检查端口冲突。
+
 ## 13. 旧功能迁移
 
 现有 `/api/admin/tunnel-chains` 和远端 `tunnel-<label>-h<n>` 没有数据库主记录，不能直接授权给用户。
@@ -547,10 +564,18 @@ both：（用户发往入口 + 入口发往用户）× 模板倍率
 迁移策略：
 
 1. 旧功能保持管理员可见但标记为“旧版未托管转发”。
-2. 新系统使用 `rd-fwd-*` Tag，与旧 Tag 完全隔离。
+2. 新系统使用 `rd-tun-*` Tag，与旧 Tag 完全隔离。
 3. 提供一次性导入预检：识别完整路线、端口和目标后，管理员确认才能创建模板或转发记录。
 4. 无法证明完整性的散装入站只允许查看和清理，不允许授权。
 5. 新页面稳定后，旧“高级功能 > Tunnel 管理”改为只读迁移入口，最终移除旧写接口，避免两套编排器同时修改 Xray。
+
+### 13.1 TCP 转发升级为 TCP+UDP
+
+1. 先升级或重装路线中每台服务器的 Agent 与 expiry Guard，使 `tunnel_networks` 上报 `tcp_udp`；旧 Guard 仍允许暂停和删除，但不能创建或续租新的 TCP+UDP generation。
+2. 数据库迁移把旧 `tcp` 规则规范化为 `tcp_udp`，并将仍为 active 的 rule 与 hop 提升 generation、重置 applied 状态，强制 Guard 重新下发 Xray 入站。
+3. 旧版多跳若各 hop 使用不同端口，reconciler 在下发前为整条路线重新选择一个公共端口和新资源身份，再清理旧资源；清理暂时失败时仍由旧资源短租约保证最终失效。
+4. 回填 UDP 端口所有权时若发现其他资源已占用，不得让数据库永久启动失败；规则保持待调和，由公共端口重分配流程恢复。
+5. 旧“高级功能 > Tunnel 管理”的链式创建会为每个 hop 的 Add/Remove 携带稳定 `mutation_id`。升级后的 Agent 将删除栅栏持久化到侧车文件，防止响应超时后迟到的 Add 在已确认删除后重新监听端口；旧 Agent 兼容忽略该字段，但不具备该保护，因此也应升级或重装。
 
 ## 14. 实施顺序
 
@@ -560,7 +585,7 @@ both：（用户发往入口 + 入口发往用户）× 模板倍率
 - Agent 五项能力与配置互斥锁。
 - 全局端口所有权、Agent revision/CAS、generation 幂等和 reconciler。
 - 目标校验、ACL 和本地到期保护。
-- 先用 TCP、自动端口、受管节点目标完成 Agent 技术验证，再开始普通用户页面。
+- 先用 TCP+UDP 同时转发、公共路线端口和受管节点目标完成 Agent 技术验证，再开始普通用户页面。
 
 ### 阶段 B：管理员闭环
 
@@ -576,7 +601,7 @@ both：（用户发往入口 + 入口发往用户）× 模板倍率
 
 ### 阶段 D：扩展能力
 
-- UDP、手动端口、多目标、负载均衡和联邦路线。
+- 多目标、负载均衡和联邦路线。
 - 自定义公网目标及其固定拨号地址策略。
 - 跳间额外加密传输和聚合速率整形。
 
@@ -586,16 +611,17 @@ both：（用户发往入口 + 入口发往用户）× 模板倍率
 
 1. 普通用户不能通过前端或直接 API 创建、修改、排序或删除隧道模板。
 2. 用户只能看到自己的授权和转发，篡改用户名、授权 ID、节点 ID 或模板 ID 均不能越权。
-3. 两个并发创建请求不会在任何一台服务器上获得相同网络和端口。
+3. 两个并发创建请求不会在任何一台服务器上获得相同 TCP 或 UDP 端口；模板端口范围不会整段预占，也不会阻止节点使用范围内未被具体转发占用的端口。
 4. 中间任一 Agent 下发失败时，入口不可用；已下发资源可回滚或明确进入待清理。
 5. 创建时 Agent 离线、删除时 Agent 离线、主控重启和 Agent 重启后都能最终收敛。
 6. 自然到期按 `hard_not_after` 停用；提前撤权或主控失联按短租约在 5 分钟加允许的时钟误差内停用。
 7. 三跳转发产生 1 GiB 可计费流量时，用户账单只增加一次并正确应用倍率。
 8. 已有节点目标生成的 Reality/TLS/WS 配置只替换入口地址和端口，SNI、Host、密钥和路径保持正确。
-9. 后续开放自定义目标前，必须验证其不能访问私网、loopback、链路本地、云元数据或 RelayDock 管理面。
-10. 模板停止新建、模板紧急停用、授权撤销、用户停用、超额和手动暂停在 UI 中有不同原因，不以笼统“失败”代替。
-11. 删除转发后，所有跳、ACL、限速规则和端口预留均被确认清理；离线服务器显示待清理且可重试。
-12. 所有管理员变更和系统自动动作可在面板审计记录中追踪，但不泄露敏感配置。
+9. 自动分配和显式 `requested_entry_port=2033` 都使 A-B-C 等全部 hop 使用同一个端口；任一 hop 上 TCP 或 UDP 已占用时，显式请求返回冲突，自动分配改选另一公共端口。
+10. 后续开放自定义目标前，必须验证其不能访问私网、loopback、链路本地、云元数据或 RelayDock 管理面。
+11. 模板停止新建、模板紧急停用、授权撤销、用户停用、超额和手动暂停在 UI 中有不同原因，不以笼统“失败”代替。
+12. 删除转发后，所有跳、ACL、限速规则和端口预留均被确认清理；离线服务器显示待清理且可重试。
+13. 所有管理员变更和系统自动动作可在面板审计记录中追踪，但不泄露敏感配置。
 
 ## 16. 已确定的产品决策
 
@@ -605,7 +631,7 @@ both：（用户发往入口 + 入口发往用户）× 模板倍率
 - 用户能力：使用授权创建自己的转发，不得改变路线。
 - 路线能力：首版保留 RelayDock 的 1 至 8 跳，不采用固定双节点拓扑。
 - 计费：入口只计一次，支持模板倍率。
-- 首发协议：TCP；UDP 在 Agent 和回归测试完成后开放。
+- 首发协议：TCP+UDP 同时转发；控制面使用 `tcp_udp`，Xray `dokodemo-door` 使用 `tcp,udp`。
 - 首发服务器：只支持本主控直接管理的服务器，不支持联邦分享服务器。
 - 自定义目标：首版不开放；后续必须由模板和用户授权双重允许，并使用固定的已审核拨号 IP。
 

@@ -1036,6 +1036,41 @@ CREATE TABLE IF NOT EXISTS speed_testers (
 		return fmt.Errorf("migrate speed_testers: %w", err)
 	}
 
+	// 服务器线路测速与节点代理测速语义不同，独立存储，避免 node_id=0 污染节点最新结果。
+	const lineSpeedTestResultsSchema = `
+CREATE TABLE IF NOT EXISTS line_speedtest_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('master', 'remote')),
+    server_id INTEGER NOT NULL DEFAULT 0,
+    server_name TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'ok', 'failed')),
+    error TEXT NOT NULL DEFAULT '',
+    ping_ms REAL NOT NULL DEFAULT 0,
+    download_mbps REAL NOT NULL DEFAULT 0,
+    upload_mbps REAL NOT NULL DEFAULT 0,
+    jitter_ms REAL,
+    packet_loss_percent REAL,
+    isp TEXT NOT NULL DEFAULT '',
+    egress_ip TEXT NOT NULL DEFAULT '',
+    test_server TEXT NOT NULL DEFAULT '',
+    server_location TEXT NOT NULL DEFAULT '',
+    implementation TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_line_speedtest_target
+    ON line_speedtest_results(target_kind, server_id, id DESC);
+`
+	if _, err := r.db.Exec(lineSpeedTestResultsSchema); err != nil {
+		return fmt.Errorf("migrate line_speedtest_results: %w", err)
+	}
+	// 异步任务无法跨主控进程恢复。启动时把遗留 running 明确收口，避免前端永久轮询。
+	if _, err := r.db.Exec(`UPDATE line_speedtest_results
+		SET status = 'failed', error = '主控重启，测速任务未完成', completed_at = CURRENT_TIMESTAMP
+		WHERE status = 'running'`); err != nil {
+		return fmt.Errorf("recover stale line speedtest jobs: %w", err)
+	}
+
 	const userTrafficRecordsSchema = `
 CREATE TABLE IF NOT EXISTS user_traffic_records (
     username TEXT NOT NULL,
@@ -2817,6 +2852,9 @@ CREATE TABLE IF NOT EXISTS traffic_threshold_notified (
 		return fmt.Errorf("migrate federated_servers: %w", err)
 	}
 	if err := r.migrateManagedNodes(); err != nil {
+		return err
+	}
+	if err := r.migrateManagedInboundResources(); err != nil {
 		return err
 	}
 	if err := r.migrateForwarding(); err != nil {

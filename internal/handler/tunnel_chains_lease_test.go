@@ -54,6 +54,7 @@ func createTunnelChainRemoteServer(t *testing.T, repo *storage.TrafficRepository
 		Status:         storage.RemoteServerStatusConnected,
 		ConnectionMode: storage.ConnectionModePush,
 		IPAddress:      "127.0.0.1",
+		IPv6Enabled:    true,
 		ListenPort:     tunnelChainAgentPort(t, agentURL),
 	}
 	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
@@ -149,12 +150,28 @@ func TestTunnelChainFailureRollsBackSynchronouslyWhileHoldingAllLeases(t *testin
 	}))
 	defer firstAgent.Close()
 
+	var secondActionsMu sync.Mutex
+	var secondActions []string
 	secondAgent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/api/child/xray/config" {
 			writeEmptyXrayConfig(w)
 			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds" {
+			var request struct {
+				Action string `json:"action"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			secondActionsMu.Lock()
+			secondActions = append(secondActions, request.Action)
+			secondActionsMu.Unlock()
+			if request.Action == "remove" {
+				_, _ = w.Write([]byte(`{"success":true}`))
+				return
+			}
 			http.Error(w, "forced second-hop failure", http.StatusBadGateway)
 			return
 		}
@@ -224,6 +241,12 @@ func TestTunnelChainFailureRollsBackSynchronouslyWhileHoldingAllLeases(t *testin
 	firstActionsMu.Unlock()
 	if got := strings.Join(actions, ","); got != "add,remove" {
 		t.Fatalf("first Agent actions=%q, want add,remove", got)
+	}
+	secondActionsMu.Lock()
+	secondActionLog := append([]string(nil), secondActions...)
+	secondActionsMu.Unlock()
+	if got := strings.Join(secondActionLog, ","); got != "add,remove" {
+		t.Fatalf("second Agent actions=%q, want add,remove", got)
 	}
 }
 

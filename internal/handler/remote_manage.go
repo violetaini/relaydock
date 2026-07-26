@@ -45,9 +45,13 @@ type RemoteManageHandler struct {
 const (
 	defaultRemoteOperationTimeout = 30 * time.Second
 	warpRemoteOperationTimeout    = 75 * time.Second
+	lineSpeedOperationTimeout     = 5 * time.Minute
 )
 
 func remoteOperationTimeout(path string) time.Duration {
+	if strings.HasPrefix(path, "/api/child/line-speedtest/") {
+		return lineSpeedOperationTimeout
+	}
 	if strings.HasPrefix(path, "/api/child/warp/") {
 		return warpRemoteOperationTimeout
 	}
@@ -69,7 +73,9 @@ func NewRemoteManageHandler(repo *storage.TrafficRepository, wsHandler *RemoteWS
 		repo:      repo,
 		wsHandler: wsHandler,
 		httpClient: &http.Client{
-			Timeout: warpRemoteOperationTimeout,
+			// Per-operation contexts still enforce the shorter default/WARP
+			// deadlines; the client ceiling must allow a full line speed test.
+			Timeout: lineSpeedOperationTimeout,
 		},
 	}
 }
@@ -1375,7 +1381,11 @@ func isSessionInvalidErr(err error) bool {
 }
 
 func (h *RemoteManageHandler) forwardToRemoteServer(ctx context.Context, serverID int64, method, path string, body []byte) ([]byte, error) {
-	if method == http.MethodGet || method == http.MethodHead {
+	// A line speed test is a long-lived measurement, not an Agent/Xray mutation.
+	// Keep this exact POST out of the installation lease. This method is also
+	// used by FederationHandler on the owning control plane, so the exception
+	// must live here rather than only in the consumer-side caller.
+	if method == http.MethodGet || method == http.MethodHead || isLineSpeedtestRun(method, path) {
 		return h.forwardToRemoteServerLeased(ctx, serverID, method, path, body)
 	}
 	var response []byte
@@ -1387,6 +1397,10 @@ func (h *RemoteManageHandler) forwardToRemoteServer(ctx context.Context, serverI
 	return response, err
 }
 
+func isLineSpeedtestRun(method, path string) bool {
+	return method == http.MethodPost && path == "/api/child/line-speedtest/run"
+}
+
 func (h *RemoteManageHandler) forwardToRemoteServerLeased(ctx context.Context, serverID int64, method, path string, body []byte) (respBody []byte, err error) {
 	// 写操作成功 + path 命中 xray 配置修改清单 → 异步 refresh snapshot
 	// (用 defer + named return 统一处理所有 return 分支,无需在每个 return 点重复)
@@ -1396,11 +1410,16 @@ func (h *RemoteManageHandler) forwardToRemoteServerLeased(ctx context.Context, s
 		}
 	}()
 
-	// 联邦(分享)服务器:不直连 agent,改走拥有方主控的 /api/federation/manage
+	// 联邦(分享)服务器:不直连 agent,改走拥有方主控的 /api/federation/manage。
+	// Only the explicit not-found sentinel may fall back to a direct Agent call;
+	// treating a database read failure as a local server can bypass the owner
+	// relay during a transient storage fault.
 	if fed, ferr := h.repo.GetFederatedServer(ctx, serverID); ferr == nil {
 		transportCtx, cancel := remoteTransportContext(ctx, path)
 		defer cancel()
 		return h.doFederationRequest(transportCtx, fed, method, path, body)
+	} else if !errors.Is(ferr, storage.ErrFederatedServerNotFound) {
+		return nil, fmt.Errorf("resolve federated server: %w", ferr)
 	}
 
 	// WS-first:agent 上报 capabilities.rpc=true 且 WS 当前已连接 → 走反向 RPC,
@@ -1903,7 +1922,7 @@ func (h *RemoteManageHandler) getRemoteServerPort(server *storage.RemoteServer) 
 // ================== X 射线入库管理 ==================
 
 // 将入站管理请求代理到远程服务器
-// validateInboundClientsSelfOnly 校验 add inbound 请求里的 clients/accounts 只包含当前登录账号自己。
+// validateInboundClientsSelfOnly 校验 add inbound 请求里的 clients/users/accounts 只包含当前登录账号自己。
 // 返回空字符串表示通过,否则返回错误信息。
 //
 // 身份口径:xray 的 vless/vmess/trojan/shadowsocks 用 client.email 标识用户;socks/http 用 account.user。
@@ -1941,6 +1960,11 @@ func validateInboundClientsSelfOnly(ctx context.Context, inboundReq map[string]i
 	}
 	if clients, ok := settings["clients"].([]interface{}); ok {
 		if msg := check(clients, "id"); msg != "" {
+			return msg
+		}
+	}
+	if users, ok := settings["users"].([]interface{}); ok {
+		if msg := check(users, "auth"); msg != "" {
 			return msg
 		}
 	}
@@ -1995,6 +2019,46 @@ func validateInboundTLS(inboundReq map[string]interface{}) string {
 		}
 	}
 	return ""
+}
+
+const managedClientSkipCertVerifyMarker = "_arcway_client_skip_cert_verify"
+
+// extractManagedClientOptions removes panel-only client preferences before the
+// request is sent to the Agent. Xray inbound TLS settings describe the server;
+// client certificate verification belongs only in the generated Clash proxy.
+func extractManagedClientOptions(inboundReq map[string]interface{}) (bool, error) {
+	raw, exists := inboundReq["client_options"]
+	if !exists {
+		return false, nil
+	}
+	delete(inboundReq, "client_options")
+	options, ok := raw.(map[string]interface{})
+	if !ok {
+		return false, errors.New("client_options must be an object")
+	}
+	for key := range options {
+		if key != "skip_cert_verify" {
+			return false, fmt.Errorf("unsupported client option %q", key)
+		}
+	}
+	rawSkip, exists := options["skip_cert_verify"]
+	if !exists {
+		return false, nil
+	}
+	skip, ok := rawSkip.(bool)
+	if !ok {
+		return false, errors.New("client_options.skip_cert_verify must be a boolean")
+	}
+	if !skip {
+		return false, nil
+	}
+	inbound, _ := inboundReq["inbound"].(map[string]interface{})
+	streamSettings, _ := inbound["streamSettings"].(map[string]interface{})
+	security, _ := streamSettings["security"].(string)
+	if !strings.EqualFold(strings.TrimSpace(security), "tls") {
+		return false, errors.New("client_options.skip_cert_verify is only valid for TLS inbounds")
+	}
+	return true, nil
 }
 
 // validateInboundRealityTarget keeps the server-side REALITY contract strict.
@@ -2170,6 +2234,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 
 	var body []byte
 	var inboundReq map[string]interface{}
+	var clientSkipCertVerify bool
 	if r.Method == http.MethodPost {
 		body, err = io.ReadAll(r.Body)
 		if err != nil {
@@ -2179,6 +2244,16 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		// 解析请求体以获取入站配置
 		if err := json.Unmarshal(body, &inboundReq); err != nil {
 			remoteWriteError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		clientSkipCertVerify, err = extractManagedClientOptions(inboundReq)
+		if err != nil {
+			remoteWriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		body, err = json.Marshal(inboundReq)
+		if err != nil {
+			remoteWriteError(w, http.StatusBadRequest, "failed to normalize client options")
 			return
 		}
 	}
@@ -2279,6 +2354,10 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 				remoteWriteError(w, http.StatusBadRequest, msg)
 				return
 			}
+			if msg := validateInboundWireGuard(inboundReq); msg != "" {
+				remoteWriteError(w, http.StatusBadRequest, msg)
+				return
+			}
 			if msg := validateInboundTLS(inboundReq); msg != "" {
 				remoteWriteError(w, http.StatusBadRequest, msg)
 				return
@@ -2368,6 +2447,9 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 						for k, v := range inbound {
 							inboundAny[k] = v
 						}
+						if clientSkipCertVerify {
+							inboundAny[managedClientSkipCertVerifyMarker] = true
+						}
 						inboundEvent := event.InboundEvent{
 							Type:          event.EventInboundAdded,
 							ServerID:      id,
@@ -2380,6 +2462,17 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 							IPVersion:     ipVersion,
 							RelayServer:   relayServer,
 							RelayPort:     relayPort,
+						}
+						if canonicalManagedProtocol(protocol) == "wireguard" {
+							if _, resourceErr := h.upsertWireGuardManagedResource(
+								operationCtx,
+								id,
+								customNodeName,
+								managedInboundCreatedBy(r.Context()),
+								inbound,
+							); resourceErr != nil {
+								postSyncErrors = append(postSyncErrors, "WireGuard 管理记录同步失败: "+resourceErr.Error())
+							}
 						}
 						if isWSSInboundReq(inboundReq) {
 							pendingWSSEvent = &inboundEvent
@@ -2515,6 +2608,10 @@ func (h *RemoteManageHandler) HandleCreateManagedNode(w http.ResponseWriter, r *
 		remoteWriteError(w, http.StatusBadRequest, "inbound.tag and inbound.protocol are required")
 		return
 	}
+	if canonicalManagedProtocol(protocol) == "wireguard" {
+		remoteWriteError(w, http.StatusUnprocessableEntity, "WireGuard 客户端私钥不能写入受管订阅节点；请使用专用一次性 WireGuard 入站创建流程")
+		return
+	}
 	inbound["tag"] = tag
 	body, err = json.Marshal(request)
 	if err != nil {
@@ -2558,7 +2655,12 @@ func (h *RemoteManageHandler) HandleCreateManagedNode(w http.ResponseWriter, r *
 		return
 	}
 	if success, message := managedNodeResponseSuccess(recorder); !success {
-		remoteWriteError(w, http.StatusBadGateway, message)
+		rollbackErr := h.rollbackManagedNode(r, serverID, server.Name, tag)
+		if rollbackErr != nil {
+			remoteWriteError(w, http.StatusBadGateway, message+"；自动回滚也失败: "+rollbackErr.Error())
+			return
+		}
+		remoteWriteError(w, http.StatusBadGateway, message+"；已回滚远程入站和节点记录")
 		return
 	}
 
@@ -2617,24 +2719,38 @@ func managedNodeResponseMessage(recorder *managedNodeResponseRecorder, fallback 
 
 func managedNodeResponseSuccess(recorder *managedNodeResponseRecorder) (bool, string) {
 	var response struct {
-		Success *bool  `json:"success"`
-		Message string `json:"message"`
-		Error   string `json:"error"`
+		Success        *bool  `json:"success"`
+		Message        string `json:"message"`
+		Error          string `json:"error"`
+		Warning        string `json:"warning"`
+		RuntimeWarning string `json:"runtime_warning"`
 	}
 	if json.Unmarshal(recorder.body.Bytes(), &response) != nil || response.Success == nil {
 		return false, "Agent 返回了无法确认的创建结果"
 	}
-	if *response.Success {
-		return true, ""
+	if !*response.Success {
+		message := strings.TrimSpace(response.Message)
+		if message == "" {
+			message = strings.TrimSpace(response.Error)
+		}
+		if message == "" {
+			message = "Agent 拒绝创建入站"
+		}
+		return false, message
 	}
-	message := strings.TrimSpace(response.Message)
-	if message == "" {
-		message = strings.TrimSpace(response.Error)
+	if warning := strings.TrimSpace(response.Warning); warning != "" {
+		message := strings.TrimSpace(response.Message)
+		if message == "" {
+			message = "Agent 创建结果包含警告: " + warning
+		} else {
+			message += " (" + warning + ")"
+		}
+		return false, message
 	}
-	if message == "" {
-		message = "Agent 拒绝创建入站"
+	if warning := strings.TrimSpace(response.RuntimeWarning); warning != "" {
+		return false, "Agent 运行态结果不可信: " + warning
 	}
-	return false, message
+	return true, ""
 }
 
 func (h *RemoteManageHandler) rollbackManagedNode(r *http.Request, serverID int64, serverName, tag string) error {
@@ -2647,6 +2763,9 @@ func (h *RemoteManageHandler) rollbackManagedNode(r *http.Request, serverID int6
 	h.HandleInbounds(rollbackRecorder, rollbackRequest)
 	if rollbackRecorder.status >= http.StatusBadRequest {
 		return errors.New(managedNodeResponseMessage(rollbackRecorder, fmt.Sprintf("回滚 HTTP %d", rollbackRecorder.status)))
+	}
+	if success, message := managedNodeResponseSuccess(rollbackRecorder); !success {
+		return errors.New(message)
 	}
 	if _, err := h.repo.DeleteNodesByInboundTag(context.Background(), serverName, tag); err != nil {
 		return fmt.Errorf("清理节点记录失败: %w", err)
@@ -2755,6 +2874,13 @@ func (h *RemoteManageHandler) filterInboundsResponse(result []byte) []byte {
 
 // 自动将入站同步到节点表
 func (h *RemoteManageHandler) autoSyncInboundToNodes(ctx context.Context, serverID int64, inbound map[string]interface{}) {
+	protocol, _ := inbound["protocol"].(string)
+	if canonicalManagedProtocol(protocol) == "wireguard" {
+		// A usable WireGuard client profile includes a private key that intentionally
+		// never enters the panel, so this inbound has no subscription node to sync.
+		return
+	}
+
 	// 获取远程服务器信息
 	server, err := h.repo.GetRemoteServer(ctx, serverID)
 	if err != nil {
@@ -2806,7 +2932,6 @@ func (h *RemoteManageHandler) autoSyncInboundToNodes(ctx context.Context, server
 
 	// 获取入站标签
 	inboundTag, _ := inbound["tag"].(string)
-	protocol, _ := inbound["protocol"].(string)
 	nodeName, _ := clashProxy["name"].(string)
 
 	// 创建节点
@@ -3364,8 +3489,16 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		protocol, _ := inbound["protocol"].(string)
 		port, _ := inbound["port"].(float64)
 
-		// 跳过 api 入站
-		if tag == "api" || protocol == "tunnel" {
+		if canonicalManagedProtocol(protocol) == "wireguard" {
+			// WireGuard is management-only: reconcile its public inventory without
+			// ever creating a subscription node or retaining a client private key.
+			if _, resourceErr := h.upsertWireGuardManagedResource(ctx, serverID, "", "system-sync", inbound); resourceErr != nil {
+				response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: WireGuard 管理记录同步失败: %v", tag, resourceErr))
+			}
+			response.SkippedCount++
+			continue
+		}
+		if tag == "api" || isTunnelProtocol(protocol) {
 			response.SkippedCount++
 			continue
 		}
@@ -3560,7 +3693,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		for _, inbound := range inboundsResp.Inbounds {
 			protocol, _ := inbound["protocol"].(string)
 			port, _ := inbound["port"].(float64)
-			if protocol == "" || port == 0 || protocol == "tunnel" {
+			if protocol == "" || port == 0 || isTunnelProtocol(protocol) {
 				continue
 			}
 			settings, _ := inbound["settings"].(map[string]interface{})
@@ -4297,6 +4430,13 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", protocol)
+	}
+
+	if skip, _ := inbound[managedClientSkipCertVerifyMarker].(bool); skip {
+		security, _ := streamSettings["security"].(string)
+		if strings.EqualFold(strings.TrimSpace(security), "tls") {
+			proxy["skip-cert-verify"] = true
+		}
 	}
 
 	return proxy, nil

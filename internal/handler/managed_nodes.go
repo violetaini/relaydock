@@ -43,12 +43,13 @@ func NewManagedNodesHandler(repo *storage.TrafficRepository, remoteManage *Remot
 
 type managedOfferResponse struct {
 	storage.SelfServiceNodeOffer
-	NodeName     string `json:"node_name"`
-	Protocol     string `json:"protocol"`
-	ServerName   string `json:"server_name"`
-	ServerStatus string `json:"server_status"`
-	AgentReady   bool   `json:"agent_ready"`
-	AgentError   string `json:"agent_error,omitempty"`
+	NodeName        string `json:"node_name"`
+	Protocol        string `json:"protocol"`
+	ProtocolProfile string `json:"protocol_profile"`
+	ServerName      string `json:"server_name"`
+	ServerStatus    string `json:"server_status"`
+	AgentReady      bool   `json:"agent_ready"`
+	AgentError      string `json:"agent_error,omitempty"`
 }
 
 type managedGrantResponse struct {
@@ -92,6 +93,7 @@ type managedCatalogResponse struct {
 	ServerName        string     `json:"server_name"`
 	ServerStatus      string     `json:"server_status"`
 	Protocol          string     `json:"protocol"`
+	ProtocolProfile   string     `json:"protocol_profile"`
 	GrantID           int64      `json:"grant_id"`
 	GrantState        string     `json:"grant_state"`
 	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
@@ -225,6 +227,7 @@ func writeManagedError(w http.ResponseWriter, err error) {
 		errors.Is(err, storage.ErrManagedResourceInUse):
 		status, message = http.StatusConflict, err.Error()
 	case errors.Is(err, storage.ErrManagedGrantInactive),
+		errors.Is(err, storage.ErrManagedProtocolNotAllowed),
 		errors.Is(err, storage.ErrManagedActiveNodeLimit),
 		errors.Is(err, storage.ErrManagedTrafficLimit),
 		errors.Is(err, storage.ErrManagedServerMismatch):
@@ -249,31 +252,72 @@ func (h *ManagedNodesHandler) findServerForNode(ctx context.Context, node storag
 }
 
 func validateSelfServiceNodeProtocol(node storage.Node) error {
-	protocol := canonicalManagedProtocol(node.Protocol)
-	if protocol != "shadowsocks" {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(node.InboundTag)), "anydoor-") {
+		return fmt.Errorf("%w: Tunnel 任意门节点不能发布到用户自助目录", storage.ErrManagedInvalidArgument)
+	}
+	if storage.SelfServiceNodeProtocolEligible(node.Protocol, node.ClashConfig) {
 		return nil
 	}
-	var config map[string]interface{}
-	if err := json.Unmarshal([]byte(node.ClashConfig), &config); err != nil {
-		return fmt.Errorf("%w: Shadowsocks 节点配置无效，不能发布到用户自助目录", storage.ErrManagedInvalidArgument)
+	if canonicalManagedProtocol(node.Protocol) == "shadowsocks" {
+		return fmt.Errorf("%w: Shadowsocks 2022 自助发布仅支持 2022-blake3-aes-128-gcm 或 2022-blake3-aes-256-gcm", storage.ErrManagedInvalidArgument)
 	}
-	cipher, _ := config["cipher"].(string)
-	if cipher == "" {
-		cipher, _ = config["method"].(string)
-	}
-	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(cipher)), "2022-") {
-		return fmt.Errorf("%w: 经典 Shadowsocks 使用共享密码，不能发布到用户自助目录；请改用 Shadowsocks 2022", storage.ErrManagedInvalidArgument)
-	}
-	return nil
+	return fmt.Errorf("%w: 协议不支持独立的用户凭据，不能发布到用户自助目录", storage.ErrManagedInvalidArgument)
 }
 
-func (h *ManagedNodesHandler) selectionOfferAvailable(ctx context.Context, selection storage.UserNodeSelection) bool {
+type managedSelectionOfferPolicy struct {
+	available  bool
+	mustRevoke bool
+}
+
+func (h *ManagedNodesHandler) selectionOfferPolicy(ctx context.Context, grant storage.UserServerGrant, selection storage.UserNodeSelection) managedSelectionOfferPolicy {
 	offer, err := h.repo.GetSelfServiceNodeOffer(ctx, selection.OfferID)
-	if err != nil || !offer.Enabled {
-		return false
+	if err != nil {
+		return managedSelectionOfferPolicy{}
 	}
 	node, err := h.repo.GetNodeByID(ctx, offer.NodeID)
-	return err == nil && node.Enabled && validateSelfServiceNodeProtocol(node) == nil
+	if err != nil {
+		return managedSelectionOfferPolicy{}
+	}
+	protocolAllowed := grant.AllowsNodeProtocol(node.Protocol, node.ClashConfig) && storage.SelfServiceNodeOfferProtocolEligible(*offer, node)
+	policy := managedSelectionOfferPolicy{mustRevoke: !protocolAllowed}
+	credentialSafe := true
+	if selection.CredentialConfigID == nil {
+		if selection.AccessSourceID == nil {
+			credentialSafe = false
+		} else {
+			source, sourceErr := h.repo.GetUserInboundAccessSource(ctx, *selection.AccessSourceID)
+			if sourceErr != nil {
+				credentialSafe = false
+			} else if source.AppliedGeneration != 0 || source.ObservedState == storage.ManagedObservedActive {
+				credentialSafe = false
+				policy.mustRevoke = true
+			}
+		}
+	} else {
+		credential, credentialErr := h.repo.GetUserInboundConfig(ctx, grant.Username, offer.ServerID, offer.InboundTag)
+		switch {
+		case errors.Is(credentialErr, sql.ErrNoRows):
+			credentialSafe = false
+			policy.mustRevoke = true
+		case credentialErr != nil:
+			credentialSafe = false
+		case credential.ID != *selection.CredentialConfigID ||
+			!storage.SelfServiceCredentialProtocolMatches(credential.Protocol, node.Protocol):
+			credentialSafe = false
+			policy.mustRevoke = true
+		}
+	}
+	server, err := h.repo.GetRemoteServer(ctx, offer.ServerID)
+	if err != nil {
+		return policy
+	}
+	policy.available = !policy.mustRevoke && credentialSafe && offer.ServerID == grant.ServerID &&
+		storage.SelfServiceNodeOfferAvailable(*offer, node, *server)
+	return policy
+}
+
+func (h *ManagedNodesHandler) selectionOfferAvailable(ctx context.Context, grant storage.UserServerGrant, selection storage.UserNodeSelection) bool {
+	return h.selectionOfferPolicy(ctx, grant, selection).available
 }
 
 func (h *ManagedNodesHandler) requireManagedAgentCapabilities(ctx context.Context, serverID int64) error {
@@ -311,11 +355,86 @@ func (h *ManagedNodesHandler) reconcileSourceCurrentLocked(ctx context.Context, 
 }
 
 func (h *ManagedNodesHandler) reconcileSourceLocked(ctx context.Context, source storage.UserInboundAccessSource) error {
+	recycleCredential := false
+	if source.SourceType == storage.ManagedSourceSelection {
+		selection, err := h.repo.GetUserNodeSelection(ctx, source.SourceID)
+		if err != nil {
+			return err
+		}
+		offer, err := h.repo.GetSelfServiceNodeOffer(ctx, selection.OfferID)
+		if err != nil {
+			return err
+		}
+		node, err := h.repo.GetNodeByID(ctx, offer.NodeID)
+		if err != nil {
+			return err
+		}
+		grant, err := h.repo.GetUserServerGrant(ctx, selection.GrantID)
+		if err != nil {
+			return err
+		}
+		if selection.CredentialConfigID != nil {
+			credential, credentialErr := h.repo.GetUserInboundConfig(ctx, source.Username, source.ServerID, source.InboundTag)
+			switch {
+			case errors.Is(credentialErr, sql.ErrNoRows):
+				recycleCredential = true
+			case credentialErr != nil:
+				return credentialErr
+			case credential.ID != *selection.CredentialConfigID ||
+				!storage.SelfServiceCredentialProtocolMatches(credential.Protocol, node.Protocol):
+				recycleCredential = true
+			}
+		} else if source.AppliedGeneration != 0 || source.ObservedState == storage.ManagedObservedActive {
+			// A successfully applied selection must always have a credential
+			// snapshot. Old/corrupt rows without one are revoked and cleaned up;
+			// only never-applied provisioning sources may proceed without it.
+			recycleCredential = true
+		}
+		if selection.AccessSourceID == nil || *selection.AccessSourceID != source.ID ||
+			grant.Username != source.Username || grant.ServerID != source.ServerID ||
+			offer.ServerID != source.ServerID || offer.NodeID != source.NodeID || offer.InboundTag != source.InboundTag {
+			return storage.ErrManagedServerMismatch
+		}
+		protocolEligible := storage.SelfServiceNodeOfferProtocolEligible(*offer, node)
+		protocolAllowed := grant.AllowsNodeProtocol(node.Protocol, node.ClashConfig) && protocolEligible
+		if !protocolEligible {
+			recycleCredential = true
+		}
+		if selection.DesiredEnabled && (recycleCredential || !protocolAllowed) {
+			deactivated, err := h.repo.DeactivateUserNodeSelection(ctx, source.Username, selection.ID, "reconciler",
+				storage.ManagedSuspendAdminDisabled, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			source = deactivated.Source
+		}
+
+		if source.DesiredState == storage.ManagedDesiredActive {
+			server, err := h.repo.GetRemoteServer(ctx, offer.ServerID)
+			if err != nil {
+				return err
+			}
+			if grant.Username != source.Username || grant.ServerID != source.ServerID || offer.ServerID != source.ServerID ||
+				offer.NodeID != source.NodeID || offer.InboundTag != source.InboundTag ||
+				selection.AccessSourceID == nil || *selection.AccessSourceID != source.ID {
+				return storage.ErrManagedServerMismatch
+			}
+			structureValid := storage.SelfServiceNodeOfferStructureValid(*offer, node, *server)
+			if !selection.DesiredEnabled || !offer.Enabled || !node.Enabled || !structureValid {
+				updated, err := h.repo.SetUserInboundAccessSourceState(ctx, source.ID, source.Generation,
+					storage.ManagedDesiredInactive, storage.ManagedSuspendAdminDisabled, "reconciler", source.ExpiresAt)
+				if err != nil {
+					return err
+				}
+				source = *updated
+			}
+		}
+	}
 	if h.remoteManage == nil {
 		return errors.New("remote manager is not available")
 	}
 	return h.repo.WithRemoteServerMutationLease(ctx, source.ServerID, func(leasedCtx context.Context) error {
-		return h.reconcileSourceMutationLocked(leasedCtx, source)
+		return h.reconcileSourceMutationLocked(leasedCtx, source, recycleCredential)
 	})
 }
 
@@ -323,7 +442,7 @@ func (h *ManagedNodesHandler) reconcileSourceLocked(ctx context.Context, source 
 // and client add/remove in one server mutation transaction. Nested remote
 // helpers reuse the lease through ctx, so an installation Begin cannot split
 // the policy update from the credential mutation.
-func (h *ManagedNodesHandler) reconcileSourceMutationLocked(ctx context.Context, source storage.UserInboundAccessSource) error {
+func (h *ManagedNodesHandler) reconcileSourceMutationLocked(ctx context.Context, source storage.UserInboundAccessSource, recycleCredential bool) error {
 	now := time.Now().UTC()
 	if source.DesiredState == storage.ManagedDesiredActive && source.ExpiresAt != nil && !now.Before(*source.ExpiresAt) {
 		updated, err := h.repo.SetUserInboundAccessSourceState(ctx, source.ID, source.Generation,
@@ -380,8 +499,11 @@ func (h *ManagedNodesHandler) reconcileSourceMutationLocked(ctx context.Context,
 			if err != nil {
 				applyErr = err
 			} else if credential != nil && source.SourceType == storage.ManagedSourceSelection {
-				if selection, selErr := h.repo.GetUserNodeSelection(ctx, source.SourceID); selErr == nil && selection.CredentialConfigID == nil {
-					_ = h.repo.SetUserNodeSelectionCredential(ctx, selection.ID, credential.ID)
+				selection, selectionErr := h.repo.GetUserNodeSelection(ctx, source.SourceID)
+				if selectionErr != nil {
+					applyErr = selectionErr
+				} else if selection.CredentialConfigID == nil {
+					applyErr = h.repo.SetUserNodeSelectionCredential(ctx, selection.ID, credential.ID)
 				}
 			}
 		}
@@ -426,6 +548,19 @@ func (h *ManagedNodesHandler) reconcileSourceMutationLocked(ctx context.Context,
 						applyErr = fmt.Errorf("parse credential for expiry cleanup: %w", err)
 					} else {
 						applyErr = h.ensureManagedClientExpiry(ctx, source.ServerID, source.InboundTag, saved, nil)
+					}
+				}
+			}
+			if applyErr == nil && recycleCredential && source.SourceType == storage.ManagedSourceSelection {
+				if credential != nil {
+					applyErr = h.repo.DeleteUserInboundConfig(ctx, source.Username, source.ServerID, source.InboundTag)
+				}
+				if applyErr == nil {
+					selection, selectionErr := h.repo.GetUserNodeSelection(ctx, source.SourceID)
+					if selectionErr != nil {
+						applyErr = selectionErr
+					} else if selection.CredentialConfigID != nil {
+						applyErr = h.repo.ClearUserNodeSelectionCredential(ctx, selection.ID, *selection.CredentialConfigID)
 					}
 				}
 			}
@@ -509,12 +644,25 @@ func (h *ManagedNodesHandler) reconcileAll(ctx context.Context) {
 				if selection.GrantID != grant.ID || selection.AccessSourceID == nil {
 					continue
 				}
+				source, sourceErr := h.repo.GetUserInboundAccessSource(ctx, *selection.AccessSourceID)
+				if sourceErr != nil {
+					continue
+				}
+				policy := h.selectionOfferPolicy(ctx, grant, selection)
+				if policy.mustRevoke && selection.DesiredEnabled {
+					deactivated, deactivateErr := h.repo.DeactivateUserNodeSelection(ctx, grant.Username, selection.ID,
+						"reconciler", storage.ManagedSuspendAdminDisabled, now)
+					if deactivateErr != nil {
+						continue
+					}
+					selection = deactivated.Selection
+					source = &deactivated.Source
+				}
 				desired := grantDesired
-				if !selection.DesiredEnabled || !h.selectionOfferAvailable(ctx, selection) {
+				if !selection.DesiredEnabled || !policy.available {
 					desired = storage.ManagedDesiredInactive
 				}
-				source, sourceErr := h.repo.GetUserInboundAccessSource(ctx, *selection.AccessSourceID)
-				if sourceErr != nil || (source.DesiredState == desired && sameOptionalTime(source.ExpiresAt, grant.ExpiresAt)) {
+				if source.DesiredState == desired && sameOptionalTime(source.ExpiresAt, grant.ExpiresAt) {
 					continue
 				}
 				reason := managedGrantSuspendReason(state)
@@ -713,6 +861,7 @@ func (h *ManagedNodesHandler) offerResponse(ctx context.Context, offer storage.S
 	if node, err := h.repo.GetNodeByID(ctx, offer.NodeID); err == nil {
 		response.NodeName = node.NodeName
 		response.Protocol = node.Protocol
+		response.ProtocolProfile, _ = storage.SelfServiceNodeProtocolProfile(node.Protocol, node.ClashConfig)
 	}
 	if server, err := h.repo.GetRemoteServer(ctx, offer.ServerID); err == nil && server != nil {
 		response.ServerName = server.Name
@@ -844,18 +993,20 @@ func (h *ManagedNodesHandler) HandleOffer(w http.ResponseWriter, r *http.Request
 }
 
 type managedGrantRequest struct {
-	ServerID          int64      `json:"server_id"`
-	Enabled           bool       `json:"enabled"`
-	StartsAt          time.Time  `json:"starts_at"`
-	ExpiresAt         *time.Time `json:"expires_at"`
-	MaxActiveNodes    int        `json:"max_active_nodes"`
-	SpeedLimitMbps    float64    `json:"speed_limit_mbps"`
-	ConnectionLimit   int        `json:"connection_limit"`
-	TrafficLimitBytes int64      `json:"traffic_limit_bytes"`
-	BillingMode       string     `json:"billing_mode"`
-	ResetPolicy       string     `json:"reset_policy"`
-	ResetDay          int        `json:"reset_day"`
-	Version           int64      `json:"version"`
+	ServerID                int64      `json:"server_id"`
+	Enabled                 bool       `json:"enabled"`
+	StartsAt                time.Time  `json:"starts_at"`
+	ExpiresAt               *time.Time `json:"expires_at"`
+	MaxActiveNodes          int        `json:"max_active_nodes"`
+	SpeedLimitMbps          float64    `json:"speed_limit_mbps"`
+	ConnectionLimit         int        `json:"connection_limit"`
+	TrafficLimitBytes       int64      `json:"traffic_limit_bytes"`
+	BillingMode             string     `json:"billing_mode"`
+	ResetPolicy             string     `json:"reset_policy"`
+	ResetDay                int        `json:"reset_day"`
+	AllowedProtocols        *[]string  `json:"allowed_protocols"`
+	AllowedProtocolProfiles *[]string  `json:"allowed_protocol_profiles"`
+	Version                 int64      `json:"version"`
 }
 
 func (request managedGrantRequest) grant(username, actor string, existing *storage.UserServerGrant) storage.UserServerGrant {
@@ -875,6 +1026,12 @@ func (request managedGrantRequest) grant(username, actor string, existing *stora
 		BillingTimezone:   "Asia/Shanghai",
 		CreatedBy:         actor,
 	}
+	if request.AllowedProtocols != nil {
+		grant.AllowedProtocols = append([]string(nil), (*request.AllowedProtocols)...)
+	}
+	if request.AllowedProtocolProfiles != nil {
+		grant.AllowedProtocolProfiles = append([]string(nil), (*request.AllowedProtocolProfiles)...)
+	}
 	if grant.ExpiresAt != nil {
 		expires := grant.ExpiresAt.UTC()
 		grant.ExpiresAt = &expires
@@ -888,6 +1045,12 @@ func (request managedGrantRequest) grant(username, actor string, existing *stora
 		grant.CreatedBy = existing.CreatedBy
 		grant.CreatedAt = existing.CreatedAt
 		grant.Version = existing.Version
+		if request.AllowedProtocols == nil {
+			grant.AllowedProtocols = append([]string(nil), existing.AllowedProtocols...)
+		}
+		if request.AllowedProtocolProfiles == nil {
+			grant.AllowedProtocolProfiles = append([]string(nil), existing.AllowedProtocolProfiles...)
+		}
 	}
 	return grant
 }
@@ -977,8 +1140,19 @@ func (h *ManagedNodesHandler) syncGrantSources(ctx context.Context, grant storag
 			errorsFound = append(errorsFound, sourceErr)
 			continue
 		}
+		policy := h.selectionOfferPolicy(ctx, grant, selection)
+		if policy.mustRevoke && selection.DesiredEnabled {
+			deactivated, deactivateErr := h.repo.DeactivateUserNodeSelection(ctx, grant.Username, selection.ID,
+				actor, storage.ManagedSuspendAdminDisabled, time.Now().UTC())
+			if deactivateErr != nil {
+				errorsFound = append(errorsFound, deactivateErr)
+				continue
+			}
+			selection = deactivated.Selection
+			source = &deactivated.Source
+		}
 		desired := storage.ManagedDesiredActive
-		offerAvailable := h.selectionOfferAvailable(ctx, selection)
+		offerAvailable := policy.available
 		if state != storage.ManagedGrantActive || !selection.DesiredEnabled || !offerAvailable {
 			desired = storage.ManagedDesiredInactive
 		}
@@ -1326,6 +1500,7 @@ func (h *ManagedNodesHandler) catalogResponses(ctx context.Context, username str
 			ServerID:          entry.Offer.ServerID,
 			ServerName:        entry.ServerName,
 			Protocol:          entry.Protocol,
+			ProtocolProfile:   entry.ProtocolProfile,
 			GrantID:           entry.Grant.ID,
 			GrantState:        entry.GrantStatus,
 			ExpiresAt:         entry.Grant.ExpiresAt,
@@ -1500,6 +1675,39 @@ func (h *ManagedNodesHandler) HandleUserManagedNodeRetry(w http.ResponseWriter, 
 	}
 	if selection.AccessSourceID == nil {
 		writeManagedError(w, storage.ErrManagedAccessSourceNotFound)
+		return
+	}
+	grant, err := h.repo.GetUserServerGrant(r.Context(), selection.GrantID)
+	if err != nil {
+		writeManagedError(w, err)
+		return
+	}
+	offer, err := h.repo.GetSelfServiceNodeOffer(r.Context(), selection.OfferID)
+	if err != nil {
+		writeManagedError(w, err)
+		return
+	}
+	node, err := h.repo.GetNodeByID(r.Context(), offer.NodeID)
+	if err != nil {
+		writeManagedError(w, err)
+		return
+	}
+	protocolErr := validateSelfServiceNodeProtocol(node)
+	if !grant.AllowsNodeProtocol(node.Protocol, node.ClashConfig) || protocolErr != nil {
+		result, deactivateErr := h.repo.DeactivateUserNodeSelection(r.Context(), username, selection.ID, username,
+			storage.ManagedSuspendAdminDisabled, time.Now().UTC())
+		if deactivateErr != nil {
+			writeManagedError(w, deactivateErr)
+			return
+		}
+		if reconcileErr := h.reconcileSource(r.Context(), result.Source); reconcileErr != nil {
+			log.Printf("[ManagedNodes] protocol-policy cleanup selection=%d failed: %v", selection.ID, reconcileErr)
+		}
+		if protocolErr != nil {
+			writeManagedError(w, protocolErr)
+		} else {
+			writeManagedError(w, fmt.Errorf("%w: %s", storage.ErrManagedProtocolNotAllowed, strings.ToLower(strings.TrimSpace(node.Protocol))))
+		}
 		return
 	}
 	source, err := h.repo.GetUserInboundAccessSource(r.Context(), *selection.AccessSourceID)

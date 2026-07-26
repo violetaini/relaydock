@@ -606,6 +606,16 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 		http.Error(w, "Expiry guard release asset is unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	agentSHA256AMD64, err := agentAssetSHA256("mmw-agent-linux-amd64")
+	if err != nil {
+		http.Error(w, "Agent release asset is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	agentSHA256ARM64, err := agentAssetSHA256("mmw-agent-linux-arm64")
+	if err != nil {
+		http.Error(w, "Agent release asset is unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	panelSourceIPs, err := configuredPanelSourceIPs()
 	if err != nil {
 		http.Error(w, "Panel source IPs are not configured", http.StatusServiceUnavailable)
@@ -682,7 +692,7 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 	// 返回安装脚本内容
 	script := `#!/bin/bash
 # MMWX Remote Server Installation Script
-# This script installs MMWX from GitHub and configures it as a remote server
+# This script installs panel-provided MMWX assets and configures a remote server
 
 set -e
 umask 077
@@ -802,12 +812,12 @@ ARCH=$(uname -m)
 case $ARCH in
     x86_64)
         ARCH_NAME="amd64"
-        AGENT_SHA256="6ce2faac96f82a501ab86b1817c332bf05239ba10e36b5be0dd11995a5a1bf2f"
+        AGENT_SHA256=` + shellSingleQuote(agentSHA256AMD64) + `
         GUARD_SHA256=` + shellSingleQuote(guardSHA256AMD64) + `
         ;;
     aarch64|arm64)
         ARCH_NAME="arm64"
-        AGENT_SHA256="04ba897947923592846d3e57282d5ac80c213892b125c1575a8664abb770168f"
+        AGENT_SHA256=` + shellSingleQuote(agentSHA256ARM64) + `
         GUARD_SHA256=` + shellSingleQuote(guardSHA256ARM64) + `
         ;;
     *)
@@ -816,18 +826,19 @@ case $ARCH in
         ;;
 esac
 
-AGENT_VERSION="v0.3.7"
-AGENT_URL="https://github.com/iluobei/mmw-agent/releases/download/${AGENT_VERSION}/mmw-agent-linux-${ARCH_NAME}"
+AGENT_URL="${MASTER_URL}/api/remote/mmw-agent?arch=${ARCH_NAME}"
 if ! command -v curl >/dev/null 2>&1; then
     echo "ERROR: install curl before retrying; no system packages were changed" >&2
     exit 1
 fi
 
-echo "Downloading verified mmw-agent ${AGENT_VERSION} from GitHub..."
-curl -fsSL --connect-timeout 10 --max-time 180 -o "$AGENT_DOWNLOAD" "$AGENT_URL" || {
-    echo "ERROR: 无法从 GitHub 下载 mmw-agent" >&2
+echo "Downloading verified mmw-agent from master..."
+if ! curl -fsSL --connect-timeout 10 --max-time 180 \
+	-H @"$CURL_AUTH_HEADER_FILE" \
+	-o "$AGENT_DOWNLOAD" "$AGENT_URL"; then
+    echo "ERROR: 无法从主控下载 mmw-agent" >&2
     exit 1
-}
+fi
 if [ "$(sha256sum "$AGENT_DOWNLOAD" | awk '{ print $1 }')" != "$AGENT_SHA256" ]; then
     echo "ERROR: mmw-agent SHA-256 校验失败,安装中止" >&2
     exit 1
@@ -854,6 +865,7 @@ if [ "$(sha256sum "$GUARD_DOWNLOAD" | awk '{ print $1 }')" != "$GUARD_SHA256" ];
     echo "ERROR: expiry guard SHA-256 verification failed; installation aborted" >&2
     exit 1
 fi
+chmod 0700 "$AGENT_DOWNLOAD" "$GUARD_DOWNLOAD"
 
 # System prerequisites are verified before the rollback transaction. The node
 # installer never mutates the package database, so a failed install cannot leave
@@ -881,6 +893,10 @@ for HOST_FILTER_SPEC in iptables:ip ip6tables:ip6; do
     HOST_FILTER_TOOL=${HOST_FILTER_SPEC%%:*}
     HOST_FILTER_NFT_FAMILY=${HOST_FILTER_SPEC#*:}
     if command -v "$HOST_FILTER_TOOL" >/dev/null 2>&1; then
+        if ! command -v "${HOST_FILTER_TOOL}-restore" >/dev/null 2>&1; then
+            echo "ERROR: ${HOST_FILTER_TOOL}-restore is required for atomic Arcway firewall updates" >&2
+            exit 1
+        fi
         if ! "$HOST_FILTER_TOOL" -w 5 -t filter -S INPUT >/dev/null 2>&1; then
             echo "ERROR: $HOST_FILTER_TOOL is installed but cannot inspect the host INPUT filter" >&2
             exit 1
@@ -1938,13 +1954,16 @@ cat > /etc/arcway-port-firewall.env << EOF
 ARCWAY_AGENT_PORT=${LISTEN_PORT}
 ARCWAY_GUARD_PORT=${GUARD_PORT}
 ARCWAY_PANEL_IPS='$PANEL_SOURCE_IPS'
-ARCWAY_FORWARD_PORT_START=39000
-ARCWAY_FORWARD_PORT_END=40000
 EOF
 chmod 0600 /etc/arcway-port-firewall.env
 cat > /usr/local/sbin/arcway-agent-firewall << 'EOF'
 #!/bin/sh
 set -eu
+if { [ -z "${ARCWAY_AGENT_PORT:-}" ] || [ -z "${ARCWAY_GUARD_PORT:-}" ] || [ -z "${ARCWAY_PANEL_IPS:-}" ]; } && [ -r /etc/arcway-port-firewall.env ]; then
+    set -a
+    . /etc/arcway-port-firewall.env
+    set +a
+fi
 FIREWALL_MODE=${1:-full}
 case "$FIREWALL_MODE" in
     full|--nft-only) ;;
@@ -1953,14 +1972,6 @@ esac
 : "${ARCWAY_AGENT_PORT:?missing ARCWAY_AGENT_PORT}"
 : "${ARCWAY_GUARD_PORT:?missing ARCWAY_GUARD_PORT}"
 : "${ARCWAY_PANEL_IPS:?missing ARCWAY_PANEL_IPS}"
-: "${ARCWAY_FORWARD_PORT_START:?missing ARCWAY_FORWARD_PORT_START}"
-: "${ARCWAY_FORWARD_PORT_END:?missing ARCWAY_FORWARD_PORT_END}"
-case "$ARCWAY_FORWARD_PORT_START" in ''|*[!0-9]*) echo "ERROR: invalid Arcway forwarding port range" >&2; exit 1 ;; esac
-case "$ARCWAY_FORWARD_PORT_END" in ''|*[!0-9]*) echo "ERROR: invalid Arcway forwarding port range" >&2; exit 1 ;; esac
-if [ "$ARCWAY_FORWARD_PORT_START" -lt 1024 ] || [ "$ARCWAY_FORWARD_PORT_END" -gt 65535 ] || [ "$ARCWAY_FORWARD_PORT_START" -gt "$ARCWAY_FORWARD_PORT_END" ]; then
-    echo "ERROR: invalid Arcway forwarding port range" >&2
-    exit 1
-fi
 
 CONFIGURED_AGENT_PORT=$(awk -F: '/^[[:space:]]*listen_port[[:space:]]*:/ { value=$2; gsub(/["[:space:]]/, "", value); print value; exit }' /etc/mmw-agent/config.yaml 2>/dev/null || true)
 case "$CONFIGURED_AGENT_PORT" in
@@ -2004,11 +2015,53 @@ if ! flock -w 30 8; then
     exit 1
 fi
 RULESET=$(mktemp "$FIREWALL_RUNTIME_DIR/arcway-agent-firewall.nft.XXXXXX")
+PUBLIC_RULES_RAW=$(mktemp "$FIREWALL_RUNTIME_DIR/arcway-agent-firewall.rules.raw.XXXXXX")
+PUBLIC_RULES=$(mktemp "$FIREWALL_RUNTIME_DIR/arcway-agent-firewall.rules.XXXXXX")
 cleanup() {
-    rm -f "$RULESET"
+    rm -f "$RULESET" "$PUBLIC_RULES_RAW" "$PUBLIC_RULES"
 }
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
+
+XRAY_CONFIG_PATH=${ARCWAY_XRAY_CONFIG_PATH:-}
+if [ -z "$XRAY_CONFIG_PATH" ]; then
+    for candidate in /usr/local/etc/xray/config.json /etc/xray/config.json /opt/xray/config.json; do
+        if [ -r "$candidate" ]; then
+            XRAY_CONFIG_PATH="$candidate"
+            break
+        fi
+    done
+fi
+if [ -n "$XRAY_CONFIG_PATH" ]; then
+    ARCWAY_AGENT_BINARY=${ARCWAY_AGENT_BINARY:-/usr/local/bin/mmw-agent}
+    if [ ! -x "$ARCWAY_AGENT_BINARY" ]; then
+        echo "ERROR: Arcway Agent binary cannot derive Xray firewall rules" >&2
+        exit 1
+    fi
+    if ! "$ARCWAY_AGENT_BINARY" -arcway-firewall-rules="$XRAY_CONFIG_PATH" > "$PUBLIC_RULES_RAW"; then
+        echo "ERROR: failed to derive public ports from Xray config" >&2
+        exit 1
+    fi
+fi
+while read -r public_protocol public_port extra; do
+    [ -n "$public_protocol" ] || continue
+    if [ -n "${extra:-}" ]; then
+        echo "ERROR: malformed Arcway public firewall rule" >&2
+        exit 1
+    fi
+    case "$public_protocol" in tcp|udp) ;; *) echo "ERROR: invalid Arcway public firewall protocol" >&2; exit 1 ;; esac
+    case "$public_port" in ''|*[!0-9]*) echo "ERROR: invalid Arcway public firewall port" >&2; exit 1 ;; esac
+    if [ "$public_port" -lt 1 ] || [ "$public_port" -gt 65535 ]; then
+        echo "ERROR: invalid Arcway public firewall port" >&2
+        exit 1
+    fi
+    if [ "$public_port" = "$ARCWAY_AGENT_PORT" ] || [ "$public_port" = "$ARCWAY_GUARD_PORT" ]; then
+        echo "ERROR: Xray inbound conflicts with protected Arcway management port $public_port" >&2
+        exit 1
+    fi
+    printf '%s %s\n' "$public_protocol" "$public_port" >> "$PUBLIC_RULES"
+done < "$PUBLIC_RULES_RAW"
+sort -u -o "$PUBLIC_RULES" "$PUBLIC_RULES"
 
 {
     if nft list table inet arcway >/dev/null 2>&1; then
@@ -2024,6 +2077,10 @@ trap 'exit 130' HUP INT TERM
             *)   printf '    ip saddr %s tcp dport { %s, %s } accept\n' "$panel_ip" "$ARCWAY_AGENT_PORT" "$ARCWAY_GUARD_PORT" ;;
         esac
     done
+    while read -r public_protocol public_port; do
+        [ -n "$public_protocol" ] || continue
+        printf '    %s dport %s accept\n' "$public_protocol" "$public_port"
+    done < "$PUBLIC_RULES"
     printf '    tcp dport { %s, %s } drop\n' "$ARCWAY_AGENT_PORT" "$ARCWAY_GUARD_PORT"
     echo '  }'
     echo '}'
@@ -2048,11 +2105,12 @@ fi
 HOST_FILTER_CHAIN=ARCWAY_PANEL_IN
 HOST_FILTER_COMMENT=arcway-managed
 host_filter_tool_ready() {
-    command -v "$1" >/dev/null 2>&1 && "$1" -w 5 -t filter -S INPUT >/dev/null 2>&1
+    command -v "$1" >/dev/null 2>&1 && command -v "${1}-restore" >/dev/null 2>&1 && "$1" -w 5 -t filter -S INPUT >/dev/null 2>&1
 }
 ensure_host_filter_chain() {
     HOST_FILTER_TOOL="$1"
     HOST_FILTER_FAMILY="$2"
+    HOST_FILTER_RESTORE="${HOST_FILTER_TOOL}-restore"
     if ! host_filter_tool_ready "$HOST_FILTER_TOOL"; then
         echo "ERROR: $HOST_FILTER_TOOL cannot manage the host INPUT filter" >&2
         return 1
@@ -2071,26 +2129,46 @@ ensure_host_filter_chain() {
             return 1
         fi
     fi
-    "$HOST_FILTER_TOOL" -w 5 -t filter -F "$HOST_FILTER_CHAIN" || return 1
-    for HOST_PANEL_IP in $ARCWAY_PANEL_IPS; do
-        case "$HOST_PANEL_IP" in
-            *:*) [ "$HOST_FILTER_FAMILY" = "ipv6" ] || continue ;;
-            *) [ "$HOST_FILTER_FAMILY" = "ipv4" ] || continue ;;
-        esac
-        for HOST_MANAGEMENT_PORT in "$ARCWAY_AGENT_PORT" "$ARCWAY_GUARD_PORT"; do
-            "$HOST_FILTER_TOOL" -w 5 -t filter -A "$HOST_FILTER_CHAIN" \
-                -s "$HOST_PANEL_IP" -p tcp --dport "$HOST_MANAGEMENT_PORT" \
-                -m comment --comment "$HOST_FILTER_COMMENT" -j ACCEPT || return 1
+    HOST_RULESET=$(mktemp "$FIREWALL_RUNTIME_DIR/arcway-agent-host-filter.XXXXXX") || return 1
+    {
+        echo '*filter'
+        printf -- '-F %s\n' "$HOST_FILTER_CHAIN"
+        for HOST_PANEL_IP in $ARCWAY_PANEL_IPS; do
+            case "$HOST_PANEL_IP" in
+                *:*) [ "$HOST_FILTER_FAMILY" = "ipv6" ] || continue ;;
+                *) [ "$HOST_FILTER_FAMILY" = "ipv4" ] || continue ;;
+            esac
+            for HOST_MANAGEMENT_PORT in "$ARCWAY_AGENT_PORT" "$ARCWAY_GUARD_PORT"; do
+                printf -- '-A %s -s %s -p tcp --dport %s -m comment --comment %s -j ACCEPT\n' \
+                    "$HOST_FILTER_CHAIN" "$HOST_PANEL_IP" "$HOST_MANAGEMENT_PORT" "$HOST_FILTER_COMMENT"
+            done
         done
-    done
-    "$HOST_FILTER_TOOL" -w 5 -t filter -A "$HOST_FILTER_CHAIN" \
-        -p tcp --dport "${ARCWAY_FORWARD_PORT_START}:${ARCWAY_FORWARD_PORT_END}" \
-        -m comment --comment "$HOST_FILTER_COMMENT" -j ACCEPT || return 1
-    "$HOST_FILTER_TOOL" -w 5 -t filter -A "$HOST_FILTER_CHAIN" -m comment --comment "$HOST_FILTER_COMMENT" -j RETURN || return 1
-    while "$HOST_FILTER_TOOL" -w 5 -t filter -C INPUT -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" >/dev/null 2>&1; do
+        while read -r HOST_PUBLIC_PROTOCOL HOST_PUBLIC_PORT; do
+            [ -n "$HOST_PUBLIC_PROTOCOL" ] || continue
+            printf -- '-A %s -p %s --dport %s -m comment --comment %s -j ACCEPT\n' \
+                "$HOST_FILTER_CHAIN" "$HOST_PUBLIC_PROTOCOL" "$HOST_PUBLIC_PORT" "$HOST_FILTER_COMMENT"
+        done < "$PUBLIC_RULES"
+        printf -- '-A %s -m comment --comment %s -j RETURN\n' "$HOST_FILTER_CHAIN" "$HOST_FILTER_COMMENT"
+        echo 'COMMIT'
+    } > "$HOST_RULESET"
+    if ! "$HOST_FILTER_RESTORE" -w 5 --test --noflush < "$HOST_RULESET" || \
+        ! "$HOST_FILTER_RESTORE" -w 5 --noflush < "$HOST_RULESET"; then
+        rm -f "$HOST_RULESET"
+        return 1
+    fi
+    rm -f "$HOST_RULESET"
+
+    HOST_JUMP_COUNT=$("$HOST_FILTER_TOOL" -w 5 -t filter -S INPUT | awk -v chain="$HOST_FILTER_CHAIN" -v comment="$HOST_FILTER_COMMENT" '
+        $0 ~ ("--comment " comment) && $0 ~ ("-j " chain "([[:space:]]|$)") { count++ }
+        END { print count+0 }
+    ')
+    while [ "$HOST_JUMP_COUNT" -gt 1 ]; do
         "$HOST_FILTER_TOOL" -w 5 -t filter -D INPUT -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" || return 1
+        HOST_JUMP_COUNT=$((HOST_JUMP_COUNT - 1))
     done
-    "$HOST_FILTER_TOOL" -w 5 -t filter -I INPUT 1 -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" || return 1
+    if [ "$HOST_JUMP_COUNT" -eq 0 ]; then
+        "$HOST_FILTER_TOOL" -w 5 -t filter -I INPUT 1 -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" || return 1
+    fi
     "$HOST_FILTER_TOOL" -w 5 -t filter -C INPUT -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" || return 1
 }
 
@@ -2131,6 +2209,10 @@ for HOST_PANEL_IP in $ARCWAY_PANEL_IPS; do
         *) HOST_FILTER_NEEDS_V4=1 ;;
     esac
 done
+if [ -s "$PUBLIC_RULES" ]; then
+    HOST_FILTER_NEEDS_V4=1
+    HOST_FILTER_NEEDS_V6=1
+fi
 if [ "$HOST_FILTER_NEEDS_V4" = "1" ]; then
     if command -v iptables >/dev/null 2>&1; then
         if ! host_filter_tool_ready iptables; then
@@ -2168,7 +2250,7 @@ chmod 0755 /usr/local/sbin/arcway-agent-firewall
 set -a
 . /etc/arcway-port-firewall.env
 set +a
-if ! /usr/local/sbin/arcway-agent-firewall; then
+if ! ARCWAY_AGENT_BINARY="$AGENT_DOWNLOAD" /usr/local/sbin/arcway-agent-firewall; then
     echo "ERROR: failed to protect the Arcway management ports" >&2
     exit 1
 fi
@@ -2733,7 +2815,13 @@ else
     pgrep -af /usr/local/bin/arcway-expiry-guard | head -5 || echo "Guard process not found"
 fi
 guard_healthy=0
-curl -fsS --max-time 5 "http://127.0.0.1:${GUARD_PORT}/healthz" >/dev/null 2>&1 && guard_healthy=1
+for health_attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:${GUARD_PORT}/healthz" >/dev/null 2>&1; then
+        guard_healthy=1
+        break
+    fi
+    sleep 1
+done
 if [ "$guard_healthy" != "1" ]; then
     echo "ERROR: expiry guard health check failed on port ${GUARD_PORT}" >&2
     exit 1
@@ -2756,7 +2844,18 @@ verify_local_services() {
         return 1
     fi
 }
-verify_local_services
+agent_healthy=0
+for health_attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if verify_local_services; then
+        agent_healthy=1
+        break
+    fi
+    sleep 1
+done
+if [ "$agent_healthy" != "1" ]; then
+    echo "ERROR: Agent did not become ready within the verification window" >&2
+    exit 1
+fi
 
 # Management readiness covers the control plane. Validate selected data-plane
 # prerequisites separately so a healthy Agent cannot mask a stopped Xray/Nginx.

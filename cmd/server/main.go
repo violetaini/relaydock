@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	_ "time/tzdata" // 嵌入时区库,LoadLocation 不依赖系统 zoneinfo(纠正缺 /etc/localtime 的机器)
 
 	appconfigs "miaomiaowux/configs"
+	"miaomiaowux/internal/agentfirewall"
 	"miaomiaowux/internal/agentlog"
 	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/capabilities"
@@ -93,6 +95,22 @@ func initTimezone() {
 }
 
 func main() {
+	// 解析命令行标志
+	configPath := flag.String("c", "", "Path to configuration file")
+	firewallRulesPath := flag.String("arcway-firewall-rules", "", "Print public Xray inbound firewall rules and exit")
+	flag.Parse()
+	if *firewallRulesPath != "" {
+		rules, err := agentfirewall.RulesFromFile(*firewallRulesPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "derive Xray inbound firewall rules: %v\n", err)
+			os.Exit(1)
+		}
+		for _, rule := range rules {
+			fmt.Printf("%s %d\n", rule.Protocol, rule.Port)
+		}
+		return
+	}
+
 	// 初始化logger
 	logger.Init()
 	initTimezone()
@@ -100,10 +118,6 @@ func main() {
 
 	// 启动日志清理任务（每天凌晨3点清理7天前的日志）
 	go startLogCleanup()
-
-	// 解析命令行标志
-	configPath := flag.String("c", "", "Path to configuration file")
-	flag.Parse()
 
 	// 从文件加载配置（如果指定）
 	var config *ServerConfig
@@ -427,6 +441,7 @@ func main() {
 	mux.Handle("/api/remote/token/refresh", http.HandlerFunc(xrayServerHandler.RefreshRemoteToken))
 	mux.Handle("/api/remote/install.sh", http.HandlerFunc(xrayServerHandler.GetRemoteInstallScript))
 	mux.Handle("/api/remote/expiry-guard", http.HandlerFunc(xrayServerHandler.GetExpiryGuardAsset))
+	mux.Handle("/api/remote/mmw-agent", http.HandlerFunc(xrayServerHandler.GetAgentAsset))
 	mux.Handle("/api/remote/install-begin", http.HandlerFunc(xrayServerHandler.BeginRemoteInstallation))
 	mux.Handle("/api/remote/install-renew", http.HandlerFunc(xrayServerHandler.RenewRemoteInstallation))
 	mux.Handle("/api/remote/install-quiesce", http.HandlerFunc(xrayServerHandler.QuiesceRemoteInstallation))
@@ -573,6 +588,8 @@ func main() {
 	speedTestHandler := handler.NewSpeedTestHandler(repo, capabilityManager)
 	speedTestHandler.SetTesterWS(speedTesterWS)
 	mux.Handle("/api/admin/speedtest/", auth.RequireAdmin(tokenStore, userRepo, speedTestHandler))
+	lineSpeedTestHandler := handler.NewLineSpeedTestHandler(repo, remoteManageHandler)
+	mux.Handle("/api/admin/line-speedtest/", auth.RequireAdmin(tokenStore, userRepo, lineSpeedTestHandler))
 	// Tunnel(dokodemo 转发入站)聚合管理:跨所有远程/分享服务器列出 protocol==tunnel 入站,供节点管理「Tunnel 管理」弹窗使用
 	mux.Handle("/api/admin/tunnels", auth.RequireAdmin(tokenStore, userRepo, handler.NewTunnelsHandler(repo, remoteManageHandler)))
 	// 链式端口转发编排:选有序多台服务器建 N 条首尾相接的单跳 tunnel。
@@ -652,6 +669,8 @@ func main() {
 	// 远程服务器Xray入站/出站/路由管理
 	mux.Handle("/api/admin/remote/inbounds", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleInbounds)))
 	mux.Handle("/api/admin/managed-nodes/create", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleCreateManagedNode)))
+	mux.Handle("/api/admin/managed-inbound-resources", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleManagedInboundResources)))
+	mux.Handle("/api/admin/managed-inbound-resources/", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleManagedInboundResources)))
 	mux.Handle("/api/admin/remote/outbounds", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleOutbounds)))
 	mux.Handle("/api/admin/remote/routing", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleRouting)))
 	mux.Handle("/api/admin/remote/scan", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleScan)))
@@ -1047,6 +1066,8 @@ func main() {
 	mux.Handle("/api/admin/dns-providers/create", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.CreateDNSProvider)))
 	mux.Handle("/api/admin/dns-providers/", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
+		case http.MethodGet:
+			certHandler.RevealDNSProviderCredentials(w, r)
 		case http.MethodPut:
 			certHandler.UpdateDNSProvider(w, r)
 		case http.MethodDelete:
@@ -1086,6 +1107,10 @@ func main() {
 	)
 	subRateLimiter.SetSkipLocalIP(secCfg.SkipLocalIP)
 	go subRateLimiter.StartCleanup(context.Background())
+	webUI := web.Handler()
+	if webRoot := strings.TrimSpace(os.Getenv("ARCWAY_WEB_ROOT")); webRoot != "" {
+		logger.Info("已配置外部前端目录，目录不可用时自动回退内嵌页面", "path", webRoot)
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.Trim(r.URL.Path, "/")
 		clientIP := handler.GetClientIP(r)
@@ -1146,7 +1171,7 @@ func main() {
 		}
 
 		// 否则，传递给 Web 处理程序
-		web.Handler().ServeHTTP(w, r)
+		webUI.ServeHTTP(w, r)
 	})
 
 	// 嵌入式 MCP server(streamable-HTTP):供 OpenClaw 等 agent 运维。鉴权在工具调用时按 API 令牌经 mux 复用现有链。

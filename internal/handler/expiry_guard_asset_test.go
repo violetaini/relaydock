@@ -3,6 +3,7 @@ package handler
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -49,6 +51,7 @@ func installExpiryGuardAssetFixtures(t *testing.T) {
 		}
 	}
 	t.Setenv(expiryGuardAssetDirEnv, assetDirectory)
+	installAgentAssetFixtures(t)
 }
 
 func requestExpiryGuardAsset(handler *XrayServerHandler, method, arch, authorization string) *httptest.ResponseRecorder {
@@ -147,11 +150,19 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	}
 
 	script := response.Body.String()
+	agentSHA256AMD64, err := agentAssetSHA256("mmw-agent-linux-amd64")
+	if err != nil {
+		t.Fatalf("agentAssetSHA256 amd64: %v", err)
+	}
+	agentSHA256ARM64, err := agentAssetSHA256("mmw-agent-linux-arm64")
+	if err != nil {
+		t.Fatalf("agentAssetSHA256 arm64: %v", err)
+	}
 	for _, expected := range []string{
-		"github.com/iluobei/mmw-agent/releases/download/${AGENT_VERSION}/mmw-agent-linux-${ARCH_NAME}",
-		"AGENT_VERSION=\"v0.3.7\"",
-		"6ce2faac96f82a501ab86b1817c332bf05239ba10e36b5be0dd11995a5a1bf2f",
-		"04ba897947923592846d3e57282d5ac80c213892b125c1575a8664abb770168f",
+		"/api/remote/mmw-agent?arch=${ARCH_NAME}",
+		agentSHA256AMD64,
+		agentSHA256ARM64,
+		"Downloading verified mmw-agent from master...",
 		"mmw-agent SHA-256 校验失败",
 		"/api/remote/expiry-guard?arch=${ARCH_NAME}",
 		"/api/remote/management-ready",
@@ -194,8 +205,13 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"chmod 0600 /var/lib/arcway-expiry-guard/state.json",
 		"PANEL_SOURCE_IPS='203.0.113.10 2001:db8::10'",
 		"ARCWAY_PANEL_IPS='$PANEL_SOURCE_IPS'",
-		"ARCWAY_FORWARD_PORT_START=39000",
-		"ARCWAY_FORWARD_PORT_END=40000",
+		"-arcway-firewall-rules=\"$XRAY_CONFIG_PATH\"",
+		"ARCWAY_XRAY_CONFIG_PATH",
+		"PUBLIC_RULES_RAW=$(mktemp",
+		"sort -u -o \"$PUBLIC_RULES\" \"$PUBLIC_RULES\"",
+		"printf -- '-A %s -p %s --dport %s",
+		"\"$HOST_FILTER_RESTORE\" -w 5 --test --noflush",
+		"\"$HOST_FILTER_RESTORE\" -w 5 --noflush",
 		"ufw allow proto tcp from \"$PANEL_IP\" to any port \"$MANAGEMENT_PORT\"",
 		"comment 'arcway-managed'",
 		"/etc/arcway-port-firewall.env",
@@ -245,6 +261,8 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"SCRIPT_PROTOCOL='https'",
 		"CONNECTION_MODE='websocket'",
 		"connection_mode: ${CONNECTION_MODE}",
+		"for health_attempt in 1 2 3 4 5 6 7 8 9 10; do",
+		"Agent did not become ready within the verification window",
 	} {
 		if !strings.Contains(script, expected) {
 			t.Errorf("install script missing %q", expected)
@@ -255,6 +273,15 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	}
 	if strings.Contains(script, `-H "Authorization: Bearer ${TOKEN}"`) {
 		t.Fatal("install script exposes the long-lived token in curl argv")
+	}
+	if strings.Contains(script, "github.com/iluobei/mmw-agent") || strings.Contains(script, "AGENT_VERSION=") {
+		t.Fatal("install script still depends on a GitHub Agent release")
+	}
+	agentDownloadStart := strings.Index(script, `AGENT_URL="${MASTER_URL}/api/remote/mmw-agent?arch=${ARCH_NAME}"`)
+	guardDownloadStart := strings.Index(script, `GUARD_URL="${MASTER_URL}/api/remote/expiry-guard?arch=${ARCH_NAME}"`)
+	if agentDownloadStart < 0 || guardDownloadStart <= agentDownloadStart ||
+		!strings.Contains(script[agentDownloadStart:guardDownloadStart], `-H @"$CURL_AUTH_HEADER_FILE"`) {
+		t.Fatal("installer does not authenticate the panel-hosted Agent download")
 	}
 	if strings.Contains(script, `command_background="yes"`) {
 		t.Fatal("OpenRC services are not supervised after startup")
@@ -298,7 +325,7 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		t.Fatal("install script mutates the running node before downloads and integrity checks complete")
 	}
 	runtimeDirIndex := strings.Index(script, "mkdir -p /var/lib/arcway-expiry-guard")
-	firstFirewallRunIndex := strings.Index(script, "if ! /usr/local/sbin/arcway-agent-firewall; then")
+	firstFirewallRunIndex := strings.Index(script, "if ! ARCWAY_AGENT_BINARY=\"$AGENT_DOWNLOAD\" /usr/local/sbin/arcway-agent-firewall; then")
 	if runtimeDirIndex < 0 || firstFirewallRunIndex < runtimeDirIndex {
 		t.Fatal("install script invokes the firewall helper before creating its writable runtime directory")
 	}
@@ -388,8 +415,9 @@ func TestRemoteInstallHostFilterSurvivesLaterDefaultDrop(t *testing.T) {
 		`HOST_FILTER_CHAIN=ARCWAY_PANEL_IN`,
 		`HOST_FILTER_COMMENT=arcway-managed`,
 		`remove_host_filter_chain()`,
-		`-s "$HOST_PANEL_IP" -p tcp --dport "$HOST_MANAGEMENT_PORT"`,
-		`-m comment --comment "$HOST_FILTER_COMMENT" -j ACCEPT || return 1`,
+		`printf -- '-A %s -s %s -p tcp --dport %s`,
+		`"$HOST_FILTER_RESTORE" -w 5 --test --noflush`,
+		`"$HOST_FILTER_RESTORE" -w 5 --noflush`,
 		`-I INPUT 1 -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" || return 1`,
 	} {
 		if !strings.Contains(helper, expected) {
@@ -481,7 +509,9 @@ func TestRemoteInstallFirewallHelperReconcilesHostInputChain(t *testing.T) {
 
 	testRoot := t.TempDir()
 	configPath := filepath.Join(testRoot, "config.yaml")
+	xrayConfigPath := filepath.Join(testRoot, "xray.json")
 	guardEnvPath := filepath.Join(testRoot, "guard.env")
+	firewallEnvPath := filepath.Join(testRoot, "firewall.env")
 	runtimeDir := filepath.Join(testRoot, "runtime")
 	helperPath := filepath.Join(testRoot, "arcway-agent-firewall")
 	mockBin := filepath.Join(testRoot, "mock-bin")
@@ -495,14 +525,25 @@ func TestRemoteInstallFirewallHelperReconcilesHostInputChain(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mockBin, "iptables"), []byte("#!/bin/sh\nexit 42\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
+	fakeAgentPath := filepath.Join(mockBin, "mmw-agent")
+	if err := os.WriteFile(fakeAgentPath, []byte("#!/bin/sh\nprintf '%b\\n' \"${FAKE_ARCWAY_RULES:-tcp 2033\\nudp 2033\\nudp 51820}\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(configPath, []byte("listen_port: \"23889\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(xrayConfigPath, []byte("{\"inbounds\":[]}"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(guardEnvPath, []byte("ARCWAY_GUARD_LISTEN=:23890\nARCWAY_AGENT_URL=http://127.0.0.1:23889\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(firewallEnvPath, []byte("ARCWAY_AGENT_PORT=23889\nARCWAY_GUARD_PORT=23890\nARCWAY_PANEL_IPS='203.0.113.10'\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	helper = strings.ReplaceAll(helper, "/etc/mmw-agent/config.yaml", configPath)
 	helper = strings.ReplaceAll(helper, "/etc/arcway-expiry-guard.env", guardEnvPath)
+	helper = strings.ReplaceAll(helper, "/etc/arcway-port-firewall.env", firewallEnvPath)
 	helper = strings.ReplaceAll(helper, "FIREWALL_RUNTIME_DIR=/var/lib/arcway-expiry-guard", "FIREWALL_RUNTIME_DIR="+runtimeDir)
 	if err := os.WriteFile(helperPath, []byte(helper), 0700); err != nil {
 		t.Fatal(err)
@@ -511,7 +552,8 @@ func TestRemoteInstallFirewallHelperReconcilesHostInputChain(t *testing.T) {
 	harness := `set -eu
 iptables -w 5 -t filter -P INPUT DROP
 ip6tables -w 5 -t filter -P INPUT DROP
-export ARCWAY_AGENT_PORT=23889 ARCWAY_GUARD_PORT=23890 ARCWAY_PANEL_IPS=203.0.113.10 ARCWAY_FORWARD_PORT_START=39000 ARCWAY_FORWARD_PORT_END=40000
+export ARCWAY_AGENT_PORT=23889 ARCWAY_GUARD_PORT=23890 ARCWAY_PANEL_IPS=203.0.113.10
+export ARCWAY_XRAY_CONFIG_PATH=` + shellSingleQuote(xrayConfigPath) + ` ARCWAY_AGENT_BINARY=` + shellSingleQuote(fakeAgentPath) + `
 if PATH=` + shellSingleQuote(mockBin) + `:/usr/sbin:/usr/bin:/bin ` + shellSingleQuote(helperPath) + ` >` + shellSingleQuote(failureLog) + ` 2>&1; then
     exit 1
 fi
@@ -524,18 +566,35 @@ CHAIN_RULES=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
 [ "$(printf '%s\n' "$INPUT_RULES" | awk '/arcway-managed/ && /ARCWAY_PANEL_IN/ { count++ } END { print count+0 }')" -eq 1 ]
 [ "$(printf '%s\n' "$CHAIN_RULES" | awk '/203[.]0[.]113[.]10/ && /--dport 23889/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
 [ "$(printf '%s\n' "$CHAIN_RULES" | awk '/203[.]0[.]113[.]10/ && /--dport 23890/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
-[ "$(printf '%s\n' "$CHAIN_RULES" | awk '/--dport 39000:40000/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
-ARCWAY_PANEL_IPS=198.51.100.20 ` + shellSingleQuote(helperPath) + `
+[ "$(printf '%s\n' "$CHAIN_RULES" | awk '/-p tcp/ && /--dport 2033/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
+[ "$(printf '%s\n' "$CHAIN_RULES" | awk '/-p udp/ && /--dport 2033/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
+[ "$(printf '%s\n' "$CHAIN_RULES" | awk '/-p udp/ && /--dport 51820/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
+HOST_FILTER_BEFORE=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
+if FAKE_ARCWAY_RULES='tcp 23889' ` + shellSingleQuote(helperPath) + ` >/dev/null 2>&1; then
+    exit 1
+fi
+HOST_FILTER_AFTER=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
+[ "$HOST_FILTER_BEFORE" = "$HOST_FILTER_AFTER" ]
+FAKE_ARCWAY_RULES='udp 51820' ` + shellSingleQuote(helperPath) + `
+CHAIN_RULES=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
+! printf '%s\n' "$CHAIN_RULES" | grep -F -- '--dport 2033' >/dev/null
+[ "$(printf '%s\n' "$CHAIN_RULES" | awk '/-p udp/ && /--dport 51820/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
+export ARCWAY_PANEL_IPS=198.51.100.20
+` + shellSingleQuote(helperPath) + `
 CHAIN_RULES=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
 ! printf '%s\n' "$CHAIN_RULES" | grep -F -- '203.0.113.10' >/dev/null
 [ "$(printf '%s\n' "$CHAIN_RULES" | awk '/198[.]51[.]100[.]20/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 2 ]
 HOST_FILTER_BEFORE=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
-ARCWAY_PANEL_IPS=192.0.2.30 ` + shellSingleQuote(helperPath) + ` --nft-only
+export ARCWAY_PANEL_IPS=192.0.2.30
+` + shellSingleQuote(helperPath) + ` --nft-only
 HOST_FILTER_AFTER=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
 [ "$HOST_FILTER_BEFORE" = "$HOST_FILTER_AFTER" ]
 nft list chain inet arcway input >/dev/null
-ARCWAY_PANEL_IPS=2001:db8::10 ` + shellSingleQuote(helperPath) + `
-! iptables -w 5 -t filter -S ARCWAY_PANEL_IN >/dev/null 2>&1
+export ARCWAY_PANEL_IPS=2001:db8::10
+` + shellSingleQuote(helperPath) + `
+IPV4_CHAIN_RULES=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
+! printf '%s\n' "$IPV4_CHAIN_RULES" | grep -F -- '198.51.100.20' >/dev/null
+[ "$(printf '%s\n' "$IPV4_CHAIN_RULES" | awk '/--dport 2033/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 2 ]
 IPV6_CHAIN_RULES=$(ip6tables -w 5 -t filter -S ARCWAY_PANEL_IN)
 [ "$(printf '%s\n' "$IPV6_CHAIN_RULES" | awk '/2001:db8::10/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 2 ]
 `
@@ -1462,6 +1521,90 @@ func TestRevealServerTokenReturnsAuthoritativeInstallCommand(t *testing.T) {
 	}
 	if strings.Contains(result.InstallCommand, server.Token) {
 		t.Fatalf("authoritative install command exposes the long-lived server token: %s", result.InstallCommand)
+	}
+}
+
+func TestRevealServerTokenRenewsExpiringCredentialBeforeIssuingInstallTicket(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	installExpiryGuardAssetFixtures(t)
+
+	for _, testCase := range []struct {
+		name      string
+		expiresAt time.Time
+	}{
+		{name: "expired", expiresAt: time.Now().Add(-time.Hour)},
+		{name: "expires before ticket", expiresAt: time.Now().Add(remoteInstallTicketTTL / 2)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "traffic.db")
+			repo, err := storage.NewTrafficRepository(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = repo.Close() })
+
+			const originalToken = "expired-install-token"
+			server := &storage.RemoteServer{
+				Name:           "expiring-reveal-command",
+				Token:          originalToken,
+				ConnectionMode: storage.ConnectionModeWebSocket,
+				ListenPort:     25000,
+			}
+			if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(context.Background(),
+				"UPDATE remote_servers SET token_expires_at = ? WHERE id = ?", testCase.expiresAt, server.ID); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			handler := NewXrayServerHandler(repo, nil, nil)
+			request := httptest.NewRequest(http.MethodGet,
+				"https://panel.example/api/admin/remote-servers/reveal-token?server_id="+strconv.FormatInt(server.ID, 10), nil)
+			response := httptest.NewRecorder()
+			handler.RevealServerToken(response, request)
+			if response.Code != http.StatusOK {
+				t.Fatalf("reveal status=%d", response.Code)
+			}
+			var result struct {
+				Success        bool   `json:"success"`
+				Token          string `json:"token"`
+				InstallCommand string `json:"install_command"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if !result.Success || result.Token == "" || result.Token == originalToken {
+				t.Fatal("reveal did not return a renewed server credential")
+			}
+			stored, err := repo.GetRemoteServer(context.Background(), server.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.Token != result.Token || stored.TokenExpiresAt == nil || !stored.TokenExpiresAt.After(time.Now().Add(remoteInstallTicketTTL)) {
+				t.Fatal("renewed server credential was not persisted with sufficient lifetime")
+			}
+
+			matches := regexp.MustCompile(`Authorization: Bearer (arcway-install-[^']+)`).FindStringSubmatch(result.InstallCommand)
+			if len(matches) != 2 {
+				t.Fatal("install command did not contain a one-time ticket")
+			}
+			download := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+			download.Header.Set("Authorization", "Bearer "+matches[1])
+			downloadResponse := httptest.NewRecorder()
+			handler.GetRemoteInstallScript(downloadResponse, download)
+			if downloadResponse.Code != http.StatusOK {
+				t.Fatalf("install ticket download status=%d", downloadResponse.Code)
+			}
+		})
 	}
 }
 

@@ -103,6 +103,19 @@ func TestEffectiveManagedNodeIDsRequireAppliedSourceAndEnabledOffer(t *testing.T
 		storage.ManagedObservedActive, now); err != nil {
 		t.Fatalf("mark source applied: %v", err)
 	}
+	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+		Username: "alice", ServerID: server.ID, InboundTag: offer.InboundTag,
+		Protocol: "vless", CredentialJSON: `{"id":"managed-node-test-credential"}`,
+	}); err != nil {
+		t.Fatalf("save source credential: %v", err)
+	}
+	credential, err := repo.GetUserInboundConfig(ctx, "alice", server.ID, offer.InboundTag)
+	if err != nil {
+		t.Fatalf("get source credential: %v", err)
+	}
+	if err := repo.SetUserNodeSelectionCredential(ctx, activation.Selection.ID, credential.ID); err != nil {
+		t.Fatalf("link source credential: %v", err)
+	}
 	ids, err = effectiveManagedNodeIDs(ctx, repo, "alice")
 	if err != nil || len(ids) != 1 || ids[0] != node.ID {
 		t.Fatalf("applied source not visible: ids=%v err=%v", ids, err)

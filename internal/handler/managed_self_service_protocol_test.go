@@ -19,6 +19,7 @@ func TestValidateSelfServiceNodeProtocol(t *testing.T) {
 	tests := []struct {
 		name        string
 		protocol    string
+		inboundTag  string
 		clashConfig string
 		wantErr     bool
 	}{
@@ -26,6 +27,13 @@ func TestValidateSelfServiceNodeProtocol(t *testing.T) {
 			name:        "VLESS does not use a shared Shadowsocks password",
 			protocol:    "vless",
 			clashConfig: `{"type":"vless"}`,
+		},
+		{
+			name:        "Tunnel clone cannot be self-service published",
+			protocol:    "vless",
+			inboundTag:  "  AnYdOoR-edge-2033  ",
+			clashConfig: `{"type":"vless"}`,
+			wantErr:     true,
 		},
 		{
 			name:        "Shadowsocks 2022 AES 128",
@@ -36,6 +44,12 @@ func TestValidateSelfServiceNodeProtocol(t *testing.T) {
 			name:        "Shadowsocks 2022 AES 256 through SS alias",
 			protocol:    "ss",
 			clashConfig: `{"method":"2022-blake3-aes-256-gcm"}`,
+		},
+		{
+			name:        "Shadowsocks 2022 ChaCha is not supported for self service",
+			protocol:    "shadowsocks",
+			clashConfig: `{"cipher":"2022-blake3-chacha20-poly1305"}`,
+			wantErr:     true,
 		},
 		{
 			name:        "classic AES 128",
@@ -73,6 +87,7 @@ func TestValidateSelfServiceNodeProtocol(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateSelfServiceNodeProtocol(storage.Node{
 				Protocol:    tt.protocol,
+				InboundTag:  tt.inboundTag,
 				ClashConfig: tt.clashConfig,
 			})
 			if tt.wantErr {

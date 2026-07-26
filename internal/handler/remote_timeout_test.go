@@ -7,11 +7,17 @@ import (
 )
 
 func TestRemoteOperationTimeout(t *testing.T) {
+	if got := remoteOperationTimeout("/api/child/line-speedtest/run"); got != 5*time.Minute {
+		t.Fatalf("line speedtest timeout = %v, want 5m", got)
+	}
 	if got := remoteOperationTimeout("/api/child/warp/install"); got != 75*time.Second {
 		t.Fatalf("WARP timeout = %v, want 75s", got)
 	}
 	if got := remoteOperationTimeout("/api/child/services/status"); got != 30*time.Second {
 		t.Fatalf("default timeout = %v, want 30s", got)
+	}
+	if got := NewRemoteManageHandler(nil, nil).httpClient.Timeout; got != 5*time.Minute {
+		t.Fatalf("remote HTTP client timeout = %v, want 5m", got)
 	}
 }
 

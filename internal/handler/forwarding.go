@@ -41,6 +41,7 @@ type ForwardTunnelSpec struct {
 	Generation   int64
 	ServerID     int64
 	Tag          string
+	Network      string
 	ListenPort   int
 	TargetHost   string
 	TargetPort   int
@@ -87,7 +88,7 @@ func (q tunnelTemplateRequest) model(actor string) storage.TunnelTemplate {
 		hops[i] = storage.TunnelTemplateHop{Position: i, ServerID: serverID}
 	}
 	return storage.TunnelTemplate{
-		Name: q.Name, Description: q.Description, State: q.State, Network: "tcp",
+		Name: q.Name, Description: q.Description, State: q.State, Network: storage.ForwardNetworkTCPUDP,
 		BillingMode: q.BillingMode, TrafficMultiplierMilli: q.TrafficMultiplierMilli,
 		MaxTotalForwards: q.MaxTotalForwards, AllowManagedTarget: true,
 		PortRangeStart: q.PortRangeStart, PortRangeEnd: q.PortRangeEnd,
@@ -244,7 +245,7 @@ func (h *ForwardingHandler) HandleAdminTunnelTemplatePreflight(w http.ResponseWr
 		writeForwardingError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "network": "tcp", "servers": servers})
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "network": storage.ForwardNetworkTCPUDP, "servers": servers})
 }
 
 func (h *ForwardingHandler) probeTunnelServerCapabilities(ctx context.Context, serverIDs []int64) error {
@@ -563,11 +564,12 @@ func (h *ForwardingHandler) HandleUserTunnelGrants(w http.ResponseWriter, r *htt
 }
 
 type createForwardRequest struct {
-	GrantID     string   `json:"grant_id"`
-	Name        string   `json:"name"`
-	Network     string   `json:"network"`
-	SourceCIDRs []string `json:"source_cidrs"`
-	Target      struct {
+	GrantID            string   `json:"grant_id"`
+	Name               string   `json:"name"`
+	Network            string   `json:"network"`
+	RequestedEntryPort int      `json:"requested_entry_port"`
+	SourceCIDRs        []string `json:"source_cidrs"`
+	Target             struct {
 		Type   string `json:"type"`
 		NodeID int64  `json:"node_id"`
 	} `json:"target"`
@@ -582,6 +584,7 @@ type userForwardResponse struct {
 	Network            string     `json:"network"`
 	EntryHost          string     `json:"entry_host,omitempty"`
 	EntryPort          int        `json:"entry_port"`
+	RequestedEntryPort int        `json:"requested_entry_port"`
 	DesiredState       string     `json:"desired_state"`
 	ObservedState      string     `json:"observed_state"`
 	SuspendReason      string     `json:"suspend_reason"`
@@ -596,7 +599,7 @@ type userForwardResponse struct {
 }
 
 func (h *ForwardingHandler) userForwardDTO(ctx context.Context, f storage.UserForwardRule) userForwardResponse {
-	out := userForwardResponse{ID: f.PublicID, Name: f.Name, TargetNodeID: f.TargetNodeID, Network: f.Network, SourceCIDRs: f.SourceCIDRs, EntryPort: f.AllocatedEntryPort, DesiredState: f.DesiredState, ObservedState: f.ObservedState, SuspendReason: f.SuspendReason, EffectiveExpiresAt: f.EffectiveExpiresAt, LastErrorCode: f.LastErrorCode, CreatedAt: f.CreatedAt}
+	out := userForwardResponse{ID: f.PublicID, Name: f.Name, TargetNodeID: f.TargetNodeID, Network: f.Network, SourceCIDRs: f.SourceCIDRs, EntryPort: f.AllocatedEntryPort, RequestedEntryPort: f.RequestedEntryPort, DesiredState: f.DesiredState, ObservedState: f.ObservedState, SuspendReason: f.SuspendReason, EffectiveExpiresAt: f.EffectiveExpiresAt, LastErrorCode: f.LastErrorCode, CreatedAt: f.CreatedAt}
 	if g, err := h.repo.GetUserTunnelGrantByID(ctx, f.GrantID); err == nil {
 		out.GrantID = g.PublicID
 	}
@@ -694,11 +697,26 @@ func validateCreateForwardRequest(req createForwardRequest) error {
 	if strings.TrimSpace(req.GrantID) == "" || strings.TrimSpace(req.Name) == "" || req.Target.NodeID <= 0 {
 		return storage.ErrForwardingInvalid
 	}
-	if req.Network != "" && strings.ToLower(req.Network) != "tcp" {
+	switch strings.ToLower(strings.TrimSpace(req.Network)) {
+	case "", "tcp", "tcp_udp", "tcp,udp":
+	default:
+		return storage.ErrForwardingInvalid
+	}
+	if req.RequestedEntryPort != 0 && (req.RequestedEntryPort < 1024 || req.RequestedEntryPort > 65535) {
 		return storage.ErrForwardingInvalid
 	}
 	if req.Target.Type != "" && req.Target.Type != "managed_node" {
 		return storage.ErrForwardingForbidden
+	}
+	return nil
+}
+
+func validateRequestedForwardPort(port int, tunnel *storage.TunnelTemplate) error {
+	if port == 0 {
+		return nil
+	}
+	if tunnel == nil || port < tunnel.PortRangeStart || port > tunnel.PortRangeEnd {
+		return storage.ErrForwardingInvalid
 	}
 	return nil
 }
@@ -790,12 +808,21 @@ func (h *ForwardingHandler) HandleUserForwardPreflight(w http.ResponseWriter, r 
 		writeForwardingError(w, storage.ErrForwardingForbidden)
 		return
 	}
+	tunnel, err := h.repo.GetTunnelTemplateByID(r.Context(), g.TunnelID)
+	if err != nil {
+		writeForwardingError(w, err)
+		return
+	}
+	if err := validateRequestedForwardPort(req.RequestedEntryPort, tunnel); err != nil {
+		writeForwardingError(w, err)
+		return
+	}
 	node, host, port, _, err := h.resolveManagedForwardTarget(r.Context(), username, req.Target.NodeID)
 	if err != nil {
 		writeForwardingError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "source_cidrs": sourceCIDRs, "target": map[string]any{"node_id": node.ID, "name": node.NodeName, "host": host, "port": port}, "tunnel": userGrantResponse(func() storage.UserTunnelGrant {
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "network": storage.ForwardNetworkTCPUDP, "requested_entry_port": req.RequestedEntryPort, "source_cidrs": sourceCIDRs, "target": map[string]any{"node_id": node.ID, "name": node.NodeName, "host": host, "port": port}, "tunnel": userGrantResponse(func() storage.UserTunnelGrant {
 		for _, v := range grants {
 			if v.ID == g.ID {
 				return v
@@ -848,6 +875,10 @@ func (h *ForwardingHandler) HandleUserForwards(w http.ResponseWriter, r *http.Re
 			writeForwardingError(w, err)
 			return
 		}
+		if err := validateRequestedForwardPort(req.RequestedEntryPort, tunnel); err != nil {
+			writeForwardingError(w, err)
+			return
+		}
 		leaseHops := make([]storage.UserForwardHop, 0, len(tunnel.Hops))
 		for _, hop := range tunnel.Hops {
 			leaseHops = append(leaseHops, storage.UserForwardHop{ServerID: hop.ServerID})
@@ -864,7 +895,7 @@ func (h *ForwardingHandler) HandleUserForwards(w http.ResponseWriter, r *http.Re
 			return
 		}
 		expiry = earlierForwardExpiry(expiry, g.ExpiresAt)
-		f, err := h.repo.CreateUserForward(leasedContext, storage.CreateUserForwardInput{Username: username, Name: req.Name, GrantPublicID: req.GrantID, TargetNodeID: node.ID, TargetHost: host, TargetPort: port, SourceCIDRs: sourceCIDRs, TunnelVersion: tunnel.Version, EffectiveExpiresAt: expiry, Actor: username})
+		f, err := h.repo.CreateUserForward(leasedContext, storage.CreateUserForwardInput{Username: username, Name: req.Name, GrantPublicID: req.GrantID, TargetNodeID: node.ID, TargetHost: host, TargetPort: port, RequestedEntryPort: req.RequestedEntryPort, SourceCIDRs: sourceCIDRs, TunnelVersion: tunnel.Version, EffectiveExpiresAt: expiry, Actor: username})
 		if err != nil {
 			writeForwardingError(w, err)
 			return
@@ -874,7 +905,12 @@ func (h *ForwardingHandler) HandleUserForwards(w http.ResponseWriter, r *http.Re
 			if latest, readErr := h.repo.GetUserForward(leasedContext, f.PublicID, username); readErr == nil && latest != nil {
 				payload["forward"] = h.userForwardDTO(leasedContext, *latest)
 			}
-			writeJSON(w, http.StatusBadGateway, payload)
+			status := http.StatusBadGateway
+			if errors.Is(err, ErrForwardTunnelPortInUse) && req.RequestedEntryPort > 0 {
+				status = http.StatusConflict
+				payload["error"] = fmt.Sprintf("requested port %d is already in use", req.RequestedEntryPort)
+			}
+			writeJSON(w, status, payload)
 			return
 		}
 		latest, err := h.repo.GetUserForward(leasedContext, f.PublicID, username)
@@ -1035,7 +1071,7 @@ func (h *ForwardingHandler) tunnelSpec(ctx context.Context, f *storage.UserForwa
 	hop := f.Hops[index]
 	spec := ForwardTunnelSpec{
 		ResourceID: hop.ResourceID, Generation: hop.Generation, ServerID: hop.ServerID,
-		Tag: hop.ResourceTag, ListenPort: hop.ListenPort, TargetHost: hop.NextHost,
+		Tag: hop.ResourceTag, Network: f.Network, ListenPort: hop.ListenPort, TargetHost: hop.NextHost,
 		TargetPort: hop.NextPort, HardNotAfter: f.EffectiveExpiresAt,
 		LeaseUntil: time.Now().UTC().Add(forwardTunnelLeaseDuration),
 	}
@@ -1129,9 +1165,37 @@ func (h *ForwardingHandler) removeConflictedForwardResources(ctx context.Context
 	return nil
 }
 
+func forwardNeedsPortConvergence(f *storage.UserForwardRule) bool {
+	if f == nil || len(f.Hops) == 0 {
+		return false
+	}
+	commonPort := f.Hops[0].ListenPort
+	for i, hop := range f.Hops {
+		if hop.ListenPort != commonPort {
+			return true
+		}
+		if i+1 < len(f.Hops) && hop.NextPort != commonPort {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *ForwardingHandler) deployForward(ctx context.Context, f *storage.UserForwardRule) error {
 	current := f
 	var err, cleanupWarning error
+	if forwardNeedsPortConvergence(current) {
+		if current.RequestedEntryPort > 0 {
+			return fmt.Errorf("%w: fixed-port forward has inconsistent route ports", storage.ErrForwardingConflict)
+		}
+		legacy := current
+		converged, reallocateErr := h.repo.ReallocateUserForwardPorts(ctx, current.PublicID, current.Username)
+		if reallocateErr != nil {
+			return reallocateErr
+		}
+		cleanupWarning = h.removeConflictedForwardResources(ctx, legacy)
+		current = converged
+	}
 	for attempt := 0; attempt < 3; attempt++ {
 		err = h.deployForwardOnce(ctx, current)
 		if !errors.Is(err, ErrForwardTunnelPortInUse) {
@@ -1144,12 +1208,16 @@ func (h *ForwardingHandler) deployForward(ctx context.Context, f *storage.UserFo
 			}
 			return err
 		}
-		cleanupWarning = errors.Join(cleanupWarning, h.removeConflictedForwardResources(ctx, current))
-		var reallocateErr error
-		current, reallocateErr = h.repo.ReallocateUserForwardPorts(ctx, current.PublicID, current.Username)
-		if reallocateErr != nil {
-			return errors.Join(err, cleanupWarning, reallocateErr)
+		if current.RequestedEntryPort > 0 {
+			return err
 		}
+		conflicted := current
+		reallocated, reallocateErr := h.repo.ReallocateUserForwardPorts(ctx, current.PublicID, current.Username)
+		if reallocateErr != nil {
+			return errors.Join(err, reallocateErr)
+		}
+		cleanupWarning = errors.Join(cleanupWarning, h.removeConflictedForwardResources(ctx, conflicted))
+		current = reallocated
 	}
 	return errors.Join(err, cleanupWarning)
 }

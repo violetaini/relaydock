@@ -3,6 +3,9 @@ package acme
 import (
 	"fmt"
 	"os"
+	"sync"
+
+	"miaomiaowux/internal/dnscredentials"
 
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/providers/dns/alidns"
@@ -22,6 +25,8 @@ var DNSProviderEnvKeys = map[string][]string{
 	"namesilo":     {"NAMESILO_API_KEY"},
 	"godaddy":      {"GODADDY_API_KEY", "GODADDY_API_SECRET"},
 }
+
+var dnsCredentialEnvMu sync.Mutex
 
 // NewDNSProviderByName 按名称创建 DNS 质询提供程序。
 // 仅导入我们支持的特定提供程序以避免依赖膨胀。
@@ -51,23 +56,58 @@ func SetDNSCredentialEnv(providerType string, credentials map[string]string) (cl
 	if !ok {
 		return nil, fmt.Errorf("unsupported DNS provider type: %s", providerType)
 	}
+	if providerType == "cloudflare" {
+		credentials, err = dnscredentials.NormalizeCloudflare(credentials)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// lego providers read process environment variables during construction.
+	// Serialize this short setup window and restore the caller's environment so
+	// credentials from another mode/request cannot influence authentication.
+	dnsCredentialEnvMu.Lock()
+	type previousValue struct {
+		value  string
+		exists bool
+	}
+	previous := make(map[string]previousValue, len(keys))
+	for _, key := range keys {
+		value, exists := os.LookupEnv(key)
+		previous[key] = previousValue{value: value, exists: exists}
+		_ = os.Unsetenv(key)
+	}
+	restore := func() {
+		for _, key := range keys {
+			old := previous[key]
+			if old.exists {
+				_ = os.Setenv(key, old.value)
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		}
+		dnsCredentialEnvMu.Unlock()
+	}
 
 	var setKeys []string
 	for _, key := range keys {
 		if val, exists := credentials[key]; exists && val != "" {
-			os.Setenv(key, val)
+			if err := os.Setenv(key, val); err != nil {
+				restore()
+				return nil, fmt.Errorf("set DNS credential %s: %w", key, err)
+			}
 			setKeys = append(setKeys, key)
 		}
 	}
 
 	if len(setKeys) == 0 {
+		restore()
 		return nil, fmt.Errorf("no valid credentials provided for DNS provider %s", providerType)
 	}
 
+	var once sync.Once
 	cleanup = func() {
-		for _, key := range setKeys {
-			os.Unsetenv(key)
-		}
+		once.Do(restore)
 	}
 	return cleanup, nil
 }

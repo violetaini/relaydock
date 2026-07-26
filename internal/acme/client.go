@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"miaomiaowux/internal/dnscredentials"
+
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
 	"github.com/go-acme/lego/v4/challenge/dns01"
@@ -137,6 +139,9 @@ func (c *Client) ObtainCertificateV2(ctx context.Context, req CertRequest) (*Cer
 
 	certificates, err := client.Certificate.Obtain(obtainReq)
 	if err != nil {
+		if req.DNSProvider == "cloudflare" {
+			err = dnscredentials.FriendlyCloudflareError(err)
+		}
 		return nil, fmt.Errorf("obtain certificate: %w", err)
 	}
 
@@ -177,6 +182,9 @@ func (c *Client) RenewCertificateV2(ctx context.Context, req CertRequest, certPE
 
 	newCert, err := client.Certificate.Renew(*certRes, true, false, "")
 	if err != nil {
+		if req.DNSProvider == "cloudflare" {
+			err = dnscredentials.FriendlyCloudflareError(err)
+		}
 		return nil, fmt.Errorf("renew certificate: %w", err)
 	}
 

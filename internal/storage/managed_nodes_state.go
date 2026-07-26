@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -225,20 +226,24 @@ WHERE username = ? AND server_id = ?`, username, offer.ServerID))
 		return nil, fmt.Errorf("get grant for activation: %w", err)
 	}
 	var userEnabled, nodeEnabled int
-	var nodeType, originalServer, serverName, xrayMode, nodeInbound string
+	var nodeType, nodeProtocol, nodeClashConfig, originalServer, serverName, xrayMode, nodeInbound string
 	if err := tx.QueryRowContext(ctx, `SELECT u.is_active, n.enabled,
-       COALESCE(n.node_type, 'physical'), COALESCE(n.original_server, ''),
-       rs.name, COALESCE(rs.xray_mode, 'external'), COALESCE(n.inbound_tag, '')
+	       COALESCE(n.node_type, 'physical'), COALESCE(n.protocol, ''), COALESCE(n.clash_config, ''), COALESCE(n.original_server, ''),
+	       rs.name, COALESCE(rs.xray_mode, 'external'), COALESCE(n.inbound_tag, '')
 FROM users u, nodes n, remote_servers rs
 WHERE u.username = ? AND n.id = ? AND rs.id = ?`, username, offer.NodeID, offer.ServerID).Scan(
-		&userEnabled, &nodeEnabled, &nodeType, &originalServer, &serverName, &xrayMode, &nodeInbound,
+		&userEnabled, &nodeEnabled, &nodeType, &nodeProtocol, &nodeClashConfig, &originalServer, &serverName, &xrayMode, &nodeInbound,
 	); errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrManagedServerMismatch
 	} else if err != nil {
 		return nil, fmt.Errorf("validate managed activation: %w", err)
 	}
-	if nodeEnabled == 0 || nodeType != "physical" || originalServer != serverName ||
-		xrayMode != "embedded" || nodeInbound != offer.InboundTag {
+	node := Node{
+		ID: offer.NodeID, Protocol: nodeProtocol, ClashConfig: nodeClashConfig, Enabled: nodeEnabled != 0,
+		NodeType: nodeType, OriginalServer: originalServer, InboundTag: nodeInbound,
+	}
+	server := RemoteServer{ID: offer.ServerID, Name: serverName, XrayMode: xrayMode}
+	if !node.Enabled || !SelfServiceNodeOfferStructureValid(offer, node, server) {
 		return nil, ErrManagedServerMismatch
 	}
 	billed, err := grantUsageTx(ctx, tx, grant.ID, grant.BillingMode)
@@ -251,11 +256,29 @@ WHERE u.username = ? AND n.id = ? AND rs.id = ?`, username, offer.NodeID, offer.
 		}
 		return nil, ErrManagedGrantInactive
 	}
+	if !grant.AllowsNodeProtocol(nodeProtocol, nodeClashConfig) {
+		return nil, fmt.Errorf("%w: %s", ErrManagedProtocolNotAllowed, strings.ToLower(strings.TrimSpace(nodeProtocol)))
+	}
+	if !SelfServiceNodeOfferProtocolEligible(offer, node) {
+		return nil, fmt.Errorf("%w: protocol does not support isolated managed credentials", ErrManagedInvalidArgument)
+	}
 	selection, scanErr := scanUserNodeSelection(tx.QueryRowContext(ctx, selectUserNodeSelection+`
 WHERE grant_id = ? AND offer_id = ?`, grant.ID, offer.ID))
 	selectionExists := scanErr == nil
 	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
 		return nil, fmt.Errorf("get existing managed selection: %w", scanErr)
+	}
+	if selectionExists && selection.CredentialConfigID != nil {
+		var credentialProtocol string
+		err := tx.QueryRowContext(ctx, `SELECT protocol FROM user_inbound_configs
+WHERE id = ? AND username = ? AND server_id = ? AND inbound_tag = ?`,
+			*selection.CredentialConfigID, username, offer.ServerID, offer.InboundTag).Scan(&credentialProtocol)
+		if errors.Is(err, sql.ErrNoRows) || err == nil && !SelfServiceCredentialProtocolMatches(credentialProtocol, nodeProtocol) {
+			return nil, fmt.Errorf("%w: previous managed credential cleanup is pending", ErrManagedAccessConflict)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("validate managed credential protocol snapshot: %w", err)
+		}
 	}
 	if !selectionExists || !selection.DesiredEnabled {
 		packageOverlap, err := userPackageContainsManagedInbound(ctx, tx, username, offer.ServerID, offer.InboundTag, now)
@@ -496,6 +519,22 @@ WHERE id = ? AND EXISTS (
 			return ErrUserNodeSelectionNotFound
 		}
 		return ErrManagedServerMismatch
+	}
+	return nil
+}
+
+func (r *TrafficRepository) ClearUserNodeSelectionCredential(ctx context.Context, selectionID, credentialConfigID int64) error {
+	if err := managedInitialized(r); err != nil {
+		return err
+	}
+	if selectionID <= 0 || credentialConfigID <= 0 {
+		return ErrManagedInvalidArgument
+	}
+	_, err := r.db.ExecContext(ctx, `UPDATE user_node_selections SET
+    credential_config_id = NULL, updated_at = ?
+WHERE id = ? AND credential_config_id = ?`, time.Now().UTC(), selectionID, credentialConfigID)
+	if err != nil {
+		return fmt.Errorf("clear managed selection credential: %w", err)
 	}
 	return nil
 }
@@ -820,25 +859,103 @@ func (r *TrafficRepository) HasEffectiveUserInboundAccess(ctx context.Context, u
 	if username == "" || serverID <= 0 || inboundTag == "" || excludeSourceID < 0 || now.IsZero() {
 		return false, nil, ErrManagedInvalidArgument
 	}
-	var count, perpetual int
-	var latest sql.NullString
-	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*),
-       COALESCE(MAX(CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END), 0),
-       MAX(expires_at)
-FROM user_inbound_access_sources
-WHERE username = ? AND server_id = ? AND inbound_tag = ? AND id != ?
-  AND source_type = ? AND desired_state = ?
-  AND starts_at <= ? AND (expires_at IS NULL OR expires_at > ?)`,
+	rows, err := r.db.QueryContext(ctx, `SELECT s.expires_at, g.allowed_protocols_json,
+	       g.allowed_protocol_profiles_json,
+	       COALESCE(n.protocol, ''), COALESCE(n.clash_config, ''), COALESCE(o.inbound_tag, ''),
+	       sel.credential_config_id, c.id, c.username, c.server_id, c.inbound_tag, c.protocol,
+	       s.observed_state, s.generation, s.applied_generation
+FROM user_inbound_access_sources s
+JOIN user_node_selections sel ON sel.id = s.source_id AND sel.desired_enabled = 1
+JOIN user_server_grants g ON g.id = sel.grant_id AND g.username = s.username AND g.server_id = s.server_id
+JOIN self_service_node_offers o ON o.id = sel.offer_id AND o.enabled = 1
+	AND o.server_id = s.server_id AND o.inbound_tag = s.inbound_tag
+JOIN remote_servers rs ON rs.id = o.server_id AND LOWER(TRIM(COALESCE(rs.xray_mode, 'external'))) = 'embedded'
+JOIN nodes n ON n.id = o.node_id AND n.id = s.node_id AND n.enabled = 1
+	AND LOWER(TRIM(COALESCE(n.node_type, 'physical'))) = 'physical'
+	AND COALESCE(n.original_server, '') = rs.name
+	AND COALESCE(n.inbound_tag, '') = o.inbound_tag
+LEFT JOIN user_inbound_configs c ON c.id = sel.credential_config_id
+WHERE s.username = ? AND s.server_id = ? AND s.inbound_tag = ? AND s.id != ?
+	  AND s.source_type = ? AND s.desired_state = ?
+	  AND s.starts_at <= ? AND (s.expires_at IS NULL OR s.expires_at > ?)`,
 		username, serverID, inboundTag, excludeSourceID, ManagedSourceSelection,
-		ManagedDesiredActive, now.UTC(), now.UTC()).Scan(&count, &perpetual, &latest)
+		ManagedDesiredActive, now.UTC(), now.UTC())
 	if err != nil {
 		return false, nil, fmt.Errorf("resolve effective managed access: %w", err)
 	}
-	if count == 0 {
+	defer rows.Close()
+	hasAccess, perpetual := false, false
+	var latest *time.Time
+	for rows.Next() {
+		var expires sql.NullString
+		var allowedProtocolsJSON, allowedProtocolProfilesJSON, protocol, clashConfig, offerInboundTag string
+		var credentialID, configID, configServerID sql.NullInt64
+		var configUsername, configInboundTag, configProtocol sql.NullString
+		var observedState string
+		var generation, appliedGeneration int64
+		if err := rows.Scan(&expires, &allowedProtocolsJSON, &allowedProtocolProfilesJSON, &protocol, &clashConfig, &offerInboundTag,
+			&credentialID, &configID, &configUsername, &configServerID, &configInboundTag, &configProtocol,
+			&observedState, &generation, &appliedGeneration); err != nil {
+			return false, nil, fmt.Errorf("scan effective managed access: %w", err)
+		}
+		var allowedProtocols []string
+		if err := json.Unmarshal([]byte(allowedProtocolsJSON), &allowedProtocols); err != nil {
+			return false, nil, fmt.Errorf("decode effective managed access protocols: %w", err)
+		}
+		allowedProtocols, err = NormalizeManagedGrantAllowedProtocols(allowedProtocols)
+		if err != nil {
+			return false, nil, fmt.Errorf("decode effective managed access protocols: %w", err)
+		}
+		var allowedProtocolProfiles []string
+		if err := json.Unmarshal([]byte(allowedProtocolProfilesJSON), &allowedProtocolProfiles); err != nil {
+			return false, nil, fmt.Errorf("decode effective managed access protocol profiles: %w", err)
+		}
+		allowedProtocolProfiles, err = NormalizeManagedGrantAllowedProtocolProfiles(allowedProtocolProfiles)
+		if err != nil {
+			return false, nil, fmt.Errorf("decode effective managed access protocol profiles: %w", err)
+		}
+		grant := UserServerGrant{AllowedProtocols: allowedProtocols, AllowedProtocolProfiles: allowedProtocolProfiles}
+		if !grant.AllowsNodeProtocol(protocol, clashConfig) || !SelfServiceNodeProtocolEligible(protocol, clashConfig) ||
+			strings.HasPrefix(strings.ToLower(strings.TrimSpace(offerInboundTag)), "anydoor-") {
+			continue
+		}
+		// A nil credential pointer means this source is still provisioning. Once
+		// a credential has been linked, its protocol becomes an immutable safety
+		// snapshot: changing the node protocol requires cleanup and reactivation.
+		if !credentialID.Valid {
+			// Only a source that has never completed provisioning may authorize
+			// credential creation without a snapshot. An applied source missing its
+			// credential link is corrupt and must fail closed.
+			if appliedGeneration != 0 || observedState == ManagedObservedActive {
+				continue
+			}
+		} else {
+			if !configID.Valid || configID.Int64 != credentialID.Int64 ||
+				!configUsername.Valid || configUsername.String != username ||
+				!configServerID.Valid || configServerID.Int64 != serverID ||
+				!configInboundTag.Valid || configInboundTag.String != inboundTag ||
+				!configProtocol.Valid || !SelfServiceCredentialProtocolMatches(configProtocol.String, protocol) {
+				continue
+			}
+		}
+		hasAccess = true
+		expiresAt := managedParseNullTime(expires)
+		if expiresAt == nil {
+			perpetual = true
+			continue
+		}
+		if latest == nil || expiresAt.After(*latest) {
+			latest = expiresAt
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, nil, fmt.Errorf("resolve effective managed access: %w", err)
+	}
+	if !hasAccess {
 		return false, nil, nil
 	}
-	if perpetual != 0 {
+	if perpetual {
 		return true, nil, nil
 	}
-	return true, managedParseNullTime(latest), nil
+	return true, latest, nil
 }

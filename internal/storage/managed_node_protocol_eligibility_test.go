@@ -22,6 +22,18 @@ func TestSelfServiceProtocolEligible(t *testing.T) {
 			want:        true,
 		},
 		{
+			name:        "SS2022 AES 256 via method field",
+			protocol:    "shadowsocks",
+			clashConfig: `{"method":"2022-blake3-aes-256-gcm"}`,
+			want:        true,
+		},
+		{
+			name:        "SS2022 chacha rejected",
+			protocol:    "shadowsocks",
+			clashConfig: `{"cipher":"2022-blake3-chacha20-poly1305"}`,
+			want:        false,
+		},
+		{
 			name:        "legacy Shadowsocks rejected",
 			protocol:    "shadowsocks",
 			clashConfig: `{"cipher":"aes-256-gcm"}`,

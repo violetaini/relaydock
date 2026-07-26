@@ -271,12 +271,67 @@ func (h *XrayServerHandler) RevealServerToken(w stdhttp.ResponseWriter, r *stdht
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "invalid server_id"})
 		return
 	}
-	server, err := h.repo.GetRemoteServer(r.Context(), id)
+	ctx := r.Context()
+	server, err := h.repo.GetRemoteServer(ctx, id)
 	if err != nil || server == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(stdhttp.StatusNotFound)
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "server not found"})
 		return
+	}
+	// The one-time download ticket is only an envelope around the server's
+	// long-lived credential. GetRemoteInstallScript intentionally rejects that
+	// ticket when the underlying credential has expired, so renew it before
+	// issuing a ticket that could otherwise be unusable. Use the ticket TTL as
+	// the renewal window to guarantee the credential remains valid for the
+	// entire lifetime of the command we return.
+	if remoteServerTokenNeedsInstallRenewal(server, time.Now()) {
+		leasedCtx, release, leaseErr := h.repo.AcquireRemoteServerExclusiveMutationLease(ctx, id)
+		if leaseErr != nil {
+			w.Header().Set("Content-Type", "application/json")
+			if errors.Is(leaseErr, storage.ErrRemoteInstallationActive) {
+				w.WriteHeader(stdhttp.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "server installation is active; retry after it completes"})
+				return
+			}
+			w.WriteHeader(stdhttp.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "unable to acquire server mutation lease"})
+			return
+		}
+		defer release()
+		ctx = leasedCtx
+
+		// Another reveal request may have renewed the token while this request
+		// waited for the exclusive lease.
+		server, err = h.repo.GetRemoteServer(ctx, id)
+		if err != nil || server == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "server not found"})
+			return
+		}
+		if remoteServerTokenNeedsInstallRenewal(server, time.Now()) {
+			oldToken := server.Token
+			newToken, expiresAt, resetErr := h.repo.ResetServerToken(ctx, id)
+			if resetErr != nil || expiresAt == nil {
+				log.Printf("[Reveal Token] Failed to renew install credential for server %d: %v", id, resetErr)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(stdhttp.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "failed to renew server token"})
+				return
+			}
+			server.Token = newToken
+			server.TokenExpiresAt = expiresAt
+
+			if guardErr := syncRemoteExpiryGuardAgentToken(ctx, h.repo, id, newToken); guardErr != nil {
+				log.Printf("[Reveal Token] Failed to synchronize expiry guard token for server %d: %v", id, guardErr)
+			}
+			if h.wsHandler != nil && h.wsHandler.IsConnected(oldToken) {
+				if pushErr := h.wsHandler.SendTokenUpdate(oldToken, newToken, *expiresAt); pushErr != nil {
+					log.Printf("[Reveal Token] Failed to push renewed token to server %d: %v", id, pushErr)
+				}
+			}
+		}
 	}
 	var panelSourceIPs []string
 	if server.ConnectionMode != storage.ConnectionModePull {
@@ -288,7 +343,8 @@ func (h *XrayServerHandler) RevealServerToken(w stdhttp.ResponseWriter, r *stdht
 			return
 		}
 	}
-	installCommand, err := h.buildRemoteInstallCommand(r, server, panelSourceIPs, server.StealSelf, "xray")
+	installRequest := r.Clone(ctx)
+	installCommand, err := h.buildRemoteInstallCommand(installRequest, server, panelSourceIPs, server.StealSelf, "xray")
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(stdhttp.StatusServiceUnavailable)
@@ -303,6 +359,10 @@ func (h *XrayServerHandler) RevealServerToken(w stdhttp.ResponseWriter, r *stdht
 		"agent_token":     server.AgentToken,
 		"install_command": installCommand,
 	})
+}
+
+func remoteServerTokenNeedsInstallRenewal(server *storage.RemoteServer, now time.Time) bool {
+	return server != nil && server.TokenExpiresAt != nil && !server.TokenExpiresAt.After(now.Add(remoteInstallTicketTTL))
 }
 
 // 使用生成的令牌创建一个新的远程服务器

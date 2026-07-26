@@ -305,6 +305,11 @@ func TestNginxTemplatesUsePortableCertificateAndProxyHeaders(t *testing.T) {
 		if strings.Contains(text, "proxy_set_header Connection") && !strings.Contains(text, "$arcway_connection_upgrade") {
 			t.Errorf("%s does not use the Arcway-owned WebSocket upgrade map", name)
 		}
+		if name == "wss_domain.conf.tpl" {
+			if strings.Contains(text, "http2                      on;") || !strings.Contains(text, "listen                     443 ssl http2;") {
+				t.Errorf("%s does not use the Nginx 1.24-compatible HTTP/2 listen syntax", name)
+			}
+		}
 	}
 	for _, name := range []string{"fallback/nginx.conf", "tunnel/nginx.conf", "single_nginx.conf"} {
 		content, err := templates.ReadFile(name)
