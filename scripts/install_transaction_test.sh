@@ -209,6 +209,7 @@ Description=old Arcway
 $(if [ "$enable_state" = static ]; then printf '%s\n' '# MOCK_STATIC=1'; fi)
 [Service]
 Type=simple
+WorkingDirectory=$case_root
 ExecStart=$install_dir/arcway
 Environment="PORT=$panel_port"
 Environment="DATABASE_PATH=$data_dir/arcway.db"
@@ -311,6 +312,40 @@ run_fault_case after_first_guard_swap enabled-runtime inactive
 run_fault_case daemon_reload_failure disabled active
 run_fault_case start_failure static inactive
 run_fault_case unit_verify_failure enabled active
+
+# Legacy units may advertise an unused arcway.db while the running application
+# actually stores state in data/mmwx.db relative to WorkingDirectory. The
+# transaction must discover and restore the live database, WAL, and SHM files.
+AUTO_DB_ROOT="$TEST_ROOT/auto-database-path"
+make_old_installation "$AUTO_DB_ROOT" enabled active
+printf '%s\n' old-mmwx-database > "$AUTO_DB_ROOT/data/mmwx.db"
+printf '%s\n' old-mmwx-wal > "$AUTO_DB_ROOT/data/mmwx.db-wal"
+printf '%s\n' old-mmwx-shm > "$AUTO_DB_ROOT/data/mmwx.db-shm"
+cp "$AUTO_DB_ROOT/data/mmwx.db" "$AUTO_DB_ROOT/expected/mmwx.db"
+cp "$AUTO_DB_ROOT/data/mmwx.db-wal" "$AUTO_DB_ROOT/expected/mmwx.db-wal"
+cp "$AUTO_DB_ROOT/data/mmwx.db-shm" "$AUTO_DB_ROOT/expected/mmwx.db-shm"
+set +e
+PATH="$MOCK_BIN:/usr/bin:/bin" \
+    MOCK_APT_MARKER="$AUTO_DB_ROOT/apt-called" \
+    MOCK_VERIFY_LOG="$AUTO_DB_ROOT/verify.log" \
+    MOCK_STATE_DIR="$AUTO_DB_ROOT/state" \
+    MOCK_FAIL_COMMAND=start \
+    MOCK_DATABASE_PATH="$AUTO_DB_ROOT/data/mmwx.db" \
+    ARCWAY_INSTALL_DIR="$AUTO_DB_ROOT/bin" \
+    ARCWAY_DATA_DIR="$AUTO_DB_ROOT/data" \
+    ARCWAY_CONFIG_DIR="$AUTO_DB_ROOT/config" \
+    ARCWAY_GUARD_ASSET_DIR="$AUTO_DB_ROOT/lib/guard-assets" \
+    ARCWAY_SYSTEMD_UNIT_DIR="$AUTO_DB_ROOT/systemd" \
+    ARCWAY_INSTALL_LOCK_FILE="$AUTO_DB_ROOT/install.lock" \
+    PORT=12889 \
+    bash "$INSTALL_SCRIPT" reinstall >"$AUTO_DB_ROOT/output.log" 2>&1
+auto_db_result=$?
+set -e
+[ "$auto_db_result" -ne 0 ] || fail "auto database path case unexpectedly succeeded"
+assert_file_equals "$AUTO_DB_ROOT/expected/mmwx.db" "$AUTO_DB_ROOT/data/mmwx.db"
+assert_file_equals "$AUTO_DB_ROOT/expected/mmwx.db-wal" "$AUTO_DB_ROOT/data/mmwx.db-wal"
+assert_file_equals "$AUTO_DB_ROOT/expected/mmwx.db-shm" "$AUTO_DB_ROOT/data/mmwx.db-shm"
+grep -q "数据库事务快照: $AUTO_DB_ROOT/data/mmwx.db" "$AUTO_DB_ROOT/output.log" || fail "installer did not discover the live mmwx database"
 
 # Unknown systemd enable states are rejected before the installed files or service are touched.
 UNSUPPORTED_ROOT="$TEST_ROOT/unsupported-enable-state"

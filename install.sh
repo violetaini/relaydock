@@ -434,11 +434,55 @@ stop_service_for_transaction() {
     return 1
 }
 
-snapshot_database_after_stop() {
-    if [ -z "$DATABASE_PATH" ] && [ -f "$SERVICE_FILE" ]; then
-        DATABASE_PATH=$(sed -n 's/^Environment="DATABASE_PATH=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
+database_has_state() {
+    candidate=$1
+    [ -e "$candidate" ] || [ -e "$candidate-wal" ] || [ -e "$candidate-shm" ]
+}
+
+resolve_database_path() {
+    # ARCWAY_DATABASE_PATH is an explicit operator override and always wins.
+    if [ -n "$DATABASE_PATH" ]; then
+        return 0
     fi
-    DATABASE_PATH=${DATABASE_PATH:-$DATA_DIR/arcway.db}
+
+    service_working_dir=""
+    service_database=""
+    service_env_file=""
+    if [ -f "$SERVICE_FILE" ]; then
+        service_working_dir=$(sed -n 's/^WorkingDirectory=\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
+        service_database=$(sed -n 's/^Environment="DATABASE_PATH=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
+        service_env_file=$(sed -n 's/^EnvironmentFile=-\{0,1\}\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
+    fi
+    if [ -z "$service_database" ] && [ -n "$service_env_file" ] && [ -f "$service_env_file" ]; then
+        service_database=$(sed -n 's/^DATABASE_PATH=\(.*\)$/\1/p' "$service_env_file" | head -n 1)
+    fi
+    service_database=${service_database#\"}
+    service_database=${service_database%\"}
+
+    # The application historically opens data/mmwx.db relative to WorkingDirectory.
+    # Prefer a database that actually exists over legacy, unused DATABASE_PATH values.
+    for candidate in \
+        "${service_working_dir:+$service_working_dir/data/mmwx.db}" \
+        "$DATA_DIR/mmwx.db" \
+        "$DATA_DIR/data/mmwx.db" \
+        "$service_database"; do
+        if [ -n "$candidate" ] && database_has_state "$candidate"; then
+            DATABASE_PATH=$candidate
+            return 0
+        fi
+    done
+
+    if [ -n "$service_working_dir" ]; then
+        DATABASE_PATH="$service_working_dir/data/mmwx.db"
+    elif [ -n "$service_database" ]; then
+        DATABASE_PATH=$service_database
+    else
+        DATABASE_PATH="$DATA_DIR/data/mmwx.db"
+    fi
+}
+
+snapshot_database_after_stop() {
+    resolve_database_path
     case "$DATABASE_PATH" in
         /*) ;;
         *)
@@ -452,6 +496,8 @@ snapshot_database_after_stop() {
             return 1
             ;;
     esac
+
+    echo_info "数据库事务快照: $DATABASE_PATH"
 
     for tracked_path in "$DATABASE_PATH" "$DATABASE_PATH-wal" "$DATABASE_PATH-shm"; do
         UPDATE_TRACKED_PATHS+=("$tracked_path")
@@ -643,7 +689,7 @@ SyslogIdentifier=$SERVICE_NAME
 
 # 环境变量
 Environment="PORT=$PORT_INPUT"
-Environment="DATABASE_PATH=$DATA_DIR/arcway.db"
+Environment="DATABASE_PATH=$DATA_DIR/data/mmwx.db"
 Environment="LOG_LEVEL=info"
 Environment="ARCWAY_GUARD_ASSET_DIR=$GUARD_ASSET_DIR"
 Environment="ARCWAY_PANEL_IPS=$PANEL_SOURCE_IPS"
