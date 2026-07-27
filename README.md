@@ -240,6 +240,4 @@ systemctl restart arcway
 
 ## 许可与致谢
 
-RelayDock 基于 `violetaini/miaomiaowuX` 与 `iluobei/miaomiaowuX` 的公开代码继续开发，原项目的 MIT 许可与版权声明保留在 [LICENSE](LICENSE) 中。
-
-项目文档版式参考了 [Chitanda IP Site](https://github.com/violetaini/chitanda-ip-site)，安装说明的信息层级参考了 [3x-ui](https://github.com/MHSanaei/3x-ui) 和 [AdGuard Home](https://github.com/AdguardTeam/AdGuardHome)。
+RelayDock 基于 [iluobei/miaomiaowuX](https://github.com/iluobei/miaomiaowuX) 的公开代码继续开发，感谢原作者的开源工作。原项目的 MIT 许可与版权声明保留在 [LICENSE](LICENSE) 中。
