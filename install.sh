@@ -746,7 +746,7 @@ show_status() {
     echo "  查看状态: systemctl status $SERVICE_NAME"
     echo "  查看日志: journalctl -u $SERVICE_NAME -f"
     echo "  更新、重装与卸载: 请按项目 README 下载脚本后执行对应操作"
-    echo "  使用说明: https://github.com/${GITHUB_REPO}#更新重装与卸载"
+    echo "  使用说明: https://github.com/${GITHUB_REPO}#更新已安装的-relaydock"
     echo ""
     echo "⚠️  首次访问需要完成初始化配置"
     echo ""

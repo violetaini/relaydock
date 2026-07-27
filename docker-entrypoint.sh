@@ -26,17 +26,15 @@ mkdir -p /app/data /app/subscribes /app/rule_templates
 echo "Fixing permissions for mounted volumes..."
 chown -R appuser:appuser /app/data /app/subscribes /app/rule_templates
 
-# Check if an updated binary exists in the data directory (from in-app update)
+# Docker updates are image-based. Older releases could leave an in-app updated
+# binary in the persistent data volume; never let it override a newly pulled image.
 UPDATED_SERVER="/app/data/server"
 ORIGINAL_SERVER="/app/server"
 
 if [ -f "$UPDATED_SERVER" ] && [ -x "$UPDATED_SERVER" ]; then
-    echo "Found updated server binary at $UPDATED_SERVER, using it..."
-    SERVER_BINARY="$UPDATED_SERVER"
-else
-    echo "Using original server binary..."
-    SERVER_BINARY="$ORIGINAL_SERVER"
+    echo "Ignoring legacy updated binary at $UPDATED_SERVER; Docker uses the image binary."
 fi
+SERVER_BINARY="$ORIGINAL_SERVER"
 
 # Set DOCKER environment variable for in-app update detection
 export DOCKER=1

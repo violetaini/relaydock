@@ -10,7 +10,7 @@
 
 多服务器 Xray 节点、用户授权与订阅管理面板
 
-[功能](#核心功能) · [快速安装](#快速安装) · [Docker](#docker) · [源码构建](#源码构建) · [前端项目](https://github.com/violetaini/relaydock-frontend)
+[功能](#核心功能) · [快速安装](#快速安装) · [更新](#更新已安装的-relaydock) · [Docker](#docker) · [源码构建](#源码构建) · [前端项目](https://github.com/violetaini/relaydock-frontend)
 </div>
 
 RelayDock 面向合租节点和小型代理服务运营场景。管理员集中接入服务器、授权用户可使用的服务器与有效期；用户在授权范围内自助创建节点，面板统一处理订阅、流量、限速和生命周期。
@@ -67,17 +67,9 @@ http://SERVER_IP:12889
 curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo env PORT=18080 bash
 ```
 
-### 更新、重装与卸载
+### 重装与卸载
 
-以下命令采用安全的非交互默认值：更新和重装保留当前端口，卸载保留 `/etc/arcway` 数据。
-
-更新到最新 Release：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash -s -- update
-```
-
-覆盖重装会保留现有数据和当前 systemd 端口。执行前仍应先备份：
+以下命令采用安全的非交互默认值：重装保留当前端口，卸载保留 `/etc/arcway` 数据。覆盖重装前仍应先备份：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash -s -- reinstall
@@ -102,6 +94,47 @@ systemctl status arcway
 journalctl -u arcway -f
 systemctl restart arcway
 ```
+
+## 更新已安装的 RelayDock
+
+更新前请先在面板下载一份加密备份，并阅读目标版本的 Release Notes。不要用仅包含旧程序的 `.bak` 文件代替数据备份。
+
+### 面板一键更新（裸机 / systemd）
+
+管理员进入 **系统设置 → 系统更新**，依次点击 **检查更新** 和 **立即更新**。面板会下载与当前系统架构匹配的最新 GitHub Release，校验控制端及守卫程序的 SHA-256 和可执行文件架构，全部验证通过后才备份、原子替换并重启；更新期间页面会短暂断开，服务恢复后重新加载即可。
+
+从不含“系统更新”入口的旧版本首次升级到 `v0.5.1` 或更高版本时，需要先执行下方的裸机命令行更新。升级完成后，后续版本即可直接在面板操作。
+
+网页一键更新仅用于裸机或 systemd 安装。Docker 容器必须按下方 Compose 方式更新镜像，面板不会在容器内应用更新。
+
+### 裸机命令行更新
+
+通过一键安装脚本部署的实例也可以执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash -s -- update
+```
+
+安装器会保留当前端口和 `/etc/arcway` 数据。它会先下载并校验新版本，再停止服务并建立事务快照；更新过程失败或新服务无法启动时，会尝试恢复原二进制、systemd 配置和数据库。
+
+### Docker Compose 更新
+
+进入最初保存 `docker-compose.yml` 的目录后执行：
+
+```bash
+docker compose pull
+docker compose up -d
+docker compose ps
+docker compose logs --tail=100 arcway
+```
+
+Compose 会重新创建容器，但 `./data` 挂载目录不会被删除。需要回退镜像时，将 `docker-compose.yml` 中的 `latest` 改为上一个可用版本标签，再执行 `docker compose pull && docker compose up -d`。
+
+### 外置前端与回滚
+
+如果配置了 `ARCWAY_WEB_ROOT`，上述面板或命令行更新只会更新后端以及二进制内嵌的备用页面，不会替换外置前端。外置前端仍需使用[前端快速发布](#前端快速发布)脚本独立更新或回滚。
+
+面板更新会为控制端和守卫程序分别留下 `.bak`。它能在文件替换失败或新程序无法执行时立即恢复，但新程序已经执行后才因配置、端口或数据库问题退出，仍需管理员按 systemd 日志手工回退。默认控制端备份路径为 `/usr/local/bin/arcway.bak`，自定义安装路径以 systemd 的 `ExecStart` 为准。版本升级可能包含数据库迁移，因此在更新成功后又决定降级时，应同时恢复更新前的数据备份，不能只替换旧二进制。操作前先停止 `arcway` 服务，并保留当前文件以便排查。
 
 ## Docker
 
