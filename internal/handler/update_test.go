@@ -153,6 +153,49 @@ func TestPopulateUpdateEnvironmentDisablesIncompleteGuardRelease(t *testing.T) {
 	}
 }
 
+func TestPopulateAgentEnvironment(t *testing.T) {
+	base := detectUpdateEnvironment(false, "")
+	withoutDir := populateAgentEnvironment(base, "")
+	if withoutDir.UpdateScope != updateScopeControlPlane || !withoutDir.CanApply {
+		t.Fatalf("unexpected environment without agent dir: %+v", withoutDir)
+	}
+	if !strings.Contains(withoutDir.Warning, "Agent 资产目录") {
+		t.Fatalf("missing Agent warning: %q", withoutDir.Warning)
+	}
+
+	withEmptyDir := populateAgentEnvironment(base, t.TempDir())
+	if withEmptyDir.UpdateScope != updateScopeFull || !withEmptyDir.CanApply {
+		t.Fatalf("unexpected environment with agent dir: %+v", withEmptyDir)
+	}
+	if !strings.Contains(withEmptyDir.Warning, "将在本次更新中补齐") {
+		t.Fatalf("missing Agent repair warning: %q", withEmptyDir.Warning)
+	}
+
+	withRelativeDir := populateAgentEnvironment(base, "relative/agents")
+	if withRelativeDir.CanApply || withRelativeDir.UpdateScope != updateScopeNone {
+		t.Fatalf("relative Agent path remained applicable: %+v", withRelativeDir)
+	}
+}
+
+func TestPopulateUpdateEnvironmentDisablesIncompleteAgentRelease(t *testing.T) {
+	info := &UpdateInfo{
+		DownloadURL:   "https://github.com/violetaini/relaydock/releases/download/v1.2.3/arcway-linux-amd64",
+		agentAssetDir: "/opt/arcway/agent-assets",
+		missingAgents: []string{"mmw-agent-linux-arm64"},
+	}
+	populateUpdateEnvironment(info, updateEnvironment{
+		DeploymentMode: updateDeploymentStandalone,
+		UpdateScope:    updateScopeFull,
+		CanApply:       true,
+	})
+	if info.CanApply {
+		t.Fatal("incomplete Agent release remained applicable")
+	}
+	if !strings.Contains(info.Warning, "版本不一致") {
+		t.Fatalf("unexpected warning: %q", info.Warning)
+	}
+}
+
 func TestUpdateHandlersRejectWrongMethodWithoutNetwork(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -334,6 +377,24 @@ func TestSelectBothGuardReleaseAssets(t *testing.T) {
 		assetURL, digest, err := selectReleaseAsset(release, asset.Name)
 		if err != nil || assetURL == "" || len(digest) != 64 {
 			t.Fatalf("guard asset %s not selectable: url=%q digest=%q err=%v", asset.Name, assetURL, digest, err)
+		}
+	}
+}
+
+func TestSelectBothAgentReleaseAssets(t *testing.T) {
+	release := GitHubRelease{TagName: "v1.2.3"}
+	for _, arch := range []string{"amd64", "arm64"} {
+		name := "mmw-agent-linux-" + arch
+		release.Assets = append(release.Assets, GitHubReleaseAsset{
+			Name:               name,
+			BrowserDownloadURL: "https://github.com/violetaini/relaydock/releases/download/v1.2.3/" + name,
+			Digest:             "sha256:" + strings.Repeat(arch[:1], 64),
+		})
+	}
+	for _, asset := range release.Assets {
+		assetURL, digest, err := selectReleaseAsset(release, asset.Name)
+		if err != nil || assetURL == "" || len(digest) != 64 {
+			t.Fatalf("Agent asset %s not selectable: url=%q digest=%q err=%v", asset.Name, assetURL, digest, err)
 		}
 	}
 }

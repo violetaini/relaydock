@@ -366,6 +366,7 @@ func (h *RemoteManageHandler) HandleSetupSSL(w http.ResponseWriter, r *http.Requ
 		"domain":        domain,
 		"nginx_config":  string(nginxConf),
 		"domain_config": domainConf,
+		"nginx_mode":    normalizedRemoteNginxMode(server),
 	})
 	if marshalErr != nil {
 		remoteWriteError(w, http.StatusInternalServerError, fmt.Sprintf("序列化 nginx 配置失败: %v", marshalErr))

@@ -3,7 +3,9 @@ package handler
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,17 +31,32 @@ var randReader io.Reader = rand.Reader
 // base64URLEncoding 用于 URL 安全的 base64 编码
 var base64URLEncoding = base64.URLEncoding
 
+// The Agent hard-stops its detached cleanup runner no later than 360 seconds
+// after dispatch. Keep one additional minute for dispatch, scheduling and the
+// final callback request so a completed uninstall cannot become an orphaned
+// panel record merely because the panel stopped waiting too early.
+const agentUninstallCallbackWaitTimeout = 7 * time.Minute
+const remoteServerDeleteLeaseAcquireTimeout = 60 * time.Second
+const agentUninstallPreDispatchTimeout = 2 * time.Minute
+const remoteServerDeleteCommitTimeout = 15 * time.Second
+
+const AgentUninstallCompletePath = "/api/remote/agent/uninstall-complete"
+
 type XrayServerHandler struct {
-	repo              *storage.TrafficRepository
-	collector         *traffic.Collector
-	limiterPusher     *LimiterConfigPusher
-	remoteManager     *RemoteManageHandler
-	wsHandler         *RemoteWSHandler
-	crypto            *CryptoConfig
-	capabilityManager *capabilities.Manager
-	ddnsManager       *ddns.Manager
-	managementProbeMu sync.Mutex
-	managementProbes  map[int64]time.Time
+	repo                     *storage.TrafficRepository
+	collector                *traffic.Collector
+	limiterPusher            *LimiterConfigPusher
+	remoteManager            *RemoteManageHandler
+	wsHandler                *RemoteWSHandler
+	crypto                   *CryptoConfig
+	capabilityManager        *capabilities.Manager
+	ddnsManager              *ddns.Manager
+	managementProbeMu        sync.Mutex
+	managementProbes         map[int64]time.Time
+	agentUninstallMu         sync.Mutex
+	agentUninstallPending    map[string]*agentUninstallPending
+	agentUninstallTimeout    time.Duration
+	serverDeleteLeaseTimeout time.Duration
 }
 
 func (h *XrayServerHandler) SetWSHandler(ws *RemoteWSHandler) {
@@ -52,10 +69,13 @@ func (h *XrayServerHandler) SetDDNSManager(m *ddns.Manager) {
 
 func NewXrayServerHandler(repo *storage.TrafficRepository, collector *traffic.Collector, crypto *CryptoConfig) *XrayServerHandler {
 	return &XrayServerHandler{
-		repo:             repo,
-		collector:        collector,
-		crypto:           crypto,
-		managementProbes: make(map[int64]time.Time),
+		repo:                     repo,
+		collector:                collector,
+		crypto:                   crypto,
+		managementProbes:         make(map[int64]time.Time),
+		agentUninstallPending:    make(map[string]*agentUninstallPending),
+		agentUninstallTimeout:    agentUninstallCallbackWaitTimeout,
+		serverDeleteLeaseTimeout: remoteServerDeleteLeaseAcquireTimeout,
 	}
 }
 
@@ -90,6 +110,7 @@ type RemoteServerCreateRequest struct {
 	Domain            string `json:"domain"`              // 服务器域（443模式）
 	Use443            bool   `json:"use_443"`             // 使用 443 端口与 nginx 隧道
 	StealMode         string `json:"steal_mode"`          // "tunnel" | "fallback"，默认 tunnel
+	NginxMode         string `json:"nginx_mode"`          // "managed" | "reuse_existing"
 	SiteType          string `json:"site_type"`           // "static" | "proxy"
 	SiteValue         string `json:"site_value"`          // 静态路径或反向代理地址
 	XrayMode          string `json:"xray_mode"`           // "external" 或 "embedded"，默认 "external"
@@ -106,6 +127,7 @@ type RemoteServerCreateRequest struct {
 type RemoteServerResponse struct {
 	Success        bool                  `json:"success"`
 	Message        string                `json:"message"`
+	DeletionStatus string                `json:"deletion_status,omitempty"`
 	Server         *storage.RemoteServer `json:"server,omitempty"`
 	InstallCommand string                `json:"install_command,omitempty"`
 	IsLocal        bool                  `json:"is_local,omitempty"`
@@ -123,10 +145,11 @@ type RemoteServerInboundInfo struct {
 // RemoteServerExtended 表示具有附加流量和入站信息的远程服务器
 type RemoteServerExtended struct {
 	storage.RemoteServer
-	TrafficUsed int64                     `json:"traffic_used"`
-	Inbounds    []RemoteServerInboundInfo `json:"inbounds"`
-	Encrypted   bool                      `json:"encrypted"`
-	WsConnected bool                      `json:"ws_connected"`
+	TrafficUsed      int64                     `json:"traffic_used"`
+	Inbounds         []RemoteServerInboundInfo `json:"inbounds"`
+	Encrypted        bool                      `json:"encrypted"`
+	WsConnected      bool                      `json:"ws_connected"`
+	AgentUninstallV2 *bool                     `json:"agent_uninstall_v2,omitempty"`
 }
 
 // RemoteServersListResponse 表示所有远程服务器的响应
@@ -138,7 +161,27 @@ type RemoteServersListResponse struct {
 
 // RemoteServerDeleteRequest 表示删除远程服务器的请求
 type RemoteServerDeleteRequest struct {
-	ID int64 `json:"id"`
+	ID             int64 `json:"id"`
+	UninstallAgent bool  `json:"uninstall_agent,omitempty"`
+}
+
+type RemoteServerDeleteImpactServer struct {
+	ID               int64  `json:"id"`
+	Name             string `json:"name"`
+	Ownership        string `json:"ownership"`
+	Online           bool   `json:"online"`
+	AgentUninstallV2 *bool  `json:"agent_uninstall_v2"`
+	XrayMode         string `json:"xray_mode"`
+	WarpInstalled    bool   `json:"warp_installed"`
+}
+
+type RemoteServerDeleteImpactResponse struct {
+	Success      bool                              `json:"success"`
+	Message      string                            `json:"message,omitempty"`
+	Server       RemoteServerDeleteImpactServer    `json:"server"`
+	Counts       storage.RemoteServerDeleteCounts  `json:"counts"`
+	Blocker      *string                           `json:"blocker"`
+	DeletionTask *storage.RemoteServerDeletionTask `json:"deletion_task,omitempty"`
 }
 
 // RemoteServerUpdateRequest 表示更新远程服务器的请求
@@ -155,6 +198,7 @@ type RemoteServerUpdateRequest struct {
 	PullPort         int    `json:"pull_port"`
 	PullToken        string `json:"pull_token"`
 	XrayMode         string `json:"xray_mode"`
+	NginxMode        string `json:"nginx_mode"`
 	TrafficStatsMode string `json:"traffic_stats_mode"` // both | upload | download
 	TrafficSource    string `json:"traffic_source"`     // xray | system
 	IPv6Enabled      *bool  `json:"ipv6_enabled"`       // 指针:nil=不改;false=关闭(服务管理不显示 v6、加节点不可选 v6)
@@ -214,6 +258,11 @@ func (h *XrayServerHandler) BuildRemoteServersList(ctx context.Context) RemoteSe
 		if h.wsHandler != nil {
 			extended.Encrypted = h.wsHandler.IsConnectionEncrypted(server.Token)
 			extended.WsConnected = h.wsHandler.IsConnected(server.Token)
+			if connection, connected := h.wsHandler.GetConnectionByServerID(server.ID); connected &&
+				server.Status == storage.RemoteServerStatusConnected && !server.IsFederated {
+				capable := connection.Capabilities.AgentUninstallV2
+				extended.AgentUninstallV2 = &capable
+			}
 		}
 
 		trafficUsed, _ := h.repo.GetServerTrafficUsed(ctx, server.ID)
@@ -483,6 +532,9 @@ func (h *XrayServerHandler) buildRemoteInstallCommand(r *stdhttp.Request, server
 		installQuery.Set("steal_self", "1")
 		installQuery.Set("front_service", frontService)
 	}
+	if server.NginxMode == "reuse_existing" {
+		installQuery.Set("nginx_mode", "reuse_existing")
+	}
 	if server.XrayMode == "embedded" {
 		installQuery.Set("xray_mode", "embedded")
 	}
@@ -582,6 +634,16 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(stdhttp.StatusBadRequest)
 		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "Tunnel/Fallback 接管模式必须填写节点域名"})
+		return
+	}
+	nginxMode := strings.TrimSpace(req.NginxMode)
+	if nginxMode == "" {
+		nginxMode = "managed"
+	}
+	if nginxMode != "managed" && nginxMode != "reuse_existing" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusBadRequest)
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "Nginx 模式必须为 managed 或 reuse_existing"})
 		return
 	}
 	mmwxDomain := getDomainFromMasterURL(h.repo, ctx)
@@ -743,6 +805,7 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		Use443:            stealSelf,
 		StealSelf:         stealSelf,
 		StealMode:         stealMode,
+		NginxMode:         nginxMode,
 		SiteType:          req.SiteType,
 		SiteValue:         req.SiteValue,
 		XrayMode:          xrayMode,
@@ -813,6 +876,46 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	})
 }
 
+type remoteServerExclusiveLeaseResult struct {
+	ctx     context.Context
+	release func()
+	err     error
+}
+
+func (h *XrayServerHandler) acquireRemoteServerExclusiveLease(parent context.Context, serverID int64) (context.Context, func(), error) {
+	timeout := h.serverDeleteLeaseTimeout
+	if timeout <= 0 {
+		timeout = remoteServerDeleteLeaseAcquireTimeout
+	}
+	acquireCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	resultCh := make(chan remoteServerExclusiveLeaseResult, 1)
+	keepLease := make(chan bool, 1)
+	go func() {
+		ctx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(acquireCtx, serverID)
+		resultCh <- remoteServerExclusiveLeaseResult{ctx: ctx, release: release, err: err}
+		if err == nil && release != nil && !<-keepLease {
+			release()
+		}
+	}()
+
+	select {
+	case result := <-resultCh:
+		keepLease <- result.err == nil
+		cancel()
+		if result.err != nil {
+			return nil, nil, result.err
+		}
+		// Strip only the acquisition deadline while retaining the repository's
+		// lease marker in Context values for reentrant nested mutations.
+		return context.WithoutCancel(result.ctx), result.release, nil
+	case <-acquireCtx.Done():
+		keepLease <- false
+		err := acquireCtx.Err()
+		cancel()
+		return nil, nil, err
+	}
+}
+
 // 通过 ID 删除远程服务器
 func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	if r.Method != "POST" {
@@ -822,25 +925,43 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 
 	var req RemoteServerDeleteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(RemoteServerResponse{
-			Success: false,
-			Message: "无效的请求参数",
-		})
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadRequest, "无效的请求参数")
 		return
 	}
 
 	if req.ID <= 0 {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(RemoteServerResponse{
-			Success: false,
-			Message: "无效的服务器ID",
-		})
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadRequest, "无效的服务器ID")
 		return
 	}
+	server, err := h.repo.GetRemoteServer(r.Context(), req.ID)
+	if err != nil {
+		if errors.Is(err, storage.ErrRemoteServerNotFound) {
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusNotFound, "服务器不存在")
+			return
+		}
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "读取服务器失败")
+		return
+	}
+	_, federatedErr := h.repo.GetFederatedServer(r.Context(), server.ID)
+	if federatedErr == nil {
+		// A shared server is only a local subscription to another panel's
+		// resource. Its owner remains solely responsible for the remote Agent.
+		h.deleteRemoteServerRecord(w, r.Context(), req.ID, "共享服务器接入关系及本地关联数据已删除")
+		return
+	}
+	if !errors.Is(federatedErr, storage.ErrFederatedServerNotFound) {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "无法确认服务器所有权")
+		return
+	}
+	if !req.UninstallAgent {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadRequest, "删除自有服务器必须同时卸载远端 Agent")
+		return
+	}
+	h.uninstallAgentAndDeleteRemoteServer(w, r, req.ID)
+}
 
-	ctx := r.Context()
-	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, req.ID)
+func (h *XrayServerHandler) deleteRemoteServerRecord(w stdhttp.ResponseWriter, parent context.Context, serverID int64, successMessage string) {
+	leasedCtx, release, err := h.acquireRemoteServerExclusiveLease(parent, serverID)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		if errors.Is(err, storage.ErrRemoteInstallationActive) {
@@ -851,6 +972,11 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			})
 			return
 		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			w.WriteHeader(stdhttp.StatusGatewayTimeout)
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "服务器仍有管理操作进行中，删除等待超时"})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(RemoteServerResponse{
 			Success: false,
 			Message: "删除服务器失败",
@@ -858,8 +984,9 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		return
 	}
 	defer release()
-	ctx = leasedCtx
-	if err := h.repo.DeleteRemoteServer(ctx, req.ID); err != nil {
+	commitCtx, cancelCommit := context.WithTimeout(leasedCtx, remoteServerDeleteCommitTimeout)
+	defer cancelCommit()
+	if err := h.repo.DeleteRemoteServer(commitCtx, serverID); err != nil {
 		msg := "删除服务器失败"
 		if errors.Is(err, storage.ErrRemoteServerNotFound) {
 			msg = "服务器不存在"
@@ -879,17 +1006,664 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		})
 		return
 	}
-
-	// 删后清掉该 server 的 inbound 内存缓存,避免残留(否则同 id 复用时会读到旧 inbound 数据)。
-	if h.remoteManager != nil && h.remoteManager.inboundCache != nil {
-		h.remoteManager.inboundCache.Invalidate(req.ID)
-	}
+	h.invalidateDeletedRemoteServer(serverID)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(RemoteServerResponse{
 		Success: true,
-		Message: "服务器已删除",
+		Message: successMessage,
 	})
+}
+
+// GetRemoteServerDeleteImpact returns the exact local records affected by the
+// delete transaction and the current remote-uninstall preconditions. It never
+// mutates the Agent or panel data.
+func (h *XrayServerHandler) GetRemoteServerDeleteImpact(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	if r.Method != stdhttp.MethodGet {
+		stdhttp.Error(w, "Method not allowed", stdhttp.StatusMethodNotAllowed)
+		return
+	}
+	serverID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("server_id")), 10, 64)
+	if err != nil || serverID <= 0 {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadRequest, "无效的服务器ID")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	server, err := h.repo.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		if errors.Is(err, storage.ErrRemoteServerNotFound) {
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusNotFound, "服务器不存在")
+			return
+		}
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "读取服务器失败")
+		return
+	}
+	counts, err := h.repo.GetRemoteServerDeleteCounts(ctx, serverID)
+	if err != nil {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "统计删除影响失败")
+		return
+	}
+	response := RemoteServerDeleteImpactResponse{
+		Success: true,
+		Server: RemoteServerDeleteImpactServer{
+			ID: server.ID, Name: server.Name, Ownership: "owned",
+			Online:   server.Status == storage.RemoteServerStatusConnected,
+			XrayMode: server.XrayMode, WarpInstalled: server.WarpInstalled,
+		},
+		Counts: counts,
+	}
+	if task, taskErr := h.repo.GetRemoteServerDeletionTask(ctx, serverID); taskErr == nil {
+		response.DeletionTask = task
+	} else if !errors.Is(taskErr, storage.ErrRemoteServerDeletionTaskNotFound) {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "读取删除任务失败")
+		return
+	}
+	if _, fedErr := h.repo.GetFederatedServer(ctx, serverID); fedErr == nil {
+		response.Server.Ownership = "shared"
+	} else if !errors.Is(fedErr, storage.ErrFederatedServerNotFound) {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "无法确认服务器所有权")
+		return
+	}
+	if err := h.repo.ValidateRemoteServerDeletion(ctx, serverID); err != nil {
+		message := "服务器暂不能安全删除: " + err.Error()
+		switch {
+		case errors.Is(err, storage.ErrForwardingConflict):
+			message = "服务器仍被转发模板、转发规则或端口分配使用，请先移除相关配置"
+		case errors.Is(err, storage.ErrRemoteInstallationActive):
+			message = "服务器正在安装，暂不能删除"
+		}
+		response.Blocker = &message
+	}
+	confirmed := response.DeletionTask != nil && response.DeletionTask.Status == storage.RemoteServerDeletionAgentUninstalled
+	inProgress := response.DeletionTask != nil && response.DeletionTask.ExpiresAt.After(time.Now().UTC()) &&
+		(response.DeletionTask.Status == storage.RemoteServerDeletionDispatched ||
+			(response.DeletionTask.Status == storage.RemoteServerDeletionPending && response.DeletionTask.CleanupID != ""))
+	if response.Server.Ownership == "owned" && response.Blocker == nil && !confirmed && !inProgress {
+		if !response.Server.Online {
+			message := "Agent 当前不在线，无法确认并执行完整卸载"
+			response.Blocker = &message
+		} else {
+			capable, capabilityErr := h.agentSupportsSafeUninstall(ctx, serverID)
+			if capabilityErr != nil {
+				message := "无法确认 Agent 的安全卸载能力: " + capabilityErr.Error()
+				response.Blocker = &message
+			} else {
+				response.Server.AgentUninstallV2 = &capable
+				if !capable {
+					message := "Agent 版本或运行环境不支持安全卸载，请先升级 Agent"
+					response.Blocker = &message
+				}
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+type remoteRemovalAcknowledgement struct {
+	Success          bool   `json:"success"`
+	Installed        *bool  `json:"installed"`
+	Uninstalled      bool   `json:"uninstalled"`
+	DispatchVerified bool   `json:"dispatch_verified"`
+	CleanupID        string `json:"cleanup_id"`
+	Message          string `json:"message"`
+	Error            string `json:"error"`
+}
+
+type agentUninstallDispatchRequest struct {
+	CallbackURL   string `json:"callback_url"`
+	CallbackToken string `json:"callback_token"`
+}
+
+type agentUninstallCallback struct {
+	Success   bool   `json:"success"`
+	CleanupID string `json:"cleanup_id"`
+	Error     string `json:"error,omitempty"`
+}
+
+type agentUninstallPending struct {
+	serverID int64
+	done     chan agentUninstallCallback
+
+	mu                sync.Mutex
+	expectedCleanupID string
+	active            bool
+	completed         bool
+}
+
+func (p *agentUninstallPending) setExpectedCleanupID(cleanupID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.active {
+		return errors.New("uninstall callback has expired")
+	}
+	cleanupID = strings.TrimSpace(cleanupID)
+	if cleanupID == "" {
+		return errors.New("cleanup id is required")
+	}
+	if p.expectedCleanupID != "" && p.expectedCleanupID != cleanupID {
+		return errors.New("cleanup id changed after dispatch")
+	}
+	p.expectedCleanupID = cleanupID
+	return nil
+}
+
+func (p *agentUninstallPending) accept(callback agentUninstallCallback) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.active {
+		return errors.New("uninstall callback has expired")
+	}
+	if p.completed {
+		return errors.New("uninstall callback was already consumed")
+	}
+	callback.CleanupID = strings.TrimSpace(callback.CleanupID)
+	if callback.CleanupID == "" {
+		return errors.New("cleanup id is required")
+	}
+	if p.expectedCleanupID != "" && callback.CleanupID != p.expectedCleanupID {
+		return errors.New("cleanup id does not match the pending uninstall")
+	}
+	p.completed = true
+	p.done <- callback
+	return nil
+}
+
+func (h *XrayServerHandler) registerAgentUninstall(serverID int64) (string, *agentUninstallPending, error) {
+	if serverID <= 0 || h.repo == nil {
+		return "", nil, errors.New("server id is required")
+	}
+	for attempt := 0; attempt < 4; attempt++ {
+		var raw [32]byte
+		if _, err := randRead(raw[:]); err != nil {
+			return "", nil, fmt.Errorf("generate uninstall callback token: %w", err)
+		}
+		// The Agent contract accepts URL-safe unpadded bearer tokens. Keep this
+		// separate from generateSecureToken so existing padded tokens remain
+		// byte-for-byte compatible with already installed nodes.
+		token := base64.RawURLEncoding.EncodeToString(raw[:])
+		tokenHash := agentUninstallTokenHash(token)
+		pending := &agentUninstallPending{serverID: serverID, done: make(chan agentUninstallCallback, 1), active: true}
+		h.agentUninstallMu.Lock()
+		if h.agentUninstallPending == nil {
+			h.agentUninstallPending = make(map[string]*agentUninstallPending)
+		}
+		_, exists := h.agentUninstallPending[token]
+		h.agentUninstallMu.Unlock()
+		if exists {
+			continue
+		}
+		expiresAt := time.Now().UTC().Add(agentUninstallCallbackWaitTimeout + 3*time.Minute)
+		if _, err := h.repo.CreateRemoteServerDeletionTask(context.Background(), serverID, tokenHash, expiresAt); err != nil {
+			return "", nil, err
+		}
+		h.agentUninstallMu.Lock()
+		h.agentUninstallPending[token] = pending
+		h.agentUninstallMu.Unlock()
+		return token, pending, nil
+	}
+	return "", nil, errors.New("could not allocate a unique uninstall callback token")
+}
+
+func agentUninstallTokenHash(token string) string {
+	digest := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(digest[:])
+}
+
+func (h *XrayServerHandler) unregisterAgentUninstall(token string, pending *agentUninstallPending) {
+	h.agentUninstallMu.Lock()
+	if current := h.agentUninstallPending[token]; current == pending {
+		pending.mu.Lock()
+		pending.active = false
+		pending.mu.Unlock()
+		delete(h.agentUninstallPending, token)
+	}
+	h.agentUninstallMu.Unlock()
+}
+
+// HandleAgentUninstallComplete accepts the Agent's one-time completion proof.
+// It deliberately sits outside admin authentication: possession of the
+// high-entropy, operation-scoped bearer token is the only callback credential.
+func (h *XrayServerHandler) HandleAgentUninstallComplete(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	if r.Method != stdhttp.MethodPost {
+		stdhttp.Error(w, "Method not allowed", stdhttp.StatusMethodNotAllowed)
+		return
+	}
+	const bearerPrefix = "Bearer "
+	authorization := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authorization, bearerPrefix) {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusUnauthorized, "invalid uninstall callback credential")
+		return
+	}
+	token := strings.TrimPrefix(authorization, bearerPrefix)
+	decodedToken, decodeErr := base64.RawURLEncoding.DecodeString(token)
+	if strings.TrimSpace(token) != token || decodeErr != nil || len(decodedToken) != 32 {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusUnauthorized, "invalid uninstall callback credential")
+		return
+	}
+
+	decoder := json.NewDecoder(stdhttp.MaxBytesReader(w, r.Body, 4<<10))
+	decoder.DisallowUnknownFields()
+	var callback agentUninstallCallback
+	if err := decoder.Decode(&callback); err != nil {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadRequest, "invalid uninstall callback")
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadRequest, "invalid uninstall callback")
+		return
+	}
+	if !validAgentUninstallCleanupID(strings.TrimSpace(callback.CleanupID)) {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadRequest, "invalid cleanup id")
+		return
+	}
+	callbackCtx, cancel := context.WithTimeout(context.Background(), remoteServerDeleteCommitTimeout)
+	defer cancel()
+	task, err := h.repo.ConsumeRemoteServerDeletionCallback(
+		callbackCtx, agentUninstallTokenHash(token), strings.TrimSpace(callback.CleanupID), callback.Success, callback.Error,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrRemoteServerDeletionTokenInvalid), errors.Is(err, storage.ErrRemoteServerDeletionTokenExpired):
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusUnauthorized, "invalid or expired uninstall callback credential")
+		case errors.Is(err, storage.ErrRemoteServerDeletionCallbackUsed), errors.Is(err, storage.ErrRemoteServerDeletionCleanupID):
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusConflict, err.Error())
+		default:
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "could not persist uninstall callback")
+		}
+		return
+	}
+	h.agentUninstallMu.Lock()
+	pending := h.agentUninstallPending[token]
+	h.agentUninstallMu.Unlock()
+	if pending != nil {
+		if notifyErr := pending.accept(callback); notifyErr != nil {
+			// The durable task is authoritative. A failed in-memory notification
+			// must not ask the Agent to replay its one-time callback.
+			log.Printf("[Agent Uninstall] persisted callback for server %d but could not notify waiter: %v", task.ServerID, notifyErr)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "received": true})
+	if pending == nil && callback.Success {
+		go h.finalizeConfirmedRemoteServerDeletion(task.ServerID)
+	}
+}
+
+func validAgentUninstallCleanupID(cleanupID string) bool {
+	if len(cleanupID) != 32 {
+		return false
+	}
+	for _, c := range cleanupID {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func remoteRemovalMessage(ack remoteRemovalAcknowledgement, fallback string) string {
+	if message := strings.TrimSpace(ack.Error); message != "" {
+		return message
+	}
+	if message := strings.TrimSpace(ack.Message); message != "" {
+		return message
+	}
+	return fallback
+}
+
+func writeRemoteServerDeleteFailure(w stdhttp.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: message})
+}
+
+func (h *XrayServerHandler) invalidateDeletedRemoteServer(serverID int64) {
+	if h.remoteManager != nil && h.remoteManager.inboundCache != nil {
+		h.remoteManager.inboundCache.Invalidate(serverID)
+	}
+}
+
+func (h *XrayServerHandler) finalizeConfirmedRemoteServerDeletion(serverID int64) {
+	if h == nil || h.repo == nil || serverID <= 0 {
+		return
+	}
+	ctx, release, err := h.acquireRemoteServerExclusiveLease(context.Background(), serverID)
+	if err != nil {
+		_ = h.repo.SetRemoteServerDeletionTaskError(context.Background(), serverID, "Agent 已卸载，等待删除面板记录: "+err.Error())
+		return
+	}
+	defer release()
+	task, err := h.repo.GetRemoteServerDeletionTask(ctx, serverID)
+	if err != nil || task.Status != storage.RemoteServerDeletionAgentUninstalled {
+		return
+	}
+	deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), remoteServerDeleteCommitTimeout)
+	defer cancel()
+	if err := h.repo.DeleteRemoteServer(deleteCtx, serverID); err != nil {
+		if !errors.Is(err, storage.ErrRemoteServerNotFound) {
+			_ = h.repo.SetRemoteServerDeletionTaskError(context.Background(), serverID, "Agent 已卸载，等待删除面板记录: "+err.Error())
+			log.Printf("[Agent Uninstall] server %d cleanup confirmed but panel deletion failed: %v", serverID, err)
+		}
+		return
+	}
+	h.invalidateDeletedRemoteServer(serverID)
+}
+
+func (h *XrayServerHandler) deleteConfirmedRemoteServer(w stdhttp.ResponseWriter, ctx context.Context, serverID int64) {
+	deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), remoteServerDeleteCommitTimeout)
+	defer cancel()
+	if err := h.repo.DeleteRemoteServer(deleteCtx, serverID); err != nil {
+		writeRemoteServerDeleteFailureWithStatus(w, stdhttp.StatusInternalServerError,
+			"远端 Agent 已完成清理，但删除面板记录失败，记录已保留: "+err.Error(),
+			storage.RemoteServerDeletionAgentUninstalled)
+		return
+	}
+	h.invalidateDeletedRemoteServer(serverID)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: true, Message: "远端 Agent 已完成清理，服务器记录已删除"})
+}
+
+func writeRemoteServerDeleteFailureWithStatus(w stdhttp.ResponseWriter, status int, message, deletionStatus string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: message, DeletionStatus: deletionStatus})
+}
+
+func (h *XrayServerHandler) waitForPersistedRemoteServerDeletion(w stdhttp.ResponseWriter, ctx context.Context, serverID int64, expiresAt time.Time) {
+	timeout := h.agentUninstallTimeout
+	if timeout <= 0 {
+		timeout = agentUninstallCallbackWaitTimeout
+	}
+	if remaining := time.Until(expiresAt); remaining > 0 && remaining < timeout {
+		timeout = remaining
+	}
+	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-waitCtx.Done():
+			writeRemoteServerDeleteFailureWithStatus(w, stdhttp.StatusGatewayTimeout, "等待 Agent 完成卸载超时，服务器记录已保留", storage.RemoteServerDeletionDispatched)
+			return
+		default:
+		}
+		task, err := h.repo.GetRemoteServerDeletionTask(waitCtx, serverID)
+		if errors.Is(err, storage.ErrRemoteServerDeletionTaskNotFound) {
+			if _, serverErr := h.repo.GetRemoteServer(waitCtx, serverID); errors.Is(serverErr, storage.ErrRemoteServerNotFound) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: true, Message: "服务器已删除"})
+				return
+			}
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusConflict, "卸载任务状态丢失，服务器记录已保留")
+			return
+		}
+		if err != nil {
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "读取 Agent 卸载任务失败")
+			return
+		}
+		switch task.Status {
+		case storage.RemoteServerDeletionAgentUninstalled:
+			h.deleteConfirmedRemoteServer(w, ctx, serverID)
+			return
+		case storage.RemoteServerDeletionFailed:
+			message := strings.TrimSpace(task.LastError)
+			if message == "" {
+				message = "远端清理未完成"
+			}
+			writeRemoteServerDeleteFailureWithStatus(w, stdhttp.StatusBadGateway, "Agent 卸载清理失败，服务器记录已保留: "+message, task.Status)
+			return
+		}
+		select {
+		case <-waitCtx.Done():
+			writeRemoteServerDeleteFailureWithStatus(w, stdhttp.StatusGatewayTimeout, "等待 Agent 完成卸载超时，服务器记录已保留", task.Status)
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *XrayServerHandler) uninstallAgentAndDeleteRemoteServer(w stdhttp.ResponseWriter, r *stdhttp.Request, serverID int64) {
+	timeout := h.agentUninstallTimeout
+	if timeout <= 0 {
+		timeout = agentUninstallCallbackWaitTimeout
+	}
+	// Once the Agent accepts this destructive operation, a closed browser must
+	// not cancel the callback wait and release the exclusive server lease early.
+	// Lease acquisition has its own deadline. The full seven-minute callback
+	// window starts only after dispatch acknowledgement below, so neither lock
+	// queuing nor capability/WARP preflight consumes the Agent's 360-second bound.
+	ctx, release, err := h.acquireRemoteServerExclusiveLease(r.Context(), serverID)
+	if err != nil {
+		if errors.Is(err, storage.ErrRemoteInstallationActive) {
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusConflict, "服务器正在安装，暂不能卸载 Agent")
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusGatewayTimeout, "服务器仍有管理操作进行中，卸载等待超时")
+			return
+		}
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "无法锁定服务器卸载操作")
+		return
+	}
+	defer release()
+	preDispatchCtx, cancelPreDispatch := context.WithTimeout(ctx, agentUninstallPreDispatchTimeout)
+	defer cancelPreDispatch()
+	ctx = preDispatchCtx
+
+	server, err := h.repo.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		if errors.Is(err, storage.ErrRemoteServerNotFound) {
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusNotFound, "服务器不存在")
+			return
+		}
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "读取服务器失败")
+		return
+	}
+	if _, fedErr := h.repo.GetFederatedServer(ctx, serverID); fedErr == nil {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusConflict, "接入的共享服务器不能卸载拥有方 Agent，只能删除本地记录")
+		return
+	} else if !errors.Is(fedErr, storage.ErrFederatedServerNotFound) {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "无法确认服务器所有权")
+		return
+	}
+	if err := h.repo.ValidateRemoteServerDeletion(ctx, serverID); err != nil {
+		switch {
+		case errors.Is(err, storage.ErrForwardingConflict):
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusConflict, "服务器仍被转发模板、转发规则或端口分配使用，请先移除相关配置")
+		case errors.Is(err, storage.ErrRemoteInstallationActive):
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusConflict, "服务器正在安装，暂不能卸载 Agent")
+		case errors.Is(err, storage.ErrRemoteServerNotFound):
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusNotFound, "服务器不存在")
+		default:
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusConflict, "服务器暂不能安全删除: "+err.Error())
+		}
+		return
+	}
+	if task, taskErr := h.repo.GetRemoteServerDeletionTask(ctx, serverID); taskErr == nil {
+		switch task.Status {
+		case storage.RemoteServerDeletionAgentUninstalled:
+			// The callback is durable. Retrying after a browser disconnect or
+			// panel restart must never contact the already removed Agent again.
+			h.deleteConfirmedRemoteServer(w, ctx, serverID)
+			return
+		case storage.RemoteServerDeletionPending:
+			if task.CleanupID == "" {
+				// The task was persisted but never crossed the durable dispatch
+				// boundary, so no Agent callback can belong to it.
+				if err := h.repo.FailRemoteServerDeletionTask(ctx, serverID, "面板在下发 Agent 卸载前中断，正在重新创建任务"); err != nil {
+					writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "无法恢复 Agent 卸载任务")
+					return
+				}
+			} else if task.ExpiresAt.After(time.Now().UTC()) {
+				h.waitForPersistedRemoteServerDeletion(w, ctx, serverID, task.ExpiresAt)
+				return
+			}
+		case storage.RemoteServerDeletionDispatched:
+			if task.ExpiresAt.After(time.Now().UTC()) {
+				h.waitForPersistedRemoteServerDeletion(w, ctx, serverID, task.ExpiresAt)
+				return
+			}
+		}
+	} else if !errors.Is(taskErr, storage.ErrRemoteServerDeletionTaskNotFound) {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "读取 Agent 卸载任务失败")
+		return
+	}
+	if server.Status != storage.RemoteServerStatusConnected {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusConflict, "Agent 当前不在线，未执行卸载，服务器记录已保留")
+		return
+	}
+	if h.remoteManager == nil {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusServiceUnavailable, "远程 Agent 管理通道不可用")
+		return
+	}
+	capable, capabilityErr := h.agentSupportsSafeUninstall(ctx, serverID)
+	if capabilityErr != nil {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadGateway, "无法确认 Agent 的安全卸载能力，服务器记录已保留: "+capabilityErr.Error())
+		return
+	}
+	if !capable {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusConflict, "Agent 版本或运行环境不支持安全卸载，请升级 Agent 或手动卸载")
+		return
+	}
+
+	statusResult, statusErr := h.remoteManager.forwardToRemoteServer(ctx, serverID, stdhttp.MethodGet, "/api/child/warp/status", nil)
+	if statusErr != nil {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadGateway, "无法确认 WARP 实际状态，未卸载 Agent，服务器记录已保留: "+statusErr.Error())
+		return
+	}
+	var warpStatus remoteRemovalAcknowledgement
+	if err := json.Unmarshal(statusResult, &warpStatus); err != nil || !warpStatus.Success || warpStatus.Installed == nil {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadGateway, "无法确认 WARP 实际状态，未卸载 Agent，服务器记录已保留: "+remoteRemovalMessage(warpStatus, "远程响应无效"))
+		return
+	}
+	if *warpStatus.Installed {
+		result, removeErr := h.remoteManager.forwardToRemoteServer(ctx, serverID, stdhttp.MethodPost, "/api/child/warp/remove", nil)
+		if removeErr != nil {
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusBadGateway, "WARP 清理失败，未卸载 Agent，服务器记录已保留: "+removeErr.Error())
+			return
+		}
+		var ack remoteRemovalAcknowledgement
+		if err := json.Unmarshal(result, &ack); err != nil || !ack.Success || !ack.Uninstalled {
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusBadGateway, "WARP 未确认完成清理，未卸载 Agent，服务器记录已保留: "+remoteRemovalMessage(ack, "远程响应无效"))
+			return
+		}
+		if err := h.repo.UpdateRemoteServerWarpInstalled(ctx, server.Token, false); err != nil {
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "WARP 已清理，但面板状态更新失败，未卸载 Agent，服务器记录已保留")
+			return
+		}
+	}
+
+	masterURL, _, masterURLErr := h.effectiveRemoteInstallMasterURL(ctx, r)
+	if masterURLErr != nil {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusServiceUnavailable, "无法生成 Agent 卸载回调地址，服务器记录已保留: "+masterURLErr.Error())
+		return
+	}
+	callbackToken, pending, registerErr := h.registerAgentUninstall(serverID)
+	if registerErr != nil {
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "无法创建 Agent 卸载回调，服务器记录已保留")
+		return
+	}
+	defer h.unregisterAgentUninstall(callbackToken, pending)
+	callbackTokenHash := agentUninstallTokenHash(callbackToken)
+	dispatchBody, marshalErr := json.Marshal(agentUninstallDispatchRequest{
+		CallbackURL:   strings.TrimRight(masterURL, "/") + AgentUninstallCompletePath,
+		CallbackToken: callbackToken,
+	})
+	if marshalErr != nil {
+		_ = h.repo.FailRemoteServerDeletionTask(context.Background(), serverID, "无法创建 Agent 卸载请求")
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "无法创建 Agent 卸载请求，服务器记录已保留")
+		return
+	}
+	// Persist the dispatch boundary before sending anything destructive. Thus
+	// pending+empty is provably pre-dispatch and can be replaced after restart;
+	// dispatched+empty is ambiguous and must keep waiting for its old callback.
+	if err := h.repo.MarkRemoteServerDeletionDispatched(context.Background(), serverID, callbackTokenHash, ""); err != nil {
+		_ = h.repo.FailRemoteServerDeletionTask(context.Background(), serverID, "无法持久化 Agent 卸载下发状态")
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusInternalServerError, "无法持久化 Agent 卸载任务，服务器记录已保留")
+		return
+	}
+
+	result, uninstallErr := h.remoteManager.forwardToRemoteServer(ctx, serverID, stdhttp.MethodPost, "/api/child/agent/uninstall-v2", dispatchBody)
+	if uninstallErr != nil {
+		_ = h.repo.SetRemoteServerDeletionTaskError(context.Background(), serverID, "Agent 卸载请求结果未知: "+uninstallErr.Error())
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadGateway, "Agent 未接受安全卸载任务，服务器记录已保留: "+uninstallErr.Error())
+		return
+	}
+	var ack remoteRemovalAcknowledgement
+	if err := json.Unmarshal(result, &ack); err != nil || !ack.Success || !ack.DispatchVerified || !validAgentUninstallCleanupID(strings.TrimSpace(ack.CleanupID)) {
+		_ = h.repo.SetRemoteServerDeletionTaskError(context.Background(), serverID, "Agent 未返回可验证的任务接收结果")
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadGateway, "Agent 未返回可验证的任务接收结果，服务器记录已保留: "+remoteRemovalMessage(ack, "远程响应无效"))
+		return
+	}
+	if err := h.repo.MarkRemoteServerDeletionDispatched(context.Background(), serverID, callbackTokenHash, strings.TrimSpace(ack.CleanupID)); err != nil {
+		_ = h.repo.KeepRemoteServerDeletionDispatched(context.Background(), serverID, "Agent 卸载任务标识与回调不一致")
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadGateway, "Agent 卸载任务标识无效，服务器记录已保留")
+		return
+	}
+	if err := pending.setExpectedCleanupID(ack.CleanupID); err != nil {
+		_ = h.repo.KeepRemoteServerDeletionDispatched(context.Background(), serverID, "Agent 卸载任务标识无效")
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusBadGateway, "Agent 卸载任务标识无效，服务器记录已保留")
+		return
+	}
+	// Start the full callback budget after dispatch is acknowledged. Capability
+	// probing and WARP removal cannot consume any of the Agent's 360-second hard
+	// cleanup bound or the panel's additional 60-second delivery margin.
+	callbackCtx, cancelCallback := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancelCallback()
+
+	var completion agentUninstallCallback
+	select {
+	case completion = <-pending.done:
+		if completion.CleanupID != strings.TrimSpace(ack.CleanupID) {
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusBadGateway, "Agent 卸载完成回执与任务不匹配，服务器记录已保留")
+			return
+		}
+		if !completion.Success {
+			message := strings.TrimSpace(completion.Error)
+			if message == "" {
+				message = "远端清理未完成"
+			}
+			writeRemoteServerDeleteFailure(w, stdhttp.StatusBadGateway, "Agent 卸载清理失败，服务器记录已保留: "+message)
+			return
+		}
+	case <-callbackCtx.Done():
+		writeRemoteServerDeleteFailure(w, stdhttp.StatusGatewayTimeout, "等待 Agent 完成卸载超时，服务器记录已保留")
+		return
+	}
+
+	// DeleteRemoteServer re-enters this exclusive lease and repeats the durable
+	// deletion checks inside its own transaction before committing.
+	h.deleteConfirmedRemoteServer(w, ctx, serverID)
+}
+
+func (h *XrayServerHandler) agentSupportsSafeUninstall(ctx context.Context, serverID int64) (bool, error) {
+	if h.wsHandler != nil {
+		if connection, connected := h.wsHandler.GetConnectionByServerID(serverID); connected {
+			return connection.Capabilities.AgentUninstallV2, nil
+		}
+	}
+	if h.remoteManager == nil {
+		return false, errors.New("remote Agent manager is unavailable")
+	}
+	result, err := h.remoteManager.forwardToRemoteServer(ctx, serverID, stdhttp.MethodGet, "/api/child/system/info", nil)
+	if err != nil {
+		return false, err
+	}
+	var info struct {
+		Success      bool            `json:"success"`
+		Capabilities map[string]bool `json:"capabilities"`
+	}
+	if err := json.Unmarshal(result, &info); err != nil {
+		return false, fmt.Errorf("decode system info: %w", err)
+	}
+	if !info.Success {
+		return false, errors.New("Agent system info reported failure")
+	}
+	return info.Capabilities["agent_uninstall_v2"], nil
 }
 
 // 更新远程服务器的基本信息
@@ -1011,6 +1785,20 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		})
 		return
 	}
+	oldNginxMode := strings.TrimSpace(oldServer.NginxMode)
+	if oldNginxMode == "" {
+		oldNginxMode = "managed"
+	}
+	newNginxMode := strings.TrimSpace(req.NginxMode)
+	if newNginxMode == "" {
+		newNginxMode = oldNginxMode
+	}
+	if newNginxMode != "managed" && newNginxMode != "reuse_existing" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusBadRequest)
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "Nginx 模式必须为 managed 或 reuse_existing"})
+		return
+	}
 
 	if req.XrayMode == "embedded" && oldServer.XrayMode != "embedded" && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureEmbeddedXray) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1061,6 +1849,18 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		oldRaw, _ := h.repo.GetServerTrafficUsed(ctx, req.ID)
 		oldDisplayForMigration = oldRaw + oldServer.TrafficUsedOffset
 	}
+	nginxModeChanged := newNginxMode != oldNginxMode
+	if nginxModeChanged {
+		if err := h.switchRemoteNginxMode(ctx, req.ID, newNginxMode); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{
+				Success: false,
+				Message: fmt.Sprintf("Agent 未确认 Nginx 模式切换，面板信息未修改: %v", err),
+			})
+			return
+		}
+	}
 
 	if err := h.repo.UpdateRemoteServer(ctx, req.ID, req.Name, req.Domain, req.TrafficLimit, req.TrafficResetDay, req.ConnectionMode, req.XrayMode, req.TrafficStatsMode, req.TrafficSource, req.IPv6Enabled); err != nil {
 		msg := "更新服务器失败"
@@ -1073,12 +1873,36 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(stdhttp.StatusConflict)
 		}
+		if nginxModeChanged {
+			if rollbackErr := h.rollbackRemoteNginxMode(ctx, req.ID, oldNginxMode); rollbackErr != nil {
+				log.Printf("[Remote Server] CRITICAL: failed to roll Agent nginx_mode back to %s for server %d after database update failure: %v", oldNginxMode, req.ID, rollbackErr)
+				msg += fmt.Sprintf("；Agent Nginx 模式回滚失败，当前状态可能不一致: %v", rollbackErr)
+			} else {
+				msg += "；Agent Nginx 模式已回滚"
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(RemoteServerResponse{
 			Success: false,
 			Message: msg,
 		})
 		return
+	}
+	if nginxModeChanged {
+		if err := h.repo.UpdateRemoteServerNginxMode(ctx, req.ID, newNginxMode); err != nil {
+			rollbackErr := h.rollbackRemoteNginxMode(ctx, req.ID, oldNginxMode)
+			message := fmt.Sprintf("其他服务器信息已保存，但面板 Nginx 模式更新失败: %v", err)
+			if rollbackErr != nil {
+				log.Printf("[Remote Server] CRITICAL: failed to roll Agent nginx_mode back to %s for server %d after nginx_mode database failure: %v", oldNginxMode, req.ID, rollbackErr)
+				message += fmt.Sprintf("；Agent 回滚失败，当前状态可能不一致: %v", rollbackErr)
+			} else {
+				message += "；Agent 已回滚到原 Nginx 模式"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusInternalServerError)
+			json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: message})
+			return
+		}
 	}
 
 	// 切换 xray→system 时,把 xray 流量的当前累计 + daily snapshot 历史完整搬到 system 维度:

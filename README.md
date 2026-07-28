@@ -47,7 +47,7 @@ RelayDock 面向合租节点和小型代理服务运营场景。管理员集中�
 
 ## 快速安装
 
-安装器会从 GitHub Release 下载对应架构的二进制和节点到期守卫，并使用 Release 中发布的 SHA-256 清单完成校验后再替换文件。
+安装器会从 GitHub Release 下载控制端、节点到期守卫和两种 Linux 架构的受管 Agent 安装包，并使用 Release 中发布的 SHA-256 清单完成校验后再替换文件。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash
@@ -101,7 +101,7 @@ systemctl restart arcway
 
 ### 面板一键更新（裸机 / systemd）
 
-管理员进入 **系统设置 → 系统更新**，依次点击 **检查更新** 和 **立即更新**。面板会下载与当前系统架构匹配的最新 GitHub Release，校验控制端及守卫程序的 SHA-256 和可执行文件架构，全部验证通过后才备份、原子替换并重启；更新期间页面会短暂断开，服务恢复后重新加载即可。
+管理员进入 **系统设置 → 系统更新**，依次点击 **检查更新** 和 **立即更新**。面板会下载最新 GitHub Release，校验控制端、守卫程序及 Agent 安装资产的 SHA-256 和可执行文件架构，全部验证通过后才备份、原子替换并重启；更新期间页面会短暂断开，服务恢复后重新加载即可。
 
 从不含“系统更新”入口的旧版本首次升级到 `v0.5.1` 或更高版本时，需要先执行下方的裸机命令行更新。升级完成后，使用内嵌前端的实例可直接在面板更新；配置了外置前端的实例仍需在每次更新后单独发布前端。
 
@@ -115,7 +115,7 @@ systemctl restart arcway
 curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash -s -- update
 ```
 
-安装器会保留当前端口和 `/etc/arcway` 数据。它会先下载并校验新版本，再停止服务并建立事务快照；更新过程失败或新服务无法启动时，会尝试恢复原二进制、systemd 配置和数据库。
+安装器会保留当前端口和 `/etc/arcway` 数据。它会先下载并校验新版本，再停止服务并建立事务快照；更新过程失败或新服务无法启动时，会尝试恢复原二进制、守卫与 Agent 安装资产、systemd 配置和数据库。
 
 ### Docker Compose 更新
 
@@ -132,9 +132,9 @@ Compose 会重新创建容器，但 `./data` 挂载目录不会被删除。需�
 
 ### 外置前端与回滚
 
-如果配置了 `ARCWAY_WEB_ROOT`，上述面板或命令行更新会更新控制端、二进制内嵌的备用页面以及已配置的守卫程序，但不会替换外置前端。外置前端仍需使用[前端快速发布](#前端快速发布)脚本独立更新或回滚。
+如果配置了 `ARCWAY_WEB_ROOT`，上述面板或命令行更新会更新控制端、二进制内嵌的备用页面、守卫程序和 Agent 安装资产，但不会替换外置前端。外置前端仍需使用[前端快速发布](#前端快速发布)脚本独立更新或回滚。
 
-面板更新会为控制端和守卫程序分别留下 `.bak`。它能在文件替换失败或新程序无法执行时立即恢复，但新程序已经执行后才因配置、端口或数据库问题退出，仍需管理员按 systemd 日志手工回退。默认控制端备份路径为 `/usr/local/bin/arcway.bak`，自定义安装路径以 systemd 的 `ExecStart` 为准。版本升级可能包含数据库迁移，因此在更新成功后又决定降级时，应同时恢复更新前的数据备份，不能只替换旧二进制。操作前先停止 `arcway` 服务，并保留当前文件以便排查。
+面板更新会为控制端、守卫程序和 Agent 安装资产分别留下 `.bak`。它能在文件替换失败或新程序无法执行时立即恢复，但新程序已经执行后才因配置、端口或数据库问题退出，仍需管理员按 systemd 日志手工回退。默认控制端备份路径为 `/usr/local/bin/arcway.bak`，自定义安装路径以 systemd 的 `ExecStart` 为准。版本升级可能包含数据库迁移，因此在更新成功后又决定降级时，应同时恢复更新前的数据备份，不能只替换旧二进制。操作前先停止 `arcway` 服务，并保留当前文件以便排查。
 
 ## Docker
 
@@ -203,6 +203,7 @@ PORT=12889 DATABASE_PATH=./data/arcway.db ./arcway
 
 - [relaydock](https://github.com/violetaini/relaydock) 是主仓库，提供 API、远端管理能力、安装与发布，并内嵌 Web 控制台。
 - [relaydock-frontend](https://github.com/violetaini/relaydock-frontend) 是独立的 React / TypeScript 前端源码。
+- [relaydock-agent](https://github.com/violetaini/relaydock-agent) 是受管服务器 Agent 源码及带签名的自升级发布源。
 
 发布新前端时，先在前端仓库执行 `npm ci --include=dev && npm run build`，再用生成的 `dist/` 整体替换本仓库的 `internal/web/dist/`。不要手工编辑已构建的哈希资源。
 

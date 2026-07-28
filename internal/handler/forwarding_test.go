@@ -1,9 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -29,6 +32,23 @@ type fakeForwardTunnelDeployer struct {
 	failRemoveOnce     bool
 	specs              []ForwardTunnelSpec
 	operations         []string
+}
+
+type blockingProbeForwardTunnelDeployer struct {
+	*fakeForwardTunnelDeployer
+	probeOnce sync.Once
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (d *blockingProbeForwardTunnelDeployer) Probe(ctx context.Context, _ int64) error {
+	d.probeOnce.Do(func() { close(d.entered) })
+	select {
+	case <-d.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func newFakeForwardTunnelDeployer() *fakeForwardTunnelDeployer {
@@ -699,5 +719,83 @@ func TestNormalizeForwardSourceCIDRsRejectsBroadMappedPrefix(t *testing.T) {
 	values, err := normalizeForwardSourceCIDRs([]string{"198.51.100.7", "198.51.100.7/32"})
 	if err != nil || len(values) != 1 || values[0] != "198.51.100.7/32" {
 		t.Fatalf("normalized=%v err=%v", values, err)
+	}
+}
+
+func TestTunnelTemplateWritesHoldServerMutationLeasesAcrossProbeAndCommit(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodPut} {
+		t.Run(method, func(t *testing.T) {
+			fixture := newForwardingHandlerFixture(t)
+			template, err := fixture.repo.GetTunnelTemplateByID(context.Background(), fixture.grant.TunnelID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			serverIDs := make([]int64, 0, len(template.Hops))
+			for _, hop := range template.Hops {
+				serverIDs = append(serverIDs, hop.ServerID)
+			}
+			blocking := &blockingProbeForwardTunnelDeployer{
+				fakeForwardTunnelDeployer: newFakeForwardTunnelDeployer(),
+				entered:                   make(chan struct{}), release: make(chan struct{}),
+			}
+			fixture.handler.SetTunnelDeployer(blocking)
+			payload, err := json.Marshal(tunnelTemplateRequest{
+				Name: "lease protected", State: storage.TunnelStateActive,
+				BillingMode: storage.ManagedBillingDownload, TrafficMultiplierMilli: 1000,
+				PortRangeStart: 22000, PortRangeEnd: 23000,
+				ServerIDs: serverIDs, Version: template.Version,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(method, "/api/admin/tunnel-templates", bytes.NewReader(payload))
+			response := httptest.NewRecorder()
+			handlerDone := make(chan struct{})
+			go func() {
+				if method == http.MethodPost {
+					fixture.handler.HandleAdminTunnelTemplates(response, request)
+				} else {
+					request.SetPathValue("id", template.PublicID)
+					fixture.handler.HandleAdminTunnelTemplate(response, request)
+				}
+				close(handlerDone)
+			}()
+			select {
+			case <-blocking.entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("template capability probe did not start")
+			}
+
+			exclusiveAcquired := make(chan struct{})
+			exclusiveDone := make(chan error, 1)
+			go func() {
+				_, release, err := fixture.repo.AcquireRemoteServerExclusiveMutationLease(context.Background(), serverIDs[0])
+				if err == nil {
+					close(exclusiveAcquired)
+					release()
+				}
+				exclusiveDone <- err
+			}()
+			select {
+			case <-exclusiveAcquired:
+				t.Fatal("exclusive delete lease entered while template write was between probe and commit")
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			close(blocking.release)
+			select {
+			case <-handlerDone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("template handler did not release leases")
+			}
+			select {
+			case err := <-exclusiveDone:
+				if err != nil {
+					t.Fatalf("exclusive lease failed after template handler: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("exclusive lease remained blocked after template handler")
+			}
+		})
 	}
 }

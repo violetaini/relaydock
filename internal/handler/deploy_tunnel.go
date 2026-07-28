@@ -34,8 +34,14 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 	if err != nil {
 		return err
 	}
+	if selectedCert != nil && selectedCert.CertPEM != "" && selectedCert.KeyPEM != "" {
+		if err := h.deployStealCertificateSync(ctx, server, rootDomain, selectedCert); err != nil {
+			return err
+		}
+		log.Printf("[DeployTunnel] Deployed certificate for %s to server %d", rootDomain, server.ID)
+	}
 
-	clearPayload, _ := json.Marshal(map[string]int{"port": 443})
+	clearPayload, _ := json.Marshal(map[string]any{"port": 443, "nginx_mode": normalizedRemoteNginxMode(server)})
 	if _, err := h.forwardToRemoteServer(ctx, server.ID, http.MethodPost, "/api/child/nginx/clear-stream-port", clearPayload); err != nil {
 		return fmt.Errorf("清理 Nginx 443 stream 失败: %w", err)
 	}
@@ -44,6 +50,7 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 		"domain":        domain,
 		"nginx_config":  string(nginxConf),
 		"domain_config": domainConf,
+		"nginx_mode":    normalizedRemoteNginxMode(server),
 	})
 	if _, err := h.forwardToRemoteServer(ctx, server.ID, http.MethodPost, "/api/child/nginx/setup-ssl", sslPayload); err != nil {
 		return fmt.Errorf("配置 Nginx SSL 失败: %w", err)
@@ -85,13 +92,6 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 	}
 	log.Printf("[DeployTunnel] Deployed xray config to server %d (%s)", server.ID, server.Name)
 
-	if selectedCert != nil && selectedCert.CertPEM != "" && selectedCert.KeyPEM != "" {
-		if err := h.deployStealCertificateSync(ctx, server, rootDomain, selectedCert); err != nil {
-			return err
-		}
-		log.Printf("[DeployTunnel] Deployed certificate for %s to server %d", rootDomain, server.ID)
-	}
-
 	if err := h.restartXrayWithRecovery(ctx, server.ID, "DeployTunnel"); err != nil {
 		return err
 	}
@@ -113,7 +113,7 @@ func (h *RemoteManageHandler) deployStealCertificateSync(ctx context.Context, se
 		KeyPEM:   cert.KeyPEM,
 		CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certDeployFilename(cert.Domain)),
 		KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certDeployFilename(cert.Domain)),
-		Reload:   "nginx",
+		Reload:   "none",
 	})
 	if err != nil {
 		return fmt.Errorf("编码证书部署请求失败: %w", err)

@@ -59,6 +59,9 @@ type UpdateInfo struct {
 	guardAssetDir   string
 	guardAssets     []updateReleaseAsset
 	missingGuards   []string
+	agentAssetDir   string
+	agentAssets     []updateReleaseAsset
+	missingAgents   []string
 }
 
 type updateEnvironment struct {
@@ -149,7 +152,8 @@ func detectUpdateEnvironment(docker bool, externalWebRoot string) updateEnvironm
 
 func currentUpdateEnvironment() updateEnvironment {
 	environment := detectUpdateEnvironment(isDocker(), os.Getenv("ARCWAY_WEB_ROOT"))
-	return populateGuardEnvironment(environment, os.Getenv("ARCWAY_GUARD_ASSET_DIR"))
+	environment = populateGuardEnvironment(environment, os.Getenv("ARCWAY_GUARD_ASSET_DIR"))
+	return populateAgentEnvironment(environment, os.Getenv("ARCWAY_AGENT_ASSET_DIR"))
 }
 
 func populateGuardEnvironment(environment updateEnvironment, guardAssetDir string) updateEnvironment {
@@ -186,6 +190,40 @@ func populateGuardEnvironment(environment updateEnvironment, guardAssetDir strin
 	return environment
 }
 
+func populateAgentEnvironment(environment updateEnvironment, agentAssetDir string) updateEnvironment {
+	if environment.DeploymentMode == updateDeploymentDocker {
+		return environment
+	}
+	agentAssetDir = strings.TrimSpace(agentAssetDir)
+	if agentAssetDir == "" {
+		if environment.UpdateScope == updateScopeFull {
+			environment.UpdateScope = updateScopeControlPlane
+		}
+		environment.Warning = appendUpdateWarning(environment.Warning, "未配置 Agent 资产目录，本次只能更新控制端程序和面板；Agent 安装资产需通过安装脚本更新。")
+		return environment
+	}
+	if !filepath.IsAbs(agentAssetDir) {
+		environment.CanApply = false
+		environment.UpdateScope = updateScopeNone
+		environment.Warning = appendUpdateWarning(environment.Warning, "ARCWAY_AGENT_ASSET_DIR 必须是绝对路径，网页更新已禁用。")
+		return environment
+	}
+	if environment.ExternalWebRoot && environment.CanApply {
+		environment.Warning = appendUpdateWarning(environment.Warning, "本次也会更新 Agent 安装资产。")
+	}
+	var missing []string
+	for _, arch := range []string{"amd64", "arm64"} {
+		name := "mmw-agent-linux-" + arch
+		if info, err := os.Stat(filepath.Join(agentAssetDir, name)); err != nil || !info.Mode().IsRegular() {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		environment.Warning = appendUpdateWarning(environment.Warning, "当前 Agent 安装资产不完整，将在本次更新中补齐："+strings.Join(missing, "、")+"。")
+	}
+	return environment
+}
+
 func populateUpdateEnvironment(info *UpdateInfo, environment updateEnvironment) {
 	info.DeploymentMode = environment.DeploymentMode
 	info.UpdateScope = environment.UpdateScope
@@ -199,6 +237,10 @@ func populateUpdateEnvironment(info *UpdateInfo, environment updateEnvironment) 
 	if info.guardAssetDir != "" && len(info.missingGuards) > 0 {
 		info.CanApply = false
 		info.Warning = appendUpdateWarning(info.Warning, "最新发布缺少守卫资产 "+strings.Join(info.missingGuards, "、")+"；为避免版本不一致，网页更新已禁用。")
+	}
+	if info.agentAssetDir != "" && len(info.missingAgents) > 0 {
+		info.CanApply = false
+		info.Warning = appendUpdateWarning(info.Warning, "最新发布缺少 Agent 安装资产 "+strings.Join(info.missingAgents, "、")+"；为避免版本不一致，网页更新已禁用。")
 	}
 }
 
@@ -277,6 +319,9 @@ func updateCompletionMessages(info *UpdateInfo) (string, string) {
 	}
 	if len(info.guardAssets) == 2 {
 		components += "及守卫资产"
+	}
+	if len(info.agentAssets) == 2 {
+		components += "、Agent 安装资产"
 	}
 	done := components + "更新完成"
 	if info.ExternalWebRoot {
@@ -403,6 +448,12 @@ func NewUpdateApplyHandler() http.Handler {
 			return
 		}
 		defer cleanupGuards()
+		agentFiles, cleanupAgents, err := prepareAgentUpdateFiles(info, nil)
+		if err != nil {
+			writeUpdateError(w, http.StatusBadGateway, fmt.Errorf("准备 Agent 安装资产失败，尚未替换任何文件: %w", err))
+			return
+		}
+		defer cleanupAgents()
 
 		// 3. 获取二进制文件的目标路径
 		targetPath, err := getUpdateTargetPath()
@@ -412,7 +463,8 @@ func NewUpdateApplyHandler() http.Handler {
 		}
 
 		// 4. 所有发布文件校验完成后，再统一备份和替换。
-		files := append(guardFiles, preparedUpdateFile{
+		files := append(guardFiles, agentFiles...)
+		files = append(files, preparedUpdateFile{
 			Name:       "arcway",
 			SourcePath: tempFile,
 			TargetPath: targetPath,
@@ -566,6 +618,14 @@ func NewUpdateApplySSEHandler() http.Handler {
 			return
 		}
 		defer cleanupGuards()
+		agentFiles, cleanupAgents, err := prepareAgentUpdateFiles(info, func(name string) {
+			sendProgress("downloading", 100, "正在下载并校验 Agent 安装资产 "+name+"...")
+		})
+		if err != nil {
+			sendProgress("error", 0, fmt.Sprintf("准备 Agent 安装资产失败，尚未替换任何文件: %v", err))
+			return
+		}
+		defer cleanupAgents()
 
 		// 3. 获取目标路径
 		targetPath, err := getUpdateTargetPath()
@@ -575,8 +635,9 @@ func NewUpdateApplySSEHandler() http.Handler {
 		}
 
 		// 4. 所有发布文件校验完成后，再统一备份和替换。
-		sendProgress("backing_up", 0, "正在备份控制端程序与守卫资产...")
-		files := append(guardFiles, preparedUpdateFile{
+		sendProgress("backing_up", 0, "正在备份控制端程序与配套资产...")
+		files := append(guardFiles, agentFiles...)
+		files = append(files, preparedUpdateFile{
 			Name:       "arcway",
 			SourcePath: tempFile,
 			TargetPath: targetPath,
@@ -588,7 +649,7 @@ func NewUpdateApplySSEHandler() http.Handler {
 		}
 
 		// 5. 守卫资产先替换、主程序最后替换；任一失败会恢复此前文件。
-		sendProgress("replacing", 0, "正在原子替换控制端程序与守卫资产...")
+		sendProgress("replacing", 0, "正在原子替换控制端程序与配套资产...")
 		logger.Info("[系统更新] 正在替换更新文件", "file_count", len(files))
 		if err := installUpdateFiles(files); err != nil {
 			sendProgress("error", 0, fmt.Sprintf("替换失败: %v", err))
@@ -673,6 +734,7 @@ func checkLatestVersion() (*UpdateInfo, error) {
 		ReleaseNotes:   release.Body,
 		expectedSHA256: expectedSHA256,
 		guardAssetDir:  strings.TrimSpace(os.Getenv("ARCWAY_GUARD_ASSET_DIR")),
+		agentAssetDir:  strings.TrimSpace(os.Getenv("ARCWAY_AGENT_ASSET_DIR")),
 	}
 	if info.guardAssetDir != "" {
 		for _, arch := range []string{"amd64", "arm64"} {
@@ -690,6 +752,27 @@ func checkLatestVersion() (*UpdateInfo, error) {
 				DownloadURL: assetURL,
 				SHA256:      digest,
 				TargetPath:  filepath.Join(info.guardAssetDir, name),
+				GOOS:        "linux",
+				GOARCH:      arch,
+			})
+		}
+	}
+	if info.agentAssetDir != "" {
+		for _, arch := range []string{"amd64", "arm64"} {
+			name := "mmw-agent-linux-" + arch
+			assetURL, digest, assetErr := selectReleaseAsset(release, name)
+			if assetErr != nil {
+				return nil, assetErr
+			}
+			if assetURL == "" {
+				info.missingAgents = append(info.missingAgents, name)
+				continue
+			}
+			info.agentAssets = append(info.agentAssets, updateReleaseAsset{
+				Name:        name,
+				DownloadURL: assetURL,
+				SHA256:      digest,
+				TargetPath:  filepath.Join(info.agentAssetDir, name),
 				GOOS:        "linux",
 				GOARCH:      arch,
 			})
@@ -803,27 +886,35 @@ func downloadBinaryWithProgressAndRetry(url string, onProgress func(downloaded, 
 }
 
 func prepareGuardUpdateFiles(info *UpdateInfo, onAsset func(name string)) ([]preparedUpdateFile, func(), error) {
-	cleanupPaths := make([]string, 0, len(info.guardAssets))
+	return prepareManagedUpdateFiles("守卫", info.guardAssetDir, info.guardAssets, onAsset)
+}
+
+func prepareAgentUpdateFiles(info *UpdateInfo, onAsset func(name string)) ([]preparedUpdateFile, func(), error) {
+	return prepareManagedUpdateFiles("Agent", info.agentAssetDir, info.agentAssets, onAsset)
+}
+
+func prepareManagedUpdateFiles(label, assetDir string, assets []updateReleaseAsset, onAsset func(name string)) ([]preparedUpdateFile, func(), error) {
+	cleanupPaths := make([]string, 0, len(assets))
 	cleanup := func() {
 		for _, path := range cleanupPaths {
 			_ = os.Remove(path)
 		}
 	}
-	if info.guardAssetDir == "" {
+	if assetDir == "" {
 		return nil, cleanup, nil
 	}
-	if len(info.guardAssets) != 2 {
-		return nil, cleanup, errors.New("守卫发布资产不完整")
+	if len(assets) != 2 {
+		return nil, cleanup, fmt.Errorf("%s 发布资产不完整", label)
 	}
-	if !filepath.IsAbs(info.guardAssetDir) {
-		return nil, cleanup, errors.New("守卫资产目录必须是绝对路径")
+	if !filepath.IsAbs(assetDir) {
+		return nil, cleanup, fmt.Errorf("%s 资产目录必须是绝对路径", label)
 	}
-	if err := os.MkdirAll(info.guardAssetDir, 0755); err != nil {
-		return nil, cleanup, fmt.Errorf("创建守卫资产目录: %w", err)
+	if err := os.MkdirAll(assetDir, 0755); err != nil {
+		return nil, cleanup, fmt.Errorf("创建%s资产目录: %w", label, err)
 	}
 
-	files := make([]preparedUpdateFile, 0, len(info.guardAssets))
-	for _, asset := range info.guardAssets {
+	files := make([]preparedUpdateFile, 0, len(assets))
+	for _, asset := range assets {
 		if onAsset != nil {
 			onAsset(asset.Name)
 		}

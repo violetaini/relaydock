@@ -146,11 +146,17 @@ func (h *ForwardingHandler) HandleAdminTunnelTemplates(w http.ResponseWriter, r 
 		if !decodeForwardingJSON(w, r, &req) {
 			return
 		}
-		if err := h.probeTunnelServerCapabilities(r.Context(), req.ServerIDs); err != nil {
+		ctx, release, err := h.acquireTemplateMutationLeases(r.Context(), req.ServerIDs)
+		if err != nil {
 			writeForwardingError(w, err)
 			return
 		}
-		item, err := h.repo.CreateTunnelTemplate(r.Context(), req.model(managedActor(r)))
+		defer release()
+		if err := h.probeTunnelServerCapabilities(ctx, req.ServerIDs); err != nil {
+			writeForwardingError(w, err)
+			return
+		}
+		item, err := h.repo.CreateTunnelTemplate(ctx, req.model(managedActor(r)))
 		if err != nil {
 			writeForwardingError(w, err)
 			return
@@ -181,11 +187,17 @@ func (h *ForwardingHandler) HandleAdminTunnelTemplate(w http.ResponseWriter, r *
 		if !decodeForwardingJSON(w, r, &req) {
 			return
 		}
-		if err := h.probeTunnelServerCapabilities(r.Context(), req.ServerIDs); err != nil {
+		ctx, release, err := h.acquireTemplateMutationLeases(r.Context(), req.ServerIDs)
+		if err != nil {
 			writeForwardingError(w, err)
 			return
 		}
-		item, err := h.repo.UpdateTunnelTemplate(r.Context(), id, req.model(managedActor(r)), req.Version, managedActor(r))
+		defer release()
+		if err := h.probeTunnelServerCapabilities(ctx, req.ServerIDs); err != nil {
+			writeForwardingError(w, err)
+			return
+		}
+		item, err := h.repo.UpdateTunnelTemplate(ctx, id, req.model(managedActor(r)), req.Version, managedActor(r))
 		if err != nil {
 			writeForwardingError(w, err)
 			return
@@ -200,6 +212,39 @@ func (h *ForwardingHandler) HandleAdminTunnelTemplate(w http.ResponseWriter, r *
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (h *ForwardingHandler) acquireTemplateMutationLeases(ctx context.Context, serverIDs []int64) (context.Context, func(), error) {
+	unique := make(map[int64]struct{}, len(serverIDs))
+	for _, serverID := range serverIDs {
+		if serverID <= 0 {
+			return nil, func() {}, storage.ErrForwardingInvalid
+		}
+		unique[serverID] = struct{}{}
+	}
+	ordered := make([]int64, 0, len(unique))
+	for serverID := range unique {
+		ordered = append(ordered, serverID)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+
+	leasedCtx := ctx
+	releases := make([]func(), 0, len(ordered))
+	releaseAll := func() {
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
+		}
+	}
+	for _, serverID := range ordered {
+		nextCtx, release, err := h.repo.AcquireRemoteServerMutationLease(leasedCtx, serverID)
+		if err != nil {
+			releaseAll()
+			return nil, func() {}, err
+		}
+		leasedCtx = nextCtx
+		releases = append(releases, release)
+	}
+	return leasedCtx, releaseAll, nil
 }
 
 // HandleAdminTunnelTemplatePreflight validates an ordered route without writing it.

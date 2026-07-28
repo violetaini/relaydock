@@ -434,6 +434,7 @@ func main() {
 	mux.Handle("/api/admin/remote-servers/add-shared", auth.RequireAdmin(tokenStore, userRepo, handler.NewAddSharedServerHandler(repo)))
 	mux.Handle("/api/admin/remote-servers/update", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.UpdateRemoteServer)))
 	mux.Handle("/api/admin/remote-servers/reorder", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.ReorderRemoteServers)))
+	mux.Handle("/api/admin/remote-servers/delete-impact", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.GetRemoteServerDeleteImpact)))
 	mux.Handle("/api/admin/remote-servers/delete", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.DeleteRemoteServer)))
 	mux.Handle("/api/admin/check-same-ip", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.CheckSameIP)))
 
@@ -448,6 +449,7 @@ func main() {
 	mux.Handle("/api/remote/install-quiesce", http.HandlerFunc(xrayServerHandler.QuiesceRemoteInstallation))
 	mux.Handle("/api/remote/install-abort", http.HandlerFunc(xrayServerHandler.AbortRemoteInstallation))
 	mux.Handle("/api/remote/management-ready", http.HandlerFunc(xrayServerHandler.VerifyRemoteManagementPorts))
+	mux.Handle(handler.AgentUninstallCompletePath, http.HandlerFunc(xrayServerHandler.HandleAgentUninstallComplete))
 	mux.Handle("/api/remote/install-prepare", http.HandlerFunc(xrayServerHandler.PrepareRemoteInstallation))
 	mux.Handle("/api/remote/install-finalize", http.HandlerFunc(xrayServerHandler.FinalizeRemoteInstallation))
 

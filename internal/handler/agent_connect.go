@@ -630,6 +630,10 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 	if xrayMode != "embedded" {
 		xrayMode = "external"
 	}
+	nginxMode := strings.TrimSpace(server.NginxMode)
+	if nginxMode != "reuse_existing" {
+		nginxMode = "managed"
+	}
 	agentConnectionMode := server.ConnectionMode
 	switch agentConnectionMode {
 	case storage.ConnectionModePush:
@@ -688,6 +692,7 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 		http.Error(w, "Unable to initialize installation transaction", http.StatusInternalServerError)
 		return
 	}
+	releaseAssetBaseURL := fmt.Sprintf("https://github.com/%s/releases/download/v%s", githubRepo, version.Version)
 
 	// 返回安装脚本内容
 	script := `#!/bin/bash
@@ -712,7 +717,30 @@ if ! flock -n 9; then
     exit 1
 fi
 
-DOWNLOAD_DIR=$(mktemp -d /tmp/arcway-install.XXXXXX)
+select_download_root() {
+    local candidate="" available="" best_root="" best_available=0
+    for candidate in /var/tmp /tmp; do
+        [ -d "$candidate" ] && [ -w "$candidate" ] || continue
+        available=$(df -Pk "$candidate" 2>/dev/null | awk 'NR == 2 { print $4 }')
+        case "$available" in ''|*[!0-9]*) continue ;; esac
+        if [ "$available" -gt "$best_available" ]; then
+            best_root="$candidate"
+            best_available="$available"
+        fi
+    done
+    if [ -z "$best_root" ]; then
+        echo "ERROR: no writable temporary directory is available" >&2
+        return 1
+    fi
+    if [ "$best_available" -lt 131072 ]; then
+        echo "ERROR: temporary storage has less than 128 MiB free; clean /tmp or /var/tmp and retry" >&2
+        df -h /tmp /var/tmp 2>/dev/null >&2 || true
+        return 1
+    fi
+    printf '%s\n' "$best_root"
+}
+DOWNLOAD_ROOT=$(select_download_root) || exit 1
+DOWNLOAD_DIR=$(mktemp -d "${DOWNLOAD_ROOT%/}/arcway-install.XXXXXX")
 chmod 0700 "$DOWNLOAD_DIR"
 trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
 trap 'exit 130' HUP INT TERM
@@ -731,12 +759,14 @@ SCRIPT_PROTOCOL=` + shellSingleQuote(scriptProtocol) + `
 EXPLICIT_MASTER=` + shellSingleQuote(explicitMaster) + `
 AUTO_STEAL_SELF=` + shellSingleQuote(map[bool]string{true: "1", false: "0"}[stealSelf]) + `
 STEAL_MODE=` + shellSingleQuote(stealMode) + `
+NGINX_MODE=` + shellSingleQuote(nginxMode) + `
 XRAY_MODE=` + shellSingleQuote(xrayMode) + `
 CONNECTION_MODE=` + shellSingleQuote(agentConnectionMode) + `
 MASTER_PUBLIC_KEY=` + shellSingleQuote(h.masterPublicKeyBase64()) + `
 MASTER_PORT=` + shellSingleQuote(h.getMasterPort()) + `
 LISTEN_PORT=` + shellSingleQuote(listenPortParam) + `
 PANEL_SOURCE_IPS=` + shellSingleQuote(strings.Join(panelSourceIPs, " ")) + `
+ASSET_RELEASE_BASE_URL=` + shellSingleQuote(releaseAssetBaseURL) + `
 
 # Keep the long-lived node token out of curl argv (/proc/*/cmdline). curl reads
 # these root-only files directly; the enclosing 0700 directory is deleted on exit.
@@ -805,6 +835,7 @@ if [ "$IS_ALPINE" = "1" ]; then
     INIT_NAME="${INIT_NAME} (Alpine)"
 fi
 echo "Init system: $INIT_NAME"
+echo "Temporary workspace: $DOWNLOAD_DIR"
 
 # All network downloads and integrity checks complete before the running node is touched.
 echo "[1/7] Downloading and verifying release assets..."
@@ -826,32 +857,54 @@ case $ARCH in
         ;;
 esac
 
-AGENT_URL="${MASTER_URL}/api/remote/mmw-agent?arch=${ARCH_NAME}"
 if ! command -v curl >/dev/null 2>&1; then
     echo "ERROR: install curl before retrying; no system packages were changed" >&2
     exit 1
 fi
 
-echo "Downloading verified mmw-agent from master..."
-if ! curl -fsSL --connect-timeout 10 --max-time 180 \
-	-H @"$CURL_AUTH_HEADER_FILE" \
-	-o "$AGENT_DOWNLOAD" "$AGENT_URL"; then
-    echo "ERROR: 无法从主控下载 mmw-agent" >&2
-    exit 1
-fi
-if [ "$(sha256sum "$AGENT_DOWNLOAD" | awk '{ print $1 }')" != "$AGENT_SHA256" ]; then
-    echo "ERROR: mmw-agent SHA-256 校验失败,安装中止" >&2
-    exit 1
-fi
+download_verified_asset() {
+    local label="$1" destination="$2" expected_sha256="$3" github_url="$4" master_url="$5"
+    local candidate="${destination}.download" actual_sha256=""
+    rm -f "$candidate"
 
-GUARD_URL="${MASTER_URL}/api/remote/expiry-guard?arch=${ARCH_NAME}"
-echo "Downloading Arcway expiry guard from master..."
-if ! curl -fsSL --connect-timeout 10 --max-time 180 \
-	-H @"$CURL_AUTH_HEADER_FILE" \
-	-o "$GUARD_DOWNLOAD" "$GUARD_URL"; then
-    echo "ERROR: 无法从主控下载 expiry guard" >&2
-    exit 1
-fi
+    echo "Downloading $label from GitHub Release..."
+    if curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 180 \
+        -o "$candidate" "$github_url"; then
+        actual_sha256=$(sha256sum "$candidate" | awk '{ print $1 }')
+        if [ "$actual_sha256" = "$expected_sha256" ]; then
+            mv -f "$candidate" "$destination"
+            return 0
+        fi
+        echo "WARNING: GitHub $label SHA-256 mismatch; retrying from the authenticated master" >&2
+    else
+        echo "WARNING: GitHub $label download failed; retrying from the authenticated master" >&2
+    fi
+    rm -f "$candidate"
+
+    echo "Downloading $label from master fallback..."
+    if ! curl -fsSL --connect-timeout 10 --max-time 180 \
+        -H @"$CURL_AUTH_HEADER_FILE" \
+        -o "$candidate" "$master_url"; then
+        echo "ERROR: unable to download $label from GitHub or master; check network and temporary storage" >&2
+        rm -f "$candidate"
+        return 1
+    fi
+    actual_sha256=$(sha256sum "$candidate" | awk '{ print $1 }')
+    if [ "$actual_sha256" != "$expected_sha256" ]; then
+        echo "ERROR: $label SHA-256 verification failed; installation aborted" >&2
+        rm -f "$candidate"
+        return 1
+    fi
+    mv -f "$candidate" "$destination"
+}
+
+AGENT_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/mmw-agent-linux-${ARCH_NAME}"
+AGENT_MASTER_URL="${MASTER_URL}/api/remote/mmw-agent?arch=${ARCH_NAME}"
+download_verified_asset "mmw-agent" "$AGENT_DOWNLOAD" "$AGENT_SHA256" "$AGENT_GITHUB_URL" "$AGENT_MASTER_URL" || exit 1
+
+GUARD_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/arcway-expiry-guard-linux-${ARCH_NAME}"
+GUARD_MASTER_URL="${MASTER_URL}/api/remote/expiry-guard?arch=${ARCH_NAME}"
+download_verified_asset "Arcway expiry guard" "$GUARD_DOWNLOAD" "$GUARD_SHA256" "$GUARD_GITHUB_URL" "$GUARD_MASTER_URL" || exit 1
 
 validate_elf() {
     [ -s "$1" ] || return 1
@@ -859,6 +912,10 @@ validate_elf() {
 }
 if ! validate_elf "$AGENT_DOWNLOAD" || ! validate_elf "$GUARD_DOWNLOAD"; then
     echo "ERROR: 下载结果不是有效 ELF 可执行文件,安装中止" >&2
+    exit 1
+fi
+if [ "$(sha256sum "$AGENT_DOWNLOAD" | awk '{ print $1 }')" != "$AGENT_SHA256" ]; then
+    echo "ERROR: mmw-agent SHA-256 verification failed; installation aborted" >&2
     exit 1
 fi
 if [ "$(sha256sum "$GUARD_DOWNLOAD" | awk '{ print $1 }')" != "$GUARD_SHA256" ]; then
@@ -1124,7 +1181,7 @@ if [ "$XRAY_UNIT_PRESENT" = "1" ] && ! reversible_systemd_enable_state "$OLD_XRA
     echo "ERROR: xray.service has unsupported enable state '$OLD_XRAY_ENABLE_STATE'; normalize it before installing" >&2
     exit 1
 fi
-if [ "$NGINX_UNIT_PRESENT" = "1" ] && ! reversible_systemd_enable_state "$OLD_NGINX_ENABLE_STATE"; then
+if [ "$NGINX_MODE" = "managed" ] && [ "$NGINX_UNIT_PRESENT" = "1" ] && ! reversible_systemd_enable_state "$OLD_NGINX_ENABLE_STATE"; then
     echo "ERROR: nginx.service has unsupported enable state '$OLD_NGINX_ENABLE_STATE'; normalize it before installing" >&2
     exit 1
 fi
@@ -1132,7 +1189,7 @@ if [ "$XRAY_MODE" != "embedded" ] && { [ "$XRAY_UNIT_PRESENT" != "1" ] || [ "$OL
     echo "ERROR: external Xray mode requires an active systemd xray service so installation can be rolled back safely" >&2
     exit 1
 fi
-if [ "$AUTO_STEAL_SELF" = "1" ] && { [ "$NGINX_UNIT_PRESENT" != "1" ] || [ "$OLD_NGINX_ACTIVE" != "1" ]; }; then
+if [ "$AUTO_STEAL_SELF" = "1" ] && [ "$NGINX_MODE" = "managed" ] && { [ "$NGINX_UNIT_PRESENT" != "1" ] || [ "$OLD_NGINX_ACTIVE" != "1" ]; }; then
     echo "ERROR: takeover mode requires an active systemd nginx service so installation can be rolled back safely" >&2
     exit 1
 fi
@@ -1211,7 +1268,7 @@ for XRAY_UNIT_FILE in "${XRAY_UNIT_FILES[@]}"; do
     done < "$XRAY_UNIT_FILE"
 done
 
-if [ "$AUTO_STEAL_SELF" = "1" ]; then
+if [ "$AUTO_STEAL_SELF" = "1" ] && [ "$NGINX_MODE" = "managed" ]; then
     NGINX_BUILD_INFO=$("$NGINX_BIN" -V 2>&1) || {
         echo "ERROR: cannot inspect the active Nginx build configuration" >&2
         exit 1
@@ -1352,14 +1409,16 @@ track_path() {
 for XRAY_DISCOVERED_PATH in "${XRAY_DISCOVERED_PATHS[@]}"; do
     track_path "$XRAY_DISCOVERED_PATH"
 done
-for NGINX_BRIDGE_PATH in \
-    /usr/local/nginx/servers \
-    /usr/local/nginx/stream_servers \
-    /usr/local/nginx/cert \
-    /www/server/panel/vhost/nginx/zz_arcway_loader.conf \
-    /www/server/panel/vhost/nginx/tcp/zz_arcway_loader.conf; do
-    track_path "$NGINX_BRIDGE_PATH"
-done
+if [ "$NGINX_MODE" = "managed" ]; then
+    for NGINX_BRIDGE_PATH in \
+        /usr/local/nginx/servers \
+        /usr/local/nginx/stream_servers \
+        /usr/local/nginx/cert \
+        /www/server/panel/vhost/nginx/zz_arcway_loader.conf \
+        /www/server/panel/vhost/nginx/tcp/zz_arcway_loader.conf; do
+        track_path "$NGINX_BRIDGE_PATH"
+    done
+fi
 track_symlink_target() {
     local link_path="$1" resolved=""
     [ -L "$link_path" ] || return 0
@@ -1560,7 +1619,7 @@ rollback_install() {
 				systemctl stop xray >/dev/null 2>&1 || true
 				systemctl is-active --quiet xray && ROLLBACK_FAILED=1
 			fi
-			if [ "$NGINX_UNIT_PRESENT" = "1" ]; then
+			if [ "$NGINX_MODE" = "managed" ] && [ "$NGINX_UNIT_PRESENT" = "1" ]; then
 				systemctl stop nginx >/dev/null 2>&1 || true
 				systemctl is-active --quiet nginx && ROLLBACK_FAILED=1
 			fi
@@ -1691,7 +1750,7 @@ rollback_install() {
 		if [ "$XRAY_UNIT_PRESENT" = "1" ]; then
 			restore_systemd_service_state xray "$OLD_XRAY_ENABLE_STATE" "$OLD_XRAY_ACTIVE" || ROLLBACK_FAILED=1
 		fi
-		if [ "$NGINX_UNIT_PRESENT" = "1" ]; then
+		if [ "$NGINX_MODE" = "managed" ] && [ "$NGINX_UNIT_PRESENT" = "1" ]; then
 			restore_systemd_service_state nginx "$OLD_NGINX_ENABLE_STATE" "$OLD_NGINX_ACTIVE" || ROLLBACK_FAILED=1
 		fi
         if [ "$OLD_AGENT_UNIT_PRESENT" = "1" ]; then
@@ -1911,6 +1970,7 @@ token: ${TOKEN}
 connection_mode: ${CONNECTION_MODE}
 xray_mode: ${XRAY_MODE}
 steal_mode: ${STEAL_MODE}
+nginx_mode: ${NGINX_MODE}
 master_public_key: ${MASTER_PUBLIC_KEY}
 listen_port: "${LISTEN_PORT}"
 hide_port_on_ws: false
@@ -2427,7 +2487,7 @@ if command -v ufw >/dev/null 2>&1; then
         fi
     fi
     if [ "$UFW_ACTIVE" = "1" ]; then
-        /usr/local/sbin/arcway-agent-firewall
+        ARCWAY_AGENT_BINARY="$AGENT_DOWNLOAD" /usr/local/sbin/arcway-agent-firewall
     fi
 fi
 
@@ -2446,6 +2506,23 @@ STREAM_LOADER="$BT_STREAM_DIR/zz_arcway_loader.conf"
 MANAGED_ROOT=/usr/local/nginx
 HTTP_INCLUDE='/www/server/panel/vhost/nginx/*.conf'
 STREAM_INCLUDE='/www/server/panel/vhost/nginx/tcp/*.conf'
+AGENT_CONFIG=${ARCWAY_AGENT_CONFIG:-/etc/mmw-agent/config.yaml}
+
+# The helper remains in service pre-start hooks for installation compatibility,
+# but reuse_existing must never create loaders or reload the externally-owned
+# Nginx. Reading the Agent config here also makes later mode changes fail safe.
+CONFIGURED_MODE=$(awk -F: '
+    /^[[:space:]]*nginx_mode[[:space:]]*:/ {
+        value=$2
+        sub(/[[:space:]]*#.*/, "", value)
+        gsub(/[[:space:]\"]/, "", value)
+        mode=value
+    }
+    END { print mode }
+' "$AGENT_CONFIG" 2>/dev/null || true)
+if [ "$CONFIGURED_MODE" = "reuse_existing" ]; then
+    exit 0
+fi
 
 # A host without the BaoTa layout is not an error. A partial BaoTa layout is:
 # silently guessing there would recreate the Agent's false-success path bug.

@@ -315,6 +315,7 @@ func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) 
 		"domain":        domain,
 		"nginx_config":  "", // 留空 → agent 跳过主 nginx.conf 写入(reality 已下过的不动)
 		"domain_config": domainConf,
+		"nginx_mode":    normalizedRemoteNginxMode(server),
 	})
 	if err != nil {
 		return fmt.Errorf("序列化 WSS nginx 配置失败: %v", err)

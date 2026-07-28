@@ -4,6 +4,7 @@
 package handler
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strconv"
@@ -16,7 +17,12 @@ func (h *RemoteManageHandler) HandleWarpInstall(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	result, err := h.forwardToRemoteServer(r.Context(), id, http.MethodPost, "/api/child/warp/install", nil)
+	ctx, release, ok := h.acquireWarpMutationLease(w, r.Context(), id)
+	if !ok {
+		return
+	}
+	defer release()
+	result, err := h.forwardToRemoteServer(ctx, id, http.MethodPost, "/api/child/warp/install", nil)
 	if err != nil {
 		remoteWriteError(w, http.StatusBadGateway, err.Error())
 		return
@@ -50,7 +56,12 @@ func (h *RemoteManageHandler) HandleWarpLicense(w http.ResponseWriter, r *http.R
 		remoteWriteError(w, http.StatusBadRequest, "read body failed")
 		return
 	}
-	result, err := h.forwardToRemoteServer(r.Context(), id, http.MethodPost, "/api/child/warp/license", body)
+	ctx, release, ok := h.acquireWarpMutationLease(w, r.Context(), id)
+	if !ok {
+		return
+	}
+	defer release()
+	result, err := h.forwardToRemoteServer(ctx, id, http.MethodPost, "/api/child/warp/license", body)
 	if err != nil {
 		remoteWriteError(w, http.StatusBadGateway, err.Error())
 		return
@@ -65,12 +76,26 @@ func (h *RemoteManageHandler) HandleWarpRemove(w http.ResponseWriter, r *http.Re
 	if !ok {
 		return
 	}
-	result, err := h.forwardToRemoteServer(r.Context(), id, http.MethodPost, "/api/child/warp/remove", nil)
+	ctx, release, ok := h.acquireWarpMutationLease(w, r.Context(), id)
+	if !ok {
+		return
+	}
+	defer release()
+	result, err := h.forwardToRemoteServer(ctx, id, http.MethodPost, "/api/child/warp/remove", nil)
 	if err != nil {
 		remoteWriteError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	writeWarpResult(w, result)
+}
+
+func (h *RemoteManageHandler) acquireWarpMutationLease(w http.ResponseWriter, ctx context.Context, serverID int64) (context.Context, func(), bool) {
+	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, serverID)
+	if err != nil {
+		remoteWriteForwardError(w, err)
+		return nil, nil, false
+	}
+	return leasedCtx, release, true
 }
 
 // parseWarpServerID 共享的 server_id 校验。expectedMethod 不匹配时返回 405。

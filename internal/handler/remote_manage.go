@@ -456,7 +456,22 @@ func (h *RemoteManageHandler) HandleServiceControl(w http.ResponseWriter, r *htt
 		Service string `json:"service"`
 		Action  string `json:"action"`
 	}
-	if json.Unmarshal(body, &req) == nil && req.Service == "xray" && (req.Action == "start" || req.Action == "restart") {
+	if err := json.Unmarshal(body, &req); err != nil {
+		remoteWriteError(w, http.StatusBadRequest, "invalid service control request")
+		return
+	}
+	server, err := h.repo.GetRemoteServer(r.Context(), id)
+	if err != nil {
+		remoteWriteError(w, http.StatusNotFound, "server not found")
+		return
+	}
+	nginxMode := normalizedRemoteNginxMode(server)
+	if req.Service == "nginx" && nginxMode == remoteNginxModeReuseExisting {
+		remoteWriteError(w, http.StatusConflict, "该服务器正在复用系统已有 Nginx；Arcway 不会启动、停止或重启外部 Nginx")
+		return
+	}
+	body, _ = json.Marshal(map[string]string{"service": req.Service, "action": req.Action, "nginx_mode": nginxMode})
+	if req.Service == "xray" && (req.Action == "start" || req.Action == "restart") {
 		// 使用独立 context，避免同机 tunnel 模式下请求断开导致 context canceled
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -657,9 +672,8 @@ func (h *RemoteManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.
 		return
 	}
 
-	server, err := h.repo.GetRemoteServer(r.Context(), id)
-	if err != nil {
-		remoteWriteError(w, http.StatusNotFound, "server not found")
+	server, ok := h.requireManagedRemoteNginx(r.Context(), w, id)
+	if !ok {
 		return
 	}
 
@@ -700,6 +714,9 @@ func (h *RemoteManageHandler) HandleNginxRemove(w http.ResponseWriter, r *http.R
 	id, err := strconv.ParseInt(serverID, 10, 64)
 	if err != nil {
 		remoteWriteError(w, http.StatusBadRequest, "invalid server_id")
+		return
+	}
+	if _, ok := h.requireManagedRemoteNginx(r.Context(), w, id); !ok {
 		return
 	}
 
@@ -881,6 +898,10 @@ func (h *RemoteManageHandler) HandleXrayRemoveStream(w http.ResponseWriter, r *h
 
 func (h *RemoteManageHandler) refreshXrayStatus(serverID int64) {
 	time.Sleep(2 * time.Second)
+	h.refreshXrayStatusNow(serverID)
+}
+
+func (h *RemoteManageHandler) refreshXrayStatusNow(serverID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, serverID)
@@ -937,9 +958,8 @@ func (h *RemoteManageHandler) HandleNginxInstallStream(w http.ResponseWriter, r 
 		return
 	}
 
-	server, err := h.repo.GetRemoteServer(r.Context(), id)
-	if err != nil {
-		remoteSSEError(w, "server not found")
+	server, ok := h.requireManagedRemoteNginxSSE(r.Context(), w, id)
+	if !ok {
 		return
 	}
 
@@ -963,6 +983,9 @@ func (h *RemoteManageHandler) HandleNginxRemoveStream(w http.ResponseWriter, r *
 	id, err := strconv.ParseInt(r.URL.Query().Get("server_id"), 10, 64)
 	if err != nil {
 		remoteSSEError(w, "invalid server_id")
+		return
+	}
+	if _, ok := h.requireManagedRemoteNginxSSE(r.Context(), w, id); !ok {
 		return
 	}
 	h.forwardStreamToRemote(w, r, id, "/api/child/nginx/remove-stream")
@@ -1253,12 +1276,7 @@ func (h *RemoteManageHandler) HandleAgentUninstallStream(w http.ResponseWriter, 
 		remoteWriteError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
-	id, err := strconv.ParseInt(r.URL.Query().Get("server_id"), 10, 64)
-	if err != nil {
-		remoteSSEError(w, "invalid server_id")
-		return
-	}
-	h.forwardStreamToRemote(w, r, id, "/api/child/agent/uninstall-stream")
+	remoteWriteError(w, http.StatusGone, "旧 Agent 卸载入口已停用；请在服务管理中使用“卸载 Agent 并删除服务器”")
 }
 
 // 将 nginx 配置请求代理到远程服务器
@@ -1273,6 +1291,11 @@ func (h *RemoteManageHandler) HandleNginxConfig(w http.ResponseWriter, r *http.R
 	if err != nil {
 		remoteWriteError(w, http.StatusBadRequest, "invalid server_id")
 		return
+	}
+	if r.Method == http.MethodPut || r.Method == http.MethodPost {
+		if _, ok := h.requireManagedRemoteNginx(r.Context(), w, id); !ok {
+			return
+		}
 	}
 
 	var body []byte
@@ -1843,6 +1866,11 @@ func (h *RemoteManageHandler) HandleNginxConfigFiles(w http.ResponseWriter, r *h
 	if err != nil {
 		remoteWriteError(w, http.StatusBadRequest, "invalid server_id")
 		return
+	}
+	if r.Method == http.MethodPut || r.Method == http.MethodPost || r.Method == http.MethodDelete {
+		if _, ok := h.requireManagedRemoteNginx(r.Context(), w, id); !ok {
+			return
+		}
 	}
 
 	// 转发查询参数
@@ -5012,13 +5040,19 @@ func (h *RemoteManageHandler) restartXrayWithRecovery(ctx context.Context, serve
 	}
 	defer release()
 	ctx = leasedCtx
+	server, err := h.repo.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		return fmt.Errorf("读取服务器 Nginx 模式失败: %w", err)
+	}
+	nginxMode := normalizedRemoteNginxMode(server)
 
 	// restartAndVerify 改成 polling — 之前固定 sleep N 秒固然简单但显著拖慢套餐绑定/批量操作:
 	// 主控对每条 server restart 都等满 sleep 时长,套餐里多 routed 节点跨多台 server 时
 	// total wait ≈ 最慢 server 的 sleep 时长。xray 实际重启通常 < 500ms,polling 能把
 	// 多数情况从 sleep 2s 砍到 ~200ms,batch 绑定/解绑直接感知"立刻完成"。
 	restartAndVerify := func(maxWait time.Duration) error {
-		controlResult, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/services/control", []byte(`{"service":"xray","action":"restart"}`))
+		controlPayload, _ := json.Marshal(map[string]string{"service": "xray", "action": "restart", "nginx_mode": nginxMode})
+		controlResult, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/services/control", controlPayload)
 		if err != nil {
 			return err
 		}
@@ -5078,10 +5112,13 @@ func (h *RemoteManageHandler) restartXrayWithRecovery(ctx context.Context, serve
 		return nil
 	} else {
 		log.Printf("[%s] Xray restart attempt 2 failed on server %d: %v, trying stream cleanup", logPrefix, serverID, err)
+		if nginxMode == remoteNginxModeReuseExisting {
+			return fmt.Errorf("xray 重启失败: %v；该服务器正在复用系统 Nginx，Arcway 已停止恢复流程，不会清理、停止或重启外部 Nginx", err)
+		}
 	}
 
 	// 第三轮：清理 nginx stream 端口冲突后重试
-	clearPayload, _ := json.Marshal(map[string]int{"port": 443})
+	clearPayload, _ := json.Marshal(map[string]any{"port": 443, "nginx_mode": nginxMode})
 	clearResult, clearErr := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/nginx/clear-stream-port", clearPayload)
 	if clearErr == nil {
 		var clearResp struct {
@@ -5240,6 +5277,7 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 	sslPayload, marshalErr := json.Marshal(map[string]any{
 		"domain":        domain,
 		"domain_config": domainConf,
+		"nginx_mode":    normalizedRemoteNginxMode(server),
 	})
 	if marshalErr != nil {
 		remoteWritePartialError(w, fmt.Sprintf("序列化 nginx 配置失败: %v", marshalErr))

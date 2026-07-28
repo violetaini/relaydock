@@ -35,7 +35,7 @@ func NewAgentVersionHandler(rm *RemoteManageHandler, repo *storage.TrafficReposi
 	return &AgentVersionHandler{rm: rm, repo: repo}
 }
 
-const githubLatestReleaseURL = "https://api.github.com/repos/iluobei/mmw-agent/releases/latest"
+const githubLatestReleaseURL = "https://api.github.com/repos/violetaini/relaydock-agent/releases/latest"
 
 // 缓存 5 分钟 — 之前 1h 太长,刚发新 release UI 要等一小时才更新,期间"升级"按钮
 // 会因为 compareSemver(current, staleCachedLatest) ≥ 0 被前端 disable,用户没法点。

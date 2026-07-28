@@ -79,7 +79,7 @@ func TestRemoteServerAdminHandlersConflictDuringInstallation(t *testing.T) {
 	}
 	handler := NewXrayServerHandler(repo, nil, nil)
 
-	deleteBody, err := json.Marshal(RemoteServerDeleteRequest{ID: server.ID})
+	deleteBody, err := json.Marshal(RemoteServerDeleteRequest{ID: server.ID, UninstallAgent: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,6 +338,62 @@ func TestHandleScanResultSkipsInboundSyncDuringInstallation(t *testing.T) {
 	case <-requested:
 		t.Fatal("active installation allowed scan_result inbound sync")
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestFinalizeRemoteInstallationRefreshesXrayStatusAfterLeaseRelease(t *testing.T) {
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/child/services/status" || r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"xray": map[string]any{
+				"running": true,
+				"version": "Xray 25.7.26",
+			},
+		})
+	}))
+	defer agent.Close()
+
+	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
+	const nonce = "finalize-status-refresh"
+	ctx := context.Background()
+	if err := repo.BeginRemoteServerInstallation(ctx, server.ID, nonce, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.MarkRemoteServerInstallationReady(ctx, server.ID, nonce); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.MarkRemoteServerInstallationPrepared(ctx, server.ID, nonce); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewXrayServerHandler(repo, nil, nil)
+	handler.SetRemoteManager(NewRemoteManageHandler(repo, nil))
+	request := httptest.NewRequest(http.MethodPost, "/api/remote/install-finalize", nil)
+	request.Header.Set("Authorization", "Bearer "+server.Token)
+	request.Header.Set(remoteInstallationNonceHeader, nonce)
+	response := httptest.NewRecorder()
+	handler.FinalizeRemoteInstallation(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("finalize status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stored, err := repo.GetRemoteServer(ctx, server.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.XrayRunning && stored.XrayVersion == "Xray 25.7.26" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("finalized server status was not refreshed: running=%v version=%q", stored.XrayRunning, stored.XrayVersion)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

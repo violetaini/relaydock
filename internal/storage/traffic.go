@@ -793,6 +793,7 @@ type RemoteServer struct {
 	Use443                bool       `json:"use_443"`                       // 是否使用443端口与nginx+xray隧道
 	StealSelf             bool       `json:"steal_self"`                    // 安装/重装时是否允许自动接管本机443
 	StealMode             string     `json:"steal_mode,omitempty"`          // "tunnel" | "fallback"，默认 tunnel
+	NginxMode             string     `json:"nginx_mode"`                    // "managed"(Arcway 管理) | "reuse_existing"(复用系统 Nginx)
 	SiteType              string     `json:"site_type,omitempty"`           // "static" | "proxy"
 	SiteValue             string     `json:"site_value,omitempty"`          // 静态路径或反向代理地址
 	XrayMode              string     `json:"xray_mode"`                     // "external" (默认) 或 "embedded"
@@ -2220,6 +2221,9 @@ CREATE INDEX IF NOT EXISTS idx_remote_server_install_tickets_server
 	if err := r.ensureRemoteServerColumn("steal_mode", "TEXT NOT NULL DEFAULT 'tunnel'"); err != nil {
 		return err
 	}
+	if err := r.ensureRemoteServerColumn("nginx_mode", "TEXT NOT NULL DEFAULT 'managed'"); err != nil {
+		return err
+	}
 	if err := r.ensureRemoteServerColumn("site_type", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
@@ -2858,6 +2862,9 @@ CREATE TABLE IF NOT EXISTS traffic_threshold_notified (
 		return err
 	}
 	if err := r.migrateForwarding(); err != nil {
+		return err
+	}
+	if err := r.migrateRemoteServerDeletionTasks(); err != nil {
 		return err
 	}
 
@@ -9527,6 +9534,13 @@ func RemoteServerInstallationPolicyFingerprint(server *RemoteServer) (string, er
 	if server.XrayMode == "embedded" {
 		xrayMode = "embedded"
 	}
+	nginxMode := strings.TrimSpace(server.NginxMode)
+	if nginxMode == "" {
+		nginxMode = "managed"
+	}
+	if nginxMode != "managed" && nginxMode != "reuse_existing" {
+		return "", errors.New("invalid remote server nginx mode")
+	}
 	connectionMode := ""
 	switch server.ConnectionMode {
 	case ConnectionModePush:
@@ -9545,8 +9559,8 @@ func RemoteServerInstallationPolicyFingerprint(server *RemoteServer) (string, er
 	}
 	guardPort := listenPort + remoteInstallationGuardPortOffset
 	canonical := fmt.Sprintf(
-		"arcway-install-policy-v1\nsteal_self=%t\nsteal_mode=%s\nxray_mode=%s\nconnection_mode=%s\nfront_service=xray\nlisten_port=%d\nguard_port=%d\n",
-		stealSelf, stealMode, xrayMode, connectionMode, listenPort, guardPort,
+		"arcway-install-policy-v1\nsteal_self=%t\nsteal_mode=%s\nnginx_mode=%s\nxray_mode=%s\nconnection_mode=%s\nfront_service=xray\nlisten_port=%d\nguard_port=%d\n",
+		stealSelf, stealMode, nginxMode, xrayMode, connectionMode, listenPort, guardPort,
 	)
 	sum := sha256.Sum256([]byte(canonical))
 	return hex.EncodeToString(sum[:]), nil
@@ -10419,7 +10433,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 		COALESCE(xray_running, 0), COALESCE(xray_version, ''), xray_scanned_at,
 		COALESCE(listen_port, 0), COALESCE(traffic_limit, 0), COALESCE(traffic_reset_day, 0),
 		COALESCE(agent_token, ''), agent_token_expires_at, last_agent_token_refresh,
-		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'),
+		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'), COALESCE(nginx_mode, 'managed'),
 		COALESCE(site_type, ''), COALESCE(site_value, ''),
 		COALESCE(xray_mode, 'external'),
 		COALESCE(time_offset_seconds, 0),
@@ -10459,7 +10473,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 			&xrayRunning, &server.XrayVersion, &xrayScannedAt,
 			&server.ListenPort, &server.TrafficLimit, &server.TrafficResetDay,
 			&server.AgentToken, &agentTokenExpiresAt, &lastAgentTokenRefresh,
-			&server.Use443, &server.StealSelf, &server.StealMode,
+			&server.Use443, &server.StealSelf, &server.StealMode, &server.NginxMode,
 			&server.SiteType, &server.SiteValue,
 			&server.XrayMode,
 			&timeOffsetSeconds,
@@ -10546,7 +10560,7 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		COALESCE(connection_mode, 'push'), COALESCE(pull_address, ''), COALESCE(pull_port, 0), COALESCE(pull_token, ''), last_pull_at,
 		COALESCE(listen_port, 0),
 		COALESCE(agent_token, ''), agent_token_expires_at, last_agent_token_refresh,
-		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'),
+		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'), COALESCE(nginx_mode, 'managed'),
 		COALESCE(site_type, ''), COALESCE(site_value, ''),
 		COALESCE(xray_mode, 'external'),
 		COALESCE(traffic_limit, 0), COALESCE(traffic_reset_day, 0),
@@ -10575,7 +10589,7 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		&server.ConnectionMode, &server.PullAddress, &server.PullPort, &server.PullToken, &lastPullAt,
 		&server.ListenPort,
 		&server.AgentToken, &agentTokenExpiresAt, &lastAgentTokenRefresh,
-		&server.Use443, &server.StealSelf, &server.StealMode,
+		&server.Use443, &server.StealSelf, &server.StealMode, &server.NginxMode,
 		&server.SiteType, &server.SiteValue,
 		&server.XrayMode,
 		&server.TrafficLimit, &server.TrafficResetDay,
@@ -10645,7 +10659,7 @@ func (r *TrafficRepository) GetRemoteServerByToken(ctx context.Context, token st
 		COALESCE(connection_mode, 'push'), COALESCE(pull_address, ''), COALESCE(pull_port, 0), COALESCE(pull_token, ''), last_pull_at,
 		COALESCE(listen_port, 0),
 		COALESCE(agent_token, ''), agent_token_expires_at, last_agent_token_refresh,
-		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'),
+		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'), COALESCE(nginx_mode, 'managed'),
 		COALESCE(site_type, ''), COALESCE(site_value, ''),
 		COALESCE(xray_mode, 'external'),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
@@ -10664,7 +10678,7 @@ func (r *TrafficRepository) GetRemoteServerByToken(ctx context.Context, token st
 		&server.ConnectionMode, &server.PullAddress, &server.PullPort, &server.PullToken, &lastPullAt,
 		&server.ListenPort,
 		&server.AgentToken, &agentTokenExpiresAt, &lastAgentTokenRefresh,
-		&server.Use443, &server.StealSelf, &server.StealMode,
+		&server.Use443, &server.StealSelf, &server.StealMode, &server.NginxMode,
 		&server.SiteType, &server.SiteValue,
 		&server.XrayMode,
 		&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
@@ -10721,7 +10735,7 @@ func (r *TrafficRepository) GetRemoteServerByName(ctx context.Context, name stri
 		COALESCE(connection_mode, 'push'), COALESCE(pull_address, ''), COALESCE(pull_port, 0), COALESCE(pull_token, ''), last_pull_at,
 		COALESCE(listen_port, 0),
 		COALESCE(agent_token, ''), agent_token_expires_at, last_agent_token_refresh,
-		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'),
+		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'), COALESCE(nginx_mode, 'managed'),
 		COALESCE(site_type, ''), COALESCE(site_value, ''),
 		COALESCE(xray_mode, 'external'),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
@@ -10740,7 +10754,7 @@ func (r *TrafficRepository) GetRemoteServerByName(ctx context.Context, name stri
 		&server.ConnectionMode, &server.PullAddress, &server.PullPort, &server.PullToken, &lastPullAt,
 		&server.ListenPort,
 		&server.AgentToken, &agentTokenExpiresAt, &lastAgentTokenRefresh,
-		&server.Use443, &server.StealSelf, &server.StealMode,
+		&server.Use443, &server.StealSelf, &server.StealMode, &server.NginxMode,
 		&server.SiteType, &server.SiteValue,
 		&server.XrayMode,
 		&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
@@ -10818,13 +10832,17 @@ func (r *TrafficRepository) CreateRemoteServer(ctx context.Context, server *Remo
 	// 将令牌有效期设置为从现在起 7 天
 	tokenExpiresAt := time.Now().Add(7 * 24 * time.Hour)
 
-	const stmt = `INSERT INTO remote_servers (name, token, status, ip_address, ip_address_v6, ipv6_enabled, domain, token_expires_at, last_token_refresh, connection_mode, listen_port, pull_address, pull_port, pull_token, use_443, steal_self, steal_mode, site_type, site_value, xray_mode, traffic_limit, traffic_used_offset, traffic_reset_day, traffic_stats_mode, traffic_source, ddns_enabled, ddns_provider_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+	const stmt = `INSERT INTO remote_servers (name, token, status, ip_address, ip_address_v6, ipv6_enabled, domain, token_expires_at, last_token_refresh, connection_mode, listen_port, pull_address, pull_port, pull_token, use_443, steal_self, steal_mode, nginx_mode, site_type, site_value, xray_mode, traffic_limit, traffic_used_offset, traffic_reset_day, traffic_stats_mode, traffic_source, ddns_enabled, ddns_provider_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
 
 	stealMode := server.StealMode
 	if stealMode == "" {
 		// 历史默认 "tunnel" 改为 "default" — 没显式选 tunnel/fallback 的就是"默认部署模式",
 		// 跟 handler 那里的默认保持一致
 		stealMode = "default"
+	}
+	nginxMode := strings.TrimSpace(server.NginxMode)
+	if nginxMode != "reuse_existing" {
+		nginxMode = "managed"
 	}
 	xrayMode := server.XrayMode
 	if xrayMode == "" {
@@ -10842,7 +10860,7 @@ func (r *TrafficRepository) CreateRemoteServer(ctx context.Context, server *Remo
 	if server.DDNSEnabled {
 		ddnsEnabledInt = 1
 	}
-	result, err := r.db.ExecContext(ctx, stmt, server.Name, server.Token, server.Status, server.IPAddress, server.IPAddressV6, server.IPv6Enabled, server.Domain, tokenExpiresAt, server.ConnectionMode, server.ListenPort, server.PullAddress, server.PullPort, server.PullToken, server.Use443, server.StealSelf, stealMode, server.SiteType, server.SiteValue, xrayMode, server.TrafficLimit, server.TrafficUsedOffset, server.TrafficResetDay, statsMode, trafficSource, ddnsEnabledInt, server.DDNSProviderID)
+	result, err := r.db.ExecContext(ctx, stmt, server.Name, server.Token, server.Status, server.IPAddress, server.IPAddressV6, server.IPv6Enabled, server.Domain, tokenExpiresAt, server.ConnectionMode, server.ListenPort, server.PullAddress, server.PullPort, server.PullToken, server.Use443, server.StealSelf, stealMode, nginxMode, server.SiteType, server.SiteValue, xrayMode, server.TrafficLimit, server.TrafficUsedOffset, server.TrafficResetDay, statsMode, trafficSource, ddnsEnabledInt, server.DDNSProviderID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return ErrRemoteServerExists
@@ -11746,6 +11764,25 @@ func (r *TrafficRepository) UpdateRemoteServerStealMode(ctx context.Context, id 
 	return nil
 }
 
+func (r *TrafficRepository) UpdateRemoteServerNginxMode(ctx context.Context, id int64, nginxMode string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	nginxMode = strings.TrimSpace(nginxMode)
+	if nginxMode != "managed" && nginxMode != "reuse_existing" {
+		return errors.New("invalid nginx mode")
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET nginx_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, nginxMode, id)
+	if err != nil {
+		return fmt.Errorf("update nginx_mode: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return ErrRemoteServerNotFound
+	}
+	return nil
+}
+
 func (r *TrafficRepository) DeleteNodesByOriginalServer(ctx context.Context, serverName string) (int64, error) {
 	if r == nil || r.db == nil {
 		return 0, errors.New("traffic repository not initialized")
@@ -11789,6 +11826,68 @@ func (r *TrafficRepository) ReorderRemoteServers(ctx context.Context, ids []int6
 	return nil
 }
 
+type remoteServerDeletionQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func validateRemoteServerDeletion(ctx context.Context, querier remoteServerDeletionQuerier, id int64) (string, error) {
+	var name string
+	switch err := querier.QueryRowContext(ctx, `SELECT name FROM remote_servers WHERE id = ?`, id).Scan(&name); err {
+	case nil:
+		// ok
+	case sql.ErrNoRows:
+		return "", ErrRemoteServerNotFound
+	default:
+		return "", fmt.Errorf("lookup remote server: %w", err)
+	}
+
+	var sameNameCount int
+	if err := querier.QueryRowContext(ctx, `SELECT COUNT(*) FROM remote_servers WHERE name = ?`, name).Scan(&sameNameCount); err != nil {
+		return "", fmt.Errorf("count same-name remote servers: %w", err)
+	}
+	if sameNameCount > 1 {
+		return "", errors.New("duplicate remote server name; rename servers before deletion")
+	}
+
+	// Forwarding routes own durable resources on the server. Removing the
+	// server record while any reference remains would orphan those resources.
+	var forwardingReferenced int
+	if err := querier.QueryRowContext(ctx, `SELECT EXISTS(
+	    SELECT 1 FROM tunnel_template_hops WHERE server_id = ?
+	    UNION ALL
+	    SELECT 1 FROM user_forward_hops WHERE server_id = ?
+	    UNION ALL
+	    SELECT 1 FROM server_port_allocations WHERE server_id = ?
+	)`, id, id, id).Scan(&forwardingReferenced); err != nil {
+		return "", fmt.Errorf("check forwarding server references: %w", err)
+	}
+	if forwardingReferenced != 0 {
+		return "", ErrForwardingConflict
+	}
+	return name, nil
+}
+
+// ValidateRemoteServerDeletion checks every durable constraint used by
+// DeleteRemoteServer without changing data. Callers that perform remote side
+// effects must hold an exclusive server mutation lease across this preflight,
+// the remote operation, and the final DeleteRemoteServer call.
+func (r *TrafficRepository) ValidateRemoteServerDeletion(ctx context.Context, id int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if id <= 0 {
+		return errors.New("remote server id is required")
+	}
+
+	leasedCtx, release, err := r.AcquireRemoteServerMutationLease(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer release()
+	_, err = validateRemoteServerDeletion(leasedCtx, r.db, id)
+	return err
+}
+
 func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
@@ -11804,51 +11903,42 @@ func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) er
 	defer release()
 	ctx = leasedCtx
 
-	// nodes / user_subaccounts 按服务器**名字**(nodes.original_server)关联,先取出来。
-	var name string
-	switch err := r.db.QueryRowContext(ctx, `SELECT name FROM remote_servers WHERE id = ?`, id).Scan(&name); err {
-	case nil:
-		// ok
-	case sql.ErrNoRows:
-		return ErrRemoteServerNotFound
-	default:
-		return fmt.Errorf("lookup remote server: %w", err)
-	}
-	var sameNameCount int
-	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM remote_servers WHERE name = ?`, name).Scan(&sameNameCount); err != nil {
-		return fmt.Errorf("count same-name remote servers: %w", err)
-	}
-	if sameNameCount > 1 {
-		return errors.New("duplicate remote server name; rename servers before deletion")
-	}
-
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin delete-server tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // commit 成功后 rollback 为 no-op
 
-	// A forwarding route owns durable resources on the server. Deleting the
-	// server first would leave templates, allocations, and remote Guard
-	// resources orphaned, so require the operator to remove those references.
-	var forwardingReferenced int
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-    SELECT 1 FROM tunnel_template_hops WHERE server_id = ?
-    UNION ALL
-    SELECT 1 FROM user_forward_hops WHERE server_id = ?
-    UNION ALL
-    SELECT 1 FROM server_port_allocations WHERE server_id = ?
-)`, id, id, id).Scan(&forwardingReferenced); err != nil {
-		return fmt.Errorf("check forwarding server references: %w", err)
-	}
-	if forwardingReferenced != 0 {
-		return ErrForwardingConflict
+	// Re-check inside the delete transaction. A compound remote-uninstall flow
+	// runs the same validation before touching the Agent, but the final database
+	// mutation must remain independently safe for every caller.
+	name, err := validateRemoteServerDeletion(ctx, tx, id)
+	if err != nil {
+		return err
 	}
 
 	// 1) 用户子账户:按 routed_node_id 关联,经 nodes.original_server 反查该服务器的(routed)节点。必须在删 nodes 之前。
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM user_subaccounts WHERE routed_node_id IN (SELECT id FROM nodes WHERE original_server = ?)`, name); err != nil {
 		return fmt.Errorf("delete user_subaccounts: %w", err)
+	}
+	// 节点测速与自助节点授权同样引用即将删除的 node/offer/grant。SQLite
+	// 历史库不一定启用了外键，按依赖顺序显式清理，避免留下不可见的授权和统计。
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM speed_test_results WHERE node_id IN (SELECT id FROM nodes WHERE original_server = ?)`, name); err != nil {
+		return fmt.Errorf("delete speed_test_results: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_node_selection_usage WHERE selection_id IN (
+		SELECT id FROM user_node_selections WHERE
+		grant_id IN (SELECT id FROM user_server_grants WHERE server_id = ?)
+		OR offer_id IN (SELECT id FROM self_service_node_offers WHERE server_id = ?)
+	)`, id, id); err != nil {
+		return fmt.Errorf("delete user_node_selection_usage: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_node_selections WHERE
+		grant_id IN (SELECT id FROM user_server_grants WHERE server_id = ?)
+		OR offer_id IN (SELECT id FROM self_service_node_offers WHERE server_id = ?)`, id, id); err != nil {
+		return fmt.Errorf("delete user_node_selections: %w", err)
 	}
 	// 2) 该服务器入站同步出来的所有节点(普通 + routed),按 original_server 名字。
 	if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE original_server = ?`, name); err != nil {
@@ -11874,7 +11964,20 @@ func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) er
 		"traffic_snapshots",
 		"node_traffic_snapshots",
 		"user_traffic_snapshots",
+		"user_email_traffic_snapshots",
 		"server_system_traffic_snapshots",
+		"line_speedtest_results",
+		// 自助节点与管理侧资源
+		"self_service_node_offers",
+		"user_server_grants",
+		"user_inbound_access_sources",
+		"managed_inbound_resources",
+		"managed_access_audit",
+		"remote_server_guard_secrets",
+		"shared_servers",
+		"federated_servers",
+		// 删除任务最后清理；若事务失败，已确认的 Agent 状态仍可重试。
+		"remote_server_deletion_tasks",
 	} {
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE server_id = ?`, table), id); err != nil {
 			return fmt.Errorf("delete %s: %w", table, err)
@@ -11889,9 +11992,6 @@ func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) er
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit delete-server tx: %w", err)
 	}
-
-	// 联邦(分享接入)标记是独立表,best-effort 清理,避免孤立记录。
-	_ = r.DeleteFederatedServer(ctx, id)
 
 	if affected, _ := res.RowsAffected(); affected == 0 {
 		return ErrRemoteServerNotFound

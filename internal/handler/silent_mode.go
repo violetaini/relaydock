@@ -159,6 +159,12 @@ func (m *SilentModeManager) extractUsername(r *http.Request) string {
 }
 
 func (m *SilentModeManager) isAllowedPath(path string) bool {
+	// The Agent may finish cleanup after the user's silent-mode recovery window
+	// closes. The exact callback remains reachable; its handler still requires
+	// the operation-scoped, high-entropy Bearer token.
+	if path == AgentUninstallCompletePath {
+		return true
+	}
 	allowedPrefixes := []string{
 		"/api/clash/subscribe",
 		"/api/proxy-provider/",

@@ -433,9 +433,13 @@ func (h *XrayServerHandler) FinalizeRemoteInstallation(w http.ResponseWriter, r 
 		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction is not ready"})
 		return
 	}
-	// The installer ACK depends only on the durable tombstone. Agent scan events
-	// and the regular reconciler converge nodes afterward; doing that work here
-	// would make response-loss retries launch duplicate mutating jobs.
+	// The first Agent scan commonly arrives while the installation lease is still
+	// active and is deliberately ignored. Refresh only operational status after
+	// finalization so a healthy new server is not left displayed as Xray offline.
+	// Node reconciliation remains on the regular scan/reconnect path.
+	if h.remoteManager != nil {
+		go h.remoteManager.refreshXrayStatusNow(server.ID)
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
 }
 

@@ -45,6 +45,11 @@ RUN mkdir -p /app/guard-assets \
         -o /app/guard-assets/arcway-expiry-guard-linux-arm64 \
         ./cmd/arcway-expiry-guard
 
+# Release CI downloads the two pinned Agent builds into the Docker context.
+RUN test -s /app/agent-assets/mmw-agent-linux-amd64 \
+    && test -s /app/agent-assets/mmw-agent-linux-arm64 \
+    && chmod 0755 /app/agent-assets/mmw-agent-linux-amd64 /app/agent-assets/mmw-agent-linux-arm64
+
 # Final stage - 用 nginx 官方 Docker base(mainline-bookworm),跟 install-nginx.sh 同款"最新 nginx mainline"语义。
 # 该镜像默认编译 --with-http_v3_module 且静态链 QuicTLS,完整支持 listen ... quic;
 # 之前 debian:bookworm-slim apt 装的 nginx 1.22.1 不带 HTTP/3 模块,EnableHTTPS 写入含 quic 指令的
@@ -82,6 +87,7 @@ RUN groupadd -g 1000 appuser && \
 # Copy binary from builder
 COPY --from=backend-builder /app/server /app/server
 COPY --from=backend-builder /app/guard-assets /app/guard-assets
+COPY --from=backend-builder /app/agent-assets /app/agent-assets
 
 # Copy rule templates directory
 COPY --from=backend-builder /app/rule_templates /app/rule_templates
@@ -91,7 +97,7 @@ COPY docker-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Set proper ownership for app files
-RUN chown -R appuser:appuser /app/server /app/guard-assets /app/rule_templates
+RUN chown -R appuser:appuser /app/server /app/guard-assets /app/agent-assets /app/rule_templates
 
 # Volume for persistent data
 VOLUME ["/app/data", "/app/subscribes"]
@@ -103,6 +109,7 @@ VOLUME ["/app/data", "/app/subscribes"]
 # is preserved.
 ENV BIND_HOST=0.0.0.0
 ENV ARCWAY_GUARD_ASSET_DIR=/app/guard-assets
+ENV ARCWAY_AGENT_ASSET_DIR=/app/agent-assets
 
 # Expose port
 EXPOSE 12889

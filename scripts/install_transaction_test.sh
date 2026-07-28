@@ -71,7 +71,12 @@ done
 [ -n "$url" ] && [ -n "$output" ] || exit 2
 asset=${url##*/}
 if [ "$asset" = "checksums.txt" ]; then
-    for name in arcway-linux-amd64 arcway-expiry-guard-linux-amd64 arcway-expiry-guard-linux-arm64; do
+    for name in \
+        arcway-linux-amd64 \
+        arcway-expiry-guard-linux-amd64 \
+        arcway-expiry-guard-linux-arm64 \
+        mmw-agent-linux-amd64 \
+        mmw-agent-linux-arm64; do
         digest=$(printf 'new-%s\n' "$name" | sha256sum | awk '{print $1}')
         printf '%s  %s\n' "$digest" "$name"
     done > "$output"
@@ -190,15 +195,18 @@ make_old_installation() {
     data_dir="$case_root/data"
     config_dir="$case_root/config"
     guard_dir="$case_root/lib/guard-assets"
+    agent_dir="$case_root/lib/agent-assets"
     unit_dir="$case_root/systemd"
     state_dir="$case_root/state"
     expected_dir="$case_root/expected"
-    mkdir -p "$install_dir" "$data_dir" "$config_dir" "$guard_dir" "$unit_dir" "$state_dir" "$expected_dir"
+    mkdir -p "$install_dir" "$data_dir" "$config_dir" "$guard_dir" "$agent_dir" "$unit_dir" "$state_dir" "$expected_dir"
 
     printf '%s\n' old-binary > "$install_dir/arcway"
     printf '%s\n' old-backup > "$install_dir/arcway.bak"
     printf '%s\n' old-guard-amd64 > "$guard_dir/arcway-expiry-guard-linux-amd64"
     printf '%s\n' old-guard-arm64 > "$guard_dir/arcway-expiry-guard-linux-arm64"
+    printf '%s\n' old-agent-amd64 > "$agent_dir/mmw-agent-linux-amd64"
+    printf '%s\n' old-agent-arm64 > "$agent_dir/mmw-agent-linux-arm64"
     printf '%s\n' old-version > "$data_dir/.version"
     printf '%s\n' old-database > "$data_dir/arcway.db"
     printf '%s\n' old-wal > "$data_dir/arcway.db-wal"
@@ -214,11 +222,12 @@ ExecStart=$install_dir/arcway
 Environment="PORT=$panel_port"
 Environment="DATABASE_PATH=$data_dir/arcway.db"
 Environment="ARCWAY_GUARD_ASSET_DIR=$guard_dir"
+Environment="ARCWAY_AGENT_ASSET_DIR=$agent_dir"
 Environment="ARCWAY_PANEL_IPS=192.0.2.1"
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 0755 "$install_dir/arcway" "$guard_dir"/arcway-expiry-guard-linux-*
+    chmod 0755 "$install_dir/arcway" "$guard_dir"/arcway-expiry-guard-linux-* "$agent_dir"/mmw-agent-linux-*
     printf '%s\n' "$enable_state" > "$state_dir/enabled"
     printf '%s\n' "$active_state" > "$state_dir/active"
 
@@ -226,6 +235,8 @@ EOF
     cp "$install_dir/arcway.bak" "$expected_dir/arcway.bak"
     cp "$guard_dir/arcway-expiry-guard-linux-amd64" "$expected_dir/guard-amd64"
     cp "$guard_dir/arcway-expiry-guard-linux-arm64" "$expected_dir/guard-arm64"
+    cp "$agent_dir/mmw-agent-linux-amd64" "$expected_dir/agent-amd64"
+    cp "$agent_dir/mmw-agent-linux-arm64" "$expected_dir/agent-arm64"
     cp "$unit_dir/arcway.service" "$expected_dir/arcway.service"
     cp "$data_dir/.version" "$expected_dir/version"
     cp "$data_dir/arcway.db" "$expected_dir/arcway.db"
@@ -243,7 +254,7 @@ run_fault_case() {
     systemctl_fail_command=""
     verify_fail=0
     case "$failpoint" in
-        after_binary_swap|after_first_guard_swap)
+        after_binary_swap|after_first_guard_swap|after_first_agent_swap)
             script_failpoint=$failpoint
             ;;
         daemon_reload_failure)
@@ -283,6 +294,8 @@ run_fault_case() {
     assert_file_equals "$case_root/expected/arcway.bak" "$case_root/bin/arcway.bak"
     assert_file_equals "$case_root/expected/guard-amd64" "$case_root/lib/guard-assets/arcway-expiry-guard-linux-amd64"
     assert_file_equals "$case_root/expected/guard-arm64" "$case_root/lib/guard-assets/arcway-expiry-guard-linux-arm64"
+    assert_file_equals "$case_root/expected/agent-amd64" "$case_root/lib/agent-assets/mmw-agent-linux-amd64"
+    assert_file_equals "$case_root/expected/agent-arm64" "$case_root/lib/agent-assets/mmw-agent-linux-arm64"
     assert_file_equals "$case_root/expected/arcway.service" "$case_root/systemd/arcway.service"
     assert_file_equals "$case_root/expected/version" "$case_root/data/.version"
     assert_file_equals "$case_root/expected/arcway.db" "$case_root/data/arcway.db"
@@ -309,6 +322,7 @@ run_fault_case() {
 
 run_fault_case after_binary_swap enabled active
 run_fault_case after_first_guard_swap enabled-runtime inactive
+run_fault_case after_first_agent_swap enabled active
 run_fault_case daemon_reload_failure disabled active
 run_fault_case start_failure static inactive
 run_fault_case unit_verify_failure enabled active
@@ -367,6 +381,7 @@ set -e
 [ "$unsupported_result" -ne 0 ] || fail "unsupported enable state unexpectedly succeeded"
 assert_file_equals "$UNSUPPORTED_ROOT/expected/arcway" "$UNSUPPORTED_ROOT/bin/arcway"
 assert_file_equals "$UNSUPPORTED_ROOT/expected/guard-amd64" "$UNSUPPORTED_ROOT/lib/guard-assets/arcway-expiry-guard-linux-amd64"
+assert_file_equals "$UNSUPPORTED_ROOT/expected/agent-amd64" "$UNSUPPORTED_ROOT/lib/agent-assets/mmw-agent-linux-amd64"
 assert_file_equals "$UNSUPPORTED_ROOT/expected/arcway.service" "$UNSUPPORTED_ROOT/systemd/arcway.service"
 assert_file_equals "$UNSUPPORTED_ROOT/expected/version" "$UNSUPPORTED_ROOT/data/.version"
 [ "$(cat "$UNSUPPORTED_ROOT/state/active")" = active ] || fail "unsupported state check stopped the service"
@@ -394,11 +409,14 @@ grep -q '^new-arcway-linux-amd64$' "$SUCCESS_ROOT/bin/arcway" || fail "successfu
 grep -q '^old-binary$' "$SUCCESS_ROOT/bin/arcway.bak" || fail "successful reinstall did not atomically retain prior binary"
 grep -q '^new-arcway-expiry-guard-linux-amd64$' "$SUCCESS_ROOT/lib/guard-assets/arcway-expiry-guard-linux-amd64" || fail "successful reinstall did not replace amd64 guard"
 grep -q '^new-arcway-expiry-guard-linux-arm64$' "$SUCCESS_ROOT/lib/guard-assets/arcway-expiry-guard-linux-arm64" || fail "successful reinstall did not replace arm64 guard"
+grep -q '^new-mmw-agent-linux-amd64$' "$SUCCESS_ROOT/lib/agent-assets/mmw-agent-linux-amd64" || fail "successful reinstall did not replace amd64 Agent"
+grep -q '^new-mmw-agent-linux-arm64$' "$SUCCESS_ROOT/lib/agent-assets/mmw-agent-linux-arm64" || fail "successful reinstall did not replace arm64 Agent"
 grep -q '^v-test$' "$SUCCESS_ROOT/data/.version" || fail "successful reinstall did not replace version file"
 [ "$(cat "$SUCCESS_ROOT/state/enabled")" = enabled ] || fail "successful reinstall is not enabled"
 [ "$(cat "$SUCCESS_ROOT/state/active")" = active ] || fail "successful reinstall is not active"
 [ -s "$SUCCESS_ROOT/verify.log" ] || fail "successful reinstall did not verify staged unit"
 grep -q '^Environment="PORT=19090"$' "$SUCCESS_ROOT/systemd/arcway.service" || fail "explicit PORT did not override the existing port"
+grep -q "^Environment=\"ARCWAY_AGENT_ASSET_DIR=$SUCCESS_ROOT/lib/agent-assets\"$" "$SUCCESS_ROOT/systemd/arcway.service" || fail "reinstall did not preserve the Agent asset directory"
 
 # A non-interactive reinstall keeps the current port when PORT is not provided.
 INHERIT_PORT_ROOT="$TEST_ROOT/inherit-port"
@@ -420,8 +438,12 @@ grep -q '^Environment="PORT=18080"$' "$INHERIT_PORT_ROOT/systemd/arcway.service"
 LEGACY_UPDATE_ROOT="$TEST_ROOT/legacy-update"
 make_old_installation "$LEGACY_UPDATE_ROOT" enabled active
 sed -i '/^Environment="ARCWAY_GUARD_ASSET_DIR=/d' "$LEGACY_UPDATE_ROOT/systemd/arcway.service"
+sed -i '/^Environment="ARCWAY_AGENT_ASSET_DIR=/d' "$LEGACY_UPDATE_ROOT/systemd/arcway.service"
 sed -i "/^\[Service\]/a EnvironmentFile=$LEGACY_UPDATE_ROOT/config/arcway.env" "$LEGACY_UPDATE_ROOT/systemd/arcway.service"
-printf '%s\n' "ARCWAY_GUARD_ASSET_DIR=$LEGACY_UPDATE_ROOT/lib/guard-assets" > "$LEGACY_UPDATE_ROOT/config/arcway.env"
+printf '%s\n' \
+    "ARCWAY_GUARD_ASSET_DIR=$LEGACY_UPDATE_ROOT/lib/guard-assets" \
+    "ARCWAY_AGENT_ASSET_DIR=$LEGACY_UPDATE_ROOT/lib/agent-assets" \
+    > "$LEGACY_UPDATE_ROOT/config/arcway.env"
 PATH="$MOCK_BIN:/usr/bin:/bin" \
     MOCK_APT_MARKER="$LEGACY_UPDATE_ROOT/apt-called" \
     MOCK_VERIFY_LOG="$LEGACY_UPDATE_ROOT/verify.log" \
@@ -431,7 +453,9 @@ PATH="$MOCK_BIN:/usr/bin:/bin" \
     bash "$INSTALL_SCRIPT" update >"$LEGACY_UPDATE_ROOT/output.log" 2>&1
 grep -q '^new-arcway-linux-amd64$' "$LEGACY_UPDATE_ROOT/bin/arcway" || fail "legacy update did not preserve the binary directory"
 grep -q '^new-arcway-expiry-guard-linux-amd64$' "$LEGACY_UPDATE_ROOT/lib/guard-assets/arcway-expiry-guard-linux-amd64" || fail "legacy update did not preserve the guard directory"
+grep -q '^new-mmw-agent-linux-amd64$' "$LEGACY_UPDATE_ROOT/lib/agent-assets/mmw-agent-linux-amd64" || fail "legacy update did not preserve the Agent directory"
 grep -q '^v-test$' "$LEGACY_UPDATE_ROOT/data/.version" || fail "legacy update did not preserve the data directory"
+grep -q "^Environment=\"ARCWAY_AGENT_ASSET_DIR=$LEGACY_UPDATE_ROOT/lib/agent-assets\"$" "$LEGACY_UPDATE_ROOT/systemd/arcway.service" || fail "legacy update did not persist the detected Agent directory"
 [ "$(cat "$LEGACY_UPDATE_ROOT/state/active")" = active ] || fail "legacy update did not restart the service"
 grep -q '检测到现有安装布局' "$LEGACY_UPDATE_ROOT/output.log" || fail "legacy update did not report layout detection"
 
@@ -449,6 +473,7 @@ PATH="$MOCK_BIN:/usr/bin:/bin" \
     bash "$INSTALL_SCRIPT" uninstall >"$UNINSTALL_ROOT/output.log" 2>&1
 [ -f "$UNINSTALL_ROOT/data/arcway.db" ] || fail "non-interactive uninstall deleted data by default"
 [ ! -e "$UNINSTALL_ROOT/bin/arcway" ] || fail "uninstall did not remove the binary"
+[ ! -e "$UNINSTALL_ROOT/lib/agent-assets/mmw-agent-linux-amd64" ] || fail "uninstall did not remove Agent assets"
 [ ! -e "$UNINSTALL_ROOT/systemd/arcway.service" ] || fail "uninstall did not remove the systemd unit"
 grep -q '保留数据模式' "$UNINSTALL_ROOT/output.log" || fail "uninstall did not report preserved data"
 

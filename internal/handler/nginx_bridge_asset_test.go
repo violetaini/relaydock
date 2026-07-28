@@ -103,6 +103,7 @@ type nginxBridgeFixture struct {
 	httpLoader       string
 	streamLoader     string
 	mainConfig       string
+	agentConfig      string
 	reloadFailMarker string
 	environment      []string
 }
@@ -131,6 +132,11 @@ func newNginxBridgeFixture(t *testing.T) nginxBridgeFixture {
 	}
 
 	helper := generatedNginxBridgeHelper(t)
+	agentConfig := filepath.Join(root, "config.yaml")
+	if err := os.WriteFile(agentConfig, []byte("nginx_mode: managed\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	helper = strings.ReplaceAll(helper, "/etc/mmw-agent/config.yaml", agentConfig)
 	helper = strings.ReplaceAll(helper, "/www/server/panel/vhost/nginx", vhostDir)
 	helper = strings.ReplaceAll(helper, "/www/server/nginx", btPrefix)
 	helper = strings.ReplaceAll(helper, "/usr/local/nginx", managedRoot)
@@ -177,7 +183,7 @@ esac
 	}
 	return nginxBridgeFixture{
 		helperPath: helperPath, logPath: logPath, httpLoader: httpLoader, streamLoader: streamLoader,
-		mainConfig: mainConfig, reloadFailMarker: reloadFailMarker,
+		mainConfig: mainConfig, agentConfig: agentConfig, reloadFailMarker: reloadFailMarker,
 		environment: append(os.Environ(),
 			"FAKE_NGINX_LOG="+logPath,
 			"FAKE_NGINX_CONF="+mainConfig,
@@ -185,6 +191,21 @@ esac
 			"FAKE_STREAM_LOADER="+streamLoader,
 			"FAKE_RELOAD_FAIL_MARKER="+reloadFailMarker,
 		),
+	}
+}
+
+func TestNginxBridgeHelperDoesNothingInReuseExistingMode(t *testing.T) {
+	fixture := newNginxBridgeFixture(t)
+	if err := os.WriteFile(fixture.agentConfig, []byte("nginx_mode: reuse_existing\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := fixture.run(t); err != nil {
+		t.Fatalf("reuse-existing bridge guard failed: %v\n%s", err, output)
+	}
+	for _, path := range []string{fixture.httpLoader, fixture.streamLoader, fixture.logPath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("reuse-existing bridge touched %s: %v", path, err)
+		}
 	}
 }
 

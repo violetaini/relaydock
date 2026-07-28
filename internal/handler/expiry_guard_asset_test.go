@@ -21,6 +21,7 @@ import (
 
 	"miaomiaowux/internal/expiryguard"
 	"miaomiaowux/internal/storage"
+	"miaomiaowux/internal/version"
 )
 
 func newExpiryGuardAssetHandler(t *testing.T) (*XrayServerHandler, string) {
@@ -162,8 +163,12 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"/api/remote/mmw-agent?arch=${ARCH_NAME}",
 		agentSHA256AMD64,
 		agentSHA256ARM64,
-		"Downloading verified mmw-agent from master...",
-		"mmw-agent SHA-256 校验失败",
+		"ASSET_RELEASE_BASE_URL='https://github.com/violetaini/relaydock/releases/download/v" + version.Version + "'",
+		"AGENT_GITHUB_URL=\"${ASSET_RELEASE_BASE_URL}/mmw-agent-linux-${ARCH_NAME}\"",
+		"GUARD_GITHUB_URL=\"${ASSET_RELEASE_BASE_URL}/arcway-expiry-guard-linux-${ARCH_NAME}\"",
+		"Downloading $label from GitHub Release...",
+		"Downloading $label from master fallback...",
+		"mmw-agent SHA-256 verification failed",
 		"/api/remote/expiry-guard?arch=${ARCH_NAME}",
 		"/api/remote/management-ready",
 		"/api/remote/install-begin",
@@ -189,7 +194,10 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"ARCWAY_AGENT_TOKEN=${TOKEN}",
 		"hide_port_on_ws: false",
 		"if [ \"$(id -u)\" -ne 0 ]",
-		"mktemp -d /tmp/arcway-install.XXXXXX",
+		"select_download_root()",
+		"for candidate in /var/tmp /tmp",
+		"temporary storage has less than 128 MiB free",
+		"mktemp -d \"${DOWNLOAD_ROOT%/}/arcway-install.XXXXXX\"",
 		"validate_elf()",
 		"rollback_install()",
 		"TRACKED_PATHS=(",
@@ -275,13 +283,19 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		t.Fatal("install script exposes the long-lived token in curl argv")
 	}
 	if strings.Contains(script, "github.com/iluobei/mmw-agent") || strings.Contains(script, "AGENT_VERSION=") {
-		t.Fatal("install script still depends on a GitHub Agent release")
+		t.Fatal("install script depends on an independently moving upstream Agent release")
 	}
-	agentDownloadStart := strings.Index(script, `AGENT_URL="${MASTER_URL}/api/remote/mmw-agent?arch=${ARCH_NAME}"`)
-	guardDownloadStart := strings.Index(script, `GUARD_URL="${MASTER_URL}/api/remote/expiry-guard?arch=${ARCH_NAME}"`)
-	if agentDownloadStart < 0 || guardDownloadStart <= agentDownloadStart ||
-		!strings.Contains(script[agentDownloadStart:guardDownloadStart], `-H @"$CURL_AUTH_HEADER_FILE"`) {
-		t.Fatal("installer does not authenticate the panel-hosted Agent download")
+	githubDownloadStart := strings.Index(script, `echo "Downloading $label from GitHub Release..."`)
+	masterFallbackStart := strings.Index(script, `echo "Downloading $label from master fallback..."`)
+	downloadHelperEnd := strings.Index(script, `AGENT_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/mmw-agent-linux-${ARCH_NAME}"`)
+	if githubDownloadStart < 0 || masterFallbackStart <= githubDownloadStart || downloadHelperEnd <= masterFallbackStart {
+		t.Fatal("installer release download helper is incomplete")
+	}
+	if strings.Contains(script[githubDownloadStart:masterFallbackStart], `CURL_AUTH_HEADER_FILE`) {
+		t.Fatal("installer leaks the node credential to GitHub")
+	}
+	if !strings.Contains(script[masterFallbackStart:downloadHelperEnd], `-H @"$CURL_AUTH_HEADER_FILE"`) {
+		t.Fatal("installer does not authenticate the panel-hosted asset fallback")
 	}
 	if strings.Contains(script, `command_background="yes"`) {
 		t.Fatal("OpenRC services are not supervised after startup")
@@ -316,7 +330,7 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	if strings.Index(script, "nft -c -f \"$RULESET\"") > strings.Index(script, "nft -f \"$RULESET\"") {
 		t.Fatal("install script applies the firewall before validating its transaction")
 	}
-	downloadIndex := strings.Index(script, "Downloading verified mmw-agent")
+	downloadIndex := strings.Index(script, "Downloading $label from GitHub Release")
 	dependencyIndex := strings.Index(script, "firewall_stack_ready()")
 	backupIndex := strings.Index(script, "BACKUP_DIR=\"$DOWNLOAD_DIR/backup\"")
 	mutationIndex := strings.Index(script, "MUTATION_STARTED=1")
@@ -387,6 +401,72 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("generated firewall helper failed sh -n: %v\n%s", err, output)
 		}
+	}
+}
+
+func TestRemoteInstallScriptSelectsSafeTemporaryFilesystem(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	handler, token := newExpiryGuardAssetHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.GetRemoteInstallScript(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+
+	script := response.Body.String()
+	functionStart := strings.Index(script, "select_download_root() {")
+	functionEnd := strings.Index(script, "DOWNLOAD_ROOT=$(select_download_root)")
+	if functionStart < 0 || functionEnd <= functionStart {
+		t.Fatal("generated installer is missing select_download_root")
+	}
+	selector := script[functionStart:functionEnd]
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is unavailable")
+	}
+
+	tests := []struct {
+		name        string
+		varTmpKB    int
+		tmpKB       int
+		wantRoot    string
+		wantFailure string
+	}{
+		{name: "prefers filesystem with enough space", varTmpKB: 80_000_000, tmpKB: 29_000, wantRoot: "/var/tmp"},
+		{name: "fails before download when both are full", varTmpKB: 64_000, tmpKB: 29_000, wantFailure: "less than 128 MiB free"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mockBin := t.TempDir()
+			dfScript := `#!/bin/sh
+case "$*" in
+  *"/var/tmp"*) available=` + strconv.Itoa(test.varTmpKB) + ` ;;
+  *) available=` + strconv.Itoa(test.tmpKB) + ` ;;
+esac
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'mock 100000000 1 %s 1%% /mock\n' "$available"
+`
+			if err := os.WriteFile(filepath.Join(mockBin, "df"), []byte(dfScript), 0755); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(bash, "-c", selector+"\nselect_download_root")
+			command.Env = append(os.Environ(), "PATH="+mockBin+":"+os.Getenv("PATH"))
+			output, runErr := command.CombinedOutput()
+			if test.wantFailure != "" {
+				if runErr == nil || !strings.Contains(string(output), test.wantFailure) {
+					t.Fatalf("selector error=%v output=%q want failure containing %q", runErr, output, test.wantFailure)
+				}
+				return
+			}
+			if runErr != nil {
+				t.Fatalf("selector failed: %v output=%q", runErr, output)
+			}
+			if got := strings.TrimSpace(string(output)); got != test.wantRoot {
+				t.Fatalf("selected root=%q want=%q", got, test.wantRoot)
+			}
+		})
 	}
 }
 
@@ -917,6 +997,74 @@ func TestRemoteInstallUFWStatusFailureRequiresEnabledPolicy(t *testing.T) {
 	}
 	if !strings.Contains(string(enabledOutput), "active UFW policy cannot be inspected") {
 		t.Fatalf("enabled UFW failure was not explicit: %s", enabledOutput)
+	}
+}
+
+func TestRemoteInstallActiveUFWReapplyUsesDownloadedAgent(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is unavailable")
+	}
+
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	handler, token := newExpiryGuardAssetHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.GetRemoteInstallScript(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	script := response.Body.String()
+	end := strings.Index(script, "\ncat > /usr/local/sbin/arcway-nginx-bridge")
+	if end < 0 {
+		t.Fatal("generated installer is missing the post-UFW boundary")
+	}
+	start := strings.LastIndex(script[:end], `    if [ "$UFW_ACTIVE" = "1" ]; then`)
+	if start < 0 {
+		t.Fatal("generated installer is missing the active-UFW firewall reapply")
+	}
+	const blockEndMarker = "\n    fi\n"
+	blockEnd := strings.Index(script[start:end], blockEndMarker)
+	if blockEnd < 0 {
+		t.Fatal("generated installer active-UFW firewall reapply is unterminated")
+	}
+	fragment := script[start : start+blockEnd+len(blockEndMarker)]
+
+	testRoot := t.TempDir()
+	downloadedAgent := filepath.Join(testRoot, "mmw-agent.download")
+	if err := os.WriteFile(downloadedAgent, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	firewallHelper := filepath.Join(testRoot, "arcway-agent-firewall")
+	helper := `#!/bin/sh
+set -eu
+[ "${ARCWAY_AGENT_BINARY:-}" = "$EXPECTED_AGENT_BINARY" ]
+[ -x "$ARCWAY_AGENT_BINARY" ]
+`
+	if err := os.WriteFile(firewallHelper, []byte(helper), 0755); err != nil {
+		t.Fatal(err)
+	}
+	fragment = strings.ReplaceAll(fragment, "/usr/local/sbin/arcway-agent-firewall", shellSingleQuote(firewallHelper))
+	command := exec.Command(bash, "-c", fragment)
+	command.Env = append(os.Environ(),
+		"UFW_ACTIVE=1",
+		"AGENT_DOWNLOAD="+downloadedAgent,
+		"EXPECTED_AGENT_BINARY="+downloadedAgent,
+		"ARCWAY_AGENT_BINARY=",
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("active-UFW clean-install reapply did not use the downloaded Agent: %v\n%s", err, output)
+	}
+
+	reapply := `ARCWAY_AGENT_BINARY="$AGENT_DOWNLOAD" /usr/local/sbin/arcway-agent-firewall`
+	if count := strings.Count(script, reapply); count < 2 {
+		t.Fatalf("downloaded Agent override count=%d want at least 2", count)
+	}
+	installIndex := strings.Index(script, `install -m 0755 "$AGENT_DOWNLOAD" /usr/local/bin/.mmw-agent.new`)
+	if installIndex < 0 || start >= installIndex {
+		t.Fatal("active-UFW reapply no longer runs before the Agent is installed")
 	}
 }
 

@@ -101,6 +101,9 @@ type AgentCapabilities struct {
 	LimiterReplace bool `json:"limiter_replace,omitempty"`
 	// LimiterReplaceAck 表示 limiter replace 只有在应用完成后才返回 RPC/HTTP 成功响应。
 	LimiterReplaceAck bool `json:"limiter_replace_ack,omitempty"`
+	// AgentUninstallV2 表示 Agent 支持两阶段安全自卸载。主控在接单回执后
+	// 继续等待一次性 callback 确认清理完成，随后才删除服务器记录。
+	AgentUninstallV2 bool `json:"agent_uninstall_v2,omitempty"`
 }
 
 // MissingManagedNodeCapabilities returns the safety contracts an Agent must

@@ -33,11 +33,18 @@ func (h *RemoteManageHandler) deployFallbackConfig(ctx context.Context, server *
 	if err != nil {
 		return err
 	}
+	if selectedCert != nil && selectedCert.CertPEM != "" && selectedCert.KeyPEM != "" {
+		if err := h.deployStealCertificateSync(ctx, server, rootDomain, selectedCert); err != nil {
+			return err
+		}
+		log.Printf("[DeployFallback] Deployed certificate for %s to server %d", rootDomain, server.ID)
+	}
 
 	sslPayload, _ := json.Marshal(map[string]any{
 		"domain":        domain,
 		"nginx_config":  string(nginxConf),
 		"domain_config": domainConf,
+		"nginx_mode":    normalizedRemoteNginxMode(server),
 	})
 	if _, err := h.forwardToRemoteServer(ctx, server.ID, http.MethodPost, "/api/child/nginx/setup-ssl", sslPayload); err != nil {
 		return fmt.Errorf("配置 Nginx SSL 失败: %w", err)
@@ -56,13 +63,6 @@ func (h *RemoteManageHandler) deployFallbackConfig(ctx context.Context, server *
 		return fmt.Errorf("下发 Xray 配置失败: %w", err)
 	}
 	log.Printf("[DeployFallback] Deployed xray config to server %d (%s)", server.ID, server.Name)
-
-	if selectedCert != nil && selectedCert.CertPEM != "" && selectedCert.KeyPEM != "" {
-		if err := h.deployStealCertificateSync(ctx, server, rootDomain, selectedCert); err != nil {
-			return err
-		}
-		log.Printf("[DeployFallback] Deployed certificate for %s to server %d", rootDomain, server.ID)
-	}
 
 	if err := h.restartXrayWithRecovery(ctx, server.ID, "DeployFallback"); err != nil {
 		return err

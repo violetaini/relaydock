@@ -117,6 +117,9 @@ func TestForwardingStorageOwnershipPortsAndIdentity(t *testing.T) {
 func TestDeleteRemoteServerRejectsForwardingReferences(t *testing.T) {
 	fixture := newForwardingStorageFixture(t)
 	serverID := fixture.servers[0].ID
+	if err := fixture.repo.ValidateRemoteServerDeletion(fixture.ctx, serverID); !errors.Is(err, ErrForwardingConflict) {
+		t.Fatalf("ValidateRemoteServerDeletion error=%v, want forwarding conflict", err)
+	}
 	if err := fixture.repo.DeleteRemoteServer(fixture.ctx, serverID); !errors.Is(err, ErrForwardingConflict) {
 		t.Fatalf("DeleteRemoteServer error=%v, want forwarding conflict", err)
 	}
