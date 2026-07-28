@@ -462,6 +462,7 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 			Description     string    `json:"description"`
 			Filename        string    `json:"filename"`
 			Type            string    `json:"type"`
+			CanDelete       bool      `json:"can_delete"`
 			FileShortCode   string    `json:"file_short_code,omitempty"`
 			CustomShortCode string    `json:"custom_short_code,omitempty"`
 			UpdatedAt       time.Time `json:"updated_at"`
@@ -488,6 +489,7 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 				Description:     file.Description,
 				Filename:        file.Filename,
 				Type:            file.Type,
+				CanDelete:       file.ID > 0 && (user.Role == storage.RoleAdmin || file.CreatedBy == username),
 				FileShortCode:   fileShortCode,
 				CustomShortCode: customShortCode,
 				UpdatedAt:       file.UpdatedAt,
