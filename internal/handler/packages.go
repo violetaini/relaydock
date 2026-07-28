@@ -1196,6 +1196,12 @@ func (h *PackageAssignHandler) autoGenerateSubscription(ctx context.Context, use
 		if err != nil || !node.Enabled || node.ClashConfig == "" {
 			continue
 		}
+		// Package subscriptions are rendered from the encrypted database by
+		// PackageSubscribeHandler. Do not copy a hydrated WireGuard identity into
+		// this legacy persistent snapshot.
+		if !shouldPersistNodeInLegacyPackageSnapshot(node) {
+			continue
+		}
 		var proxyConfig map[string]any
 		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
 			continue
@@ -1227,12 +1233,15 @@ func (h *PackageAssignHandler) autoGenerateSubscription(ctx context.Context, use
 		return
 	}
 
-	os.MkdirAll("subscribes", 0755)
+	if err := os.MkdirAll("subscribes", 0700); err != nil {
+		log.Printf("[PackageAssign] 自动生成订阅失败: 创建目录错误: %v", err)
+		return
+	}
 
 	existing, err := h.repo.GetUserPackageSubscription(ctx, username)
 	if err == nil {
 		filePath := filepath.Join("subscribes", existing.Filename)
-		if err := os.WriteFile(filePath, []byte(result), 0644); err != nil {
+		if err := os.WriteFile(filePath, []byte(result), 0600); err != nil {
 			log.Printf("[PackageAssign] 自动生成订阅失败: 写入文件错误: %v", err)
 			return
 		}
@@ -1245,7 +1254,7 @@ func (h *PackageAssignHandler) autoGenerateSubscription(ctx context.Context, use
 
 	filename := fmt.Sprintf("pkg_%s.yaml", username)
 	filePath := filepath.Join("subscribes", filename)
-	if err := os.WriteFile(filePath, []byte(result), 0644); err != nil {
+	if err := os.WriteFile(filePath, []byte(result), 0600); err != nil {
 		log.Printf("[PackageAssign] 自动生成订阅失败: 写入文件错误: %v", err)
 		return
 	}
@@ -1267,6 +1276,10 @@ func (h *PackageAssignHandler) autoGenerateSubscription(ctx context.Context, use
 		return
 	}
 	log.Printf("[PackageAssign] 已为用户 %s 创建套餐订阅文件", username)
+}
+
+func shouldPersistNodeInLegacyPackageSnapshot(node storage.Node) bool {
+	return !strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard")
 }
 
 func (h *PackageAssignHandler) loadDefaultTemplate(ctx context.Context) (string, error) {

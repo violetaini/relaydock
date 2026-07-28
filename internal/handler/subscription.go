@@ -378,6 +378,13 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		logger.Info("[⏱️ 耗时监测] 文件读取完成", "step", "file_read", "duration_ms", time.Since(stepStart).Milliseconds(), "bytes", len(data))
+		hydrated, hydrateErr := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, string(data))
+		if hydrateErr != nil {
+			logger.Info("[Subscription] WireGuard 节点私钥引用解析失败", "error", hydrateErr)
+			writeError(w, http.StatusServiceUnavailable, errors.New("WireGuard 节点配置暂不可用"))
+			return
+		}
+		data = []byte(hydrated)
 	}
 
 	// 外部订阅同步
@@ -458,7 +465,13 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 							if err != nil {
 								logger.Info("[Subscription] 同步后重新读取订阅文件失败", "error", err)
 							} else {
-								data = updatedData
+								hydrated, hydrateErr := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, string(updatedData))
+								if hydrateErr != nil {
+									logger.Info("[Subscription] 同步后 WireGuard 节点私钥引用解析失败", "error", hydrateErr)
+									writeError(w, http.StatusServiceUnavailable, errors.New("WireGuard 节点配置暂不可用"))
+									return
+								}
+								data = []byte(hydrated)
 								logger.Info("[Subscription] 同步后重新读取订阅文件成功", "bytes", len(data))
 							}
 						}

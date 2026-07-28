@@ -140,6 +140,9 @@ func (r *TrafficRepository) ListNodes(ctx context.Context, username string) ([]N
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate nodes: %w", err)
 	}
+	if err := r.hydrateWireGuardNodeSecrets(ctx, nodes); err != nil {
+		return nil, err
+	}
 
 	return nodes, nil
 }
@@ -192,6 +195,9 @@ func (r *TrafficRepository) ListSharedRoutedByParentIDs(ctx context.Context, par
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate nodes: %w", err)
 	}
+	if err := r.hydrateWireGuardNodeSecrets(ctx, nodes); err != nil {
+		return nil, err
+	}
 	return nodes, nil
 }
 
@@ -222,6 +228,9 @@ func (r *TrafficRepository) ListAllNodes(ctx context.Context) ([]Node, error) {
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate nodes: %w", err)
+	}
+	if err := r.hydrateWireGuardNodeSecrets(ctx, nodes); err != nil {
+		return nil, err
 	}
 
 	return nodes, nil
@@ -254,6 +263,9 @@ func (r *TrafficRepository) GetNode(ctx context.Context, id int64, username stri
 	}
 	node.Enabled = enabled != 0
 	scanNodeTags(&node, tagsJSON)
+	if err := r.hydrateWireGuardNodeSecret(ctx, &node); err != nil {
+		return Node{}, err
+	}
 
 	return node, nil
 }
@@ -281,6 +293,9 @@ func (r *TrafficRepository) GetNodeByID(ctx context.Context, id int64) (Node, er
 	}
 	node.Enabled = enabled != 0
 	scanNodeTags(&node, tagsJSON)
+	if err := r.hydrateWireGuardNodeSecret(ctx, &node); err != nil {
+		return Node{}, err
+	}
 
 	return node, nil
 }
@@ -311,6 +326,14 @@ func (r *TrafficRepository) CreateNode(ctx context.Context, node Node) (Node, er
 	if node.Protocol == "" {
 		return Node{}, errors.New("protocol is required")
 	}
+	protectedNode, privateKey, err := protectWireGuardNodeForStorage(node)
+	if err != nil {
+		return Node{}, fmt.Errorf("protect node secret: %w", err)
+	}
+	node = protectedNode
+	if strings.EqualFold(node.Protocol, "wireguard") && privateKey == "" {
+		return Node{}, errors.New("WireGuard node requires a private key")
+	}
 	// 默认标签策略:新节点 tag 为空 / 是历史默认"手动输入" 且 OriginalServer 非空 → 用所属服务器名,
 	// 让标签下拉天然按服务器分类筛选。用户显式设过 tag 的不改。
 	if (node.Tag == "" || node.Tag == "手动输入") && node.OriginalServer != "" {
@@ -326,7 +349,12 @@ func (r *TrafficRepository) CreateNode(ctx context.Context, node Node) (Node, er
 		enabled = 1
 	}
 
-	res, err := r.db.ExecContext(ctx, `INSERT INTO nodes (username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, tag, tags, original_server, original_domain, inbound_tag, chain_proxy_node_id, relay_orig_server, relay_orig_port) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, node.Username, node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, tagsJSON, node.OriginalServer, node.OriginalDomain, node.InboundTag, node.ChainProxyNodeID, node.RelayOrigServer, node.RelayOrigPort)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Node{}, fmt.Errorf("begin create node: %w", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `INSERT INTO nodes (username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, tag, tags, original_server, original_domain, inbound_tag, chain_proxy_node_id, relay_orig_server, relay_orig_port) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, node.Username, node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, tagsJSON, node.OriginalServer, node.OriginalDomain, node.InboundTag, node.ChainProxyNodeID, node.RelayOrigServer, node.RelayOrigPort)
 	if err != nil {
 		return Node{}, fmt.Errorf("create node: %w", err)
 	}
@@ -334,6 +362,18 @@ func (r *TrafficRepository) CreateNode(ctx context.Context, node Node) (Node, er
 	id, err := res.LastInsertId()
 	if err != nil {
 		return Node{}, fmt.Errorf("fetch node id: %w", err)
+	}
+	if privateKey != "" {
+		ciphertext, err := r.sealWireGuardPrivateKey(id, privateKey)
+		if err != nil {
+			return Node{}, err
+		}
+		if err := upsertNodeSecret(ctx, tx, id, ciphertext); err != nil {
+			return Node{}, fmt.Errorf("store node secret: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Node{}, fmt.Errorf("commit create node: %w", err)
 	}
 
 	return r.GetNode(ctx, id, node.Username)
@@ -369,6 +409,37 @@ func (r *TrafficRepository) UpdateNode(ctx context.Context, node Node) (Node, er
 	if node.Protocol == "" {
 		return Node{}, errors.New("protocol is required")
 	}
+	existingSecretKind, hasExistingSecret, err := r.nodeSecretKind(ctx, node.ID)
+	if err != nil {
+		return Node{}, err
+	}
+	if hasExistingSecret && existingSecretKind != wireGuardPrivateKeySecretKind {
+		return Node{}, fmt.Errorf("node %d contains an unsupported encrypted secret", node.ID)
+	}
+	if hasExistingSecret && !strings.EqualFold(node.Protocol, "wireguard") {
+		return Node{}, errors.New("WireGuard node protocol cannot be changed while it owns an encrypted private key")
+	}
+	protectedNode, privateKey, err := protectWireGuardNodeForStorage(node)
+	if err != nil {
+		return Node{}, fmt.Errorf("protect node secret: %w", err)
+	}
+	node = protectedNode
+	if strings.EqualFold(node.Protocol, "wireguard") && privateKey == "" && !hasExistingSecret {
+		return Node{}, errors.New("WireGuard node requires a private key")
+	}
+	if hasExistingSecret && privateKey != "" {
+		var ciphertext string
+		if err := r.db.QueryRowContext(ctx, `SELECT ciphertext FROM node_secrets WHERE node_id = ? AND kind = ?`, node.ID, wireGuardPrivateKeySecretKind).Scan(&ciphertext); err != nil {
+			return Node{}, fmt.Errorf("read existing WireGuard private key: %w", err)
+		}
+		existingPrivateKey, err := r.openWireGuardPrivateKey(node.ID, ciphertext)
+		if err != nil {
+			return Node{}, err
+		}
+		if !equalStoredWireGuardPrivateKeys(existingPrivateKey, privateKey) {
+			return Node{}, errors.New("WireGuard private key rotation requires a dedicated remote peer rotation workflow")
+		}
+	}
 	if node.Tag == "" {
 		node.Tag = "手动输入"
 	}
@@ -379,7 +450,12 @@ func (r *TrafficRepository) UpdateNode(ctx context.Context, node Node) (Node, er
 		enabled = 1
 	}
 
-	res, err := r.db.ExecContext(ctx, `UPDATE nodes SET raw_url = ?, node_name = ?, protocol = ?, parsed_config = ?, clash_config = ?, enabled = ?, tag = ?, tags = ?, original_server = ?, original_domain = ?, inbound_tag = ?, chain_proxy_node_id = ?, relay_orig_server = ?, relay_orig_port = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND username = ?`, node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, tagsJSON, node.OriginalServer, node.OriginalDomain, node.InboundTag, node.ChainProxyNodeID, node.RelayOrigServer, node.RelayOrigPort, node.ID, node.Username)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Node{}, fmt.Errorf("begin update node: %w", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE nodes SET raw_url = ?, node_name = ?, protocol = ?, parsed_config = ?, clash_config = ?, enabled = ?, tag = ?, tags = ?, original_server = ?, original_domain = ?, inbound_tag = ?, chain_proxy_node_id = ?, relay_orig_server = ?, relay_orig_port = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND username = ?`, node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, tagsJSON, node.OriginalServer, node.OriginalDomain, node.InboundTag, node.ChainProxyNodeID, node.RelayOrigServer, node.RelayOrigPort, node.ID, node.Username)
 	if err != nil {
 		return Node{}, fmt.Errorf("update node: %w", err)
 	}
@@ -390,6 +466,22 @@ func (r *TrafficRepository) UpdateNode(ctx context.Context, node Node) (Node, er
 	}
 	if affected == 0 {
 		return Node{}, ErrNodeNotFound
+	}
+	if privateKey != "" {
+		ciphertext, err := r.sealWireGuardPrivateKey(node.ID, privateKey)
+		if err != nil {
+			return Node{}, err
+		}
+		if err := upsertNodeSecret(ctx, tx, node.ID, ciphertext); err != nil {
+			return Node{}, fmt.Errorf("store node secret: %w", err)
+		}
+	} else if !strings.EqualFold(node.Protocol, "wireguard") {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM node_secrets WHERE node_id = ?`, node.ID); err != nil {
+			return Node{}, fmt.Errorf("delete obsolete node secret: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Node{}, fmt.Errorf("commit update node: %w", err)
 	}
 
 	return r.GetNode(ctx, node.ID, node.Username)
@@ -605,6 +697,14 @@ func (r *TrafficRepository) BatchCreateNodes(ctx context.Context, nodes []Node) 
 		if node.Protocol == "" {
 			return nil, fmt.Errorf("node %d: protocol is required", idx+1)
 		}
+		protectedNode, privateKey, err := protectWireGuardNodeForStorage(node)
+		if err != nil {
+			return nil, fmt.Errorf("node %d: protect node secret: %w", idx+1, err)
+		}
+		node = protectedNode
+		if strings.EqualFold(node.Protocol, "wireguard") && privateKey == "" {
+			return nil, fmt.Errorf("node %d: WireGuard node requires a private key", idx+1)
+		}
 		// 默认标签策略同 CreateNode:tag 空 / "手动输入" 时改用 OriginalServer
 		if (node.Tag == "" || node.Tag == "手动输入") && node.OriginalServer != "" {
 			node.Tag = node.OriginalServer
@@ -628,7 +728,17 @@ func (r *TrafficRepository) BatchCreateNodes(ctx context.Context, nodes []Node) 
 		if err != nil {
 			return nil, fmt.Errorf("fetch node %d id: %w", idx+1, err)
 		}
+		if privateKey != "" {
+			ciphertext, err := r.sealWireGuardPrivateKey(id, privateKey)
+			if err != nil {
+				return nil, fmt.Errorf("node %d: %w", idx+1, err)
+			}
+			if err := upsertNodeSecret(ctx, tx, id, ciphertext); err != nil {
+				return nil, fmt.Errorf("node %d: store node secret: %w", idx+1, err)
+			}
+		}
 
+		nodes[idx] = node
 		createdIDs = append(createdIDs, id)
 	}
 
@@ -846,6 +956,9 @@ func (r *TrafficRepository) CreateRoutedNode(ctx context.Context, detail RoutedN
 		return RoutedNodeDetail{}, errors.New("traffic repository not initialized")
 	}
 	n := detail.Node
+	if strings.EqualFold(strings.TrimSpace(n.Protocol), "wireguard") {
+		return RoutedNodeDetail{}, errors.New("WireGuard nodes cannot be converted into routed nodes")
+	}
 	n.NodeName = strings.TrimSpace(n.NodeName)
 	if n.NodeName == "" {
 		return RoutedNodeDetail{}, errors.New("node name is required")
@@ -932,6 +1045,9 @@ func (r *TrafficRepository) GetRoutedNodeDetail(ctx context.Context, id int64) (
 		return RoutedNodeDetail{}, fmt.Errorf("get routed node detail: %w", err)
 	}
 	d.Enabled = enabled != 0
+	if err := r.hydrateWireGuardNodeSecret(ctx, &d.Node); err != nil {
+		return RoutedNodeDetail{}, err
+	}
 	return d, nil
 }
 
@@ -975,7 +1091,15 @@ func (r *TrafficRepository) ListRoutedNodesByParent(ctx context.Context, parentN
 		d.Enabled = enabled != 0
 		out = append(out, d)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for index := range out {
+		if err := r.hydrateWireGuardNodeSecret(ctx, &out[index].Node); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // GetSystemNodeOwner 返回"系统节点"应该归属的 username。
@@ -1056,6 +1180,16 @@ func (r *TrafficRepository) CountUserRoutedOutboundActionsToday(ctx context.Cont
 func (r *TrafficRepository) MarkNodeAsRouted(ctx context.Context, nodeID int64, outboundTag string, parentNodeID int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
+	}
+	var protocol string
+	if err := r.db.QueryRowContext(ctx, `SELECT protocol FROM nodes WHERE id = ?`, nodeID).Scan(&protocol); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNodeNotFound
+		}
+		return fmt.Errorf("read node protocol before routed conversion: %w", err)
+	}
+	if strings.EqualFold(strings.TrimSpace(protocol), "wireguard") {
+		return errors.New("WireGuard nodes cannot be converted into routed nodes")
 	}
 	if parentNodeID > 0 {
 		_, err := r.db.ExecContext(ctx,
@@ -1156,7 +1290,15 @@ func (r *TrafficRepository) ListUserRoutedOutbounds(ctx context.Context, usernam
 		d.Enabled = enabled != 0
 		out = append(out, d)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for index := range out {
+		if err := r.hydrateWireGuardNodeSecret(ctx, &out[index].Node); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // ListRoutedAdminEmails 返回所有 nodes.routed_admin_email 非空的 email 集合。

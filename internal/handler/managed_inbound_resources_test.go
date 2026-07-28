@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -19,9 +21,17 @@ import (
 )
 
 type managedWireGuardAgent struct {
-	mu      sync.Mutex
-	inbound map[string]interface{}
-	actions []string
+	mu                 sync.Mutex
+	inbound            map[string]interface{}
+	actions            []string
+	mutationIDs        []string
+	ownerMutationID    string
+	addResponseMode    string
+	removeResponseMode string
+	rejectAddIfExists  bool
+	failRemove         bool
+	rejectRemove       bool
+	beforeAdd          func()
 }
 
 func (a *managedWireGuardAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -49,15 +59,59 @@ func (a *managedWireGuardAgent) ServeHTTP(w http.ResponseWriter, r *http.Request
 		}
 		a.mu.Lock()
 		a.actions = append(a.actions, action)
+		mutationID := strings.TrimSpace(wireGuardStringValue(request["mutation_id"]))
+		a.mutationIDs = append(a.mutationIDs, mutationID)
+		beforeAdd := a.beforeAdd
+		a.mu.Unlock()
+		if action == "add" && beforeAdd != nil {
+			beforeAdd()
+		}
+		a.mu.Lock()
+		responseMode := ""
 		switch action {
 		case "add":
+			if a.rejectAddIfExists && a.inbound != nil {
+				a.mu.Unlock()
+				http.Error(w, `{"success":false,"error":"inbound tag already exists"}`, http.StatusConflict)
+				return
+			}
 			inbound, _ := request["inbound"].(map[string]interface{})
 			a.inbound = cloneManagedWireGuardInbound(inbound)
+			a.ownerMutationID = mutationID
+			responseMode = a.addResponseMode
 		case "remove":
+			if a.rejectRemove {
+				a.mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "simulated logical remove rejection"})
+				return
+			}
+			if a.failRemove {
+				a.mu.Unlock()
+				http.Error(w, `{"success":false,"error":"simulated remove failure"}`, http.StatusBadGateway)
+				return
+			}
+			if mutationID != "" && a.ownerMutationID != "" && mutationID != a.ownerMutationID {
+				a.mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": true, "mutation_id": mutationID,
+					"message": "Inbound removal superseded by a newer mutation",
+				})
+				return
+			}
 			a.inbound = nil
+			a.ownerMutationID = ""
+			responseMode = a.removeResponseMode
 		}
 		a.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+		if responseMode == "malformed" {
+			_, _ = w.Write([]byte(`{"success":`))
+			return
+		}
+		response := map[string]interface{}{"success": true}
+		if mutationID != "" && responseMode != "missing-mutation" {
+			response["mutation_id"] = mutationID
+		}
+		_ = json.NewEncoder(w).Encode(response)
 	default:
 		http.NotFound(w, r)
 	}
@@ -67,6 +121,61 @@ func (a *managedWireGuardAgent) actionSnapshot() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]string(nil), a.actions...)
+}
+
+func (a *managedWireGuardAgent) mutationSnapshot() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.mutationIDs...)
+}
+
+func (a *managedWireGuardAgent) setAddResponseMode(value string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.addResponseMode = value
+}
+
+func (a *managedWireGuardAgent) setRemoveResponseMode(value string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.removeResponseMode = value
+}
+
+func (a *managedWireGuardAgent) setRejectAddIfExists(value bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.rejectAddIfExists = value
+}
+
+func (a *managedWireGuardAgent) setInbound(inbound map[string]interface{}, ownerMutationID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.inbound = cloneManagedWireGuardInbound(inbound)
+	a.ownerMutationID = ownerMutationID
+}
+
+func (a *managedWireGuardAgent) setFailRemove(value bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.failRemove = value
+}
+
+func (a *managedWireGuardAgent) setRejectRemove(value bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.rejectRemove = value
+}
+
+func (a *managedWireGuardAgent) setBeforeAdd(callback func()) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.beforeAdd = callback
+}
+
+func (a *managedWireGuardAgent) hasInbound() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.inbound != nil
 }
 
 func cloneManagedWireGuardInbound(inbound map[string]interface{}) map[string]interface{} {
@@ -85,6 +194,9 @@ func newManagedInboundHandlerTest(t *testing.T, initialInbound map[string]interf
 	repo, err := storage.NewTrafficRepository(dbPath)
 	if err != nil {
 		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	if err := repo.ConfigureNodeSecretEncryption(bytes.Repeat([]byte{0x71}, 32)); err != nil {
+		t.Fatalf("ConfigureNodeSecretEncryption: %v", err)
 	}
 	t.Cleanup(func() { _ = repo.Close() })
 	if err := repo.CreateUser(context.Background(), "admin", "admin@example.test", "Admin", "test-hash", storage.RoleAdmin, ""); err != nil {
@@ -116,27 +228,80 @@ func managedWireGuardRequest(t *testing.T, method, path string, body interface{}
 func managedWireGuardCreateBody(t *testing.T, displayName string) map[string]interface{} {
 	t.Helper()
 	request := wireGuardInboundRequest(t)
+	inbound := request["inbound"].(map[string]interface{})
+	settings := inbound["settings"].(map[string]interface{})
+	clientPrivateKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x32}, 32))
+	clientPublicKey, err := managedWireGuardPublicKey(clientPrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverPublicKey, err := managedWireGuardPublicKey(wireGuardStringValue(settings["secretKey"]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := settings["peers"].([]interface{})[0].(map[string]interface{})
+	peer["publicKey"] = clientPublicKey
 	return map[string]interface{}{
 		"action":       "add",
 		"display_name": displayName,
-		"inbound":      request["inbound"],
+		"inbound":      inbound,
+		"client": map[string]interface{}{
+			"private_key":       clientPrivateKey,
+			"public_key":        clientPublicKey,
+			"address":           []string{"10.66.66.2/32"},
+			"dns":               []string{"1.1.1.1", "1.0.0.1"},
+			"mtu":               1420,
+			"keep_alive":        25,
+			"server_public_key": serverPublicKey,
+			"allowed_ips":       []string{"0.0.0.0/0", "::/0"},
+		},
 	}
 }
 
 func TestManagedWireGuardResourceCreateListRenameDelete(t *testing.T) {
-	handler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	handler, repo, server, agent, dbPath := newManagedInboundHandlerTest(t, nil)
 	serverID := strconv.FormatInt(server.ID, 10)
+	inspectionDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inspectionDB.Close()
+	createBody := managedWireGuardCreateBody(t, "Hong Kong WireGuard")
+	clientPrivateKey := createBody["client"].(map[string]interface{})["private_key"].(string)
+	stagedResult := make(chan error, 1)
+	agent.setBeforeAdd(func() {
+		var enabled int
+		var rawURL, parsedConfig, clashConfig, ciphertext, originalServer, inboundTag string
+		err := inspectionDB.QueryRow(`
+SELECT n.enabled, n.raw_url, n.parsed_config, n.clash_config, ns.ciphertext,
+       COALESCE(n.original_server, ''), COALESCE(n.inbound_tag, '')
+FROM nodes n JOIN node_secrets ns ON ns.node_id = n.id
+WHERE lower(n.protocol) = 'wireguard' AND n.node_name = 'Hong Kong WireGuard'`).
+			Scan(&enabled, &rawURL, &parsedConfig, &clashConfig, &ciphertext, &originalServer, &inboundTag)
+		if err == nil && (enabled != 0 || rawURL != "" || !strings.HasPrefix(ciphertext, "v1:") ||
+			originalServer != "" || inboundTag != "" || strings.Contains(parsedConfig, clientPrivateKey) ||
+			strings.Contains(clashConfig, clientPrivateKey)) {
+			err = fmt.Errorf("unsafe staged node: enabled=%d raw_url=%q original_server=%q inbound_tag=%q ciphertext=%q",
+				enabled, rawURL, originalServer, inboundTag, ciphertext)
+		}
+		stagedResult <- err
+	})
 
 	createResponse := httptest.NewRecorder()
 	handler.HandleManagedInboundResources(createResponse, managedWireGuardRequest(t, http.MethodPost,
 		managedInboundResourcesPath+"/wireguard?server_id="+serverID,
-		managedWireGuardCreateBody(t, "Hong Kong WireGuard")))
+		createBody))
 	if createResponse.Code != http.StatusCreated {
 		t.Fatalf("create status=%d body=%s", createResponse.Code, createResponse.Body.String())
 	}
+	if err := <-stagedResult; err != nil {
+		t.Fatalf("client identity was not encrypted before remote creation: %v", err)
+	}
 	var created struct {
-		Success  bool                      `json:"success"`
-		Resource managedInboundResourceDTO `json:"resource"`
+		Success      bool                      `json:"success"`
+		Resource     managedInboundResourceDTO `json:"resource"`
+		Node         nodeDTO                   `json:"node"`
+		ClientConfig string                    `json:"client_config"`
 	}
 	if err := json.Unmarshal(createResponse.Body.Bytes(), &created); err != nil {
 		t.Fatalf("decode create response: %v", err)
@@ -147,9 +312,16 @@ func TestManagedWireGuardResourceCreateListRenameDelete(t *testing.T) {
 	if created.Resource.Protocol != "wireguard" || created.Resource.InboundTag != "wireguard-in" || created.Resource.EndpointPort != 51820 {
 		t.Fatalf("unexpected resource identity: %+v", created.Resource)
 	}
-	lowerResponse := strings.ToLower(createResponse.Body.String())
-	if strings.Contains(lowerResponse, "secretkey") || strings.Contains(lowerResponse, "privatekey") || strings.Contains(lowerResponse, "private_key") {
-		t.Fatalf("create response exposed secret material: %s", createResponse.Body.String())
+	if created.Node.ID <= 0 || created.Node.Protocol != "wireguard" || !strings.Contains(created.Node.ClashConfig, `"private-key"`) {
+		t.Fatalf("ordinary WireGuard node missing from response: %+v", created.Node)
+	}
+	if !strings.Contains(created.ClientConfig, "[Interface]") || !strings.Contains(created.ClientConfig, "PrivateKey = ") {
+		t.Fatalf("client config missing: %q", created.ClientConfig)
+	}
+	resourceJSON, _ := json.Marshal(created.Resource)
+	lowerResource := strings.ToLower(string(resourceJSON))
+	if strings.Contains(lowerResource, "secretkey") || strings.Contains(lowerResource, "privatekey") || strings.Contains(lowerResource, "private_key") {
+		t.Fatalf("public resource exposed secret material: %s", resourceJSON)
 	}
 	var metadata map[string]interface{}
 	if err := json.Unmarshal(created.Resource.PublicMetadata, &metadata); err != nil {
@@ -160,8 +332,8 @@ func TestManagedWireGuardResourceCreateListRenameDelete(t *testing.T) {
 	}
 
 	nodes, err := repo.ListAllNodes(context.Background())
-	if err != nil || len(nodes) != 0 {
-		t.Fatalf("WireGuard entered subscription nodes: nodes=%+v err=%v", nodes, err)
+	if err != nil || len(nodes) != 1 || nodes[0].ID != created.Node.ID || !strings.Contains(nodes[0].ClashConfig, `"private-key"`) {
+		t.Fatalf("WireGuard ordinary node missing: nodes=%+v err=%v", nodes, err)
 	}
 
 	listResponse := httptest.NewRecorder()
@@ -186,6 +358,9 @@ func TestManagedWireGuardResourceCreateListRenameDelete(t *testing.T) {
 	}
 	if _, err := repo.GetManagedInboundResource(context.Background(), created.Resource.ID); !errors.Is(err, storage.ErrManagedInboundResourceNotFound) {
 		t.Fatalf("resource remained after delete: %v", err)
+	}
+	if nodes, err := repo.ListAllNodes(context.Background()); err != nil || len(nodes) != 0 {
+		t.Fatalf("resource delete left ordinary node: nodes=%+v err=%v", nodes, err)
 	}
 	if actions := agent.actionSnapshot(); len(actions) != 2 || actions[0] != "add" || actions[1] != "remove" {
 		t.Fatalf("agent actions=%v, want [add remove]", actions)
@@ -217,7 +392,7 @@ func TestManagedWireGuardResourceRejectsClientPrivateMaterialBeforeAgent(t *test
 	}
 }
 
-func TestManagedWireGuardPersistenceFailureRollsBackRemoteInbound(t *testing.T) {
+func TestManagedWireGuardPersistenceFailureStopsBeforeRemoteInbound(t *testing.T) {
 	handler, repo, server, agent, dbPath := newManagedInboundHandlerTest(t, nil)
 	triggerDB, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -243,15 +418,216 @@ END;`); err != nil {
 	if err := json.Unmarshal(response.Body.Bytes(), &failureBody); err != nil {
 		t.Fatalf("decode rollback response: %v", err)
 	}
-	if response.Code != http.StatusBadRequest || failureBody.Status != http.StatusBadGateway || !strings.Contains(response.Body.String(), "已回滚") {
-		t.Fatalf("status=%d body=%s, want rollback failure response", response.Code, response.Body.String())
+	if response.Code != http.StatusBadRequest || failureBody.Status != http.StatusBadRequest || !strings.Contains(response.Body.String(), "预存失败") {
+		t.Fatalf("status=%d body=%s, want preflight persistence failure", response.Code, response.Body.String())
 	}
-	if actions := agent.actionSnapshot(); len(actions) != 2 || actions[0] != "add" || actions[1] != "remove" {
-		t.Fatalf("agent actions=%v, want [add remove]", actions)
+	if actions := agent.actionSnapshot(); len(actions) != 0 {
+		t.Fatalf("persistence failure reached Agent: %v", actions)
 	}
 	resources, err := repo.ListManagedInboundResources(context.Background())
 	if err != nil || len(resources) != 0 {
 		t.Fatalf("failed transaction left resources=%+v err=%v", resources, err)
+	}
+	if nodes, err := repo.ListAllNodes(context.Background()); err != nil || len(nodes) != 0 {
+		t.Fatalf("failed preflight left nodes=%+v err=%v", nodes, err)
+	}
+}
+
+func TestManagedWireGuardCreateRejectsExistingRemoteTagBeforeStaging(t *testing.T) {
+	existing := wireGuardInboundRequest(t)["inbound"].(map[string]interface{})
+	handler, repo, server, agent, _ := newManagedInboundHandlerTest(t, existing)
+	response := httptest.NewRecorder()
+	handler.HandleManagedInboundResources(response, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10),
+		managedWireGuardCreateBody(t, "Duplicate WG")))
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "相同 Tag") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if actions := agent.actionSnapshot(); len(actions) != 0 {
+		t.Fatalf("remote preflight conflict performed mutations: %v", actions)
+	}
+	if !agent.hasInbound() {
+		t.Fatal("remote preflight conflict removed the existing inbound")
+	}
+	if resources, err := repo.ListManagedInboundResources(context.Background()); err != nil || len(resources) != 0 {
+		t.Fatalf("remote preflight conflict staged resources=%+v err=%v", resources, err)
+	}
+	if nodes, err := repo.ListAllNodes(context.Background()); err != nil || len(nodes) != 0 {
+		t.Fatalf("remote preflight conflict staged nodes=%+v err=%v", nodes, err)
+	}
+}
+
+func TestManagedWireGuardUncertainCreateStaysDetachedAndLocalDeleteDoesNotTouchRemote(t *testing.T) {
+	handler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	foreignInbound := wireGuardInboundRequest(t)["inbound"].(map[string]interface{})
+	agent.setRejectAddIfExists(true)
+	agent.setBeforeAdd(func() {
+		agent.setInbound(foreignInbound, "foreign-owner")
+	})
+
+	response := httptest.NewRecorder()
+	handler.HandleManagedInboundResources(response, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10),
+		managedWireGuardCreateBody(t, "Uncertain WG")))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "已保留禁用节点和加密凭据") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	nodes, err := repo.ListAllNodes(context.Background())
+	if err != nil || len(nodes) != 1 {
+		t.Fatalf("uncertain create nodes=%+v err=%v", nodes, err)
+	}
+	staged := nodes[0]
+	if staged.Enabled || staged.OriginalServer != "" || staged.InboundTag != "" || !strings.Contains(staged.ClashConfig, `"private-key"`) {
+		t.Fatalf("unsafe uncertain node: %+v", staged)
+	}
+	resources, err := repo.ListManagedInboundResources(context.Background())
+	if err != nil || len(resources) != 1 || resources[0].InboundTag != "wireguard-in" {
+		t.Fatalf("uncertain create did not retain coordination resource: resources=%+v err=%v", resources, err)
+	}
+	mutations := agent.mutationSnapshot()
+	if actions := agent.actionSnapshot(); len(actions) != 1 || actions[0] != "add" || len(mutations) != 1 || mutations[0] == "" {
+		t.Fatalf("agent actions=%v mutation_ids=%v", actions, mutations)
+	}
+
+	nodesHandler := NewNodesHandler(repo, t.TempDir(), handler)
+	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/admin/nodes/"+strconv.FormatInt(staged.ID, 10), nil)
+	deleteRequest = deleteRequest.WithContext(auth.ContextWithUsername(deleteRequest.Context(), "admin"))
+	deleteResponse := httptest.NewRecorder()
+	nodesHandler.ServeHTTP(deleteResponse, deleteRequest)
+	if deleteResponse.Code != http.StatusOK {
+		t.Fatalf("delete staged node status=%d body=%s", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	if actions := agent.actionSnapshot(); len(actions) != 1 || actions[0] != "add" {
+		t.Fatalf("local staged-node deletion touched remote inbound: %v", actions)
+	}
+	if !agent.hasInbound() {
+		t.Fatal("local staged-node deletion removed the foreign remote inbound")
+	}
+	if _, err := repo.GetNodeByID(context.Background(), staged.ID); !errors.Is(err, storage.ErrNodeNotFound) {
+		t.Fatalf("staged node remained after local deletion: %v", err)
+	}
+	resources, err = repo.ListManagedInboundResources(context.Background())
+	if err != nil || len(resources) != 1 {
+		t.Fatalf("local staged-node deletion removed coordination resource: resources=%+v err=%v", resources, err)
+	}
+}
+
+func TestManagedWireGuardMissingAddMutationACKRetainsDetachedEncryptedNode(t *testing.T) {
+	handler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	agent.setAddResponseMode("missing-mutation")
+
+	response := httptest.NewRecorder()
+	handler.HandleManagedInboundResources(response, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10),
+		managedWireGuardCreateBody(t, "Missing ACK WG")))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "已保留禁用节点和加密凭据") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if actions := agent.actionSnapshot(); len(actions) != 1 || actions[0] != "add" {
+		t.Fatalf("uncertain add ACK triggered a rollback: %v", actions)
+	}
+	mutations := agent.mutationSnapshot()
+	if len(mutations) != 1 || mutations[0] == "" {
+		t.Fatalf("add did not carry a stable mutation ID: %v", mutations)
+	}
+	nodes, err := repo.ListAllNodes(context.Background())
+	if err != nil || len(nodes) != 1 {
+		t.Fatalf("missing ACK nodes=%+v err=%v", nodes, err)
+	}
+	if nodes[0].Enabled || nodes[0].OriginalServer != "" || nodes[0].InboundTag != "" || !strings.Contains(nodes[0].ClashConfig, `"private-key"`) {
+		t.Fatalf("missing ACK did not retain a detached encrypted node: %+v", nodes[0])
+	}
+	if resources, err := repo.ListManagedInboundResources(context.Background()); err != nil || len(resources) != 1 {
+		t.Fatalf("missing ACK resources=%+v err=%v", resources, err)
+	}
+	if !agent.hasInbound() {
+		t.Fatal("test setup did not apply the remote inbound before dropping the mutation ACK")
+	}
+}
+
+func TestManagedWireGuardConfirmedCreateFailureUsesMatchingFencedRollback(t *testing.T) {
+	handler, repo, server, agent, dbPath := newManagedInboundHandlerTest(t, nil)
+	triggerDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer triggerDB.Close()
+	agent.setBeforeAdd(func() {
+		if _, triggerErr := triggerDB.Exec(`
+CREATE TRIGGER fail_managed_wireguard_enable
+BEFORE UPDATE ON nodes
+BEGIN
+    SELECT RAISE(FAIL, 'forced WireGuard enable failure');
+END;`); triggerErr != nil {
+			t.Errorf("create enable failure trigger: %v", triggerErr)
+		}
+	})
+
+	response := httptest.NewRecorder()
+	handler.HandleManagedInboundResources(response, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10),
+		managedWireGuardCreateBody(t, "Rollback WG")))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "预存节点与远程入站已回滚") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	actions := agent.actionSnapshot()
+	mutations := agent.mutationSnapshot()
+	if len(actions) != 2 || actions[0] != "add" || actions[1] != "remove" ||
+		len(mutations) != 2 || mutations[0] == "" || mutations[0] != mutations[1] {
+		t.Fatalf("agent actions=%v mutation_ids=%v", actions, mutations)
+	}
+	if agent.hasInbound() {
+		t.Fatal("confirmed rollback left the remote inbound")
+	}
+	if nodes, err := repo.ListAllNodes(context.Background()); err != nil || len(nodes) != 0 {
+		t.Fatalf("confirmed rollback left nodes=%+v err=%v", nodes, err)
+	}
+	if resources, err := repo.ListManagedInboundResources(context.Background()); err != nil || len(resources) != 0 {
+		t.Fatalf("confirmed rollback left resources=%+v err=%v", resources, err)
+	}
+}
+
+func TestManagedWireGuardUnconfirmedRollbackRetainsDetachedEncryptedNode(t *testing.T) {
+	handler, repo, server, agent, dbPath := newManagedInboundHandlerTest(t, nil)
+	triggerDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer triggerDB.Close()
+	agent.setRemoveResponseMode("missing-mutation")
+	agent.setBeforeAdd(func() {
+		if _, triggerErr := triggerDB.Exec(`
+CREATE TRIGGER fail_managed_wireguard_enable_unconfirmed
+BEFORE UPDATE ON nodes
+BEGIN
+    SELECT RAISE(FAIL, 'forced WireGuard enable failure');
+END;`); triggerErr != nil {
+			t.Errorf("create enable failure trigger: %v", triggerErr)
+		}
+	})
+
+	response := httptest.NewRecorder()
+	handler.HandleManagedInboundResources(response, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10),
+		managedWireGuardCreateBody(t, "Retained WG")))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "自动回滚失败，已保留禁用节点和加密凭据") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	actions := agent.actionSnapshot()
+	mutations := agent.mutationSnapshot()
+	if len(actions) != 2 || actions[0] != "add" || actions[1] != "remove" ||
+		len(mutations) != 2 || mutations[0] == "" || mutations[0] != mutations[1] {
+		t.Fatalf("agent actions=%v mutation_ids=%v", actions, mutations)
+	}
+	nodes, err := repo.ListAllNodes(context.Background())
+	if err != nil || len(nodes) != 1 {
+		t.Fatalf("unconfirmed rollback nodes=%+v err=%v", nodes, err)
+	}
+	if nodes[0].Enabled || nodes[0].OriginalServer != "" || nodes[0].InboundTag != "" || !strings.Contains(nodes[0].ClashConfig, `"private-key"`) {
+		t.Fatalf("unconfirmed rollback did not retain a detached encrypted node: %+v", nodes[0])
+	}
+	if resources, err := repo.ListManagedInboundResources(context.Background()); err != nil || len(resources) != 1 {
+		t.Fatalf("unconfirmed rollback resources=%+v err=%v", resources, err)
 	}
 }
 
@@ -285,5 +661,93 @@ func TestManagedWireGuardInventorySyncBackfillsWithoutCreatingNode(t *testing.T)
 	nodes, err := repo.ListAllNodes(context.Background())
 	if err != nil || len(nodes) != 0 {
 		t.Fatalf("sync created subscription nodes: nodes=%+v err=%v", nodes, err)
+	}
+}
+
+func TestManagedWireGuardOrdinaryNodeDeleteClosesRemoteLifecycle(t *testing.T) {
+	remoteHandler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	createResponse := httptest.NewRecorder()
+	remoteHandler.HandleManagedInboundResources(createResponse, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10),
+		managedWireGuardCreateBody(t, "Delete WG")))
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", createResponse.Code, createResponse.Body.String())
+	}
+	var created struct {
+		Resource managedInboundResourceDTO `json:"resource"`
+		Node     nodeDTO                   `json:"node"`
+	}
+	if err := json.Unmarshal(createResponse.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	nodesHandler := NewNodesHandler(repo, t.TempDir(), remoteHandler)
+	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/admin/nodes/"+strconv.FormatInt(created.Node.ID, 10), nil)
+	deleteRequest = deleteRequest.WithContext(auth.ContextWithUsername(deleteRequest.Context(), "admin"))
+	deleteResponse := httptest.NewRecorder()
+	nodesHandler.ServeHTTP(deleteResponse, deleteRequest)
+	if deleteResponse.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	if _, err := repo.GetNodeByID(context.Background(), created.Node.ID); !errors.Is(err, storage.ErrNodeNotFound) {
+		t.Fatalf("ordinary node remained after delete: %v", err)
+	}
+	if _, err := repo.GetManagedInboundResource(context.Background(), created.Resource.ID); !errors.Is(err, storage.ErrManagedInboundResourceNotFound) {
+		t.Fatalf("managed resource remained after ordinary node delete: %v", err)
+	}
+	if actions := agent.actionSnapshot(); len(actions) != 2 || actions[0] != "add" || actions[1] != "remove" {
+		t.Fatalf("agent actions=%v, want [add remove]", actions)
+	}
+}
+
+func TestManagedWireGuardOrdinaryNodeDeleteRetainsEncryptedNodeWhenRemoteCleanupFails(t *testing.T) {
+	remoteHandler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	createResponse := httptest.NewRecorder()
+	remoteHandler.HandleManagedInboundResources(createResponse, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10),
+		managedWireGuardCreateBody(t, "Retain WG")))
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", createResponse.Code, createResponse.Body.String())
+	}
+	var created struct {
+		Resource managedInboundResourceDTO `json:"resource"`
+		Node     nodeDTO                   `json:"node"`
+	}
+	if err := json.Unmarshal(createResponse.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	agent.setRejectRemove(true)
+	nodesHandler := NewNodesHandler(repo, t.TempDir(), remoteHandler)
+	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/admin/nodes/"+strconv.FormatInt(created.Node.ID, 10), nil)
+	deleteRequest = deleteRequest.WithContext(auth.ContextWithUsername(deleteRequest.Context(), "admin"))
+	deleteResponse := httptest.NewRecorder()
+	nodesHandler.ServeHTTP(deleteResponse, deleteRequest)
+	if deleteResponse.Code != http.StatusBadGateway || !strings.Contains(deleteResponse.Body.String(), "已保留本地节点和加密凭据") {
+		t.Fatalf("delete status=%d body=%s", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	node, err := repo.GetNodeByID(context.Background(), created.Node.ID)
+	if err != nil || !strings.Contains(node.ClashConfig, `"private-key"`) {
+		t.Fatalf("remote failure lost the encrypted client node: node=%+v err=%v", node, err)
+	}
+	if _, err := repo.GetManagedInboundResource(context.Background(), created.Resource.ID); err != nil {
+		t.Fatalf("remote failure removed managed resource: %v", err)
+	}
+	if !agent.hasInbound() {
+		t.Fatal("remote WireGuard inbound was removed despite the reported failure")
+	}
+}
+
+func TestManagedWireGuardRejectsMismatchedClientKeysBeforeAgent(t *testing.T) {
+	handler, _, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	body := managedWireGuardCreateBody(t, "Mismatched WG")
+	client := body["client"].(map[string]interface{})
+	client["public_key"] = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+	response := httptest.NewRecorder()
+	handler.HandleManagedInboundResources(response, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10), body))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "does not match") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if actions := agent.actionSnapshot(); len(actions) != 0 {
+		t.Fatalf("mismatched keys reached Agent: %v", actions)
 	}
 }

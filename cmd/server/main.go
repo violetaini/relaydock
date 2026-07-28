@@ -144,6 +144,10 @@ func main() {
 		logger.Error("加密密钥初始化失败", "error", err)
 		os.Exit(1)
 	}
+	if err := repo.ConfigureNodeSecretEncryption(masterIdentity.PrivateKey.Seed()); err != nil {
+		logger.Error("WireGuard 节点私钥加密初始化失败", "error", err)
+		os.Exit(1)
+	}
 	logger.Info("主控加密公钥已加载", "public_key", masterIdentity.PublicKeyBase64())
 
 	cryptoConfig := handler.NewCryptoConfig(masterIdentity, securechan.NewSessionCache(1*time.Hour))

@@ -131,8 +131,9 @@ release acceptance through the panel on disposable test nodes:
 3. Connect with the emitted client configuration and require the same HTTP exit
    assertion. Require a real Hysteria2 QUIC connection and a WireGuard
    handshake, not only config validation.
-4. Create WireGuard through its dedicated one-time client-config API and
-   require a real handshake without persisting the client private key.
+4. Create WireGuard through its dedicated API, require the encrypted client
+   configuration to appear as a normal node and subscription/share item, then
+   require a real handshake using the recovered client configuration.
 5. Build AnyDoor A-B-C with the same numeric port (use 2033 when explicitly
    reserved for staging), then require both its TCP and UDP checks.
 6. Delete only the disposable node IDs created by this run and confirm their
@@ -150,7 +151,9 @@ managed protocols through the real panel API. It creates a uniquely prefixed
 inbound, verifies the returned database node and Agent inbound readback,
 converts the persisted Clash node to an Xray 26.3.27 client, and sends a real
 HTTP request through that client. WireGuard and AnyDoor remain a separate phase
-because they have different lifecycle and multi-server rules.
+because WireGuard has a dedicated peer-creation request and AnyDoor spans
+multiple servers. A successfully created WireGuard entry otherwise follows the
+same node, package, subscription, share and deletion lifecycle as other nodes.
 
 Without `--execute`, the command is a dry run and sends no API request. The
 admin session token is read only from an environment variable, never from a
@@ -188,14 +191,61 @@ that do not use the standard managed-node lifecycle. It is also a dry run
 unless `--execute` is supplied, and cleanup cannot be disabled.
 
 - WireGuard is created through
-  `/api/admin/managed-inbound-resources/wireguard`. The client private key is
-  held only in memory and a mode-0600 temporary Xray configuration. The runner
-  verifies a TCP HTTP exit and an inner UDP DNS response through the userspace
-  WireGuard client, then deletes the resource by its returned resource ID.
+  `/api/admin/managed-inbound-resources/wireguard`. The authenticated request
+  carries server `inbound` and client `client` objects separately, so the
+  client private key is encrypted in panel storage and is never forwarded in
+  the Agent inbound request. The runner requires the response to include the
+  compatibility `resource`, normal `node`, and recoverable `client_config`;
+  it then verifies the node through `/api/admin/nodes`, requires its
+  `wireguard://` subscription/share representation, and proves TCP HTTP plus
+  inner UDP DNS connectivity. Cleanup uses the ordinary node deletion API and
+  confirms that the node, compatibility resource, and remote inbound all
+  disappear. The resource API is used only to clean a half-completed create.
 - AnyDoor is created through `/api/admin/tunnel-chains`. Every managed hop and
   the final echo target use one explicit numeric port. The runner requires both
   a TCP nonce echo and a UDP nonce echo, removes hop tags in reverse order, and
   confirms every tag is absent.
+
+The WireGuard create body uses this contract (placeholder values shown):
+
+```json
+{
+  "action": "add",
+  "display_name": "Acceptance WireGuard",
+  "inbound": {
+    "tag": "accept-<run-id>-wireguard",
+    "protocol": "wireguard",
+    "port": 51920,
+    "settings": {
+      "secretKey": "<server-private-key>",
+      "address": ["10.200.1.1/32"],
+      "mtu": 1420,
+      "peers": [
+        {
+          "publicKey": "<client-public-key>",
+          "allowedIPs": ["10.200.1.2/32"],
+          "keepAlive": 25
+        }
+      ]
+    }
+  },
+  "client": {
+    "private_key": "<client-private-key>",
+    "public_key": "<client-public-key>",
+    "address": ["10.200.1.2/32"],
+    "dns": ["1.1.1.1"],
+    "mtu": 1420,
+    "keep_alive": 25,
+    "server_public_key": "<server-public-key>",
+    "allowed_ips": ["0.0.0.0/0"]
+  }
+}
+```
+
+Only `inbound` is sent to the Agent. The server derives the normal Clash node
+and downloadable `.conf` from `client`, encrypts the sensitive node fields at
+rest, and decrypts them only for an authorized node, subscription or share
+response.
 
 Run the AnyDoor phase on the third host that will act as C, or point it at an
 equivalent external TCP/UDP echo process. `--serve-echo` opens a temporary,

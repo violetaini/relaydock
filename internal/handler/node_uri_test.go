@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/storage"
 
+	"github.com/MMWOrg/mmwX-plugins/proxyparser"
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 )
 
@@ -90,5 +92,81 @@ func TestMakeNodeURIItemNormalizesSocksAndRejectsUnsupportedProtocol(t *testing.
 	}, producer)
 	if err == nil || !strings.Contains(err.Error(), "暂不支持") {
 		t.Fatalf("unsupported protocol error = %v", err)
+	}
+}
+
+func TestMakeNodeURIItemCanonicalWireGuardRoundTripDualStack(t *testing.T) {
+	privateKey := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+="
+	publicKey := "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB+="
+	allowedIPs := []string{"0.0.0.0/0", "::/0"}
+	tests := []struct {
+		name          string
+		server        string
+		wantAuthority string
+	}{
+		{name: "IPv4 endpoint", server: "203.0.113.10", wantAuthority: "@203.0.113.10:51820/"},
+		{name: "IPv6 endpoint", server: "2001:db8::10", wantAuthority: "@[2001:db8::10]:51820/"},
+	}
+
+	for index, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy := map[string]any{
+				"name":                 "双栈 WireGuard + #1",
+				"type":                 "wireguard",
+				"server":               tt.server,
+				"port":                 51820,
+				"private-key":          privateKey,
+				"public-key":           publicKey,
+				"ip":                   "10.66.66.2",
+				"ipv6":                 "fd00::2",
+				"allowed-ips":          allowedIPs,
+				"persistent-keepalive": 25,
+				"udp":                  true,
+			}
+			config, err := json.Marshal(proxy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			item, err := makeNodeURIItem("alice", storage.Node{
+				ID: int64(index + 1), NodeName: "双栈 WireGuard", Protocol: "wireguard", ClashConfig: string(config),
+			}, substore.NewURIProducer())
+			if err != nil {
+				t.Fatalf("generate WireGuard URI: %v", err)
+			}
+			if !strings.Contains(item.URI, tt.wantAuthority) {
+				t.Fatalf("URI authority = %q, want fragment %q", item.URI, tt.wantAuthority)
+			}
+			if !strings.Contains(item.URI, "allowed-ips=%5B0.0.0.0%2F0%2C%3A%3A%2F0%5D") {
+				t.Fatalf("allowed-ips array was not comma encoded: %q", item.URI)
+			}
+			if !strings.Contains(item.URI, "wireguard://AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%2B%3D@") {
+				t.Fatalf("private key reserved characters were not encoded: %q", item.URI)
+			}
+
+			parsed, err := proxyparser.Parse(item.URI)
+			if err != nil {
+				t.Fatalf("parse generated WireGuard URI: %v", err)
+			}
+			if got := strings.Trim(strings.TrimSpace(parsed["server"].(string)), "[]"); got != tt.server {
+				t.Fatalf("parsed server = %q, want %q", got, tt.server)
+			}
+			if parsed["private-key"] != privateKey || parsed["public-key"] != publicKey {
+				t.Fatalf("parsed keys changed: private=%q public=%q", parsed["private-key"], parsed["public-key"])
+			}
+			if parsed["ip"] != "10.66.66.2" || parsed["ipv6"] != "fd00::2" {
+				t.Fatalf("parsed dual-stack addresses = ip:%v ipv6:%v", parsed["ip"], parsed["ipv6"])
+			}
+			if got, ok := parsed["allowed-ips"].([]string); !ok || !reflect.DeepEqual(got, allowedIPs) {
+				t.Fatalf("parsed allowed-ips = %#v, want %#v", parsed["allowed-ips"], allowedIPs)
+			}
+
+			reencoded, err := encodeCanonicalWireGuardURI(parsed)
+			if err != nil {
+				t.Fatalf("re-encode parsed WireGuard URI: %v", err)
+			}
+			if reencoded != item.URI {
+				t.Fatalf("WireGuard URI round trip changed:\nfirst:  %s\nsecond: %s", item.URI, reencoded)
+			}
+		})
 	}
 }

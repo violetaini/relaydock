@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 	"miaomiaowux/internal/storage"
 )
 
@@ -83,6 +85,47 @@ func TestApplyUserCredentialsFailsClosed(t *testing.T) {
 	socksCred := map[credKey]string{{"edge-1", "socks-in"}: `{"user":"alice","pass":"user-pass"}`}
 	if !applyUserCredentials(socksProxy, socksNode, socksCred) || socksProxy["username"] != "alice" || socksProxy["password"] != "user-pass" {
 		t.Fatalf("socks credential was not safely replaced: %#v", socksProxy)
+	}
+
+	wireGuardProxy := map[string]any{
+		"name": "WG", "type": "wireguard", "server": "203.0.113.10", "port": 51820,
+		"private-key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		"public-key":  "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+	}
+	wireGuardNode := storage.Node{ID: 9, NodeName: "WG", Protocol: "wireguard", OriginalServer: "edge-1", InboundTag: "wg-in"}
+	if !applyUserCredentials(wireGuardProxy, wireGuardNode, nil) {
+		t.Fatal("managed WireGuard static client config was hidden from an assigned user")
+	}
+	wireGuardJSON, _ := json.Marshal(wireGuardProxy)
+	wireGuardNode.ClashConfig = string(wireGuardJSON)
+	item, err := makeNodeURIItem("alice", wireGuardNode, substore.NewURIProducer())
+	if err != nil || !strings.HasPrefix(item.URI, "wireguard://") {
+		t.Fatalf("managed WireGuard URI item=%+v err=%v", item, err)
+	}
+	delete(wireGuardProxy, "private-key")
+	if applyUserCredentials(wireGuardProxy, wireGuardNode, nil) {
+		t.Fatal("managed WireGuard config without a hydrated private key passed")
+	}
+}
+
+func TestWireGuardDoesNotPersistHydratedConfigToLegacyYAML(t *testing.T) {
+	if shouldSyncNodeToLegacyYAML(storage.Node{
+		Protocol:    "wireguard",
+		ClashConfig: `{"private-key":"sensitive"}`,
+	}) {
+		t.Fatal("hydrated WireGuard config would be written to a legacy YAML file")
+	}
+	if !shouldSyncNodeToLegacyYAML(storage.Node{
+		Protocol:    "vless",
+		ClashConfig: `{"uuid":"ordinary"}`,
+	}) {
+		t.Fatal("ordinary proxy updates should continue syncing to legacy YAML files")
+	}
+	if shouldPersistNodeInLegacyPackageSnapshot(storage.Node{Protocol: "wireguard"}) {
+		t.Fatal("WireGuard identity would be copied into a legacy package snapshot")
+	}
+	if !shouldPersistNodeInLegacyPackageSnapshot(storage.Node{Protocol: "vless"}) {
+		t.Fatal("ordinary nodes should remain available to legacy package snapshots")
 	}
 }
 

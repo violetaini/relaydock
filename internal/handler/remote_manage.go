@@ -386,14 +386,20 @@ func remoteWriteForwardError(w http.ResponseWriter, err error) {
 
 // remoteWritePartialError 表示远程多步操作的主动作已经生效，但后置同步未完成。
 // 用 409 保证 CDN 不替换 body，并让客户端明确知道不应把该请求当成全部成功。
-func remoteWritePartialError(w http.ResponseWriter, message string) {
-	remoteWriteJSON(w, http.StatusConflict, map[string]any{
+func remoteWritePartialError(w http.ResponseWriter, message string, mutationIDs ...string) {
+	payload := map[string]any{
 		"success": false,
 		"partial": true,
 		"error":   message,
 		"message": message,
 		"status":  http.StatusBadGateway,
-	})
+	}
+	if len(mutationIDs) > 0 {
+		if mutationID := strings.TrimSpace(mutationIDs[0]); mutationID != "" {
+			payload["mutation_id"] = mutationID
+		}
+	}
+	remoteWriteJSON(w, http.StatusConflict, payload)
 }
 
 // 代理对远程服务器的服务状态请求
@@ -2448,6 +2454,11 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		var resp map[string]interface{}
 		if err := json.Unmarshal(result, &resp); err == nil {
 			if success, ok := resp["success"].(bool); ok && success {
+				mutationID := strings.TrimSpace(wireGuardStringValue(inboundReq["mutation_id"]))
+				if mutationID != "" && strings.TrimSpace(wireGuardStringValue(resp["mutation_id"])) != mutationID {
+					remoteWriteError(w, http.StatusBadGateway, "Agent 未回显匹配的 mutation_id，远端变更结果无法确认")
+					return
+				}
 				var postSyncErrors []string
 				if actionLower == "" || actionLower == "add" {
 					var pendingWSSEvent *event.InboundEvent
@@ -2545,7 +2556,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 					}
 				}
 				if len(postSyncErrors) > 0 {
-					remoteWritePartialError(w, "入站主动作已生效，但后置同步未完成: "+strings.Join(postSyncErrors, "; "))
+					remoteWritePartialError(w, "入站主动作已生效，但后置同步未完成: "+strings.Join(postSyncErrors, "; "), mutationID)
 					return
 				}
 			}
@@ -3560,8 +3571,9 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		port, _ := inbound["port"].(float64)
 
 		if canonicalManagedProtocol(protocol) == "wireguard" {
-			// WireGuard is management-only: reconcile its public inventory without
-			// ever creating a subscription node or retaining a client private key.
+			// Inventory entries without a client private key are external or historical
+			// WireGuard inbounds. Reconcile only their public resource metadata here;
+			// the dedicated panel creation path creates ordinary subscription nodes.
 			if _, resourceErr := h.upsertWireGuardManagedResource(ctx, serverID, "", "system-sync", inbound); resourceErr != nil {
 				response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: WireGuard 管理记录同步失败: %v", tag, resourceErr))
 			}

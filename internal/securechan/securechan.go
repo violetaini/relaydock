@@ -34,12 +34,20 @@ type MasterIdentity struct {
 	PublicKey  ed25519.PublicKey
 }
 
-// LoadOrGenerate loads an Ed25519 key from path, or generates and saves one.
+// LoadOrGenerate loads an Ed25519 key from path, or creates one only when the
+// file does not exist. A malformed or unreadable existing key must never be
+// replaced because it may also protect encrypted application data.
 func LoadOrGenerate(path string) (*MasterIdentity, error) {
 	data, err := os.ReadFile(path)
-	if err == nil && len(data) == ed25519.SeedSize {
+	if err == nil {
+		if len(data) != ed25519.SeedSize {
+			return nil, fmt.Errorf("invalid existing ed25519 key size: got %d, want %d", len(data), ed25519.SeedSize)
+		}
 		priv := ed25519.NewKeyFromSeed(data)
 		return &MasterIdentity{PrivateKey: priv, PublicKey: priv.Public().(ed25519.PublicKey)}, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read existing ed25519 key: %w", err)
 	}
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -50,8 +58,40 @@ func LoadOrGenerate(path string) (*MasterIdentity, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, fmt.Errorf("create key directory: %w", err)
 	}
-	if err := os.WriteFile(path, priv.Seed(), 0600); err != nil {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, os.ErrExist) {
+		return nil, fmt.Errorf("ed25519 key appeared during initialization; retry safely: %w", err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("create key: %w", err)
+	}
+	seed := priv.Seed()
+	written, err := file.Write(seed)
+	if err != nil {
+		_ = file.Close()
 		return nil, fmt.Errorf("save key: %w", err)
+	}
+	if written != len(seed) {
+		_ = file.Close()
+		return nil, fmt.Errorf("save key: %w", io.ErrShortWrite)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("sync key: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return nil, fmt.Errorf("close key: %w", err)
+	}
+	parent, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("open key directory for sync: %w", err)
+	}
+	if err := parent.Sync(); err != nil {
+		_ = parent.Close()
+		return nil, fmt.Errorf("sync key directory: %w", err)
+	}
+	if err := parent.Close(); err != nil {
+		return nil, fmt.Errorf("close key directory: %w", err)
 	}
 
 	return &MasterIdentity{PrivateKey: priv, PublicKey: pub}, nil

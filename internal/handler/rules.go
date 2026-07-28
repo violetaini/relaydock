@@ -142,6 +142,11 @@ func (h *RuleEditorHandler) handleGet(w http.ResponseWriter, r *http.Request, fi
 		http.Error(w, "读取规则文件失败", http.StatusInternalServerError)
 		return
 	}
+	hydratedContent, err := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, string(content))
+	if err != nil {
+		http.Error(w, "WireGuard 节点配置暂不可用", http.StatusServiceUnavailable)
+		return
+	}
 
 	var latestVersion int64
 	if h.repo != nil {
@@ -152,7 +157,7 @@ func (h *RuleEditorHandler) handleGet(w http.ResponseWriter, r *http.Request, fi
 
 	respondJSON(w, http.StatusOK, map[string]any{
 		"name":           filename,
-		"content":        string(content),
+		"content":        hydratedContent,
 		"latest_version": latestVersion,
 	})
 }
@@ -182,6 +187,14 @@ func (h *RuleEditorHandler) handleHistory(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		http.Error(w, "获取历史版本失败", http.StatusInternalServerError)
 		return
+	}
+	for index := range versions {
+		hydrated, hydrateErr := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, versions[index].Content)
+		if hydrateErr != nil {
+			http.Error(w, "WireGuard 节点配置暂不可用", http.StatusServiceUnavailable)
+			return
+		}
+		versions[index].Content = hydrated
 	}
 
 	respondJSON(w, http.StatusOK, map[string]any{"history": versions})
@@ -228,8 +241,13 @@ func (h *RuleEditorHandler) handleUpdate(w http.ResponseWriter, r *http.Request,
 		writeBadRequest(w, "YAML 解析失败: "+err.Error())
 		return
 	}
+	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, payload.Content)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
 
-	if err := os.WriteFile(resolved, []byte(payload.Content), 0o644); err != nil {
+	if err := writePrivateSubscriptionFile(resolved, []byte(protectedContent)); err != nil {
 		http.Error(w, "写入规则文件失败", http.StatusInternalServerError)
 		return
 	}
@@ -238,7 +256,7 @@ func (h *RuleEditorHandler) handleUpdate(w http.ResponseWriter, r *http.Request,
 
 	var newVersion int64
 	if h.repo != nil {
-		v, saveErr := h.repo.SaveRuleVersion(r.Context(), filename, payload.Content, username)
+		v, saveErr := h.repo.SaveRuleVersion(r.Context(), filename, protectedContent, username)
 		if saveErr != nil {
 			http.Error(w, "保存历史版本失败", http.StatusInternalServerError)
 			return

@@ -19,6 +19,8 @@ import (
 	"sync"
 	"time"
 
+	"miaomiaowux/internal/secretbox"
+
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
@@ -58,7 +60,7 @@ const (
 	//   - synchronous=NORMAL WAL 推荐组合(FULL 仅在断电时多一层保护,代价是显著变慢)
 	//   - journal_size_limit=64MB  checkpoint 后把 -wal 文件截回 ≤64MB(默认 -1=无限,-wal 只涨不缩)。
 	//     配合 main.go 里周期性 wal_checkpoint(TRUNCATE),避免长跑容器里 mmwx.db-wal 无界膨胀。
-	sqliteDSNPragma = "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(normal)&_pragma=journal_size_limit(67108864)"
+	sqliteDSNPragma = "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(normal)&_pragma=journal_size_limit(67108864)&_pragma=secure_delete(ON)"
 
 	// 多连接数:实测 1 个 SQLite 数据库文件并发写仍串行(文件锁),但多 conn 让"读 / 短写"
 	// 不会被"长写 / 等锁"完全堵死。8 ≈ 典型 server 数 + 后台采集/订阅生成的并发,留充裕度。
@@ -90,6 +92,8 @@ type TrafficRepository struct {
 	db                       *sql.DB
 	managedNodeMu            sync.Mutex
 	remoteInstallationLeases sync.Map // serverID (int64) -> *sync.RWMutex
+	nodeSecretMu             sync.RWMutex
+	nodeSecretBox            *secretbox.Box
 }
 
 // SubscriptionLink 表示向客户端公开的可配置订阅条目。
@@ -954,6 +958,10 @@ func NewTrafficRepository(path string) (*TrafficRepository, error) {
 	if _, err := db.Exec("PRAGMA journal_size_limit=67108864"); err != nil {
 		log.Printf("[storage] set journal_size_limit failed (non-fatal): %v", err)
 	}
+	if _, err := db.Exec("PRAGMA secure_delete=ON"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("enable secure delete: %w", err)
+	}
 
 	repo := &TrafficRepository{db: db}
 	if err := repo.migrate(); err != nil {
@@ -1439,6 +1447,24 @@ CREATE INDEX IF NOT EXISTS idx_nodes_enabled ON nodes(enabled);
 	}
 	if err := r.ensureNodeColumn("relay_orig_port", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
+	}
+
+	const nodeSecretsSchema = `
+CREATE TABLE IF NOT EXISTS node_secrets (
+    node_id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    ciphertext TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TRIGGER IF NOT EXISTS trg_nodes_delete_secret
+AFTER DELETE ON nodes
+BEGIN
+    DELETE FROM node_secrets WHERE node_id = OLD.id;
+END;
+`
+	if _, err := r.db.Exec(nodeSecretsSchema); err != nil {
+		return fmt.Errorf("migrate node secrets: %w", err)
 	}
 
 	// 确保列存在后创建标签索引

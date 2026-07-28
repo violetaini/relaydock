@@ -53,8 +53,9 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 	if event.Tag == "api" {
 		return
 	}
-	// WireGuard is tracked as a management-only inbound resource by the remote
-	// handler. It must never be converted into a nodes-table subscription proxy.
+	// The dedicated WireGuard creation endpoint creates the ordinary node only
+	// after it has encrypted the client private key. Inventory events contain no
+	// client secret, so converting them here would create a broken duplicate.
 	if strings.EqualFold(strings.TrimSpace(event.Protocol), "wireguard") {
 		return
 	}
@@ -513,6 +514,11 @@ func (l *NodeSyncListener) handleUpdated(ctx context.Context, event InboundEvent
 	server, err := l.repo.GetRemoteServer(ctx, event.ServerID)
 	if err != nil {
 		log.Printf("[NodeSync] Failed to get server %d: %v", event.ServerID, err)
+		return
+	}
+	// Agent inventory only contains server-side WireGuard data. Rebuilding the
+	// client proxy from it would discard the encrypted client identity.
+	if strings.EqualFold(strings.TrimSpace(event.Protocol), "wireguard") {
 		return
 	}
 

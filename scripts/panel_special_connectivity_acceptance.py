@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify disposable panel-managed WireGuard and AnyDoor resources.
+"""Verify disposable panel-managed WireGuard nodes and AnyDoor resources.
 
 The runner is a dry run unless --execute is present. It reads the admin token
 only from an environment variable and always attempts exact cleanup for the
@@ -107,6 +107,32 @@ def matching_wireguard_resources(api: PanelAPI, server_id: int, tag: str) -> lis
     ]
 
 
+def normal_nodes(api: PanelAPI) -> list[dict[str, object]]:
+    response = api.request("GET", "/api/admin/nodes?include_private=1")
+    if not isinstance(response, dict) or not isinstance(response.get("nodes"), list):
+        raise PanelAcceptanceError("normal node list returned invalid data")
+    return [dict(item) for item in response["nodes"] if isinstance(item, dict)]
+
+
+def node_field(node: dict[str, object], snake_case: str, pascal_case: str) -> object | None:
+    if snake_case in node:
+        return node[snake_case]
+    return node.get(pascal_case)
+
+
+def matching_wireguard_nodes(api: PanelAPI, _server_id: int, tag: str) -> list[dict[str, object]]:
+    # The run tag is globally unique; node DTOs expose the server name, not its numeric ID.
+    matches: list[dict[str, object]] = []
+    for node in normal_nodes(api):
+        if node_field(node, "inbound_tag", "InboundTag") != tag:
+            continue
+        protocol = str(node_field(node, "protocol", "Protocol") or "").lower()
+        if protocol != "wireguard":
+            continue
+        matches.append(node)
+    return matches
+
+
 def parse_metadata(value: object) -> dict[str, object]:
     if isinstance(value, dict):
         return dict(value)
@@ -131,9 +157,12 @@ def build_wireguard_request(
     tag: str,
     port: int,
     server_private: str,
+    server_public: str,
+    client_private: str,
     client_public: str,
     server_address: str,
     client_address: str,
+    dns_server: str,
 ) -> dict[str, object]:
     return {
         "action": "add",
@@ -155,6 +184,16 @@ def build_wireguard_request(
                 }],
             },
             "sniffing": {"enabled": False},
+        },
+        "client": {
+            "private_key": client_private,
+            "public_key": client_public,
+            "address": [client_address],
+            "dns": [dns_server],
+            "mtu": 1420,
+            "keep_alive": 25,
+            "server_public_key": server_public,
+            "allowed_ips": ["0.0.0.0/0"],
         },
     }
 
@@ -296,7 +335,8 @@ def validate_wireguard_response(
     tag: str,
     port: int,
     server_public: str,
-) -> tuple[int, str]:
+    client_private: str,
+) -> tuple[int, int, str, dict[str, object]]:
     if not isinstance(response, dict) or response.get("success") is not True or not isinstance(response.get("resource"), dict):
         raise PanelAcceptanceError("WireGuard create response did not confirm a managed resource")
     resource = dict(response["resource"])
@@ -319,7 +359,50 @@ def validate_wireguard_response(
     inbound = remote_inbound(api, server_id, tag)
     if inbound is None or str(inbound.get("protocol", "")).lower() != "wireguard" or int(inbound.get("port", 0)) != port:
         raise PanelAcceptanceError("WireGuard Agent readback does not match the created resource")
-    return resource_id, endpoint_host
+    if client_private in json.dumps(inbound, sort_keys=True):
+        raise PanelAcceptanceError("WireGuard client private key leaked into the Agent inbound")
+
+    response_node = response.get("node")
+    if not isinstance(response_node, dict) or node_field(response_node, "inbound_tag", "InboundTag") != tag:
+        raise PanelAcceptanceError("WireGuard create response did not include the normal node")
+    try:
+        node_id = int(response.get("node_id") or node_field(response_node, "id", "ID") or 0)
+    except (TypeError, ValueError) as reason:
+        raise PanelAcceptanceError("WireGuard normal node ID is invalid") from reason
+    if node_id <= 0:
+        raise PanelAcceptanceError("WireGuard normal node ID is invalid")
+
+    matches = matching_wireguard_nodes(api, server_id, tag)
+    if len(matches) != 1 or int(node_field(matches[0], "id", "ID") or 0) != node_id:
+        raise PanelAcceptanceError("WireGuard node is not visible in the normal node list")
+    raw_proxy = node_field(matches[0], "clash_config", "ClashConfig")
+    try:
+        proxy = dict(raw_proxy) if isinstance(raw_proxy, dict) else json.loads(str(raw_proxy or ""))
+    except (TypeError, ValueError, json.JSONDecodeError) as reason:
+        raise PanelAcceptanceError("WireGuard normal node has no usable Clash configuration") from reason
+    if (
+        str(proxy.get("type", "")).lower() != "wireguard"
+        or proxy.get("private-key") != client_private
+        or proxy.get("public-key") != server_public
+        or str(proxy.get("server", "")).strip() != endpoint_host
+        or int(proxy.get("port", 0)) != port
+    ):
+        raise PanelAcceptanceError("WireGuard normal node does not contain the recoverable client configuration")
+
+    client_config = response.get("client_config")
+    if not isinstance(client_config, str) or (
+        f"PrivateKey = {client_private}" not in client_config
+        or f"PublicKey = {server_public}" not in client_config
+        or f"Endpoint = {endpoint_text(endpoint_host, port)}" not in client_config
+    ):
+        raise PanelAcceptanceError("WireGuard response did not return the recoverable client configuration")
+
+    share = api.request("GET", f"/api/admin/nodes/{node_id}/uri")
+    item = share.get("item") if isinstance(share, dict) else None
+    uri = node_field(item, "uri", "URI") if isinstance(item, dict) else None
+    if not isinstance(uri, str) or not uri.startswith("wireguard://"):
+        raise PanelAcceptanceError("WireGuard node is not available to subscription/share serialization")
+    return resource_id, node_id, endpoint_host, proxy
 
 
 def remove_raw_inbound(api: PanelAPI, server_id: int, tag: str) -> None:
@@ -334,9 +417,33 @@ def remove_raw_inbound(api: PanelAPI, server_id: int, tag: str) -> None:
 
 def cleanup_wireguard(api: PanelAPI, server_id: int, tag: str, expected_tag: str) -> None:
     require_wireguard_tag(tag, expected_tag)
+    nodes = matching_wireguard_nodes(api, server_id, tag)
     resources = matching_wireguard_resources(api, server_id, tag)
+    if len(nodes) > 1:
+        raise PanelAcceptanceError("refusing cleanup because duplicate WireGuard nodes exist")
     if len(resources) > 1:
         raise PanelAcceptanceError("refusing cleanup because duplicate WireGuard resource records exist")
+    lifecycle_error = ""
+    if nodes:
+        try:
+            node_id = int(node_field(nodes[0], "id", "ID") or 0)
+        except (TypeError, ValueError) as reason:
+            raise PanelAcceptanceError("WireGuard cleanup node ID is invalid") from reason
+        if node_id <= 0:
+            raise PanelAcceptanceError("WireGuard cleanup node ID is invalid")
+        response = api.request("DELETE", f"/api/admin/nodes/{node_id}")
+        if not isinstance(response, dict) or response.get("status") != "deleted":
+            raise PanelAcceptanceError("normal WireGuard node deletion was not confirmed")
+        if (
+            matching_wireguard_nodes(api, server_id, tag)
+            or matching_wireguard_resources(api, server_id, tag)
+            or remote_inbound(api, server_id, tag) is not None
+        ):
+            lifecycle_error = "normal WireGuard node deletion did not remove its managed inbound lifecycle"
+
+    # Compatibility cleanup is only for a half-completed create, or to avoid
+    # leaking a disposable resource after recording a normal-node regression.
+    resources = matching_wireguard_resources(api, server_id, tag)
     if resources:
         try:
             resource_id = int(resources[0].get("id", 0))
@@ -349,8 +456,10 @@ def cleanup_wireguard(api: PanelAPI, server_id: int, tag: str, expected_tag: str
             raise PanelAcceptanceError("managed WireGuard deletion was not confirmed")
     if remote_inbound(api, server_id, tag) is not None:
         remove_raw_inbound(api, server_id, tag)
-    if remote_inbound(api, server_id, tag) is not None or matching_wireguard_resources(api, server_id, tag):
+    if remote_inbound(api, server_id, tag) is not None or matching_wireguard_resources(api, server_id, tag) or matching_wireguard_nodes(api, server_id, tag):
         raise PanelAcceptanceError("WireGuard cleanup verification failed")
+    if lifecycle_error:
+        raise PanelAcceptanceError(lifecycle_error)
 
 
 def run_wireguard(args: argparse.Namespace, api: PanelAPI, run_id: str, xray_bin: str, curl_bin: str) -> None:
@@ -367,9 +476,12 @@ def run_wireguard(args: argparse.Namespace, api: PanelAPI, run_id: str, xray_bin
         tag,
         args.wireguard_port,
         server_private,
+        server_public,
+        client_private,
         client_public,
         server_address,
         client_address,
+        args.dns_server,
     )
     hidden = [server_private, server_public, client_private, client_public]
     attempted = False
@@ -381,8 +493,8 @@ def run_wireguard(args: argparse.Namespace, api: PanelAPI, run_id: str, xray_bin
             f"/api/admin/managed-inbound-resources/wireguard?server_id={args.wireguard_server_id}",
             request,
         )
-        _resource_id, endpoint_host = validate_wireguard_response(
-            api, response, args.wireguard_server_id, tag, args.wireguard_port, server_public,
+        _resource_id, node_id, endpoint_host, _proxy = validate_wireguard_response(
+            api, response, args.wireguard_server_id, tag, args.wireguard_port, server_public, client_private,
         )
         socks_port = local_acceptance.reserve_ports(1)[0]
         udp_port = local_acceptance.reserve_ports(1, socket.SOCK_DGRAM)[0]
@@ -409,7 +521,10 @@ def run_wireguard(args: argparse.Namespace, api: PanelAPI, run_id: str, xray_bin
                 probe_dns(udp_port, args.timeout)
             finally:
                 process.close()
-        print("PASS wireguard: managed resource, Agent readback, TCP HTTP and inner UDP DNS verified")
+        print(
+            f"PASS wireguard: normal node {node_id}, encrypted-persistence API readback, "
+            "subscription URI, TCP HTTP and inner UDP DNS verified"
+        )
     except Exception as reason:
         primary_error = reason
         raise PanelAcceptanceError(local_acceptance.redact(str(reason), hidden)) from reason
@@ -417,7 +532,7 @@ def run_wireguard(args: argparse.Namespace, api: PanelAPI, run_id: str, xray_bin
         if attempted:
             try:
                 cleanup_wireguard(api, args.wireguard_server_id, tag, tag)
-                print("CLEAN wireguard: disposable managed resource removed")
+                print("CLEAN wireguard: disposable normal node and managed inbound removed")
             except Exception as cleanup_error:
                 message = local_acceptance.redact(str(cleanup_error), hidden)
                 if primary_error is None:

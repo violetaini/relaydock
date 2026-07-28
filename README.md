@@ -24,7 +24,7 @@ RelayDock 面向合租节点和小型代理服务运营场景。管理员集中�
 - 按用户授权可用服务器、有效期和具体协议组合；用户在授权范围内自助创建节点
 - VLESS、VMess、Trojan、Shadowsocks 2022、Hysteria2、SOCKS5、HTTP、WireGuard 等常见协议
 - TCP、WebSocket、gRPC、TLS、REALITY 等常用组合，并兼容 AnyTLS、Snell 等订阅节点
-- 直接创建 WireGuard 入站并一次性生成客户端配置
+- 直接创建 WireGuard 入站；客户端密钥加密保存为普通节点，可用于节点管理、套餐、订阅、分享和二维码
 - 1 至 8 跳 TCP/UDP 隧道和 Tunnel（任意门），各跳可使用相同端口
 - 主控和受管服务器均可安装、控制并运行 Ookla Speedtest CLI
 - 用户、套餐、订阅、模板、规则、可编辑 DNS 凭据、证书和 DDNS 管理

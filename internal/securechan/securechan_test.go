@@ -30,6 +30,25 @@ func TestLoadOrGenerate(t *testing.T) {
 	}
 }
 
+func TestLoadOrGenerateRejectsMalformedExistingKeyWithoutOverwritingIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "corrupt.key")
+	original := []byte("not-an-ed25519-seed")
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := LoadOrGenerate(path); err == nil {
+		t.Fatal("LoadOrGenerate accepted a malformed existing key")
+	}
+	stored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stored) != string(original) {
+		t.Fatalf("malformed key was overwritten: got %q want %q", stored, original)
+	}
+}
+
 func TestParsePublicKey(t *testing.T) {
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	id := &MasterIdentity{PrivateKey: priv, PublicKey: priv.Public().(ed25519.PublicKey)}

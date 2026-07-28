@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,6 +18,8 @@ import (
 
 	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/storage"
+
+	"github.com/google/uuid"
 )
 
 const managedInboundResourcesPath = "/api/admin/managed-inbound-resources"
@@ -58,9 +61,21 @@ func managedInboundResourceResponse(resource *storage.ManagedInboundResource) ma
 }
 
 type managedWireGuardCreateRequest struct {
-	Action      string                 `json:"action"`
-	DisplayName string                 `json:"display_name"`
-	Inbound     map[string]interface{} `json:"inbound"`
+	Action      string                  `json:"action"`
+	DisplayName string                  `json:"display_name"`
+	Inbound     map[string]interface{}  `json:"inbound"`
+	Client      *managedWireGuardClient `json:"client"`
+}
+
+type managedWireGuardClient struct {
+	PrivateKey      string   `json:"private_key"`
+	PublicKey       string   `json:"public_key"`
+	Address         []string `json:"address"`
+	DNS             []string `json:"dns"`
+	MTU             int      `json:"mtu"`
+	KeepAlive       int      `json:"keep_alive"`
+	ServerPublicKey string   `json:"server_public_key"`
+	AllowedIPs      []string `json:"allowed_ips"`
 }
 
 type managedInboundRenameRequest struct {
@@ -83,10 +98,9 @@ func decodeStrictManagedInboundJSON(r *http.Request, target interface{}) error {
 	return nil
 }
 
-// HandleManagedInboundResources serves management-only resources. These
-// records never enter nodes, packages, subscriptions, URI generation or proxy
-// speed tests because a usable WireGuard profile needs a client private key
-// that the panel deliberately does not retain.
+// HandleManagedInboundResources keeps public inbound inventory for compatibility.
+// Panel-created WireGuard profiles additionally become ordinary nodes; only the
+// client private key is separated and encrypted at rest.
 func (h *RemoteManageHandler) HandleManagedInboundResources(w http.ResponseWriter, r *http.Request) {
 	if h == nil || h.repo == nil {
 		remoteWriteError(w, http.StatusServiceUnavailable, "managed inbound resource storage unavailable")
@@ -151,7 +165,7 @@ func (h *RemoteManageHandler) createManagedWireGuardResource(w http.ResponseWrit
 		return
 	}
 	if key := managedInboundPrivateKey(request.Inbound); key != "" {
-		remoteWriteError(w, http.StatusBadRequest, fmt.Sprintf("WireGuard 请求包含客户端私钥字段 %q；客户端私钥只能保留在浏览器", key))
+		remoteWriteError(w, http.StatusBadRequest, fmt.Sprintf("WireGuard 入站包含客户端私钥字段 %q；客户端私钥只能存入加密节点配置", key))
 		return
 	}
 	validationRequest := map[string]interface{}{"inbound": request.Inbound}
@@ -164,6 +178,15 @@ func (h *RemoteManageHandler) createManagedWireGuardResource(w http.ResponseWrit
 		remoteWriteError(w, http.StatusBadRequest, "inbound.tag is required")
 		return
 	}
+	if request.Client == nil {
+		remoteWriteError(w, http.StatusBadRequest, "client is required")
+		return
+	}
+	client, err := validateManagedWireGuardClient(request.Inbound, *request.Client)
+	if err != nil {
+		remoteWriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if _, err := h.repo.GetManagedInboundResourceByServerTag(r.Context(), serverID, tag); err == nil {
 		remoteWriteError(w, http.StatusConflict, "该服务器已存在相同 Tag 的 WireGuard 管理资源")
 		return
@@ -171,48 +194,157 @@ func (h *RemoteManageHandler) createManagedWireGuardResource(w http.ResponseWrit
 		remoteWriteError(w, http.StatusInternalServerError, "failed to check managed WireGuard resource")
 		return
 	}
+	server, err := h.repo.GetRemoteServer(r.Context(), serverID)
+	if err != nil || server == nil {
+		remoteWriteError(w, http.StatusNotFound, "server not found")
+		return
+	}
+	operationCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(r.Context(), serverID)
+	if err != nil {
+		remoteWriteForwardError(w, err)
+		return
+	}
+	defer release()
+	r = r.WithContext(operationCtx)
 
-	payload, err := json.Marshal(map[string]interface{}{
-		"action":    "add",
-		"node_name": strings.TrimSpace(request.DisplayName),
-		"inbound":   request.Inbound,
+	// A mutation fence only proves ownership after this request has created the
+	// inbound. Refuse a pre-existing live tag before staging any local identity so
+	// an add rejection can never be followed by a destructive remove of someone
+	// else's inbound. The exclusive server lease closes the race with other panel
+	// mutations until this create workflow finishes.
+	if exists, inventoryErr := h.managedInboundTagExists(operationCtx, serverID, tag); inventoryErr != nil {
+		remoteWriteError(w, http.StatusBadGateway, "无法确认远端 WireGuard 入站 Tag: "+inventoryErr.Error())
+		return
+	} else if exists {
+		remoteWriteError(w, http.StatusConflict, "目标服务器已存在相同 Tag 的入站")
+		return
+	}
+
+	// Repeat local checks while holding the exclusive lease. Another request may
+	// have completed between the initial fast check and lease acquisition.
+	if _, err := h.repo.GetManagedInboundResourceByServerTag(operationCtx, serverID, tag); err == nil {
+		remoteWriteError(w, http.StatusConflict, "该服务器已存在相同 Tag 的 WireGuard 管理资源")
+		return
+	} else if !errors.Is(err, storage.ErrManagedInboundResourceNotFound) {
+		remoteWriteError(w, http.StatusInternalServerError, "failed to check managed WireGuard resource")
+		return
+	}
+	if _, found, lookupErr := h.findManagedNode(r.Context(), server.Name, tag); lookupErr != nil {
+		remoteWriteError(w, http.StatusInternalServerError, "failed to check managed WireGuard node")
+		return
+	} else if found {
+		remoteWriteError(w, http.StatusConflict, "该服务器已存在相同 Tag 的 WireGuard 节点")
+		return
+	}
+	displayName := strings.TrimSpace(request.DisplayName)
+	resource, err := h.upsertWireGuardManagedResource(r.Context(), serverID, displayName, auth.UsernameFromContext(r.Context()), request.Inbound)
+	if err != nil {
+		remoteWriteError(w, http.StatusBadRequest, "WireGuard 公开元数据预存失败: "+err.Error())
+		return
+	}
+	displayName = resource.DisplayName
+	clashConfig, clientConfig, err := buildManagedWireGuardClientConfigs(displayName, resource.EndpointHost, resource.EndpointPort, client)
+	if err != nil {
+		_ = h.repo.DeleteManagedInboundResource(r.Context(), resource.ID)
+		remoteWriteError(w, http.StatusBadRequest, "WireGuard 客户端配置生成失败: "+err.Error())
+		return
+	}
+
+	// Persist the client identity before touching the remote server. The node is
+	// intentionally disabled until the Agent confirms creation. A process crash
+	// can therefore leave a recoverable disabled node, never an unrecoverable
+	// remote peer whose client private key only existed in memory.
+	node, err := h.repo.CreateNode(r.Context(), storage.Node{
+		Username:     h.repo.GetSystemNodeOwner(r.Context()),
+		NodeName:     displayName,
+		Protocol:     "wireguard",
+		ParsedConfig: clashConfig,
+		ClashConfig:  clashConfig,
+		Enabled:      false,
 	})
 	if err != nil {
+		_ = h.repo.DeleteManagedInboundResource(r.Context(), resource.ID)
+		remoteWriteError(w, http.StatusBadGateway, "WireGuard 节点加密预存失败: "+err.Error())
+		return
+	}
+	stagedNodeID := node.ID
+	mutationID := "managed-wireguard:" + uuid.NewString()
+
+	payload, err := json.Marshal(map[string]interface{}{
+		"action":      "add",
+		"node_name":   strings.TrimSpace(request.DisplayName),
+		"inbound":     request.Inbound,
+		"mutation_id": mutationID,
+	})
+	if err != nil {
+		_ = h.repo.DeleteNodeByID(r.Context(), stagedNodeID)
+		_ = h.repo.DeleteManagedInboundResource(r.Context(), resource.ID)
 		remoteWriteError(w, http.StatusBadRequest, "failed to encode managed WireGuard request")
 		return
 	}
 	recorder := h.runManagedInboundMutation(r, serverID, payload)
 	if recorder.status >= http.StatusBadRequest {
-		if managedNodeResponseIsPartial(recorder) {
-			rollbackErr := h.rollbackManagedInboundResource(r, serverID, tag)
-			message := managedNodeResponseMessage(recorder, "WireGuard 公开元数据落库失败")
-			if rollbackErr != nil {
-				remoteWriteError(w, http.StatusBadGateway, message+"；自动回滚也失败: "+rollbackErr.Error())
-				return
-			}
-			remoteWriteError(w, http.StatusBadGateway, message+"；刚创建的远程入站已回滚")
+		message := managedNodeResponseMessage(recorder, "WireGuard 远程入站创建失败")
+		if !managedWireGuardMutationApplied(recorder, mutationID) {
+			remoteWriteError(w, http.StatusBadGateway, message+"；远端创建结果无法确认，已保留禁用节点和加密凭据")
 			return
 		}
-		copyHTTPResponse(w, recorder)
+		if rollbackErr := h.rollbackStagedManagedWireGuard(r, serverID, tag, stagedNodeID, mutationID); rollbackErr != nil {
+			remoteWriteError(w, http.StatusBadGateway, message+"；自动回滚失败，已保留禁用节点和加密凭据: "+rollbackErr.Error())
+			return
+		}
+		remoteWriteError(w, http.StatusBadGateway, message+"；预存节点与远程入站已回滚")
 		return
 	}
-	if success, message := managedNodeResponseSuccess(recorder); !success {
-		remoteWriteError(w, http.StatusBadGateway, message)
+	if ackErr := validateManagedWireGuardMutationACK(recorder.body.Bytes(), mutationID); ackErr != nil {
+		message := ackErr.Error()
+		if !managedWireGuardMutationApplied(recorder, mutationID) {
+			remoteWriteError(w, http.StatusBadGateway, message+"；远端创建结果无法确认，已保留禁用节点和加密凭据")
+			return
+		}
+		if rollbackErr := h.rollbackStagedManagedWireGuard(r, serverID, tag, stagedNodeID, mutationID); rollbackErr != nil {
+			remoteWriteError(w, http.StatusBadGateway, message+"；自动回滚失败，已保留禁用节点和加密凭据: "+rollbackErr.Error())
+			return
+		}
+		remoteWriteError(w, http.StatusBadGateway, message+"；预存节点与远程入站已回滚")
 		return
 	}
-	resource, err := h.repo.GetManagedInboundResourceByServerTag(r.Context(), serverID, tag)
+	resource, err = h.repo.GetManagedInboundResourceByServerTag(r.Context(), serverID, tag)
 	if err != nil {
-		rollbackErr := h.rollbackManagedInboundResource(r, serverID, tag)
+		rollbackErr := h.rollbackStagedManagedWireGuard(r, serverID, tag, stagedNodeID, mutationID)
 		if rollbackErr != nil {
-			remoteWriteError(w, http.StatusBadGateway, "WireGuard 入站已创建但管理记录缺失；自动回滚也失败: "+rollbackErr.Error())
+			remoteWriteError(w, http.StatusBadGateway, "WireGuard 入站已创建但管理记录缺失；自动回滚失败，已保留禁用节点和加密凭据: "+rollbackErr.Error())
 			return
 		}
-		remoteWriteError(w, http.StatusBadGateway, "WireGuard 入站已创建但管理记录缺失；远程入站已回滚")
+		remoteWriteError(w, http.StatusBadGateway, "WireGuard 入站已创建但管理记录缺失；预存节点与远程入站已回滚")
+		return
+	}
+	// Attach remote lifecycle coordinates only after a matching Agent ACK. An
+	// uncertain staged node can then be deleted locally without issuing an
+	// unfenced remove against a tag whose ownership was never established.
+	node.Tag = "远程:" + server.Name
+	node.OriginalServer = server.Name
+	node.InboundTag = tag
+	node.Enabled = true
+	node, err = h.repo.UpdateNode(r.Context(), node)
+	if err != nil {
+		rollbackErr := h.rollbackStagedManagedWireGuard(r, serverID, tag, stagedNodeID, mutationID)
+		if rollbackErr != nil {
+			remoteWriteError(w, http.StatusBadGateway, "WireGuard 节点启用失败: "+err.Error()+"；自动回滚失败，已保留禁用节点和加密凭据: "+rollbackErr.Error())
+			return
+		}
+		remoteWriteError(w, http.StatusBadGateway, "WireGuard 节点启用失败；预存节点与远程入站已回滚: "+err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "resource": managedInboundResourceResponse(resource)})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":       true,
+		"resource":      managedInboundResourceResponse(resource),
+		"node_id":       node.ID,
+		"node":          convertNode(node),
+		"client_config": clientConfig,
+	})
 }
 
 func (h *RemoteManageHandler) renameManagedInboundResource(w http.ResponseWriter, r *http.Request, id int64) {
@@ -266,6 +398,10 @@ func (h *RemoteManageHandler) deleteManagedInboundResource(w http.ResponseWriter
 		remoteWritePartialError(w, "远程 WireGuard 入站已删除，但本地管理记录清理失败")
 		return
 	}
+	if _, err := h.repo.DeleteNodesByInboundTag(r.Context(), resource.ServerName, resource.InboundTag); err != nil {
+		remoteWritePartialError(w, "远程 WireGuard 入站已删除，但普通节点记录清理失败")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "status": "deleted", "id": id})
 }
@@ -281,17 +417,113 @@ func (h *RemoteManageHandler) runManagedInboundMutation(r *http.Request, serverI
 	return recorder
 }
 
-func (h *RemoteManageHandler) rollbackManagedInboundResource(r *http.Request, serverID int64, tag string) error {
-	payload, _ := json.Marshal(map[string]string{"action": "remove", "tag": tag})
-	recorder := h.runManagedInboundMutation(r, serverID, payload)
-	if recorder.status >= http.StatusBadRequest {
-		return errors.New(managedNodeResponseMessage(recorder, fmt.Sprintf("回滚 HTTP %d", recorder.status)))
+func (h *RemoteManageHandler) rollbackManagedInboundResource(r *http.Request, serverID int64, tag, mutationID string) error {
+	payload, _ := json.Marshal(map[string]string{"action": "remove", "tag": tag, "mutation_id": mutationID})
+	baseCtx := context.WithoutCancel(r.Context())
+	removeCtx, cancelRemove := context.WithTimeout(baseCtx, 15*time.Second)
+	result, err := h.forwardToRemoteServer(removeCtx, serverID, http.MethodPost, "/api/child/inbounds", payload)
+	cancelRemove()
+	if err != nil {
+		return fmt.Errorf("Agent 未确认 fenced remove: %w", err)
 	}
-	if success, message := managedNodeResponseSuccess(recorder); !success {
+	if err := validateManagedWireGuardMutationACK(result, mutationID); err != nil {
+		return fmt.Errorf("Agent fenced remove ACK 无效: %w", err)
+	}
+	verifyCtx, cancelVerify := context.WithTimeout(baseCtx, 8*time.Second)
+	stillExists, err := h.managedInboundTagExists(verifyCtx, serverID, tag)
+	cancelVerify()
+	if err != nil {
+		return fmt.Errorf("无法确认 fenced remove 结果: %w", err)
+	}
+	if stillExists {
+		return errors.New("Agent 已响应 fenced remove，但同 Tag 入站仍存在")
+	}
+	return nil
+}
+
+func (h *RemoteManageHandler) rollbackStagedManagedWireGuard(r *http.Request, serverID int64, tag string, nodeID int64, mutationID string) error {
+	if err := h.rollbackManagedInboundResource(r, serverID, tag, mutationID); err != nil {
+		return err
+	}
+	cleanupCtx := context.WithoutCancel(r.Context())
+	if err := h.repo.DeleteNodeByID(cleanupCtx, nodeID); err != nil && !errors.Is(err, storage.ErrNodeNotFound) {
+		return fmt.Errorf("delete staged WireGuard node: %w", err)
+	}
+	_, err := h.repo.DeleteManagedInboundResourceByServerTag(cleanupCtx, serverID, tag)
+	return err
+}
+
+func (h *RemoteManageHandler) managedInboundTagExists(ctx context.Context, serverID int64, tag string) (bool, error) {
+	result, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/inbounds", nil)
+	if err != nil {
+		return false, err
+	}
+	var response struct {
+		Success  *bool                    `json:"success"`
+		Inbounds []map[string]interface{} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(result, &response); err != nil {
+		return false, fmt.Errorf("解析 Agent 入站清单失败: %w", err)
+	}
+	if response.Success == nil || !*response.Success {
+		return false, errors.New("Agent 未确认入站清单")
+	}
+	tag = strings.TrimSpace(tag)
+	for _, inbound := range response.Inbounds {
+		if strings.TrimSpace(wireGuardStringValue(inbound["tag"])) == tag {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func validateManagedWireGuardMutationACK(body []byte, mutationID string) error {
+	var response struct {
+		Success        *bool  `json:"success"`
+		MutationID     string `json:"mutation_id"`
+		Message        string `json:"message"`
+		Error          string `json:"error"`
+		Warning        string `json:"warning"`
+		RuntimeWarning string `json:"runtime_warning"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return fmt.Errorf("Agent 返回了无法解析的变更结果: %w", err)
+	}
+	if response.Success == nil || !*response.Success {
+		message := strings.TrimSpace(response.Error)
+		if message == "" {
+			message = strings.TrimSpace(response.Message)
+		}
+		if message == "" {
+			message = "Agent 未确认 WireGuard 变更"
+		}
 		return errors.New(message)
 	}
-	_, err := h.repo.DeleteManagedInboundResourceByServerTag(context.Background(), serverID, tag)
-	return err
+	if strings.TrimSpace(response.MutationID) != strings.TrimSpace(mutationID) || strings.TrimSpace(mutationID) == "" {
+		return errors.New("Agent 未回显匹配的 mutation_id")
+	}
+	if warning := strings.TrimSpace(response.Warning); warning != "" {
+		return errors.New("Agent WireGuard 变更包含警告: " + warning)
+	}
+	if warning := strings.TrimSpace(response.RuntimeWarning); warning != "" {
+		return errors.New("Agent WireGuard 运行态结果不可信: " + warning)
+	}
+	return nil
+}
+
+func managedWireGuardMutationApplied(recorder *managedNodeResponseRecorder, mutationID string) bool {
+	var response struct {
+		Success    *bool  `json:"success"`
+		Partial    bool   `json:"partial"`
+		MutationID string `json:"mutation_id"`
+	}
+	if recorder == nil || json.Unmarshal(recorder.body.Bytes(), &response) != nil {
+		return false
+	}
+	if strings.TrimSpace(mutationID) == "" || strings.TrimSpace(response.MutationID) != strings.TrimSpace(mutationID) {
+		return false
+	}
+	return response.Partial || (response.Success != nil && *response.Success)
 }
 
 func managedInboundPrivateKey(value interface{}) string {
@@ -314,6 +546,174 @@ func managedInboundPrivateKey(value interface{}) string {
 		}
 	}
 	return ""
+}
+
+func validateManagedWireGuardClient(inbound map[string]interface{}, client managedWireGuardClient) (managedWireGuardClient, error) {
+	client.PrivateKey = strings.TrimSpace(client.PrivateKey)
+	client.PublicKey = strings.TrimSpace(client.PublicKey)
+	client.ServerPublicKey = strings.TrimSpace(client.ServerPublicKey)
+	client.Address = normalizedWireGuardStrings(client.Address)
+	client.DNS = normalizedWireGuardStrings(client.DNS)
+	client.AllowedIPs = normalizedWireGuardStrings(client.AllowedIPs)
+	if !validWireGuardKey(client.PrivateKey) {
+		return client, errors.New("client.private_key must be a 32-byte WireGuard key")
+	}
+	if !validWireGuardKey(client.PublicKey) {
+		return client, errors.New("client.public_key must be a 32-byte WireGuard key")
+	}
+	derivedClientPublicKey, err := managedWireGuardPublicKey(client.PrivateKey)
+	if err != nil || !equalManagedWireGuardKeys(derivedClientPublicKey, client.PublicKey) {
+		return client, errors.New("client.public_key does not match client.private_key")
+	}
+	if len(client.Address) == 0 {
+		return client, errors.New("client.address must contain at least one tunnel address")
+	}
+	for _, address := range client.Address {
+		if !validWireGuardHostCIDR(address) {
+			return client, errors.New("client.address must use IPv4 /32 or IPv6 /128 host prefixes")
+		}
+	}
+	for _, dnsServer := range client.DNS {
+		if net.ParseIP(dnsServer) == nil {
+			return client, errors.New("client.dns contains an invalid IP address")
+		}
+	}
+	if client.MTU < 576 || client.MTU > 9000 {
+		return client, errors.New("client.mtu must be between 576 and 9000")
+	}
+	if client.KeepAlive < 0 || client.KeepAlive > 65535 {
+		return client, errors.New("client.keep_alive must be between 0 and 65535")
+	}
+	if len(client.AllowedIPs) == 0 {
+		return client, errors.New("client.allowed_ips must contain at least one route")
+	}
+	for _, allowedIP := range client.AllowedIPs {
+		if !validWireGuardIPOrCIDR(allowedIP) {
+			return client, errors.New("client.allowed_ips contains an invalid IP/CIDR")
+		}
+	}
+
+	settings, _ := inbound["settings"].(map[string]interface{})
+	serverPublicKey, err := managedWireGuardPublicKey(wireGuardStringValue(settings["secretKey"]))
+	if err != nil {
+		return client, fmt.Errorf("derive WireGuard server public key: %w", err)
+	}
+	if !equalManagedWireGuardKeys(serverPublicKey, client.ServerPublicKey) {
+		return client, errors.New("client.server_public_key does not match the inbound server key")
+	}
+	client.ServerPublicKey = serverPublicKey
+	if mtu, ok := wireGuardNumericValue(settings["mtu"]); ok && int(mtu) != client.MTU {
+		return client, errors.New("client.mtu does not match inbound.settings.mtu")
+	}
+
+	var matchingPeer map[string]interface{}
+	for _, rawPeer := range wireGuardInterfaceSlice(settings["peers"]) {
+		peer, _ := rawPeer.(map[string]interface{})
+		if peer != nil && equalManagedWireGuardKeys(wireGuardStringValue(peer["publicKey"]), client.PublicKey) {
+			matchingPeer = peer
+			break
+		}
+	}
+	if matchingPeer == nil {
+		return client, errors.New("client.public_key does not match any inbound peer")
+	}
+	if keepAlive, ok := wireGuardNumericValue(matchingPeer["keepAlive"]); ok && int(keepAlive) != client.KeepAlive {
+		return client, errors.New("client.keep_alive does not match the inbound peer")
+	}
+	peerAddresses := make(map[string]struct{})
+	for _, allowedIP := range wireGuardStringValues(matchingPeer["allowedIPs"]) {
+		peerAddresses[strings.TrimSpace(allowedIP)] = struct{}{}
+	}
+	for _, address := range client.Address {
+		if _, ok := peerAddresses[address]; !ok {
+			return client, errors.New("client.address is not assigned to the matching inbound peer")
+		}
+	}
+	return client, nil
+}
+
+func normalizedWireGuardStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func equalManagedWireGuardKeys(left, right string) bool {
+	leftKey, leftErr := decodeManagedWireGuardKey(left)
+	rightKey, rightErr := decodeManagedWireGuardKey(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftKey, rightKey)
+}
+
+func buildManagedWireGuardClientConfigs(name, endpointHost string, endpointPort int, client managedWireGuardClient) (string, string, error) {
+	name = strings.TrimSpace(name)
+	endpointHost = strings.TrimSpace(endpointHost)
+	if name == "" || endpointHost == "" || endpointPort < 1 || endpointPort > 65535 {
+		return "", "", errors.New("WireGuard endpoint or node name is invalid")
+	}
+	proxy := map[string]interface{}{
+		"name":                 name,
+		"type":                 "wireguard",
+		"server":               endpointHost,
+		"port":                 endpointPort,
+		"private-key":          client.PrivateKey,
+		"public-key":           client.ServerPublicKey,
+		"udp":                  true,
+		"mtu":                  client.MTU,
+		"allowed-ips":          client.AllowedIPs,
+		"persistent-keepalive": client.KeepAlive,
+	}
+	if len(client.DNS) > 0 {
+		proxy["dns"] = client.DNS
+	}
+	for _, address := range client.Address {
+		ip, _, err := net.ParseCIDR(address)
+		if err != nil {
+			return "", "", fmt.Errorf("parse WireGuard client address: %w", err)
+		}
+		if ip.To4() != nil {
+			proxy["ip"] = ip.String()
+		} else {
+			proxy["ipv6"] = ip.String()
+		}
+	}
+	encoded, err := json.Marshal(proxy)
+	if err != nil {
+		return "", "", fmt.Errorf("encode WireGuard node config: %w", err)
+	}
+	var config strings.Builder
+	config.WriteString("[Interface]\nPrivateKey = ")
+	config.WriteString(client.PrivateKey)
+	config.WriteString("\nAddress = ")
+	config.WriteString(strings.Join(client.Address, ", "))
+	if len(client.DNS) > 0 {
+		config.WriteString("\nDNS = ")
+		config.WriteString(strings.Join(client.DNS, ", "))
+	}
+	config.WriteString("\nMTU = ")
+	config.WriteString(strconv.Itoa(client.MTU))
+	config.WriteString("\n\n[Peer]\nPublicKey = ")
+	config.WriteString(client.ServerPublicKey)
+	config.WriteString("\nAllowedIPs = ")
+	config.WriteString(strings.Join(client.AllowedIPs, ", "))
+	config.WriteString("\nEndpoint = ")
+	config.WriteString(net.JoinHostPort(endpointHost, strconv.Itoa(endpointPort)))
+	if client.KeepAlive > 0 {
+		config.WriteString("\nPersistentKeepalive = ")
+		config.WriteString(strconv.Itoa(client.KeepAlive))
+	}
+	config.WriteByte('\n')
+	return string(encoded), config.String(), nil
 }
 
 type managedWireGuardPublicMetadata struct {

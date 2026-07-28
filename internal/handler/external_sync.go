@@ -662,9 +662,10 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 
 			logger.Info("[外部订阅同步] 成功更新节点 (ID)", "node_name", existingNode.NodeName, "id", existingNode.ID)
 
-			// 同步到 YAML 文件（如果需要，可处理名称更改）
+			// 同步到 YAML 文件（如果需要，可处理名称更改）。WireGuard
+			// 节点在读取时会临时水合私钥，必须沿用普通节点更新入口的持久化门禁。
 			if subscribeDir != "" {
-				if err := syncNodeToYAMLFiles(subscribeDir, oldNodeName, existingNode.NodeName, existingNode.ClashConfig); err != nil {
+				if err := syncExternalNodeUpdateToLegacyYAML(subscribeDir, oldNodeName, *existingNode); err != nil {
 					logger.Info("[外部订阅同步] 同步节点 到YAML文件失败", "node_name", existingNode.NodeName, "error", err)
 				}
 			}
@@ -693,6 +694,13 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 	logger.Info("[外部订阅同步] 订阅同步完成", "name", sub.Name, "synced_count", syncedCount, "total_count", len(nodesToUpdate), "updated", updatedCount, "created", createdCount, "skipped", skippedCount)
 
 	return syncedCount, sub, nil
+}
+
+func syncExternalNodeUpdateToLegacyYAML(subscribeDir, oldNodeName string, node storage.Node) error {
+	if !shouldSyncNodeToLegacyYAML(node) {
+		return nil
+	}
+	return syncNodeToYAMLFiles(subscribeDir, oldNodeName, node.NodeName, node.ClashConfig)
 }
 
 // ParseTrafficInfoHeader 解析 subscription-userinfo 标头并返回流量信息

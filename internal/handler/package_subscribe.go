@@ -588,6 +588,18 @@ func applyUserCredentials(proxy map[string]any, node storage.Node, credMap map[c
 	if !managed {
 		return true
 	}
+	// A panel-created WireGuard inbound has one static client peer. Its private
+	// key is encrypted at rest and hydrated only when the node is read, so it can
+	// be published unchanged without a user_inbound_configs credential record.
+	// This intentionally means users assigned the same node share that peer.
+	if strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard") {
+		if proxy == nil || strings.TrimSpace(node.OriginalServer) == "" || strings.TrimSpace(node.InboundTag) == "" {
+			return false
+		}
+		privateKey, _ := proxy["private-key"].(string)
+		publicKey, _ := proxy["public-key"].(string)
+		return strings.TrimSpace(privateKey) != "" && strings.TrimSpace(publicKey) != ""
+	}
 	// A half-associated node is not safe to publish: without both coordinates
 	// there is no unambiguous per-user credential lookup.
 	if proxy == nil || strings.TrimSpace(node.OriginalServer) == "" || strings.TrimSpace(node.InboundTag) == "" || credMap == nil {

@@ -42,6 +42,13 @@ func convertNilToEmptyStringInMap(m map[string]any) {
 	}
 }
 
+// Legacy YAML files are persistent subscription snapshots. WireGuard client
+// identities are rendered from the encrypted database on demand, so writing a
+// hydrated WireGuard config here would create a second plaintext copy on disk.
+func shouldSyncNodeToLegacyYAML(node storage.Node) bool {
+	return node.ClashConfig != "" && !strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard")
+}
+
 // 安全地进行 URL 解码，解码失败时返回原字符串
 func safeURLDecode(s string) string {
 	if s == "" {
@@ -835,7 +842,7 @@ func (h *nodesHandler) handleUpdate(w http.ResponseWriter, r *http.Request, idSe
 	logger.Info("[节点更新] 数据库更新成功 - 节点ID, 节点名称", "id", updated.ID, "node_name", updated.NodeName)
 
 	// 使用同步管理器将节点更改同步到 YAML 文件
-	if updated.ClashConfig != "" {
+	if shouldSyncNodeToLegacyYAML(updated) {
 		newNodeName := updated.NodeName
 		if err := h.yamlSyncManager.SyncNode(oldNodeName, newNodeName, updated.ClashConfig); err != nil {
 			// 记录错误但不要使请求失败
@@ -935,7 +942,7 @@ func (h *nodesHandler) handleUpdateServer(w http.ResponseWriter, r *http.Request
 	}
 
 	// 使用同步管理器将节点更改同步到 YAML 文件（服务器地址更新）
-	if updated.ClashConfig != "" {
+	if shouldSyncNodeToLegacyYAML(updated) {
 		nodeName := updated.NodeName
 		if err := h.yamlSyncManager.SyncNode(nodeName, nodeName, updated.ClashConfig); err != nil {
 			// 记录错误但不要使请求失败
@@ -1011,7 +1018,7 @@ func (h *nodesHandler) handleRestoreServer(w http.ResponseWriter, r *http.Reques
 	}
 
 	// 使用同步管理器将节点更改同步到 YAML 文件（恢复服务器地址）
-	if updated.ClashConfig != "" {
+	if shouldSyncNodeToLegacyYAML(updated) {
 		nodeName := updated.NodeName
 		if err := h.yamlSyncManager.SyncNode(nodeName, nodeName, updated.ClashConfig); err != nil {
 			// 记录错误但不要使请求失败
@@ -1140,7 +1147,7 @@ func (h *nodesHandler) handleSetRelay(w http.ResponseWriter, r *http.Request, id
 		writeError(w, status, err)
 		return
 	}
-	if updated.ClashConfig != "" {
+	if shouldSyncNodeToLegacyYAML(updated) {
 		_ = h.yamlSyncManager.SyncNode(updated.NodeName, updated.NodeName, updated.ClashConfig)
 	}
 	respondJSON(w, http.StatusOK, map[string]any{"node": convertNode(updated)})
@@ -1183,7 +1190,7 @@ func (h *nodesHandler) handleCancelRelay(w http.ResponseWriter, r *http.Request,
 		writeError(w, status, err)
 		return
 	}
-	if updated.ClashConfig != "" {
+	if shouldSyncNodeToLegacyYAML(updated) {
 		_ = h.yamlSyncManager.SyncNode(updated.NodeName, updated.NodeName, updated.ClashConfig)
 	}
 	respondJSON(w, http.StatusOK, map[string]any{"node": convertNode(updated)})
@@ -1258,7 +1265,7 @@ func (h *nodesHandler) handleUpdateConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	// 使用同步管理器同步到 YAML 订阅文件
-	if updated.ClashConfig != "" {
+	if shouldSyncNodeToLegacyYAML(updated) {
 		// 如果节点名称发生更改，请将 YAML 文件中的旧名称更新为新名称
 		newNodeName := updated.NodeName
 		if err := h.yamlSyncManager.SyncNode(oldNodeName, newNodeName, updated.ClashConfig); err != nil {
@@ -1298,22 +1305,12 @@ func (h *nodesHandler) handleDelete(w http.ResponseWriter, r *http.Request, idSe
 		return
 	}
 
-	// 如果找到节点并且delete_inbound为true，则删除关联的批次入站
-	var deletedInboundCount int
-	if !nodeNotFound && deleteInbound && node.NodeName != "" {
-		// 获取带有匹配标签的批次入站
-		batches, err := h.repo.GetBatchInboundsByTag(r.Context(), node.NodeName)
-		if err == nil && len(batches) > 0 {
-			// 删除批量入库记录
-			if err := h.repo.DeleteBatchInboundsByTag(r.Context(), node.NodeName); err == nil {
-				deletedInboundCount = len(batches)
-			}
-		}
-	}
-
 	// 远程闭环:routed 清 rule+outbound+client,physical 清 inbound(并兜底刷 nginx)。单删 / 批删共用 helper。
 	if !nodeNotFound {
-		h.cleanupRemoteForNode(r.Context(), &node)
+		if err := h.cleanupRemoteForNode(r.Context(), &node); err != nil {
+			writeError(w, http.StatusBadGateway, fmt.Errorf("远程入站清理失败，已保留本地节点和加密凭据: %w", err))
+			return
+		}
 	}
 
 	// 删除节点(按权限:管理员任意,普通用户仅自己的)
@@ -1323,6 +1320,19 @@ func (h *nodesHandler) handleDelete(w http.ResponseWriter, r *http.Request, idSe
 			return
 		}
 		// 未找到节点是可以接受的 - 它已被删除
+	}
+
+	// Only remove related local batch records after the remote lifecycle and the
+	// authoritative node deletion both succeeded. A failed remote cleanup must
+	// leave all local recovery state intact.
+	var deletedInboundCount int
+	if !nodeNotFound && deleteInbound && node.NodeName != "" {
+		batches, err := h.repo.GetBatchInboundsByTag(r.Context(), node.NodeName)
+		if err == nil && len(batches) > 0 {
+			if err := h.repo.DeleteBatchInboundsByTag(r.Context(), node.NodeName); err == nil {
+				deletedInboundCount = len(batches)
+			}
+		}
 	}
 
 	// 使用同步管理器将删除同步到 YAML 文件
@@ -1393,20 +1403,54 @@ func (h *nodesHandler) handleClearAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 清空前先逐个清理 agent 侧残留(以该节点为出口的出站/路由、routed outbound、inbound clients),
-	// 否则只删 DB 会在 agent 端留下孤儿出站/路由/入站(handleDelete/handleBatchDelete 走 cleanupRemoteForNode,清空之前漏了)。
-	if nodes, err := h.repo.ListNodes(r.Context(), username); err == nil {
-		for i := range nodes {
-			h.cleanupRemoteForNode(r.Context(), &nodes[i])
-		}
-	}
-
-	if err := h.repo.DeleteAllUserNodes(r.Context(), username); err != nil {
+	// Clear the remote lifecycle first. A failed managed inbound cleanup keeps
+	// that local node and its encrypted client identity so the operation can be
+	// retried instead of leaving an unrecoverable remote peer behind.
+	nodes, err := h.repo.ListNodes(r.Context(), username)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	ready := make([]storage.Node, 0, len(nodes))
+	failed := make([]string, 0)
+	for i := range nodes {
+		if err := h.cleanupRemoteForNode(r.Context(), &nodes[i]); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", nodes[i].NodeName, err))
+			continue
+		}
+		ready = append(ready, nodes[i])
+	}
 
-	respondJSON(w, http.StatusOK, map[string]string{"status": "cleared"})
+	deletedNames := make([]string, 0, len(ready))
+	deleted := 0
+	for _, node := range ready {
+		err := h.repo.DeleteNode(r.Context(), node.ID, username)
+		if err != nil && !errors.Is(err, storage.ErrNodeNotFound) {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		deleted++
+		if node.NodeName != "" {
+			deletedNames = append(deletedNames, node.NodeName)
+		}
+	}
+	if len(deletedNames) > 0 {
+		if err := h.yamlSyncManager.BatchDeleteNodes(deletedNames); err != nil {
+			// YAML compatibility output is best effort; the authoritative node
+			// record has already been removed.
+		}
+	}
+	if len(failed) > 0 {
+		respondJSON(w, http.StatusBadGateway, map[string]any{
+			"status":   "partial",
+			"deleted":  deleted,
+			"retained": len(failed),
+			"error":    "部分节点的远程入站清理失败，已保留本地节点和加密凭据: " + strings.Join(failed, "; "),
+		})
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{"status": "cleared", "deleted": deleted})
 }
 
 func (h *nodesHandler) handleBatchDelete(w http.ResponseWriter, r *http.Request) {
@@ -1446,35 +1490,52 @@ func (h *nodesHandler) handleBatchDelete(w http.ResponseWriter, r *http.Request)
 		nodes = append(nodes, node)
 	}
 
-	// 远程闭环。先「整批一次」清理各服务器上以这些节点为落地出口的出站(每台服务器只 GET 一次 outbounds
-	// + 并发 + 短超时),避免旧实现「每节点 × 每服务器」的 O(N×M) 串行远程调用 —— 那会让批量删外部节点
-	// 撞上 N×M×(HTTP 30s 兜底)= 几分钟并超时失败。再逐节点清各自 OriginalServer 上的 inbound/routed
-	// 出站(外部节点 OriginalServer 为空,自动跳过,基本不发远程请求)。
-	h.cleanupOutboundsTargetingNodes(r.Context(), nodes)
+	// Clear each node's own remote inbound before cleaning shared outbound
+	// references. Failed managed inbound cleanup retains its local node/secret;
+	// it must not be included in the subsequent destructive cleanup.
+	readyIDs := make([]int64, 0, len(accessibleIDs))
+	readyNodes := make([]storage.Node, 0, len(nodes))
+	failed := make([]string, 0)
 	for i := range nodes {
-		h.cleanupRemoteInboundForNode(r.Context(), &nodes[i])
+		if err := h.cleanupRemoteInboundForNode(r.Context(), &nodes[i]); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", nodes[i].NodeName, err))
+			continue
+		}
+		readyIDs = append(readyIDs, nodes[i].ID)
+		readyNodes = append(readyNodes, nodes[i])
 	}
+	h.cleanupOutboundsTargetingNodes(r.Context(), readyNodes)
 
 	// 从数据库中删除节点(按权限)
 	deletedCount := 0
-	for _, id := range accessibleIDs {
+	deletedNames := make([]string, 0, len(readyNodes))
+	for index, id := range readyIDs {
 		if err := h.deleteNodeForAccess(r.Context(), id, username, isAdmin); err != nil {
-			continue
+			if !errors.Is(err, storage.ErrNodeNotFound) {
+				continue
+			}
 		}
 		deletedCount++
+		if readyNodes[index].NodeName != "" {
+			deletedNames = append(deletedNames, readyNodes[index].NodeName)
+		}
 	}
 
 	// 使用同步管理器批量同步删除 YAML 文件
-	nodeNames := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		if n.NodeName != "" {
-			nodeNames = append(nodeNames, n.NodeName)
-		}
-	}
-	if len(nodeNames) > 0 {
-		if err := h.yamlSyncManager.BatchDeleteNodes(nodeNames); err != nil {
+	if len(deletedNames) > 0 {
+		if err := h.yamlSyncManager.BatchDeleteNodes(deletedNames); err != nil {
 			// 记录错误但不要使请求失败
 		}
+	}
+	if len(failed) > 0 {
+		respondJSON(w, http.StatusBadGateway, map[string]any{
+			"status":   "partial",
+			"deleted":  deletedCount,
+			"retained": len(failed),
+			"total":    len(req.NodeIDs),
+			"error":    "部分节点的远程入站清理失败，已保留本地节点和加密凭据: " + strings.Join(failed, "; "),
+		})
+		return
 	}
 
 	respondJSON(w, http.StatusOK, map[string]any{
@@ -1491,21 +1552,28 @@ func (h *nodesHandler) handleBatchDelete(w http.ResponseWriter, r *http.Request)
 //
 // 设计:本 helper 替代各调用方手抄 if-else 的旧模式,降低单删/批删行为分歧风险(批删之前漏判 routed)。
 // RoutedAdminEmail 不在 storage.Node 上(只在 RoutedNodeDetail),helper 内 routed 分支自动 fetch detail。
-func (h *nodesHandler) cleanupRemoteForNode(ctx context.Context, node *storage.Node) {
+func (h *nodesHandler) cleanupRemoteForNode(ctx context.Context, node *storage.Node) error {
 	if node == nil {
-		return
+		return nil
 	}
-	// 先清「以该节点为出口的出站」—— 这些 outbound + routing rule 可能在任意服务器上,与本节点的 OriginalServer 无关,
-	// 故放在 OriginalServer 守卫之前(外部/手动节点也可能被别的节点当落地出口)。
+	// Confirm its own managed inbound is gone before deleting outbounds that use
+	// this node as their target. This preserves the node and its private key if
+	// the remote Agent is unavailable.
+	if err := h.cleanupRemoteInboundForNode(ctx, node); err != nil {
+		return err
+	}
+	// These outbounds may live on any server and are independent from the
+	// node's OriginalServer, so retain the existing best-effort cleanup after
+	// the managed inbound has been safely removed.
 	h.cleanupOutboundsTargetingNode(ctx, node)
-	h.cleanupRemoteInboundForNode(ctx, node)
+	return nil
 }
 
 // cleanupRemoteInboundForNode 清节点自身在其 OriginalServer 上的 inbound / routed 出站。
 // 外部/手动导入节点没有 OriginalServer,直接返回(不发远程请求)。
-func (h *nodesHandler) cleanupRemoteInboundForNode(ctx context.Context, node *storage.Node) {
+func (h *nodesHandler) cleanupRemoteInboundForNode(ctx context.Context, node *storage.Node) error {
 	if node == nil || node.OriginalServer == "" {
-		return
+		return nil
 	}
 	if node.NodeType == "routed" && node.RoutedOutboundTag != "" {
 		adminEmail := ""
@@ -1513,11 +1581,12 @@ func (h *nodesHandler) cleanupRemoteInboundForNode(ctx context.Context, node *st
 			adminEmail = detail.RoutedAdminEmail
 		}
 		h.deleteRemoteRoutedOutbound(ctx, node.OriginalServer, node.RoutedOutboundTag, node.InboundTag, adminEmail, node.ID)
-		return
+		return nil
 	}
 	if node.InboundTag != "" {
-		h.deleteRemoteInbound(ctx, node.OriginalServer, node.InboundTag)
+		return h.deleteRemoteInbound(ctx, node.OriginalServer, node.InboundTag)
 	}
+	return nil
 }
 
 // deleteRemoteRoutedOutbound:routed 节点删除时清掉服务器侧的 routing rule + outbound + inbound 内 admin/sub clients。
@@ -1759,15 +1828,14 @@ func (h *nodesHandler) removeOutboundAndRules(ctx context.Context, serverID int6
 	_ = h.repo.DeleteUserOutboundByServerTag(ctx, serverID, tag)
 }
 
-func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inboundTag string) {
+func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inboundTag string) error {
 	if h.remoteManage == nil {
-		return
+		return errors.New("远程管理器不可用")
 	}
 
 	server, err := h.repo.GetRemoteServerByName(ctx, serverName)
 	if err != nil {
-		log.Printf("[Nodes] Failed to find remote server %q for inbound cleanup: %v", serverName, err)
-		return
+		return fmt.Errorf("查找远程服务器 %q 失败: %w", serverName, err)
 	}
 
 	// Serialize the pre-delete snapshot, delete and any dependent Reality/WSS
@@ -1786,16 +1854,22 @@ func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inbo
 		"tag":    inboundTag,
 	})
 
-	if _, err := h.remoteManage.forwardToRemoteServer(ctx, server.ID, "POST", "/api/child/inbounds", body); err != nil {
-		log.Printf("[Nodes] Failed to delete remote inbound %s on server %s: %v", inboundTag, serverName, err)
-		return
+	raw, err := h.remoteManage.forwardToRemoteServer(ctx, server.ID, "POST", "/api/child/inbounds", body)
+	if err != nil {
+		return fmt.Errorf("删除远程入站 %s/%s 失败: %w", serverName, inboundTag, err)
+	}
+	if err := requireRemoteMutationSuccess(raw, "删除远程入站"); err != nil {
+		return fmt.Errorf("删除远程入站 %s/%s 失败: %w", serverName, inboundTag, err)
 	}
 	log.Printf("[Nodes] Deleted remote inbound %s on server %s", inboundTag, serverName)
+	if _, err := h.repo.DeleteManagedInboundResourceByServerTag(ctx, server.ID, inboundTag); err != nil {
+		log.Printf("[Nodes] Failed to delete managed inbound resource %s on server %s: %v", inboundTag, serverName, err)
+	}
 
 	if stateErr != nil {
 		// Do not guess after deletion. An unconditional WSS rewrite here can
 		// disturb unrelated nginx sites when the removed inbound was plain WS.
-		return
+		return nil
 	}
 	if len(realityDomains) > 0 {
 		if err := h.remoteManage.restoreTunnelRouteForReality(ctx, server.ID, realityDomains); err != nil {
@@ -1807,6 +1881,37 @@ func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inbo
 			log.Printf("[Nodes] SyncWSSNginx after delete inbound %s on server=%d failed: %v", inboundTag, server.ID, err)
 		}
 	}
+	return nil
+}
+
+func requireRemoteMutationSuccess(raw []byte, operation string) error {
+	var response struct {
+		Success        *bool  `json:"success"`
+		Message        string `json:"message"`
+		Error          string `json:"error"`
+		Warning        string `json:"warning"`
+		RuntimeWarning string `json:"runtime_warning"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil || response.Success == nil {
+		return fmt.Errorf("Agent 返回了无法确认的%s结果", operation)
+	}
+	if !*response.Success {
+		message := strings.TrimSpace(response.Message)
+		if message == "" {
+			message = strings.TrimSpace(response.Error)
+		}
+		if message == "" {
+			message = "Agent 拒绝执行" + operation
+		}
+		return errors.New(message)
+	}
+	if warning := strings.TrimSpace(response.Warning); warning != "" {
+		return fmt.Errorf("Agent %s结果包含警告: %s", operation, warning)
+	}
+	if warning := strings.TrimSpace(response.RuntimeWarning); warning != "" {
+		return fmt.Errorf("Agent %s运行态结果不可信: %s", operation, warning)
+	}
+	return nil
 }
 
 func (h *nodesHandler) handleBatchRename(w http.ResponseWriter, r *http.Request) {
@@ -1885,7 +1990,7 @@ func (h *nodesHandler) handleBatchRename(w http.ResponseWriter, r *http.Request)
 		}
 
 		// 收集 YAML 同步更新（不立即同步）
-		if updated.ClashConfig != "" {
+		if shouldSyncNodeToLegacyYAML(updated) {
 			yamlUpdates = append(yamlUpdates, NodeUpdate{
 				OldName:         oldNodeName,
 				NewName:         update.NewName,
@@ -2009,7 +2114,13 @@ func makeNodeURIItem(username string, node storage.Node, producer *substore.URIP
 		protocol = "socks5"
 		proxy["type"] = protocol
 	}
-	uri, err := producer.ProduceOne(substore.Proxy(proxy))
+	var uri string
+	var err error
+	if protocol == "wireguard" {
+		uri, err = encodeCanonicalWireGuardURI(proxy)
+	} else {
+		uri, err = producer.ProduceOne(substore.Proxy(proxy))
+	}
 	if err != nil || strings.TrimSpace(uri) == "" {
 		label := strings.ToUpper(strings.TrimSpace(node.Protocol))
 		if label == "" {

@@ -29,6 +29,20 @@ type subscribeFilesHandler struct {
 	repo *storage.TrafficRepository
 }
 
+func writePrivateSubscriptionFile(path string, content []byte) error {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return err
+	}
+	if err := os.Chmod(directory, 0700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, content, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
+}
+
 // 返回一个仅用于管理订阅文件的处理程序。
 func NewSubscribeFilesHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
@@ -253,6 +267,11 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, errors.New("订阅内容不是有效的YAML格式"))
 		return
 	}
+	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, string(body))
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
 
 	// 从content-disposition获取文件名
 	filename := req.Filename
@@ -272,15 +291,8 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 		filename = filename + ".yaml"
 	}
 
-	// 保存文件到subscribes目录
-	subscribesDir := "subscribes"
-	if err := os.MkdirAll(subscribesDir, 0755); err != nil {
-		writeError(w, http.StatusInternalServerError, errors.New("创建订阅目录失败"))
-		return
-	}
-
-	filePath := filepath.Join(subscribesDir, filename)
-	if err := os.WriteFile(filePath, body, 0644); err != nil {
+	filePath := filepath.Join("subscribes", filename)
+	if err := writePrivateSubscriptionFile(filePath, []byte(protectedContent)); err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
 		return
 	}
@@ -371,16 +383,14 @@ func (h *subscribeFilesHandler) handleUpload(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, errors.New("文件不是有效的YAML格式"))
 		return
 	}
-
-	// 保存文件到subscribes目录
-	subscribesDir := "subscribes"
-	if err := os.MkdirAll(subscribesDir, 0755); err != nil {
-		writeError(w, http.StatusInternalServerError, errors.New("创建订阅目录失败"))
+	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, string(content))
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
 		return
 	}
 
-	filePath := filepath.Join(subscribesDir, filename)
-	if err := os.WriteFile(filePath, content, 0644); err != nil {
+	filePath := filepath.Join("subscribes", filename)
+	if err := writePrivateSubscriptionFile(filePath, []byte(protectedContent)); err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
 		return
 	}
@@ -1071,15 +1081,15 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 	// 修复表情符号/反斜杠转义
 	fixedContent := RemoveUnicodeEscapeQuotes(string(reserializedContent))
 
-	// 保存文件到subscribes目录
-	subscribesDir := "subscribes"
-	if err := os.MkdirAll(subscribesDir, 0755); err != nil {
-		writeError(w, http.StatusInternalServerError, errors.New("创建订阅目录失败"))
+	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, fixedContent)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
 		return
 	}
 
-	filePath := filepath.Join(subscribesDir, filename)
-	if err := os.WriteFile(filePath, []byte(fixedContent), 0644); err != nil {
+	// WireGuard 私钥以节点引用落盘，只有返回订阅时才在内存中解密。
+	filePath := filepath.Join("subscribes", filename)
+	if err := writePrivateSubscriptionFile(filePath, []byte(protectedContent)); err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
 		return
 	}
@@ -1167,9 +1177,14 @@ func (h *subscribeFilesHandler) handleGetContent(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusInternalServerError, errors.New("读取文件失败"))
 		return
 	}
+	hydratedContent, err := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, string(content))
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("WireGuard 节点配置暂不可用"))
+		return
+	}
 
 	respondJSON(w, http.StatusOK, map[string]any{
-		"content": string(content),
+		"content": hydratedContent,
 	})
 }
 
@@ -1253,6 +1268,11 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 
 	// 直接保存前端发送的内容（已经过前端修复，保持字段顺序）
 	contentToSave := RemoveUnicodeEscapeQuotes(req.Content)
+	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, contentToSave)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
 
 	// 记录警告信息（如果有）
 	for _, issue := range validationResult.Issues {
@@ -1263,7 +1283,7 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 
 	// 保存文件
 	filePath := filepath.Join("subscribes", filename)
-	if err := os.WriteFile(filePath, []byte(contentToSave), 0644); err != nil {
+	if err := writePrivateSubscriptionFile(filePath, []byte(protectedContent)); err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("保存文件失败"))
 		return
 	}
@@ -1273,7 +1293,7 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 	if author == "" {
 		author = "admin"
 	}
-	version, err := h.repo.SaveRuleVersion(r.Context(), filename, contentToSave, author)
+	version, err := h.repo.SaveRuleVersion(r.Context(), filename, protectedContent, author)
 	if err != nil {
 		// 版本保存失败不影响文件保存，只记录错误
 		writeError(w, http.StatusInternalServerError, errors.New("保存版本记录失败"))
