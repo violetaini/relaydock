@@ -22,10 +22,20 @@ func TestValidateRuleTemplateSecretsRejectsWireGuardIdentityEverywhere(t *testin
 	if err := validateRuleTemplateSecrets("proxies:\n  - name: ordinary\n    type: vless\n    public-key: " + privateKey + "\n"); err != nil {
 		t.Fatalf("ordinary public key was rejected: %v", err)
 	}
+	if err := validateRuleTemplateSecrets("mode: rule\nproxies: null\n"); err != nil {
+		t.Fatalf("empty proxy placeholder was rejected: %v", err)
+	}
+	if err := validateRuleTemplateSecrets("proxies: {}\n"); err == nil || !strings.Contains(err.Error(), "必须是 YAML 列表") {
+		t.Fatalf("invalid proxy placeholder error = %v", err)
+	}
 }
 
 func TestValidatePersistedRuleTemplateSecretsFailsClosedWithFilename(t *testing.T) {
 	directory := t.TempDir()
+	placeholder := "mode: rule\nproxies: null\nproxy-groups: []\n"
+	if err := os.WriteFile(filepath.Join(directory, "placeholder.yaml"), []byte(placeholder), 0644); err != nil {
+		t.Fatal(err)
+	}
 	ordinary := "proxies:\n  - name: ordinary\n    type: vless\n    uuid: test\n"
 	if err := os.WriteFile(filepath.Join(directory, "ordinary.yaml"), []byte(ordinary), 0644); err != nil {
 		t.Fatal(err)

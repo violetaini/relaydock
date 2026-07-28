@@ -196,6 +196,12 @@ func wireGuardProxyPrivateKeySources(content string) (*yaml.Node, []*yaml.Node, 
 	if err != nil {
 		return nil, nil, err
 	}
+	// Built-in and user rule templates use `proxies: null` as an empty
+	// placeholder that is populated when a subscription is generated. It does
+	// not contain a client identity and must remain valid persisted policy.
+	if proxies != nil && proxies.Kind == yaml.ScalarNode && proxies.Tag == "!!null" {
+		return root, nil, nil
+	}
 	if proxies == nil || proxies.Kind != yaml.SequenceNode {
 		return nil, nil, errors.New("proxies 必须是 YAML 列表")
 	}
