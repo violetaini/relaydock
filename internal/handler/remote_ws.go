@@ -285,6 +285,9 @@ type RemoteWSConnection struct {
 	session    *securechan.Session
 	Encrypted  bool
 	mu         sync.Mutex
+	// sendMu serializes the complete encrypted write path. gorilla/websocket only
+	// permits one concurrent writer, and Encrypt also assigns the frame sequence.
+	sendMu sync.Mutex
 	// Capabilities 从 auth payload 读到的 agent 能力位。RPC=true 时 forwardToRemoteServer 走 WS RPC,
 	// 否则走 HTTP(老 agent 兼容)。
 	Capabilities AgentCapabilities
@@ -681,10 +684,10 @@ func (h *RemoteWSHandler) handleConnection(conn *websocket.Conn, remoteAddr stri
 			conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
 		case WSMsgTypePing:
-			if wsConn != nil && wsConn.session != nil {
-				h.sendEncryptedMessage(wsConn, WSMessage{Type: WSMsgTypePong})
+			if wsConn != nil {
+				_ = h.sendEncryptedMessage(wsConn, WSMessage{Type: WSMsgTypePong})
 			} else {
-				h.sendMessage(conn, WSMessage{Type: WSMsgTypePong})
+				_ = h.sendMessage(conn, WSMessage{Type: WSMsgTypePong})
 			}
 			conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
@@ -822,6 +825,9 @@ func (h *RemoteWSHandler) handleKeyExchange(conn *websocket.Conn, remoteAddr str
 
 // 发送加密消息（如有 session 则加密，否则明文）
 func (h *RemoteWSHandler) sendEncryptedMessage(wsConn *RemoteWSConnection, msg WSMessage) error {
+	wsConn.sendMu.Lock()
+	defer wsConn.sendMu.Unlock()
+
 	if wsConn.session != nil {
 		data, err := json.Marshal(msg)
 		if err != nil {
