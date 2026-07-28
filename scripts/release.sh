@@ -23,5 +23,11 @@ git tag "v$NEW_VERSION"
 git push origin main
 git push origin "v$NEW_VERSION"
 
-echo "RelayDock Backend v$NEW_VERSION tagged. GitHub Actions will publish binaries and GHCR."
+command -v gh >/dev/null || { echo "ERROR: gh is required to start the manual release build" >&2; exit 1; }
+gh workflow run build.yml \
+    --repo violetaini/relaydock \
+    --ref "v$NEW_VERSION" \
+    -f publish=true
+
+echo "RelayDock Backend v$NEW_VERSION tagged. The explicitly requested GitHub build has been started."
 echo "Release: https://github.com/violetaini/relaydock/releases/tag/v$NEW_VERSION"
