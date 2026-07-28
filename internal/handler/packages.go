@@ -1339,7 +1339,18 @@ func getOrCreateInboundCredential(ctx context.Context, repo *storage.TrafficRepo
 	if existing, _ := repo.GetUserInboundConfig(ctx, user.Username, serverID, inboundTag); existing != nil && existing.Protocol == protocol {
 		var cred map[string]interface{}
 		if json.Unmarshal([]byte(existing.CredentialJSON), &cred) == nil && cred != nil {
-			return cred, existing.CredentialJSON, true, nil
+			credJSON := existing.CredentialJSON
+			if strings.EqualFold(protocol, "vless") && reconcileVLESSCredentialFlow(cred, settings) {
+				updated, err := json.Marshal(cred)
+				if err != nil {
+					return nil, "", false, fmt.Errorf("marshal reconciled VLESS credential: %w", err)
+				}
+				credJSON = string(updated)
+				if err := repo.UpdateUserInboundCredentialJSONByID(ctx, existing.ID, credJSON); err != nil {
+					return nil, "", false, fmt.Errorf("persist reconciled VLESS credential: %w", err)
+				}
+			}
+			return cred, credJSON, true, nil
 		}
 	}
 
@@ -1368,19 +1379,10 @@ func getOrCreateInboundCredential(ctx context.Context, repo *storage.TrafficRepo
 	if err != nil {
 		return nil, "", false, err
 	}
-	// VLESS Reality 从现有 client 继承 flow
-	if strings.EqualFold(protocol, "vless") {
-		if _, hasFlow := cred["flow"]; !hasFlow && settings != nil {
-			if clients, ok := settings["clients"].([]interface{}); ok && len(clients) > 0 {
-				if first, ok := clients[0].(map[string]interface{}); ok {
-					if flow, ok := first["flow"].(string); ok && flow != "" {
-						cred["flow"] = flow
-						if b, err := json.Marshal(cred); err == nil {
-							credJSON = string(b)
-						}
-					}
-				}
-			}
+	// VLESS 新凭据尚未存在于 Agent，按入站参考 client 继承 flow。
+	if strings.EqualFold(protocol, "vless") && reconcileVLESSCredentialFlow(cred, settings) {
+		if b, err := json.Marshal(cred); err == nil {
+			credJSON = string(b)
 		}
 	}
 	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
@@ -1555,6 +1557,65 @@ func extractClientByEmail(settings map[string]interface{}, email string) map[str
 		}
 	}
 	return nil
+}
+
+// reconcileVLESSCredentialFlow 让主控凭据与 Agent 当前 VLESS client 的 flow 保持一致。
+// 已存在的 client 优先按 id、其次按 email 匹配；尚未下发的凭据才继承第一个 client 的 flow。
+// 这样存量凭据不会错误继承其他账户的 Vision flow，新账户仍能继承入站的协议组合。
+func reconcileVLESSCredentialFlow(credential, settings map[string]interface{}) bool {
+	if credential == nil || settings == nil {
+		return false
+	}
+	clients, _ := settings["clients"].([]interface{})
+	if len(clients) == 0 {
+		return false
+	}
+
+	var matched map[string]interface{}
+	id := strings.TrimSpace(fmt.Sprint(credential["id"]))
+	if id != "" && id != "<nil>" {
+		for _, item := range clients {
+			client, _ := item.(map[string]interface{})
+			if client != nil && strings.TrimSpace(fmt.Sprint(client["id"])) == id {
+				matched = client
+				break
+			}
+		}
+	}
+	if matched == nil {
+		email := strings.TrimSpace(fmt.Sprint(credential["email"]))
+		if email != "" && email != "<nil>" {
+			for _, item := range clients {
+				client, _ := item.(map[string]interface{})
+				if client != nil && strings.TrimSpace(fmt.Sprint(client["email"])) == email {
+					matched = client
+					break
+				}
+			}
+		}
+	}
+	if matched == nil {
+		matched, _ = clients[0].(map[string]interface{})
+	}
+	if matched == nil {
+		return false
+	}
+
+	desiredFlow, _ := matched["flow"].(string)
+	desiredFlow = strings.TrimSpace(desiredFlow)
+	currentFlow, hasFlow := credential["flow"]
+	if desiredFlow == "" {
+		if hasFlow {
+			delete(credential, "flow")
+			return true
+		}
+		return false
+	}
+	if current, ok := currentFlow.(string); ok && current == desiredFlow {
+		return false
+	}
+	credential["flow"] = desiredFlow
+	return true
 }
 
 // removeUserFromInbound 通过 agent 原子 remove-client 移除用户凭据。

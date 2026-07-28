@@ -3405,10 +3405,58 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 
 	username := h.repo.GetSystemNodeOwner(ctx)
 
+	// Load the managed inventory before repairing clients. An exact physical
+	// node match gives us the stable credential that has already been published
+	// to users; routed nodes must never become the source of that credential.
+	existingNodes, _ := h.repo.ListNodes(ctx, username)
+	existingNodeNames := make(map[string]bool)
+	existingByTag := make(map[string]*storage.Node)         // server.Name + ":" + inbound_tag
+	existingByFingerprint := make(map[string]*storage.Node) // server.Name + ":" + protocol + ":" + port
+
+	serverAddrSet := map[string]bool{}
+	for _, address := range []string{server.IPAddress, server.Domain, server.PullAddress, serverHost} {
+		address = strings.TrimSpace(address)
+		if address != "" {
+			serverAddrSet[address] = true
+		}
+	}
+
+	for i := range existingNodes {
+		node := &existingNodes[i]
+		existingNodeNames[node.NodeName] = true
+		var config map[string]interface{}
+		if err := json.Unmarshal([]byte(node.ClashConfig), &config); err != nil {
+			continue
+		}
+		configServer, _ := config["server"].(string)
+		belongs := node.OriginalServer == server.Name || (node.OriginalServer == "" && serverAddrSet[configServer])
+		physical := node.NodeType == "" || node.NodeType == "physical"
+		if !belongs || !physical {
+			continue
+		}
+		if node.InboundTag != "" {
+			key := server.Name + ":" + node.InboundTag
+			if _, exists := existingByTag[key]; !exists {
+				existingByTag[key] = node
+			}
+		}
+		protocol, _ := config["type"].(string)
+		port, _ := config["port"].(float64)
+		if protocol == "" || port == 0 {
+			continue
+		}
+		fingerprint := fmt.Sprintf("%s:%s:%d", server.Name, normalizeProtocol(protocol), int(port))
+		if _, exists := existingByFingerprint[fingerprint]; !exists {
+			existingByFingerprint[fingerprint] = node
+		}
+	}
+
 	// 先确保 admin email 已经在 vless/vmess/trojan inbound 的 clients[] 里。
 	// 历史 inbound(从 mmw 迁过来 / 老 agent 手动加的)往往只有用户原始 client,没有 admin 的 — 流量统计会算到别人头上、
 	// admin 也无法以"自己的身份"连。这里给缺失的 inbound 自动补一个 admin client,凭据现场生成,后续同步幂等不重复。
-	for _, inbound := range inboundsResp.Inbounds {
+	failedCredentialRepair := make(map[string]bool)
+	for index := range inboundsResp.Inbounds {
+		inbound := inboundsResp.Inbounds[index]
 		protocol, _ := inbound["protocol"].(string)
 		// 只对带 clients[] 的协议补 admin client;ss 类协议是入站全局密码,没有 per-client 身份
 		if protocol != "vless" && protocol != "vmess" && protocol != "trojan" {
@@ -3418,20 +3466,47 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		if tag == "" || tag == "api" {
 			continue
 		}
+
+		// For a panel-managed Reality node, the database credential is the
+		// published contract. Restore it to the Agent before deriving a client
+		// configuration from the live inbound.
+		if existingNode := existingByTag[server.Name+":"+tag]; existingNode != nil && isVLESSRealityInbound(inbound) {
+			reconciled, changed, managed, reconcileErr := reconcileManagedRealityInbound(inbound, existingNode, username)
+			if reconcileErr != nil {
+				response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: Reality 凭据校验失败: %v", tag, reconcileErr))
+				failedCredentialRepair[tag] = true
+				continue
+			}
+			if managed {
+				if changed {
+					if err := h.replaceInboundForSync(ctx, serverID, reconciled); err != nil {
+						response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: Reality 凭据修复失败: %v", tag, err))
+						failedCredentialRepair[tag] = true
+						continue
+					}
+					log.Printf("[Remote Manage] Restored managed Reality credential (server=%s tag=%s)", server.Name, tag)
+				}
+				inboundsResp.Inbounds[index] = reconciled
+				continue
+			}
+		}
+
 		settings, _ := inbound["settings"].(map[string]interface{})
 		if settings == nil {
 			continue
 		}
 		clients, _ := settings["clients"].([]interface{})
 		var refClient map[string]interface{}
+		adminIndex := -1
 		hasAdmin := false
-		for _, c := range clients {
+		for clientIndex, c := range clients {
 			cm, _ := c.(map[string]interface{})
 			if cm == nil {
 				continue
 			}
 			if e, _ := cm["email"].(string); e == username {
 				hasAdmin = true
+				adminIndex = clientIndex
 				break
 			}
 			if refClient == nil {
@@ -3439,6 +3514,14 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 			}
 		}
 		if hasAdmin {
+			if adminIndex > 0 {
+				ordered := make([]interface{}, 0, len(clients))
+				ordered = append(ordered, clients[adminIndex])
+				ordered = append(ordered, clients[:adminIndex]...)
+				ordered = append(ordered, clients[adminIndex+1:]...)
+				settings["clients"] = ordered
+				inbound["settings"] = settings
+			}
 			continue
 		}
 		// 生成新 client。flow 复用现有 client 的(reality/vision 必须一致);其它字段 agent 端自行补默认
@@ -3450,65 +3533,24 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 				if flow, ok := refClient["flow"].(string); ok && flow != "" {
 					newClient["flow"] = flow
 				}
+			} else if isVLESSRealityInbound(inbound) {
+				newClient["flow"] = "xtls-rprx-vision"
 			}
 		case "trojan":
 			newClient["password"] = uuid.New().String()
 		}
 		if err := addClientToInbound(ctx, h, server.ID, tag, newClient); err != nil {
 			log.Printf("[Remote Manage] inject admin client failed (server=%s tag=%s): %v", server.Name, tag, err)
+			if isVLESSRealityInbound(inbound) {
+				response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: Reality 管理客户端补全失败: %v", tag, err))
+				failedCredentialRepair[tag] = true
+			}
 			continue
 		}
 		log.Printf("[Remote Manage] Injected admin client into inbound (server=%s tag=%s email=%s protocol=%s)", server.Name, tag, username, protocol)
 		// 更新本次循环的 in-memory inbound 视图,后续 routed 检测 / 节点 dedup 才能正确看到 admin client
-		settings["clients"] = append(clients, newClient)
+		settings["clients"] = append([]interface{}{newClient}, clients...)
 		inbound["settings"] = settings
-	}
-
-	// 在循环之前获取现有节点一次。dedup 两步走:
-	//   1. inbound_tag 精确匹配 → 直接 skip(命中后续 tag 维护逻辑无需触发)
-	//   2. clash 配置指纹(server + 归一化 protocol + port)→ skip,并把库里该节点的 inbound_tag 校正成本次同步扫到的 tag,
-	//      下次再同步就能走第 1 步快速通道(tag 用户改名 / 老 agent 改命名规则,都是通过这一步收敛)。
-	// 端口与协议用 clash_config 字段(已应用过 tunnel 端口映射等规则,与本次同步生成的 clashProxy 同坐标系)。
-	existingNodes, _ := h.repo.ListNodes(ctx, username)
-	existingNodeNames := make(map[string]bool)
-	existingByTag := make(map[string]bool)                  // 键: server.Name + ":" + inbound_tag
-	existingByFingerprint := make(map[string]*storage.Node) // 键: server.Name + ":" + 归一化协议 + ":" + 端口
-
-	serverAddrSet := map[string]bool{}
-	for _, a := range []string{server.IPAddress, server.Domain, server.PullAddress, serverHost} {
-		a = strings.TrimSpace(a)
-		if a != "" {
-			serverAddrSet[a] = true
-		}
-	}
-
-	for i := range existingNodes {
-		n := &existingNodes[i]
-		existingNodeNames[n.NodeName] = true
-		var config map[string]interface{}
-		if err := json.Unmarshal([]byte(n.ClashConfig), &config); err != nil {
-			continue
-		}
-		proto, _ := config["type"].(string)
-		port, _ := config["port"].(float64)
-		if proto == "" || port == 0 {
-			continue
-		}
-		cfgServer, _ := config["server"].(string)
-		// 节点归属本服务器的判定:已绑 original_server,或老的未绑节点但 clash_config.server 落在本服务器地址集内
-		belongs := n.OriginalServer == server.Name || (n.OriginalServer == "" && serverAddrSet[cfgServer])
-		if !belongs {
-			continue
-		}
-		if n.InboundTag != "" {
-			existingByTag[server.Name+":"+n.InboundTag] = true
-		}
-		fp := fmt.Sprintf("%s:%s:%d", server.Name, normalizeProtocol(proto), int(port))
-		// 多个节点共享同一 fingerprint(回落+路由出站)时,这里只挂第一个 —— 它代表「这条 inbound 连接坐标已被消耗」,
-		// 真正需要按 credential 区分的多节点 claim 走 tryClaimExternalNodeForSync 那条独立路径。
-		if _, ok := existingByFingerprint[fp]; !ok {
-			existingByFingerprint[fp] = n
-		}
 	}
 
 	// 处理每个入站并创建节点
@@ -3530,6 +3572,10 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 			response.SkippedCount++
 			continue
 		}
+		if failedCredentialRepair[tag] {
+			response.SkippedCount++
+			continue
+		}
 
 		// 将入站转换为 Clash 代理配置(server 保持用 IP,域名可能走 CDN)
 		// 即便该 inbound 会被 dedupe skip,我们仍需 clash_config 来 claim 同 server:port:proto 的其它外部节点
@@ -3542,7 +3588,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 			tunnelPort = effPort
 			effectiveServerHost = effHost
 		}
-		clashProxy, err := h.inboundToClashProxy(inbound, effectiveServerHost, server.Name, tunnelPort)
+		clashProxy, err := h.inboundToClashProxy(inbound, effectiveServerHost, server.Name, tunnelPort, username)
 		if err != nil {
 			// "no settings found" — agent listInbounds 返回的"孤儿入站"(只有 tag/protocol/port,缺 settings),
 			// 既无法生成节点配置也对用户毫无价值。后台静默调 agent remove RPC 清理掉,
@@ -3589,10 +3635,32 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 			}
 		}
 
-		// Step 1: inbound_tag 精确匹配 → 直接 skip。最便宜的快速通道
-		if tag != "" && existingByTag[server.Name+":"+tag] {
-			response.SkippedCount++
-			continue
+		// Step 1: an exact physical-node match is reconciled, not merely skipped.
+		// Live transport/security fields are authoritative, while user-selected
+		// endpoint and chain fields remain stable.
+		if tag != "" {
+			if existingNode := existingByTag[server.Name+":"+tag]; existingNode != nil {
+				updatedNode, changed, mergeErr := mergeManagedPhysicalNodeConfig(*existingNode, clashProxy)
+				if mergeErr != nil {
+					response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: 节点配置校准失败: %v", tag, mergeErr))
+					response.SkippedCount++
+					continue
+				}
+				if changed {
+					storedNode, updateErr := h.repo.UpdateNode(ctx, updatedNode)
+					if updateErr != nil {
+						response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: 节点配置回写失败: %v", tag, updateErr))
+						response.SkippedCount++
+						continue
+					}
+					*existingNode = storedNode
+					response.SyncedCount++
+					response.SyncedTags = append(response.SyncedTags, fmt.Sprintf("%s (port:%d) [reconciled]", tag, int(port)))
+				} else {
+					response.SkippedCount++
+				}
+				continue
+			}
 		}
 
 		// Step 2: clash 配置指纹(server+协议+端口)匹配 → skip 创建,但若 agent 这次扫到的 tag 与库里不一致,
@@ -3604,7 +3672,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 				} else {
 					log.Printf("[Remote Manage] Reconciled inbound_tag id=%d: %q → %q (matched by config fingerprint)", existingNode.ID, existingNode.InboundTag, tag)
 					existingNode.InboundTag = tag
-					existingByTag[server.Name+":"+tag] = true
+					existingByTag[server.Name+":"+tag] = existingNode
 				}
 			}
 			response.SkippedCount++
@@ -3646,7 +3714,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 			// claim 后该节点已落库,占用当前 fingerprint/tag,后续同步循环里别再生成重复
 			existingByFingerprint[dedupeKey] = &storage.Node{InboundTag: tag}
 			if tag != "" {
-				existingByTag[server.Name+":"+tag] = true
+				existingByTag[server.Name+":"+tag] = &storage.Node{InboundTag: tag, OriginalServer: server.Name, NodeType: "physical"}
 			}
 			continue
 		}
@@ -3686,7 +3754,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		// 更新 dedup 索引,防止同一批次同 fingerprint 的入站再次落到这里(理论上 inbound 列表不会重复,纯防御)
 		existingByFingerprint[dedupeKey] = &storage.Node{InboundTag: tag}
 		if tag != "" {
-			existingByTag[server.Name+":"+tag] = true
+			existingByTag[server.Name+":"+tag] = &storage.Node{InboundTag: tag, OriginalServer: server.Name, NodeType: "physical"}
 		}
 		existingNodeNames[nodeName] = true
 	}
@@ -4254,7 +4322,7 @@ func (h *RemoteManageHandler) silentlyRemoveOrphanInbound(serverID int64, tag st
 
 // inboundToClashProxy 将 Xray 入站配置转换为 Clash 代理配置。
 // tunnelPort > 0 表示服务器使用隧道模式；将其用作节点的外部端口。
-func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}, serverHost, serverName string, tunnelPort int) (map[string]interface{}, error) {
+func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}, serverHost, serverName string, tunnelPort int, preferredEmails ...string) (map[string]interface{}, error) {
 	protocol, _ := inbound["protocol"].(string)
 	protocol = canonicalManagedProtocol(protocol)
 	tag, _ := inbound["tag"].(string)
@@ -4266,14 +4334,38 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 		return nil, fmt.Errorf("no settings found")
 	}
 
-	// 获取第一个客户/帐户(anytls 用 users[],其他主流协议用 clients[],socks/http 用 accounts[])
+	preferredEmail := ""
+	if len(preferredEmails) > 0 {
+		preferredEmail = strings.TrimSpace(preferredEmails[0])
+	}
+	selectClient := func(entries []interface{}) map[string]interface{} {
+		var first map[string]interface{}
+		for _, entry := range entries {
+			candidate, _ := entry.(map[string]interface{})
+			if candidate == nil {
+				continue
+			}
+			if first == nil {
+				first = candidate
+			}
+			if preferredEmail != "" {
+				email, _ := candidate["email"].(string)
+				if strings.TrimSpace(email) == preferredEmail {
+					return candidate
+				}
+			}
+		}
+		return first
+	}
+
+	// 获取首选客户/帐户(anytls 用 users[],其他主流协议用 clients[],socks/http 用 accounts[])
 	var client map[string]interface{}
 	if clients, ok := settings["clients"].([]interface{}); ok && len(clients) > 0 {
-		client, _ = clients[0].(map[string]interface{})
+		client = selectClient(clients)
 	} else if users, ok := settings["users"].([]interface{}); ok && len(users) > 0 {
-		client, _ = users[0].(map[string]interface{})
+		client = selectClient(users)
 	} else if accounts, ok := settings["accounts"].([]interface{}); ok && len(accounts) > 0 {
-		client, _ = accounts[0].(map[string]interface{})
+		client = selectClient(accounts)
 	}
 
 	// shadowsocks server 端 password 在 settings 顶层不在 clients[];socks / http 无认证模式 accounts 可空;
