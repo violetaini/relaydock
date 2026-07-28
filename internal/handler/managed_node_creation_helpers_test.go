@@ -163,10 +163,14 @@ func TestCreateManagedNodeRollsBackWarningResponse(t *testing.T) {
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/child/inbounds":
-			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "inbounds": []any{}})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true, "inbounds": []any{},
+				"mutation_fence_known": true, "mutation_owners": map[string]string{},
+			})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
 			var request struct {
-				Action string `json:"action"`
+				Action     string `json:"action"`
+				MutationID string `json:"mutation_id"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -174,11 +178,12 @@ func TestCreateManagedNodeRollsBackWarningResponse(t *testing.T) {
 			}
 			actions = append(actions, request.Action)
 			if request.Action == "remove" {
-				_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "mutation_id": request.MutationID})
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"success": true, "message": "runtime only", "warning": "persist_failed",
+				"success": true, "mutation_id": request.MutationID,
+				"message": "runtime only", "warning": "persist_failed",
 			})
 		default:
 			http.NotFound(w, r)

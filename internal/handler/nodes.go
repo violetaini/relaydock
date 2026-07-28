@@ -134,7 +134,7 @@ func NewNodesHandler(repo *storage.TrafficRepository, subscribeDir string, remot
 	return &nodesHandler{
 		repo:            repo,
 		subscribeDir:    subscribeDir,
-		yamlSyncManager: NewYAMLSyncManager(subscribeDir),
+		yamlSyncManager: NewYAMLSyncManager(subscribeDir, repo),
 		remoteManage:    remoteManage,
 	}
 }
@@ -148,11 +148,11 @@ func (h *nodesHandler) fetchNodeForAccess(ctx context.Context, id int64, usernam
 }
 
 // deleteNodeForAccess 按权限删除节点:管理员可删任意,普通用户只能删自己的。
-func (h *nodesHandler) deleteNodeForAccess(ctx context.Context, id int64, username string, isAdmin bool) error {
+func (h *nodesHandler) deleteNodeForAccess(ctx context.Context, id int64, username string, isAdmin bool, expectedMutationID string) error {
 	if isAdmin {
-		return h.repo.DeleteNodeByID(ctx, id)
+		return h.repo.DeleteNodeByIDIfMutation(ctx, id, expectedMutationID)
 	}
-	return h.repo.DeleteNode(ctx, id, username)
+	return h.repo.DeleteNodeIfMutation(ctx, id, username, expectedMutationID)
 }
 
 func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1314,7 +1314,15 @@ func (h *nodesHandler) handleDelete(w http.ResponseWriter, r *http.Request, idSe
 	}
 
 	// 删除节点(按权限:管理员任意,普通用户仅自己的)
-	if err := h.deleteNodeForAccess(r.Context(), id, username, isAdmin); err != nil {
+	expectedMutationID := ""
+	if !nodeNotFound {
+		expectedMutationID = node.InboundMutationID
+	}
+	if err := h.deleteNodeForAccess(r.Context(), id, username, isAdmin, expectedMutationID); err != nil {
+		if errors.Is(err, storage.ErrNodeMutationChanged) {
+			writeError(w, http.StatusConflict, errors.New("节点已被新一代入站替换，未删除当前节点"))
+			return
+		}
 		if !errors.Is(err, storage.ErrNodeNotFound) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -1424,8 +1432,12 @@ func (h *nodesHandler) handleClearAll(w http.ResponseWriter, r *http.Request) {
 	deletedNames := make([]string, 0, len(ready))
 	deleted := 0
 	for _, node := range ready {
-		err := h.repo.DeleteNode(r.Context(), node.ID, username)
+		err := h.repo.DeleteNodeIfMutation(r.Context(), node.ID, username, node.InboundMutationID)
 		if err != nil && !errors.Is(err, storage.ErrNodeNotFound) {
+			if errors.Is(err, storage.ErrNodeMutationChanged) {
+				failed = append(failed, fmt.Sprintf("%s: 节点已被新一代入站替换", node.NodeName))
+				continue
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -1510,7 +1522,11 @@ func (h *nodesHandler) handleBatchDelete(w http.ResponseWriter, r *http.Request)
 	deletedCount := 0
 	deletedNames := make([]string, 0, len(readyNodes))
 	for index, id := range readyIDs {
-		if err := h.deleteNodeForAccess(r.Context(), id, username, isAdmin); err != nil {
+		if err := h.deleteNodeForAccess(r.Context(), id, username, isAdmin, readyNodes[index].InboundMutationID); err != nil {
+			if errors.Is(err, storage.ErrNodeMutationChanged) {
+				failed = append(failed, fmt.Sprintf("%s: 节点已被新一代入站替换", readyNodes[index].NodeName))
+				continue
+			}
 			if !errors.Is(err, storage.ErrNodeNotFound) {
 				continue
 			}
@@ -1584,7 +1600,7 @@ func (h *nodesHandler) cleanupRemoteInboundForNode(ctx context.Context, node *st
 		return nil
 	}
 	if node.InboundTag != "" {
-		return h.deleteRemoteInbound(ctx, node.OriginalServer, node.InboundTag)
+		return h.deleteRemoteInbound(ctx, node.OriginalServer, node.InboundTag, node.InboundMutationID)
 	}
 	return nil
 }
@@ -1828,7 +1844,7 @@ func (h *nodesHandler) removeOutboundAndRules(ctx context.Context, serverID int6
 	_ = h.repo.DeleteUserOutboundByServerTag(ctx, serverID, tag)
 }
 
-func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inboundTag string) error {
+func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inboundTag, mutationID string) error {
 	if h.remoteManage == nil {
 		return errors.New("远程管理器不可用")
 	}
@@ -1837,6 +1853,12 @@ func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inbo
 	if err != nil {
 		return fmt.Errorf("查找远程服务器 %q 失败: %w", serverName, err)
 	}
+	leasedCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(ctx, server.ID)
+	if err != nil {
+		return fmt.Errorf("锁定远程服务器 %q 入站变更失败: %w", serverName, err)
+	}
+	defer release()
+	ctx = leasedCtx
 
 	// Serialize the pre-delete snapshot, delete and any dependent Reality/WSS
 	// repair with managed inbound creation on the same server. The snapshot is
@@ -1850,20 +1872,36 @@ func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inbo
 	}
 
 	body, _ := json.Marshal(map[string]string{
-		"action": "remove",
-		"tag":    inboundTag,
+		"action":      "remove",
+		"tag":         inboundTag,
+		"mutation_id": strings.TrimSpace(mutationID),
 	})
 
 	raw, err := h.remoteManage.forwardToRemoteServer(ctx, server.ID, "POST", "/api/child/inbounds", body)
 	if err != nil {
 		return fmt.Errorf("删除远程入站 %s/%s 失败: %w", serverName, inboundTag, err)
 	}
-	if err := requireRemoteMutationSuccess(raw, "删除远程入站"); err != nil {
+	if err := requireRemoteInboundRemovalSuccess(raw, mutationID); err != nil {
+		if errors.Is(err, errRemoteInboundRemovalSuperseded) {
+			if reconcileErr := h.remoteManage.reconcileRemoteInboundOwnershipFromAgent(ctx, server.ID, inboundTag); reconcileErr != nil {
+				return fmt.Errorf("删除远程入站 %s/%s 失败: %w；刷新当前所有权也失败: %v", serverName, inboundTag, err, reconcileErr)
+			}
+		}
 		return fmt.Errorf("删除远程入站 %s/%s 失败: %w", serverName, inboundTag, err)
 	}
 	log.Printf("[Nodes] Deleted remote inbound %s on server %s", inboundTag, serverName)
-	if _, err := h.repo.DeleteManagedInboundResourceByServerTag(ctx, server.ID, inboundTag); err != nil {
+	if strings.TrimSpace(mutationID) != "" {
+		_, err = h.repo.DeleteManagedInboundResourceByServerTagMutation(ctx, server.ID, inboundTag, mutationID)
+	} else {
+		_, err = h.repo.DeleteManagedInboundResourceByServerTag(ctx, server.ID, inboundTag)
+	}
+	if err != nil {
 		log.Printf("[Nodes] Failed to delete managed inbound resource %s on server %s: %v", inboundTag, serverName, err)
+	}
+	if strings.TrimSpace(mutationID) != "" {
+		if _, err := h.repo.DeleteRemoteInboundOwnershipIfMutation(ctx, server.ID, inboundTag, mutationID); err != nil {
+			return fmt.Errorf("远程入站已删除，但本地所有权记录清理失败: %w", err)
+		}
 	}
 
 	if stateErr != nil {
@@ -1883,6 +1921,29 @@ func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inbo
 	}
 	return nil
 }
+
+func requireRemoteInboundRemovalSuccess(raw []byte, expectedMutationID string) error {
+	if err := requireRemoteMutationSuccess(raw, "删除远程入站"); err != nil {
+		return err
+	}
+	var response struct {
+		MutationID string `json:"mutation_id"`
+		Superseded bool   `json:"superseded"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return errors.New("Agent 返回了无法确认的删除远程入站结果")
+	}
+	expectedMutationID = strings.TrimSpace(expectedMutationID)
+	if expectedMutationID != "" && strings.TrimSpace(response.MutationID) != expectedMutationID {
+		return errors.New("Agent 未回显匹配的 mutation_id")
+	}
+	if response.Superseded {
+		return errRemoteInboundRemovalSuperseded
+	}
+	return nil
+}
+
+var errRemoteInboundRemovalSuperseded = errors.New("同 Tag 入站已被新一代配置替换，旧节点不能删除它")
 
 func requireRemoteMutationSuccess(raw []byte, operation string) error {
 	var response struct {

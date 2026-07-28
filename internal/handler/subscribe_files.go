@@ -9,8 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/logger"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"miaomiaowux/internal/auth"
+	"miaomiaowux/internal/logger"
 	"miaomiaowux/internal/storage"
 	"miaomiaowux/internal/validator"
 
@@ -29,7 +29,18 @@ type subscribeFilesHandler struct {
 	repo *storage.TrafficRepository
 }
 
+var errSubscribeFilenameTargetExists = errors.New("目标订阅文件已存在")
+
 func writePrivateSubscriptionFile(path string, content []byte) error {
+	unlock, err := lockSubscriptionFilenames(filepath.Base(path))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return writePrivateSubscriptionFileUnlocked(path, content)
+}
+
+func writePrivateSubscriptionFileUnlocked(path string, content []byte) error {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return err
@@ -37,10 +48,88 @@ func writePrivateSubscriptionFile(path string, content []byte) error {
 	if err := os.Chmod(directory, 0700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, content, 0600); err != nil {
+	temporary, err := os.CreateTemp(directory, ".arcway-subscription-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(content); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0600)
+}
+
+// writeNewPrivateSubscriptionFile creates a fully written private file without
+// replacing an existing path. It is used during filename changes so a failed
+// database transaction can discard the new copy while the old file remains.
+func writeNewPrivateSubscriptionFile(path string, content []byte) (ownership os.FileInfo, err error) {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(directory, 0700); err != nil {
+		return nil, err
+	}
+	file, err := os.CreateTemp(directory, ".arcway-subscription-rename-*")
+	if err != nil {
+		return nil, err
+	}
+	temporaryPath := file.Name()
+	linked := false
+	defer os.Remove(temporaryPath)
+	defer func() {
+		if file != nil {
+			if closeErr := file.Close(); err == nil && closeErr != nil {
+				err = closeErr
+			}
+		}
+		// os.Link can fail because another writer already owns path. Only
+		// remove the destination when this invocation actually linked it.
+		if err != nil && linked {
+			_ = removeSubscriptionFileIfOwned(path, ownership)
+		}
+	}()
+	if err = file.Chmod(0600); err != nil {
+		return nil, err
+	}
+	if _, err = file.Write(content); err != nil {
+		return nil, err
+	}
+	if err = file.Sync(); err != nil {
+		return nil, err
+	}
+	ownership, err = file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if err = file.Close(); err != nil {
+		return nil, err
+	}
+	file = nil
+	if err = os.Link(temporaryPath, path); err != nil {
+		return nil, err
+	}
+	linked = true
+	if err = os.Chmod(path, 0600); err != nil {
+		return nil, err
+	}
+	return ownership, nil
 }
 
 // 返回一个仅用于管理订阅文件的处理程序。
@@ -97,6 +186,12 @@ func (h *subscribeFilesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 
 func (h *subscribeFilesHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
 	files, err := h.repo.ListSubscribeFiles(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -150,6 +245,24 @@ func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Requ
 		writeBadRequest(w, "文件名是必填项")
 		return
 	}
+	req.Filename = strings.TrimSpace(req.Filename)
+	if err := storage.ValidateSubscribeFilename(req.Filename); err != nil {
+		writeBadRequest(w, "文件名必须是 .yaml 或 .yml 结尾且不能包含路径")
+		return
+	}
+	unlock, err := lockSubscriptionFilenames(req.Filename)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
+	if _, err := os.Lstat(filepath.Join("subscribes", req.Filename)); err == nil {
+		writeError(w, http.StatusConflict, errSubscribeFilenameTargetExists)
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 
 	username := auth.UsernameFromContext(r.Context())
 
@@ -183,14 +296,25 @@ func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Requ
 	if req.CustomShortCode != nil {
 		file.CustomShortCode = *req.CustomShortCode
 	}
+	filePath := filepath.Join("subscribes", req.Filename)
+	ownership, err := writeNewPrivateSubscriptionFile(filePath, []byte("proxies: []\n"))
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			writeError(w, http.StatusConflict, errSubscribeFilenameTargetExists)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
+		return
+	}
 
 	created, err := h.repo.CreateSubscribeFile(r.Context(), file)
 	if err != nil {
+		_ = removeSubscriptionFileIfOwned(filePath, ownership)
 		if errors.Is(err, storage.ErrCustomShortCodeExists) {
 			writeError(w, http.StatusConflict, err)
 			return
 		}
-		if errors.Is(err, storage.ErrSubscribeFileExists) {
+		if errors.Is(err, storage.ErrSubscribeFileExists) || errors.Is(err, storage.ErrSubscribeFilenameHistory) {
 			writeError(w, http.StatusConflict, errors.New("订阅名称已存在"))
 			return
 		}
@@ -226,6 +350,20 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 	if req.Name == "" {
 		writeBadRequest(w, "订阅名称是必填项")
 		return
+	}
+	// Reject a caller-supplied path before making the upstream request. A
+	// generated or Content-Disposition filename is validated again below.
+	if strings.TrimSpace(req.Filename) != "" {
+		filename := strings.TrimSpace(req.Filename)
+		extension := strings.ToLower(filepath.Ext(filename))
+		if extension != ".yaml" && extension != ".yml" {
+			filename += ".yaml"
+		}
+		if err := storage.ValidateSubscribeFilename(filename); err != nil {
+			writeBadRequest(w, "文件名必须是 .yaml 或 .yml 结尾且不能包含路径")
+			return
+		}
+		req.Filename = filename
 	}
 
 	// 创建HTTP客户端并获取订阅内容
@@ -267,12 +405,6 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, errors.New("订阅内容不是有效的YAML格式"))
 		return
 	}
-	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, string(body))
-	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err)
-		return
-	}
-
 	// 从content-disposition获取文件名
 	filename := req.Filename
 	if filename == "" {
@@ -290,9 +422,30 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 	if ext != ".yaml" && ext != ".yml" {
 		filename = filename + ".yaml"
 	}
+	filename = strings.TrimSpace(filename)
+	if err := storage.ValidateSubscribeFilename(filename); err != nil {
+		writeBadRequest(w, "文件名必须是 .yaml 或 .yml 结尾且不能包含路径")
+		return
+	}
+	unlock, err := lockSubscriptionFilenames(filename)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
+	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, filename, string(body), false)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
 
 	filePath := filepath.Join("subscribes", filename)
-	if err := writePrivateSubscriptionFile(filePath, []byte(protectedContent)); err != nil {
+	ownership, err := writeNewPrivateSubscriptionFile(filePath, []byte(protectedContent))
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			writeError(w, http.StatusConflict, errSubscribeFilenameTargetExists)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
 		return
 	}
@@ -301,7 +454,7 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 
 	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。
 	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
-		_ = os.Remove(filePath)
+		_ = removeSubscriptionFileIfOwned(filePath, ownership)
 		writeError(w, http.StatusForbidden, err)
 		return
 	}
@@ -319,12 +472,12 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 	created, err := h.repo.CreateSubscribeFile(r.Context(), file)
 	if err != nil {
 		// 如果数据库保存失败，删除已保存的文件
-		_ = os.Remove(filePath)
+		_ = removeSubscriptionFileIfOwned(filePath, ownership)
 		if errors.Is(err, storage.ErrCustomShortCodeExists) {
 			writeError(w, http.StatusConflict, err)
 			return
 		}
-		if errors.Is(err, storage.ErrSubscribeFileExists) {
+		if errors.Is(err, storage.ErrSubscribeFileExists) || errors.Is(err, storage.ErrSubscribeFilenameHistory) {
 			writeError(w, http.StatusConflict, errors.New("订阅名称已存在"))
 			return
 		}
@@ -370,6 +523,11 @@ func (h *subscribeFilesHandler) handleUpload(w http.ResponseWriter, r *http.Requ
 	if ext != ".yaml" && ext != ".yml" {
 		filename = filename + ".yaml"
 	}
+	filename = strings.TrimSpace(filename)
+	if err := storage.ValidateSubscribeFilename(filename); err != nil {
+		writeBadRequest(w, "文件名必须是 .yaml 或 .yml 结尾且不能包含路径")
+		return
+	}
 
 	// 读取并验证YAML格式
 	content, err := io.ReadAll(file)
@@ -383,14 +541,25 @@ func (h *subscribeFilesHandler) handleUpload(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, errors.New("文件不是有效的YAML格式"))
 		return
 	}
-	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, string(content))
+	unlock, err := lockSubscriptionFilenames(filename)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
+	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, filename, string(content), false)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err)
 		return
 	}
 
 	filePath := filepath.Join("subscribes", filename)
-	if err := writePrivateSubscriptionFile(filePath, []byte(protectedContent)); err != nil {
+	ownership, err := writeNewPrivateSubscriptionFile(filePath, []byte(protectedContent))
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			writeError(w, http.StatusConflict, errSubscribeFilenameTargetExists)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
 		return
 	}
@@ -399,7 +568,7 @@ func (h *subscribeFilesHandler) handleUpload(w http.ResponseWriter, r *http.Requ
 
 	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。
 	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
-		_ = os.Remove(filePath)
+		_ = removeSubscriptionFileIfOwned(filePath, ownership)
 		writeError(w, http.StatusForbidden, err)
 		return
 	}
@@ -417,12 +586,12 @@ func (h *subscribeFilesHandler) handleUpload(w http.ResponseWriter, r *http.Requ
 	created, err := h.repo.CreateSubscribeFile(r.Context(), subscribeFile)
 	if err != nil {
 		// 如果数据库保存失败，删除已保存的文件
-		_ = os.Remove(filePath)
+		_ = removeSubscriptionFileIfOwned(filePath, ownership)
 		if errors.Is(err, storage.ErrCustomShortCodeExists) {
 			writeError(w, http.StatusConflict, err)
 			return
 		}
-		if errors.Is(err, storage.ErrSubscribeFileExists) {
+		if errors.Is(err, storage.ErrSubscribeFileExists) || errors.Is(err, storage.ErrSubscribeFilenameHistory) {
 			writeError(w, http.StatusConflict, errors.New("订阅名称已存在"))
 			return
 		}
@@ -444,6 +613,12 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 		writeBadRequest(w, "无效的订阅ID")
 		return
 	}
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
 
 	existing, err := h.repo.GetSubscribeFileByID(r.Context(), id)
 	if err != nil {
@@ -531,6 +706,10 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusBadRequest, errors.New("文件名必须以 .yaml 或 .yml 结尾"))
 			return
 		}
+		if err := storage.ValidateSubscribeFilename(req.Filename); err != nil {
+			writeBadRequest(w, "文件名必须是 .yaml 或 .yml 结尾且不能包含路径")
+			return
+		}
 
 		// 检查新文件名是否已被其他订阅使用
 		if existingFile, err := h.repo.GetSubscribeFileByFilename(r.Context(), req.Filename); err == nil && existingFile.ID != id {
@@ -542,8 +721,17 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 		needRenameFile = true
 	}
 
-	updated, err := h.repo.UpdateSubscribeFile(r.Context(), existing)
+	var updated storage.SubscribeFile
+	if needRenameFile {
+		updated, err = h.renameSubscriptionFile(r.Context(), existing, oldFilename)
+	} else {
+		updated, err = h.repo.UpdateSubscribeFile(r.Context(), existing)
+	}
 	if err != nil {
+		if errors.Is(err, errSubscribeFilenameTargetExists) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		if errors.Is(err, storage.ErrCustomShortCodeExists) {
 			writeError(w, http.StatusConflict, err)
 			return
@@ -552,31 +740,16 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusConflict, errors.New("订阅名称已存在"))
 			return
 		}
+		if errors.Is(err, storage.ErrSubscribeFilenameHistory) || errors.Is(err, storage.ErrSubscribeFileChanged) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		if errors.Is(err, storage.ErrSubscribeFileNotFound) {
 			writeError(w, http.StatusNotFound, err)
 			return
 		}
 		writeError(w, http.StatusBadRequest, err)
 		return
-	}
-
-	// 如果文件名发生变化，重命名物理文件
-	if needRenameFile {
-		oldPath := filepath.Join("subscribes", oldFilename)
-		newPath := filepath.Join("subscribes", req.Filename)
-
-		// 检查旧文件是否存在
-		if _, err := os.Stat(oldPath); err == nil {
-			// 重命名文件
-			if err := os.Rename(oldPath, newPath); err != nil {
-				// 重命名失败，回滚数据库更新
-				existing.Filename = oldFilename
-				_, _ = h.repo.UpdateSubscribeFile(r.Context(), existing)
-				writeError(w, http.StatusInternalServerError, errors.New("重命名文件失败: "+err.Error()))
-				return
-			}
-		}
-		// 如果旧文件不存在，只更新数据库记录，不报错
 	}
 
 	// 如果 auto_sync 刚刚启用（从 false 更改为 true），则触发立即同步
@@ -597,6 +770,76 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 	respondJSON(w, http.StatusOK, map[string]any{
 		"file": convertSubscribeFile(updated),
 	})
+}
+
+func (h *subscribeFilesHandler) renameSubscriptionFile(ctx context.Context, file storage.SubscribeFile, oldFilename string) (storage.SubscribeFile, error) {
+	newFilename := strings.TrimSpace(file.Filename)
+	oldFilename = strings.TrimSpace(oldFilename)
+	if err := storage.ValidateSubscribeFilename(oldFilename); err != nil {
+		return storage.SubscribeFile{}, fmt.Errorf("旧文件名不合法: %w", err)
+	}
+	if err := storage.ValidateSubscribeFilename(newFilename); err != nil {
+		return storage.SubscribeFile{}, fmt.Errorf("新文件名不合法: %w", err)
+	}
+	versions, err := h.repo.ListRuleVersionContentsByFilename(ctx, oldFilename)
+	if err != nil {
+		return storage.SubscribeFile{}, fmt.Errorf("读取订阅历史失败: %w", err)
+	}
+	for index := range versions {
+		rebound, err := rebindWireGuardSubscriptionContent(ctx, h.repo, oldFilename, newFilename, versions[index].Content)
+		if err != nil {
+			return storage.SubscribeFile{}, fmt.Errorf("重绑定历史版本 %d 失败: %w", versions[index].ID, err)
+		}
+		versions[index].Content = rebound
+	}
+
+	oldPath := filepath.Join("subscribes", oldFilename)
+	newPath := filepath.Join("subscribes", newFilename)
+	if _, err := os.Lstat(newPath); err == nil {
+		return storage.SubscribeFile{}, errSubscribeFilenameTargetExists
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return storage.SubscribeFile{}, fmt.Errorf("检查目标订阅文件失败: %w", err)
+	}
+	oldOwnership, statErr := os.Lstat(oldPath)
+	if errors.Is(statErr, os.ErrNotExist) {
+		return storage.SubscribeFile{}, errors.New("旧订阅文件不存在，拒绝提交改名")
+	}
+	if statErr != nil {
+		return storage.SubscribeFile{}, fmt.Errorf("检查旧订阅文件失败: %w", statErr)
+	}
+	if !oldOwnership.Mode().IsRegular() {
+		return storage.SubscribeFile{}, errors.New("旧订阅文件不是普通文件，拒绝提交改名")
+	}
+	oldContent, readErr := os.ReadFile(oldPath)
+	if readErr != nil {
+		return storage.SubscribeFile{}, fmt.Errorf("读取旧订阅文件失败: %w", readErr)
+	}
+	rebound, err := rebindWireGuardSubscriptionContent(ctx, h.repo, oldFilename, newFilename, string(oldContent))
+	if err != nil {
+		return storage.SubscribeFile{}, fmt.Errorf("重绑定订阅文件失败: %w", err)
+	}
+	newOwnership, err := writeNewPrivateSubscriptionFile(newPath, []byte(rebound))
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return storage.SubscribeFile{}, errSubscribeFilenameTargetExists
+		}
+		return storage.SubscribeFile{}, fmt.Errorf("写入新订阅文件失败: %w", err)
+	}
+
+	updated, err := h.repo.RenameSubscribeFileAndRuleVersions(ctx, file, oldFilename, versions)
+	if err != nil {
+		if cleanupErr := removeSubscriptionFileIfOwned(newPath, newOwnership); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
+			logger.Info("[订阅改名] 数据库回滚后清理新文件失败", "filename", newFilename, "error", cleanupErr)
+		}
+		return storage.SubscribeFile{}, err
+	}
+	if err := removeSubscriptionFileIfOwned(oldPath, oldOwnership); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// The database and new 0600 file are already consistent. Keeping the
+		// old encrypted orphan is safer than deleting or rolling back the new
+		// working copy after commit.
+		logger.Info("[订阅改名] 清理旧加密文件失败", "filename", oldFilename, "error", err)
+	}
+	return updated, nil
 }
 
 func (h *subscribeFilesHandler) handleDelete(w http.ResponseWriter, r *http.Request, idSegment string) {
@@ -622,9 +865,7 @@ func (h *subscribeFilesHandler) handleDelete(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusNotFound, storage.ErrSubscribeFileNotFound)
 		return
 	}
-
-	// 删除数据库记录
-	if err := h.repo.DeleteSubscribeFile(r.Context(), id); err != nil {
+	if err := deleteSubscribeFileAndPhysical(r.Context(), h.repo, "subscribes", file); err != nil {
 		if errors.Is(err, storage.ErrSubscribeFileNotFound) {
 			writeError(w, http.StatusNotFound, err)
 			return
@@ -632,10 +873,6 @@ func (h *subscribeFilesHandler) handleDelete(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-
-	// 删除物理文件
-	filePath := filepath.Join("subscribes", file.Filename)
-	_ = os.Remove(filePath) // 忽略错误，即使文件不存在也继续
 
 	respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
@@ -652,6 +889,12 @@ func (h *subscribeFilesHandler) handleReorder(w http.ResponseWriter, r *http.Req
 		writeBadRequest(w, "排序列表不能为空")
 		return
 	}
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
 
 	if err := h.repo.ReorderSubscribeFiles(r.Context(), req.IDs); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1003,6 +1246,11 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 	if ext != ".yaml" && ext != ".yml" {
 		filename = filename + ".yaml"
 	}
+	filename = strings.TrimSpace(filename)
+	if err := storage.ValidateSubscribeFilename(filename); err != nil {
+		writeBadRequest(w, "文件名必须是 .yaml 或 .yml 结尾且不能包含路径")
+		return
+	}
 
 	// 验证YAML格式，使用Node API保持顺序和格式
 	var rootNode yaml.Node
@@ -1081,22 +1329,33 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 	// 修复表情符号/反斜杠转义
 	fixedContent := RemoveUnicodeEscapeQuotes(string(reserializedContent))
 
-	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, fixedContent)
+	unlock, err := lockSubscriptionFilenames(filename)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
+	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, filename, fixedContent, false)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err)
 		return
 	}
 
-	// WireGuard 私钥以节点引用落盘，只有返回订阅时才在内存中解密。
+	// WireGuard 私钥以文件范围绑定的密文落盘，只有返回订阅时才在内存中解密。
 	filePath := filepath.Join("subscribes", filename)
-	if err := writePrivateSubscriptionFile(filePath, []byte(protectedContent)); err != nil {
+	ownership, err := writeNewPrivateSubscriptionFile(filePath, []byte(protectedContent))
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			writeError(w, http.StatusConflict, errSubscribeFilenameTargetExists)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
 		return
 	}
 
 	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。
 	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
-		_ = os.Remove(filePath)
+		_ = removeSubscriptionFileIfOwned(filePath, ownership)
 		writeError(w, http.StatusForbidden, err)
 		return
 	}
@@ -1114,12 +1373,12 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 	created, err := h.repo.CreateSubscribeFile(r.Context(), file)
 	if err != nil {
 		// 如果数据库保存失败，删除已保存的文件
-		_ = os.Remove(filePath)
+		_ = removeSubscriptionFileIfOwned(filePath, ownership)
 		if errors.Is(err, storage.ErrCustomShortCodeExists) {
 			writeError(w, http.StatusConflict, err)
 			return
 		}
-		if errors.Is(err, storage.ErrSubscribeFileExists) {
+		if errors.Is(err, storage.ErrSubscribeFileExists) || errors.Is(err, storage.ErrSubscribeFilenameHistory) {
 			writeError(w, http.StatusConflict, errors.New("订阅名称已存在"))
 			return
 		}
@@ -1148,6 +1407,16 @@ func (h *subscribeFilesHandler) handleGetContent(w http.ResponseWriter, r *http.
 		writeBadRequest(w, "无效的文件名")
 		return
 	}
+	if err := storage.ValidateSubscribeFilename(filename); err != nil {
+		writeBadRequest(w, "无效的文件名")
+		return
+	}
+	unlock, err := lockSubscriptionFilenames(filename)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
 
 	// 检查文件是否存在于数据库
 	sf, err := h.repo.GetSubscribeFileByFilename(r.Context(), filename)
@@ -1177,7 +1446,7 @@ func (h *subscribeFilesHandler) handleGetContent(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusInternalServerError, errors.New("读取文件失败"))
 		return
 	}
-	hydratedContent, err := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, string(content))
+	hydratedContent, err := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, filename, string(content))
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, errors.New("WireGuard 节点配置暂不可用"))
 		return
@@ -1201,6 +1470,16 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 		writeBadRequest(w, "无效的文件名")
 		return
 	}
+	if err := storage.ValidateSubscribeFilename(filename); err != nil {
+		writeBadRequest(w, "无效的文件名")
+		return
+	}
+	unlock, err := lockSubscriptionFilenames(filename)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
 
 	// 检查文件是否存在于数据库
 	subscribeFile, err := h.repo.GetSubscribeFileByFilename(r.Context(), filename)
@@ -1268,7 +1547,7 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 
 	// 直接保存前端发送的内容（已经过前端修复，保持字段顺序）
 	contentToSave := RemoveUnicodeEscapeQuotes(req.Content)
-	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, contentToSave)
+	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, filename, contentToSave, false)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err)
 		return
@@ -1283,7 +1562,7 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 
 	// 保存文件
 	filePath := filepath.Join("subscribes", filename)
-	if err := writePrivateSubscriptionFile(filePath, []byte(protectedContent)); err != nil {
+	if err := writePrivateSubscriptionFileUnlocked(filePath, []byte(protectedContent)); err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("保存文件失败"))
 		return
 	}
@@ -1293,7 +1572,7 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 	if author == "" {
 		author = "admin"
 	}
-	version, err := h.repo.SaveRuleVersion(r.Context(), filename, protectedContent, author)
+	version, err := h.repo.SaveRuleVersionForSubscribe(r.Context(), subscribeFile.ID, filename, protectedContent, author)
 	if err != nil {
 		// 版本保存失败不影响文件保存，只记录错误
 		writeError(w, http.StatusInternalServerError, errors.New("保存版本记录失败"))

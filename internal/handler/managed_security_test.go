@@ -273,7 +273,7 @@ func TestRemoteSyncDoesNotClaimOrdinaryUserNodes(t *testing.T) {
 	}
 
 	h := &RemoteManageHandler{repo: repo}
-	if !h.tryClaimExternalNodeForSync(ctx, server, "vless", 443, config, "vless-in") {
+	if !h.tryClaimExternalNodeForSync(ctx, server, "vless", 443, config, "vless-in", "") {
 		t.Fatal("expected the administrator node to be claimed")
 	}
 	gotAdmin, err := repo.GetNodeByID(ctx, adminNode.ID)

@@ -1,6 +1,10 @@
 package event
 
-import "sync"
+import (
+	"errors"
+	"log"
+	"sync"
+)
 
 // Bus 事件总线
 type Bus struct {
@@ -29,17 +33,25 @@ func (b *Bus) Subscribe(eventType EventType, listener Listener) {
 }
 
 // 发布事件
-func (b *Bus) Publish(event InboundEvent) {
+func (b *Bus) Publish(event InboundEvent) error {
 	b.mu.RLock()
-	listeners := b.listeners[event.Type]
+	listeners := append([]Listener(nil), b.listeners[event.Type]...)
 	b.mu.RUnlock()
 
+	var publishErrors []error
 	for _, listener := range listeners {
-		listener.Handle(event)
+		if err := listener.Handle(event); err != nil {
+			publishErrors = append(publishErrors, err)
+		}
 	}
+	return errors.Join(publishErrors...)
 }
 
 // 异步发布事件
 func (b *Bus) PublishAsync(event InboundEvent) {
-	go b.Publish(event)
+	go func() {
+		if err := b.Publish(event); err != nil {
+			log.Printf("[Event] asynchronous %s listener failed: %v", event.Type, err)
+		}
+	}()
 }

@@ -26,6 +26,8 @@ import (
 
 const subscriptionDefaultType = "clash"
 
+var errSubscriptionAccessForbidden = errors.New("subscription access forbidden")
+
 // Token失效时返回的YAML内容
 const tokenInvalidYAML = `allow-lan: false
 dns:
@@ -174,10 +176,14 @@ func (s *subscriptionEndpoint) authorizeRequest(w http.ResponseWriter, r *http.R
 	if queryToken != "" && s.repo != nil {
 		username, err := s.repo.ValidateUserToken(r.Context(), queryToken)
 		if err == nil {
-			ctx := auth.ContextWithUsername(r.Context(), username)
-			return r.WithContext(ctx), true
-		}
-		if !errors.Is(err, storage.ErrTokenNotFound) {
+			request, ok := s.activeUserRequest(w, r, username)
+			if !ok {
+				return nil, false
+			}
+			if request != nil {
+				return request, true
+			}
+		} else if !errors.Is(err, storage.ErrTokenNotFound) {
 			writeError(w, http.StatusInternalServerError, err)
 			return nil, false
 		}
@@ -187,13 +193,137 @@ func (s *subscriptionEndpoint) authorizeRequest(w http.ResponseWriter, r *http.R
 	headerToken := strings.TrimSpace(r.Header.Get(auth.AuthHeader))
 	username, ok := s.tokens.Lookup(headerToken)
 	if ok {
-		ctx := auth.ContextWithUsername(r.Context(), username)
-		return r.WithContext(ctx), true
+		request, activeOK := s.activeUserRequest(w, r, username)
+		if !activeOK {
+			return nil, false
+		}
+		if request != nil {
+			return request, true
+		}
 	}
 
 	// 所有认证方式都失败，设置token失效标记
 	ctx := context.WithValue(r.Context(), TokenInvalidKey, true)
 	return r.WithContext(ctx), true
+}
+
+// activeUserRequest revalidates the durable user record for subscription
+// credentials. TokenStore sessions and legacy user_tokens can outlive a user
+// disable/delete operation, so neither is sufficient authorization by itself.
+// A nil request with ok=true means the credential must be treated as invalid.
+func (s *subscriptionEndpoint) activeUserRequest(w http.ResponseWriter, r *http.Request, username string) (*http.Request, bool) {
+	username = strings.TrimSpace(username)
+	if username == "" || s.repo == nil {
+		return nil, true
+	}
+	user, err := s.repo.GetUser(r.Context(), username)
+	if err != nil {
+		if errors.Is(err, storage.ErrUserNotFound) {
+			return nil, true
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return nil, false
+	}
+	if !user.IsActive {
+		return nil, true
+	}
+	ctx := auth.ContextWithUsername(r.Context(), user.Username)
+	return r.WithContext(ctx), true
+}
+
+func (h *SubscriptionHandler) authorizeSubscriptionAccess(ctx context.Context, username string, subscribeFile storage.SubscribeFile, hasSubscribeFile bool) error {
+	if h == nil || h.repo == nil {
+		return errors.New("subscription repository not configured")
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errSubscriptionAccessForbidden
+	}
+	user, err := h.repo.GetUser(ctx, username)
+	if err != nil {
+		if errors.Is(err, storage.ErrUserNotFound) {
+			return errSubscriptionAccessForbidden
+		}
+		return fmt.Errorf("load subscription user: %w", err)
+	}
+	if !user.IsActive {
+		return errSubscriptionAccessForbidden
+	}
+	if user.Role == storage.RoleAdmin {
+		return nil
+	}
+	// Legacy subscription_links without a subscribe_files row have no owner or
+	// assignment binding. Keep them available to administrators only.
+	if !hasSubscribeFile || subscribeFile.ID <= 0 {
+		return errSubscriptionAccessForbidden
+	}
+	if strings.TrimSpace(subscribeFile.CreatedBy) == username {
+		return nil
+	}
+	ids, err := h.repo.GetUserSubscriptionIDs(ctx, username)
+	if err != nil {
+		return fmt.Errorf("load subscription assignments: %w", err)
+	}
+	for _, id := range ids {
+		if id == subscribeFile.ID {
+			return nil
+		}
+	}
+	return errSubscriptionAccessForbidden
+}
+
+// authorizeShortLinkPrincipal makes the user suffix of a composite short URL
+// authoritative. Historically /x/{file-code} and /x/{custom-file-code} were
+// accepted on their own and short_link.go injected the file creator as the
+// current user. Those standalone forms cannot represent a revocable user grant
+// and are deliberately rejected here. Both generated and custom user suffixes
+// remain accepted for compatibility with existing composite links.
+func (h *SubscriptionHandler) authorizeShortLinkPrincipal(ctx context.Context, r *http.Request, username string, subscribeFile storage.SubscribeFile) error {
+	if r == nil {
+		return errSubscriptionAccessForbidden
+	}
+	path := strings.Trim(r.URL.Path, "/")
+	if !strings.HasPrefix(path, "x/") {
+		return nil
+	}
+	code := strings.TrimPrefix(path, "x/")
+	if code == "" {
+		return errSubscriptionAccessForbidden
+	}
+
+	standaloneKind := ""
+	if subscribeFile.FileShortCode != "" && code == subscribeFile.FileShortCode {
+		standaloneKind = "file_short_code"
+	} else if subscribeFile.CustomShortCode != "" && code == subscribeFile.CustomShortCode {
+		standaloneKind = "custom_short_code"
+	}
+	if standaloneKind != "" {
+		logger.Info("[Subscription] 拒绝旧单独订阅短码：缺少用户短码", "filename", subscribeFile.Filename, "short_code_type", standaloneKind)
+		return errSubscriptionAccessForbidden
+	}
+
+	users, err := h.repo.ListUserShortCodeInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("load user short codes: %w", err)
+	}
+	info, ok := users[username]
+	if !ok {
+		return errSubscriptionAccessForbidden
+	}
+	fileCodes := []string{subscribeFile.FileShortCode, subscribeFile.CustomShortCode}
+	userCodes := []string{info.UserShortCode, info.CustomUserShortCode}
+	for _, fileCode := range fileCodes {
+		if fileCode == "" {
+			continue
+		}
+		for _, userCode := range userCodes {
+			if userCode != "" && code == fileCode+userCode {
+				return nil
+			}
+		}
+	}
+	logger.Info("[Subscription] 拒绝无法绑定当前用户的订阅短链", "filename", subscribeFile.Filename)
+	return errSubscriptionAccessForbidden
 }
 
 func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -232,28 +362,6 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		// 越权防护:token 认证路径下,用户只能访问"自己创建的"或"管理员分配给自己的"订阅文件。
-		// 短链接路径(/x/{code})不会走到这里 — 它由 short_link.go 解析后直接转发 + 注入 created_by,
-		// 链接本身就是身份证明(谁拿到 code 谁访问),所以那条路径无需此校验。
-		// 此校验仅针对 token 认证 + filename 参数的入口,堵住 IDOR(改 filename 拿别人订阅)。
-		if username != "" {
-			user, uerr := h.repo.GetUser(r.Context(), username)
-			if uerr == nil && user.Role != storage.RoleAdmin && subscribeFile.CreatedBy != username {
-				allowed := false
-				if ids, ierr := h.repo.GetUserSubscriptionIDs(r.Context(), username); ierr == nil {
-					for _, id := range ids {
-						if id == subscribeFile.ID {
-							allowed = true
-							break
-						}
-					}
-				}
-				if !allowed {
-					writeError(w, http.StatusForbidden, errors.New("forbidden: subscription not assigned to user"))
-					return
-				}
-			}
-		}
 		displayName = subscribeFile.Name
 		hasSubscribeFile = true
 	} else {
@@ -281,6 +389,28 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 	}
+
+	// One authorization gate covers filename, legacy ?t= and short-link paths.
+	// The lookup is intentionally repeated for every fetch so disabling a user
+	// or removing an assignment revokes an already configured client promptly.
+	if err := h.authorizeSubscriptionAccess(r.Context(), username, subscribeFile, hasSubscribeFile); err != nil {
+		if errors.Is(err, errSubscriptionAccessForbidden) {
+			writeError(w, http.StatusForbidden, errSubscriptionAccessForbidden)
+		} else {
+			writeError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	if hasSubscribeFile {
+		if err := h.authorizeShortLinkPrincipal(r.Context(), r, username, subscribeFile); err != nil {
+			if errors.Is(err, errSubscriptionAccessForbidden) {
+				writeError(w, http.StatusForbidden, errSubscriptionAccessForbidden)
+			} else {
+				writeError(w, http.StatusInternalServerError, err)
+			}
+			return
+		}
+	}
 	logger.Info("[⏱️ 耗时监测] 文件查找完成", "step", "file_lookup", "duration_ms", time.Since(stepStart).Milliseconds(), "filename", filename)
 
 	if username != "" {
@@ -294,11 +424,11 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	cleanedName := filepath.Clean(filename)
-	if strings.HasPrefix(cleanedName, "..") || filepath.IsAbs(cleanedName) {
+	if err := storage.ValidateSubscribeFilename(filename); err != nil {
 		writeError(w, http.StatusBadRequest, errors.New("invalid rule filename"))
 		return
 	}
+	cleanedName := filepath.Clean(filename)
 
 	resolvedPath := filepath.Join(h.baseDir, cleanedName)
 
@@ -367,9 +497,15 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	// 文件读取（如果模板生成失败或未绑定模板）
 	if len(data) == 0 {
 		stepStart = time.Now()
+		unlock, lockErr := lockSubscriptionFilenames(filename)
+		if lockErr != nil {
+			writeError(w, http.StatusInternalServerError, lockErr)
+			return
+		}
 		var readErr error
 		data, readErr = os.ReadFile(resolvedPath)
 		if readErr != nil {
+			unlock()
 			if errors.Is(readErr, os.ErrNotExist) {
 				writeError(w, http.StatusNotFound, readErr)
 			} else {
@@ -378,13 +514,15 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		logger.Info("[⏱️ 耗时监测] 文件读取完成", "step", "file_read", "duration_ms", time.Since(stepStart).Milliseconds(), "bytes", len(data))
-		hydrated, hydrateErr := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, string(data))
+		hydrated, hydrateErr := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, filename, string(data))
 		if hydrateErr != nil {
+			unlock()
 			logger.Info("[Subscription] WireGuard 节点私钥引用解析失败", "error", hydrateErr)
 			writeError(w, http.StatusServiceUnavailable, errors.New("WireGuard 节点配置暂不可用"))
 			return
 		}
 		data = []byte(hydrated)
+		unlock()
 	}
 
 	// 外部订阅同步
@@ -461,17 +599,25 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 							logger.Info("[Subscription] External subscriptions sync completed successfully")
 
 							// 同步后重新读取订阅文件以获取更新的节点
+							unlock, lockErr := lockSubscriptionFilenames(filename)
+							if lockErr != nil {
+								writeError(w, http.StatusInternalServerError, lockErr)
+								return
+							}
 							updatedData, err := os.ReadFile(resolvedPath)
 							if err != nil {
+								unlock()
 								logger.Info("[Subscription] 同步后重新读取订阅文件失败", "error", err)
 							} else {
-								hydrated, hydrateErr := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, string(updatedData))
+								hydrated, hydrateErr := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, filename, string(updatedData))
 								if hydrateErr != nil {
+									unlock()
 									logger.Info("[Subscription] 同步后 WireGuard 节点私钥引用解析失败", "error", hydrateErr)
 									writeError(w, http.StatusServiceUnavailable, errors.New("WireGuard 节点配置暂不可用"))
 									return
 								}
 								data = []byte(hydrated)
+								unlock()
 								logger.Info("[Subscription] 同步后重新读取订阅文件成功", "bytes", len(data))
 							}
 						}

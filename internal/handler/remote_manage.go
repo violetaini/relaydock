@@ -272,7 +272,7 @@ func (h *RemoteManageHandler) handleConnLimitKickDelta(ctx context.Context, serv
 func (h *RemoteManageHandler) HandleScanResult(serverID int64, payload WSScanResultPayload) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, serverID)
+	leasedCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(ctx, serverID)
 	if err != nil {
 		if !errors.Is(err, storage.ErrRemoteInstallationActive) {
 			log.Printf("[Remote Manage] Failed to acquire scan-result lease for server %d: %v", serverID, err)
@@ -2285,6 +2285,18 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 			remoteWriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		action := strings.ToLower(strings.TrimSpace(wireGuardStringValue(inboundReq["action"])))
+		if action == "" || action == "add" {
+			if strings.TrimSpace(wireGuardStringValue(inboundReq["mutation_id"])) == "" {
+				inboundReq["mutation_id"] = "managed-inbound:" + uuid.NewString()
+			}
+		} else if action == "remove" {
+			tag := strings.TrimSpace(wireGuardStringValue(inboundReq["tag"]))
+			if tag == "" {
+				remoteWriteError(w, http.StatusBadRequest, "入站 Tag 不能为空")
+				return
+			}
+		}
 		body, err = json.Marshal(inboundReq)
 		if err != nil {
 			remoteWriteError(w, http.StatusBadRequest, "failed to normalize client options")
@@ -2296,6 +2308,8 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	// 用户卡片在前端已锁死,但后端必须独立校验,防止普通用户绕过前端直接构造请求把别人的 uuid/email 塞进节点。
 	// 管理员是节点管理者,可添加任意 client(任意 uuid/email),不受此限制。
 	// 注:套餐分配用户走的是 addUserToInbound → forwardToRemoteServer,不经过本 HTTP handler,不受影响。
+	var reservedInboundTag string
+	var reservedMutationID string
 	if r.Method == http.MethodPost && inboundReq != nil {
 		action, _ := inboundReq["action"].(string)
 		if al := strings.ToLower(action); al == "" || al == "add" {
@@ -2313,13 +2327,42 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	// WSS nginx 聚合都必须在同一 server mutation lease 内完成。GET 保持原来的无写租约路径。
 	operationCtx := r.Context()
 	if r.Method == http.MethodPost {
-		leasedCtx, release, leaseErr := h.repo.AcquireRemoteServerMutationLease(operationCtx, id)
+		leasedCtx, release, leaseErr := h.repo.AcquireRemoteServerExclusiveMutationLease(operationCtx, id)
 		if leaseErr != nil {
 			remoteWriteForwardError(w, leaseErr)
 			return
 		}
 		defer release()
 		operationCtx = leasedCtx
+	}
+	if r.Method == http.MethodPost && inboundReq != nil &&
+		strings.EqualFold(strings.TrimSpace(wireGuardStringValue(inboundReq["action"])), "remove") &&
+		strings.TrimSpace(wireGuardStringValue(inboundReq["mutation_id"])) == "" {
+		tag := strings.TrimSpace(wireGuardStringValue(inboundReq["tag"]))
+		mutationID, resolveErr := h.repo.FindInboundMutationID(operationCtx, id, tag)
+		if resolveErr != nil {
+			remoteWriteError(w, http.StatusConflict, "无法确认当前入站所有权: "+resolveErr.Error())
+			return
+		}
+		if mutationID == "" {
+			// Upgrade adoption: a newer Agent may already have a real sidecar owner
+			// while legacy database rows still contain an empty token.
+			if adoptionErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, tag); adoptionErr == nil {
+				mutationID, resolveErr = h.repo.FindInboundMutationID(operationCtx, id, tag)
+				if resolveErr != nil {
+					remoteWriteError(w, http.StatusConflict, "无法确认迁移后的入站所有权: "+resolveErr.Error())
+					return
+				}
+			}
+		}
+		if mutationID != "" {
+			inboundReq["mutation_id"] = mutationID
+			body, err = json.Marshal(inboundReq)
+			if err != nil {
+				remoteWriteError(w, http.StatusBadRequest, "failed to encode inbound ownership")
+				return
+			}
+		}
 	}
 
 	// 删除 reality 入站前，先保存其 serverNames 以便后续恢复路由
@@ -2434,8 +2477,37 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	if r.Method == http.MethodPost && inboundReq != nil {
+		action := strings.ToLower(strings.TrimSpace(wireGuardStringValue(inboundReq["action"])))
+		if action == "" || action == "add" {
+			inbound, _ := inboundReq["inbound"].(map[string]interface{})
+			tag := strings.TrimSpace(wireGuardStringValue(inbound["tag"]))
+			mutationID := strings.TrimSpace(wireGuardStringValue(inboundReq["mutation_id"]))
+			if tag == "" || mutationID == "" {
+				remoteWriteError(w, http.StatusBadRequest, "入站 Tag 和 mutation_id 不能为空")
+				return
+			}
+			// Persist the generation before the remote write. A process crash after
+			// the Agent ACK can then never leave a fenced, undeletable tunnel.
+			if err := h.repo.SetRemoteInboundOwnership(operationCtx, id, tag, mutationID); err != nil {
+				remoteWriteError(w, http.StatusInternalServerError, "无法预存远端入站所有权: "+err.Error())
+				return
+			}
+			reservedInboundTag = tag
+			reservedMutationID = mutationID
+		}
+	}
+
 	result, err := h.forwardToRemoteServer(operationCtx, id, r.Method, "/api/child/inbounds", body)
 	if err != nil {
+		// If the Agent is still reachable, its authenticated fence inventory is
+		// authoritative and can restore a previous owner after a confirmed rollback.
+		// A timeout or disconnect keeps the pre-reserved new owner conservatively.
+		if reservedInboundTag != "" && reservedMutationID != "" {
+			if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, reservedInboundTag); reconcileErr != nil {
+				log.Printf("[Remote Manage] Retaining uncertain inbound ownership %d/%s (%s): %v", id, reservedInboundTag, reservedMutationID, reconcileErr)
+			}
+		}
 		remoteWriteForwardError(w, err)
 		return
 	}
@@ -2452,113 +2524,175 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 
 		// 检查远程服务器响应是否成功
 		var resp map[string]interface{}
-		if err := json.Unmarshal(result, &resp); err == nil {
-			if success, ok := resp["success"].(bool); ok && success {
-				mutationID := strings.TrimSpace(wireGuardStringValue(inboundReq["mutation_id"]))
-				if mutationID != "" && strings.TrimSpace(wireGuardStringValue(resp["mutation_id"])) != mutationID {
-					remoteWriteError(w, http.StatusBadGateway, "Agent 未回显匹配的 mutation_id，远端变更结果无法确认")
+		if decodeErr := json.Unmarshal(result, &resp); decodeErr != nil {
+			if reservedInboundTag != "" && reservedMutationID != "" {
+				if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, reservedInboundTag); reconcileErr != nil {
+					remoteWriteError(w, http.StatusBadGateway, "Agent 返回无法解析，且无法确认当前入站所有权: "+reconcileErr.Error())
 					return
 				}
-				var postSyncErrors []string
-				if actionLower == "" || actionLower == "add" {
-					var pendingWSSEvent *event.InboundEvent
-					// 添加入站：先处理 reality 相关配置（更新 tunnel-in port + 清理域名路由）
-					if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok {
-						tag, _ := inbound["tag"].(string)
-						protocol, _ := inbound["protocol"].(string)
-						port, _ := inbound["port"].(float64)
-						customNodeName, _ := inboundReq["node_name"].(string)
-						forwardNodeID, _ := inboundReq["forward_node_id"].(float64) // tunnel「转发已有节点」时携带源节点 ID
-						// ip_version: ""/v4(默认) | v6 | both —— 决定生成节点 clash server 用 v4/v6/双节点
-						ipVersion, _ := inboundReq["ip_version"].(string)
-						switch ipVersion {
-						case "v4", "v6", "both":
-						default:
-							ipVersion = "" // 非法值降级为默认 v4
-						}
+			}
+			remoteWriteError(w, http.StatusBadGateway, "Agent 返回了无法解析的入站变更结果")
+			return
+		}
+		success, successPresent := resp["success"].(bool)
+		if !successPresent || !success {
+			if reservedInboundTag != "" && reservedMutationID != "" {
+				if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, reservedInboundTag); reconcileErr != nil {
+					remoteWriteError(w, http.StatusBadGateway, "Agent 未确认入站变更，且无法恢复当前入站所有权: "+reconcileErr.Error())
+					return
+				}
+			}
+			message := strings.TrimSpace(wireGuardStringValue(resp["error"]))
+			if message == "" {
+				message = strings.TrimSpace(wireGuardStringValue(resp["message"]))
+			}
+			if message == "" {
+				message = "Agent 未确认入站变更"
+			}
+			remoteWriteError(w, http.StatusBadGateway, message)
+			return
+		}
+		{
+			mutationID := strings.TrimSpace(wireGuardStringValue(inboundReq["mutation_id"]))
+			if mutationID != "" && strings.TrimSpace(wireGuardStringValue(resp["mutation_id"])) != mutationID {
+				if reservedInboundTag != "" && reservedMutationID != "" {
+					if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, reservedInboundTag); reconcileErr != nil {
+						remoteWriteError(w, http.StatusBadGateway, "Agent 未回显匹配的 mutation_id，且无法确认当前入站所有权: "+reconcileErr.Error())
+						return
+					}
+				}
+				remoteWriteError(w, http.StatusBadGateway, "Agent 未回显匹配的 mutation_id，远端变更结果无法确认")
+				return
+			}
+			superseded, _ := resp["superseded"].(bool)
+			if (actionLower == "" || actionLower == "add") && superseded {
+				if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, reservedInboundTag); reconcileErr != nil {
+					remoteWriteError(w, http.StatusConflict, "该入站创建已被更新代次取代，且刷新当前所有权失败: "+reconcileErr.Error())
+					return
+				}
+				remoteWriteError(w, http.StatusConflict, "该入站创建已被更新代次取代")
+				return
+			}
+			var postSyncErrors []string
+			if actionLower == "remove" && superseded {
+				if tag := strings.TrimSpace(wireGuardStringValue(inboundReq["tag"])); tag != "" {
+					if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, tag); reconcileErr != nil {
+						postSyncErrors = append(postSyncErrors, "刷新当前入站所有权失败: "+reconcileErr.Error())
+					}
+				}
+			}
+			if actionLower == "" || actionLower == "add" {
+				var pendingWSSEvent *event.InboundEvent
+				// 添加入站：先处理 reality 相关配置（更新 tunnel-in port + 清理域名路由）
+				if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok {
+					tag, _ := inbound["tag"].(string)
+					protocol, _ := inbound["protocol"].(string)
+					port, _ := inbound["port"].(float64)
+					customNodeName, _ := inboundReq["node_name"].(string)
+					forwardNodeID, _ := inboundReq["forward_node_id"].(float64) // tunnel「转发已有节点」时携带源节点 ID
+					// ip_version: ""/v4(默认) | v6 | both —— 决定生成节点 clash server 用 v4/v6/双节点
+					ipVersion, _ := inboundReq["ip_version"].(string)
+					switch ipVersion {
+					case "v4", "v6", "both":
+					default:
+						ipVersion = "" // 非法值降级为默认 v4
+					}
 
-						if err := h.cleanupTunnelRouteForReality(operationCtx, id, inbound); err != nil {
-							postSyncErrors = append(postSyncErrors, "Reality 路由同步失败: "+err.Error())
-						}
+					if err := h.cleanupTunnelRouteForReality(operationCtx, id, inbound); err != nil {
+						postSyncErrors = append(postSyncErrors, "Reality 路由同步失败: "+err.Error())
+					}
 
-						// 转换为 map[string]any
-						inboundAny := make(map[string]any)
-						for k, v := range inbound {
-							inboundAny[k] = v
-						}
-						if clientSkipCertVerify {
-							inboundAny[managedClientSkipCertVerifyMarker] = true
-						}
-						inboundEvent := event.InboundEvent{
-							Type:          event.EventInboundAdded,
-							ServerID:      id,
-							Tag:           tag,
-							Protocol:      protocol,
-							Port:          int(port),
-							Inbound:       inboundAny,
-							NodeName:      customNodeName,
-							ForwardNodeID: int64(forwardNodeID),
-							IPVersion:     ipVersion,
-							RelayServer:   relayServer,
-							RelayPort:     relayPort,
-						}
-						if canonicalManagedProtocol(protocol) == "wireguard" {
-							if _, resourceErr := h.upsertWireGuardManagedResource(
-								operationCtx,
-								id,
-								customNodeName,
-								managedInboundCreatedBy(r.Context()),
-								inbound,
-							); resourceErr != nil {
-								postSyncErrors = append(postSyncErrors, "WireGuard 管理记录同步失败: "+resourceErr.Error())
-							}
-						}
-						if isWSSInboundReq(inboundReq) {
-							pendingWSSEvent = &inboundEvent
-						} else {
-							event.GetBus().Publish(inboundEvent)
+					// 转换为 map[string]any
+					inboundAny := make(map[string]any)
+					for k, v := range inbound {
+						inboundAny[k] = v
+					}
+					if clientSkipCertVerify {
+						inboundAny[managedClientSkipCertVerifyMarker] = true
+					}
+					inboundEvent := event.InboundEvent{
+						Type:          event.EventInboundAdded,
+						ServerID:      id,
+						Tag:           tag,
+						MutationID:    mutationID,
+						Protocol:      protocol,
+						Port:          int(port),
+						Inbound:       inboundAny,
+						NodeName:      customNodeName,
+						ForwardNodeID: int64(forwardNodeID),
+						IPVersion:     ipVersion,
+						RelayServer:   relayServer,
+						RelayPort:     relayPort,
+					}
+					if canonicalManagedProtocol(protocol) == "wireguard" {
+						if _, resourceErr := h.upsertWireGuardManagedResource(
+							operationCtx,
+							id,
+							customNodeName,
+							managedInboundCreatedBy(r.Context()),
+							inbound,
+							mutationID,
+						); resourceErr != nil {
+							postSyncErrors = append(postSyncErrors, "WireGuard 管理记录同步失败: "+resourceErr.Error())
 						}
 					}
-					// 受管 WS 入站添加成功 → 在同一租约内聚合渲染并等待 Agent ACK。
 					if isWSSInboundReq(inboundReq) {
-						if err := h.SyncWSSNginx(operationCtx, id); err != nil {
-							inbound, _ := inboundReq["inbound"].(map[string]interface{})
-							tag, _ := inbound["tag"].(string)
-							rollbackErr := h.rollbackWSSInboundAdd(operationCtx, id, tag)
-							if rollbackErr == nil {
-								remoteWriteError(w, http.StatusBadGateway, "WSS nginx 同步失败，刚创建的入站已自动回滚: "+err.Error())
-								return
-							}
-							postSyncErrors = append(postSyncErrors, "WSS nginx 同步失败: "+err.Error()+"；自动回滚失败: "+rollbackErr.Error())
-						} else if pendingWSSEvent != nil {
-							event.GetBus().Publish(*pendingWSSEvent)
-						}
-					}
-				} else if actionLower == "remove" {
-					// 删除入站：发布事件
-					if tag, ok := inboundReq["tag"].(string); ok && tag != "" {
-						event.GetBus().Publish(event.InboundEvent{
-							Type:     event.EventInboundRemoved,
-							ServerID: id,
-							Tag:      tag,
-						})
-					}
-					// 恢复被 reality 接管的域名到 tunnel-in→nginx 路由
-					if len(preDeleteRealityDomains) > 0 {
-						if err := h.restoreTunnelRouteForReality(operationCtx, id, preDeleteRealityDomains); err != nil {
-							postSyncErrors = append(postSyncErrors, "Reality 路由恢复失败: "+err.Error())
-						}
-					}
-					if removedInboundWasWSS {
-						if err := h.SyncWSSNginx(operationCtx, id); err != nil {
-							postSyncErrors = append(postSyncErrors, "WSS nginx 清理失败: "+err.Error())
+						pendingWSSEvent = &inboundEvent
+					} else {
+						if publishErr := event.GetBus().Publish(inboundEvent); publishErr != nil {
+							postSyncErrors = append(postSyncErrors, "节点同步失败: "+publishErr.Error())
 						}
 					}
 				}
-				if len(postSyncErrors) > 0 {
-					remoteWritePartialError(w, "入站主动作已生效，但后置同步未完成: "+strings.Join(postSyncErrors, "; "), mutationID)
-					return
+				// 受管 WS 入站添加成功 → 在同一租约内聚合渲染并等待 Agent ACK。
+				if isWSSInboundReq(inboundReq) {
+					if err := h.SyncWSSNginx(operationCtx, id); err != nil {
+						inbound, _ := inboundReq["inbound"].(map[string]interface{})
+						tag, _ := inbound["tag"].(string)
+						rollbackErr := h.rollbackWSSInboundAdd(operationCtx, id, tag, mutationID)
+						if rollbackErr == nil {
+							remoteWriteError(w, http.StatusBadGateway, "WSS nginx 同步失败，刚创建的入站已自动回滚: "+err.Error())
+							return
+						}
+						postSyncErrors = append(postSyncErrors, "WSS nginx 同步失败: "+err.Error()+"；自动回滚失败: "+rollbackErr.Error())
+					} else if pendingWSSEvent != nil {
+						if publishErr := event.GetBus().Publish(*pendingWSSEvent); publishErr != nil {
+							postSyncErrors = append(postSyncErrors, "节点同步失败: "+publishErr.Error())
+						}
+					}
 				}
+			} else if actionLower == "remove" && !superseded {
+				// 删除入站：发布事件
+				if tag, ok := inboundReq["tag"].(string); ok && tag != "" {
+					if mutationID != "" {
+						if _, ownershipErr := h.repo.DeleteRemoteInboundOwnershipIfMutation(operationCtx, id, tag, mutationID); ownershipErr != nil {
+							postSyncErrors = append(postSyncErrors, "入站所有权清理失败: "+ownershipErr.Error())
+						}
+					}
+					if publishErr := event.GetBus().Publish(event.InboundEvent{
+						Type:       event.EventInboundRemoved,
+						ServerID:   id,
+						Tag:        tag,
+						MutationID: mutationID,
+					}); publishErr != nil {
+						postSyncErrors = append(postSyncErrors, "节点清理失败: "+publishErr.Error())
+					}
+				}
+				// 恢复被 reality 接管的域名到 tunnel-in→nginx 路由
+				if len(preDeleteRealityDomains) > 0 {
+					if err := h.restoreTunnelRouteForReality(operationCtx, id, preDeleteRealityDomains); err != nil {
+						postSyncErrors = append(postSyncErrors, "Reality 路由恢复失败: "+err.Error())
+					}
+				}
+				if removedInboundWasWSS {
+					if err := h.SyncWSSNginx(operationCtx, id); err != nil {
+						postSyncErrors = append(postSyncErrors, "WSS nginx 清理失败: "+err.Error())
+					}
+				}
+			}
+			if len(postSyncErrors) > 0 {
+				remoteWritePartialError(w, "入站主动作已生效，但后置同步未完成: "+strings.Join(postSyncErrors, "; "), mutationID)
+				return
 			}
 		}
 	}
@@ -2568,12 +2702,38 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	w.Write(result)
 }
 
-func (h *RemoteManageHandler) rollbackWSSInboundAdd(ctx context.Context, serverID int64, tag string) error {
+func (h *RemoteManageHandler) reconcileRemoteInboundOwnershipFromAgent(ctx context.Context, serverID int64, tag string) error {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return errors.New("inbound tag is required")
+	}
+	raw, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/inbounds", nil)
+	if err != nil {
+		return err
+	}
+	var inventory struct {
+		Success            bool              `json:"success"`
+		MutationFenceKnown bool              `json:"mutation_fence_known"`
+		MutationOwners     map[string]string `json:"mutation_owners"`
+	}
+	if err := json.Unmarshal(raw, &inventory); err != nil {
+		return fmt.Errorf("parse Agent inbound ownership: %w", err)
+	}
+	if !inventory.Success || !inventory.MutationFenceKnown {
+		return errors.New("Agent does not expose authoritative inbound ownership")
+	}
+	if owner := strings.TrimSpace(inventory.MutationOwners[tag]); owner != "" {
+		return h.repo.SetRemoteInboundOwnership(ctx, serverID, tag, owner)
+	}
+	return h.repo.ClearRemoteInboundOwnership(ctx, serverID, tag)
+}
+
+func (h *RemoteManageHandler) rollbackWSSInboundAdd(ctx context.Context, serverID int64, tag, mutationID string) error {
 	tag = strings.TrimSpace(tag)
 	if tag == "" {
 		return errors.New("入站 Tag 为空")
 	}
-	body, err := json.Marshal(map[string]interface{}{"action": "remove", "tag": tag})
+	body, err := json.Marshal(map[string]interface{}{"action": "remove", "tag": tag, "mutation_id": strings.TrimSpace(mutationID)})
 	if err != nil {
 		return err
 	}
@@ -2582,14 +2742,17 @@ func (h *RemoteManageHandler) rollbackWSSInboundAdd(ctx context.Context, serverI
 		return err
 	}
 	var response struct {
-		Success *bool  `json:"success"`
-		Error   string `json:"error"`
-		Message string `json:"message"`
+		Success    *bool  `json:"success"`
+		MutationID string `json:"mutation_id"`
+		Superseded bool   `json:"superseded"`
+		Error      string `json:"error"`
+		Message    string `json:"message"`
 	}
 	if err := json.Unmarshal(result, &response); err != nil {
 		return fmt.Errorf("解析 Agent 回滚响应失败: %w", err)
 	}
-	if response.Success != nil && *response.Success {
+	if response.Success != nil && *response.Success && !response.Superseded &&
+		(strings.TrimSpace(mutationID) == "" || strings.TrimSpace(response.MutationID) == strings.TrimSpace(mutationID)) {
 		return nil
 	}
 	message := strings.TrimSpace(response.Error)
@@ -2632,6 +2795,8 @@ func (h *RemoteManageHandler) HandleCreateManagedNode(w http.ResponseWriter, r *
 		return
 	}
 	request["action"] = "add"
+	mutationID := "managed-node:" + uuid.NewString()
+	request["mutation_id"] = mutationID
 	nodeName, _ := request["node_name"].(string)
 	nodeName = strings.TrimSpace(nodeName)
 	if nodeName == "" {
@@ -2684,7 +2849,7 @@ func (h *RemoteManageHandler) HandleCreateManagedNode(w http.ResponseWriter, r *
 			copyHTTPResponse(w, recorder)
 			return
 		}
-		rollbackErr := h.rollbackManagedNode(r, serverID, server.Name, tag)
+		rollbackErr := h.rollbackManagedNode(r, serverID, server.Name, tag, mutationID)
 		message := managedNodeResponseMessage(recorder, "入站后置同步失败")
 		if rollbackErr != nil {
 			remoteWriteError(w, http.StatusBadGateway, message+"；自动回滚也失败: "+rollbackErr.Error())
@@ -2694,7 +2859,7 @@ func (h *RemoteManageHandler) HandleCreateManagedNode(w http.ResponseWriter, r *
 		return
 	}
 	if success, message := managedNodeResponseSuccess(recorder); !success {
-		rollbackErr := h.rollbackManagedNode(r, serverID, server.Name, tag)
+		rollbackErr := h.rollbackManagedNode(r, serverID, server.Name, tag, mutationID)
 		if rollbackErr != nil {
 			remoteWriteError(w, http.StatusBadGateway, message+"；自动回滚也失败: "+rollbackErr.Error())
 			return
@@ -2716,7 +2881,7 @@ func (h *RemoteManageHandler) HandleCreateManagedNode(w http.ResponseWriter, r *
 		lookupErr = errors.New("入站已创建，但节点同步未生成记录")
 	}
 	if lookupErr != nil {
-		if rollbackErr := h.rollbackManagedNode(r, serverID, server.Name, tag); rollbackErr != nil {
+		if rollbackErr := h.rollbackManagedNode(r, serverID, server.Name, tag, mutationID); rollbackErr != nil {
 			remoteWriteError(w, http.StatusBadGateway, "节点同步失败，自动回滚也失败: "+lookupErr.Error()+"；"+rollbackErr.Error())
 			return
 		}
@@ -2792,8 +2957,8 @@ func managedNodeResponseSuccess(recorder *managedNodeResponseRecorder) (bool, st
 	return true, ""
 }
 
-func (h *RemoteManageHandler) rollbackManagedNode(r *http.Request, serverID int64, serverName, tag string) error {
-	rollbackBody, _ := json.Marshal(map[string]interface{}{"action": "remove", "tag": tag})
+func (h *RemoteManageHandler) rollbackManagedNode(r *http.Request, serverID int64, serverName, tag, mutationID string) error {
+	rollbackBody, _ := json.Marshal(map[string]interface{}{"action": "remove", "tag": tag, "mutation_id": mutationID})
 	rollbackRequest := r.Clone(context.Background())
 	rollbackRequest.Body = io.NopCloser(bytes.NewReader(rollbackBody))
 	rollbackRequest.ContentLength = int64(len(rollbackBody))
@@ -2806,7 +2971,10 @@ func (h *RemoteManageHandler) rollbackManagedNode(r *http.Request, serverID int6
 	if success, message := managedNodeResponseSuccess(rollbackRecorder); !success {
 		return errors.New(message)
 	}
-	if _, err := h.repo.DeleteNodesByInboundTag(context.Background(), serverName, tag); err != nil {
+	if err := validateManagedWireGuardMutationACK(rollbackRecorder.body.Bytes(), mutationID); err != nil {
+		return err
+	}
+	if _, err := h.repo.DeleteNodesByInboundTagMutation(context.Background(), serverName, tag, mutationID); err != nil {
 		return fmt.Errorf("清理节点记录失败: %w", err)
 	}
 	return nil
@@ -3223,7 +3391,7 @@ func (h *RemoteManageHandler) HandleScan(w http.ResponseWriter, r *http.Request)
 		remoteWriteError(w, http.StatusBadRequest, "invalid server_id")
 		return
 	}
-	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(r.Context(), id)
+	leasedCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(r.Context(), id)
 	if errors.Is(err, storage.ErrRemoteInstallationActive) {
 		remoteWriteError(w, http.StatusConflict, "server installation is active; retry after it completes")
 		return
@@ -3298,16 +3466,15 @@ func (h *RemoteManageHandler) syncInboundsToNodesInternal(ctx context.Context, s
 // forceOverride: true 时,遇到同名节点先删除再新建(手动同步对话框的"强制覆盖"开关)。
 func (h *RemoteManageHandler) syncInboundsToNodes(ctx context.Context, serverID int64, serverHostOverride string, forceOverride bool) SyncInboundsToNodesResponse {
 	var response SyncInboundsToNodesResponse
-	err := withRemoteInstallationSafeMutation(ctx, h.repo, serverID, "Inbound-to-node sync", func(leasedCtx context.Context) error {
-		response = h.syncInboundsToNodesLeased(leasedCtx, serverID, serverHostOverride, forceOverride)
-		return nil
-	})
+	leasedCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(ctx, serverID)
 	if err != nil {
 		return SyncInboundsToNodesResponse{
 			Success: false,
 			Errors:  []string{err.Error()},
 		}
 	}
+	defer release()
+	response = h.syncInboundsToNodesLeased(leasedCtx, serverID, serverHostOverride, forceOverride)
 	return response
 }
 
@@ -3359,6 +3526,34 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		response.Success = false
 		response.Errors = append(response.Errors, "远程服务器返回错误")
 		return response
+	}
+
+	// Reconcile the control-plane generation from authenticated Agent inventory.
+	// Node rows receive that generation only together with a confirmed config
+	// merge below; ownership alone cannot prove that an old UUID/key is current.
+	inventoryMutationByTag := make(map[string]string)
+	inventoryMutationKnown := make(map[string]bool)
+	for _, inbound := range inboundsResp.Inbounds {
+		tag := strings.TrimSpace(wireGuardStringValue(inbound["tag"]))
+		known, _ := inbound["_mutation_fence_known"].(bool)
+		if tag == "" || !known {
+			continue
+		}
+		mutationID := strings.TrimSpace(wireGuardStringValue(inbound["_mutation_id"]))
+		inventoryMutationKnown[tag] = true
+		inventoryMutationByTag[tag] = mutationID
+		if mutationID == "" {
+			if err := h.repo.ClearRemoteInboundOwnership(ctx, serverID, tag); err != nil {
+				response.Success = false
+				response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: 清理旧入站所有权失败: %v", tag, err))
+			}
+			continue
+		}
+		if err := h.repo.SetRemoteInboundOwnership(ctx, serverID, tag, mutationID); err != nil {
+			response.Success = false
+			response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: 回填入站所有权失败: %v", tag, err))
+			continue
+		}
 	}
 
 	// 拉一次全量 xray config,提取 routing.rules 用于构造 email → outboundTag 映射。
@@ -3421,7 +3616,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 	// to users; routed nodes must never become the source of that credential.
 	existingNodes, _ := h.repo.ListNodes(ctx, username)
 	existingNodeNames := make(map[string]bool)
-	existingByTag := make(map[string]*storage.Node)         // server.Name + ":" + inbound_tag
+	existingByTag := make(map[string][]*storage.Node)       // server.Name + ":" + inbound_tag
 	existingByFingerprint := make(map[string]*storage.Node) // server.Name + ":" + protocol + ":" + port
 
 	serverAddrSet := map[string]bool{}
@@ -3447,9 +3642,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		}
 		if node.InboundTag != "" {
 			key := server.Name + ":" + node.InboundTag
-			if _, exists := existingByTag[key]; !exists {
-				existingByTag[key] = node
-			}
+			existingByTag[key] = append(existingByTag[key], node)
 		}
 		protocol, _ := config["type"].(string)
 		port, _ := config["port"].(float64)
@@ -3481,7 +3674,8 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		// For a panel-managed Reality node, the database credential is the
 		// published contract. Restore it to the Agent before deriving a client
 		// configuration from the live inbound.
-		if existingNode := existingByTag[server.Name+":"+tag]; existingNode != nil && isVLESSRealityInbound(inbound) {
+		if existing := existingByTag[server.Name+":"+tag]; len(existing) > 0 && isVLESSRealityInbound(inbound) {
+			existingNode := existing[0]
 			reconciled, changed, managed, reconcileErr := reconcileManagedRealityInbound(inbound, existingNode, username)
 			if reconcileErr != nil {
 				response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: Reality 凭据校验失败: %v", tag, reconcileErr))
@@ -3490,7 +3684,13 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 			}
 			if managed {
 				if changed {
-					if err := h.replaceInboundForSync(ctx, serverID, reconciled); err != nil {
+					mutationID := inventoryMutationByTag[tag]
+					if !inventoryMutationKnown[tag] || strings.TrimSpace(mutationID) == "" {
+						response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: Agent 未提供 Reality 入站的精确所有权，拒绝整份替换", tag))
+						failedCredentialRepair[tag] = true
+						continue
+					}
+					if err := h.replaceInboundForSync(ctx, serverID, reconciled, mutationID); err != nil {
 						response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: Reality 凭据修复失败: %v", tag, err))
 						failedCredentialRepair[tag] = true
 						continue
@@ -3569,12 +3769,14 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		tag, _ := inbound["tag"].(string)
 		protocol, _ := inbound["protocol"].(string)
 		port, _ := inbound["port"].(float64)
+		mutationID := inventoryMutationByTag[tag]
+		mutationKnown := inventoryMutationKnown[tag]
 
 		if canonicalManagedProtocol(protocol) == "wireguard" {
 			// Inventory entries without a client private key are external or historical
 			// WireGuard inbounds. Reconcile only their public resource metadata here;
 			// the dedicated panel creation path creates ordinary subscription nodes.
-			if _, resourceErr := h.upsertWireGuardManagedResource(ctx, serverID, "", "system-sync", inbound); resourceErr != nil {
+			if _, resourceErr := h.upsertWireGuardManagedResource(ctx, serverID, "", "system-sync", inbound, mutationID); resourceErr != nil {
 				response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: WireGuard 管理记录同步失败: %v", tag, resourceErr))
 			}
 			response.SkippedCount++
@@ -3602,11 +3804,11 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		}
 		clashProxy, err := h.inboundToClashProxy(inbound, effectiveServerHost, server.Name, tunnelPort, username)
 		if err != nil {
-			// "no settings found" — agent listInbounds 返回的"孤儿入站"(只有 tag/protocol/port,缺 settings),
-			// 既无法生成节点配置也对用户毫无价值。后台静默调 agent remove RPC 清理掉,
-			// 不污染前端 SkippedCount/Errors,用户感知不到。
+			// A partial inventory entry cannot be converted safely. Never mutate or
+			// delete it from a scan: ownership may have changed after discovery.
 			if err.Error() == "no settings found" {
-				go h.silentlyRemoveOrphanInbound(serverID, tag)
+				response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: Agent 清单缺少 settings，已跳过且未自动删除", tag))
+				response.SkippedCount++
 				continue
 			}
 			response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: %v", tag, err))
@@ -3639,7 +3841,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		// 先尝试 claim 所有匹配的未认领外部节点 — 这一步必须在 dedupe 之前,
 		// 因为「回落+路由出站」场景下 1 个 inbound 可能对应 N 个客户端节点(uuid/email 不同),
 		// 即使其中 1 个节点已经认领了这个 inbound(导致 dedupe 命中),其余的也仍需要 claim。
-		claimedThis := h.tryClaimExternalNodeForSync(ctx, server, protocol, int(port), string(clashConfigJSON), tag)
+		claimedThis := h.tryClaimExternalNodeForSync(ctx, server, protocol, int(port), string(clashConfigJSON), tag, mutationID)
 		if claimedThis {
 			response.ClaimedCount++
 			if tag != "" {
@@ -3651,23 +3853,38 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		// Live transport/security fields are authoritative, while user-selected
 		// endpoint and chain fields remain stable.
 		if tag != "" {
-			if existingNode := existingByTag[server.Name+":"+tag]; existingNode != nil {
-				updatedNode, changed, mergeErr := mergeManagedPhysicalNodeConfig(*existingNode, clashProxy)
-				if mergeErr != nil {
-					response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: 节点配置校准失败: %v", tag, mergeErr))
-					response.SkippedCount++
-					continue
-				}
-				if changed {
+			if matchingNodes := existingByTag[server.Name+":"+tag]; len(matchingNodes) > 0 {
+				changedCount := 0
+				failed := false
+				for _, existingNode := range matchingNodes {
+					updatedNode, changed, mergeErr := mergeManagedPhysicalNodeConfig(*existingNode, clashProxy)
+					if mergeErr != nil {
+						response.Errors = append(response.Errors, fmt.Sprintf("tag=%s node=%d: 节点配置校准失败: %v", tag, existingNode.ID, mergeErr))
+						failed = true
+						continue
+					}
+					if mutationKnown && updatedNode.InboundMutationID != mutationID {
+						updatedNode.InboundMutationID = mutationID
+						changed = true
+					}
+					if !changed {
+						continue
+					}
 					storedNode, updateErr := h.repo.UpdateNode(ctx, updatedNode)
 					if updateErr != nil {
-						response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: 节点配置回写失败: %v", tag, updateErr))
-						response.SkippedCount++
+						response.Errors = append(response.Errors, fmt.Sprintf("tag=%s node=%d: 节点配置回写失败: %v", tag, existingNode.ID, updateErr))
+						failed = true
 						continue
 					}
 					*existingNode = storedNode
-					response.SyncedCount++
-					response.SyncedTags = append(response.SyncedTags, fmt.Sprintf("%s (port:%d) [reconciled]", tag, int(port)))
+					changedCount++
+				}
+				if failed {
+					response.Success = false
+				}
+				if changedCount > 0 {
+					response.SyncedCount += changedCount
+					response.SyncedTags = append(response.SyncedTags, fmt.Sprintf("%s (port:%d) [reconciled x%d]", tag, int(port), changedCount))
 				} else {
 					response.SkippedCount++
 				}
@@ -3678,13 +3895,22 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		// Step 2: clash 配置指纹(server+协议+端口)匹配 → skip 创建,但若 agent 这次扫到的 tag 与库里不一致,
 		//          把库里 tag 校正成最新值;这样下次同步就能走 Step 1 快速通道。
 		if existingNode, ok := existingByFingerprint[dedupeKey]; ok {
-			if tag != "" && existingNode.InboundTag != tag {
-				if err := h.repo.UpdateNodeInboundTag(ctx, existingNode.ID, tag); err != nil {
-					log.Printf("[Remote Manage] UpdateNodeInboundTag id=%d %q → %q failed: %v", existingNode.ID, existingNode.InboundTag, tag, err)
+			needsUpdate := tag != "" && existingNode.InboundTag != tag
+			if mutationKnown && existingNode.InboundMutationID != mutationID {
+				needsUpdate = true
+			}
+			if needsUpdate {
+				previousTag := existingNode.InboundTag
+				existingNode.InboundTag = tag
+				if mutationKnown {
+					existingNode.InboundMutationID = mutationID
+				}
+				if stored, err := h.repo.UpdateNode(ctx, *existingNode); err != nil {
+					log.Printf("[Remote Manage] Reconcile node ownership id=%d failed: %v", existingNode.ID, err)
 				} else {
-					log.Printf("[Remote Manage] Reconciled inbound_tag id=%d: %q → %q (matched by config fingerprint)", existingNode.ID, existingNode.InboundTag, tag)
-					existingNode.InboundTag = tag
-					existingByTag[server.Name+":"+tag] = existingNode
+					*existingNode = stored
+					log.Printf("[Remote Manage] Reconciled inbound_tag id=%d: %q → %q (matched by config fingerprint)", existingNode.ID, previousTag, tag)
+					existingByTag[server.Name+":"+tag] = append(existingByTag[server.Name+":"+tag], existingNode)
 				}
 			}
 			response.SkippedCount++
@@ -3726,7 +3952,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 			// claim 后该节点已落库,占用当前 fingerprint/tag,后续同步循环里别再生成重复
 			existingByFingerprint[dedupeKey] = &storage.Node{InboundTag: tag}
 			if tag != "" {
-				existingByTag[server.Name+":"+tag] = &storage.Node{InboundTag: tag, OriginalServer: server.Name, NodeType: "physical"}
+				existingByTag[server.Name+":"+tag] = append(existingByTag[server.Name+":"+tag], &storage.Node{InboundTag: tag, OriginalServer: server.Name, NodeType: "physical"})
 			}
 			continue
 		}
@@ -3739,15 +3965,16 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 
 		// 创建节点
 		node := storage.Node{
-			Username:       username,
-			NodeName:       nodeName,
-			Protocol:       protocol,
-			ClashConfig:    string(clashConfigJSON),
-			ParsedConfig:   string(clashConfigJSON),
-			Enabled:        true,
-			Tag:            fmt.Sprintf("远程:%s", server.Name),
-			OriginalServer: server.Name,
-			InboundTag:     tag,
+			Username:          username,
+			NodeName:          nodeName,
+			Protocol:          protocol,
+			ClashConfig:       string(clashConfigJSON),
+			ParsedConfig:      string(clashConfigJSON),
+			Enabled:           true,
+			Tag:               fmt.Sprintf("远程:%s", server.Name),
+			OriginalServer:    server.Name,
+			InboundTag:        tag,
+			InboundMutationID: mutationID,
 		}
 
 		if _, err := h.repo.CreateNode(ctx, node); err != nil {
@@ -3766,7 +3993,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		// 更新 dedup 索引,防止同一批次同 fingerprint 的入站再次落到这里(理论上 inbound 列表不会重复,纯防御)
 		existingByFingerprint[dedupeKey] = &storage.Node{InboundTag: tag}
 		if tag != "" {
-			existingByTag[server.Name+":"+tag] = &storage.Node{InboundTag: tag, OriginalServer: server.Name, NodeType: "physical"}
+			existingByTag[server.Name+":"+tag] = append(existingByTag[server.Name+":"+tag], &storage.Node{InboundTag: tag, OriginalServer: server.Name, NodeType: "physical"})
 		}
 		existingNodeNames[nodeName] = true
 	}
@@ -4054,6 +4281,9 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 
 	response.Message = fmt.Sprintf("已同步 %d 个节点(绑定 %d 个，新增 %d 个)，跳过 %d 个",
 		response.SyncedCount, response.ClaimedCount, response.CreatedCount, response.SkippedCount)
+	if len(response.Errors) > 0 {
+		response.Success = false
+	}
 	return response
 }
 
@@ -4123,7 +4353,7 @@ func (h *RemoteManageHandler) MatchRemoteServerByNodeHost(ctx context.Context, c
 // 全部 claim 而非 claim 第一个:同一台服务器使用「回落+路由出站」时,订阅里会出现多条
 // server+port+protocol 完全相同、只是用户凭据 / email 不同的客户端节点(各自走不同上游路径),
 // 都应该匹配到这台服务器,见 Issue: hk-n.2ha.me 多个节点只匹配到 1 个的反馈。
-func (h *RemoteManageHandler) tryClaimExternalNodeForSync(ctx context.Context, server *storage.RemoteServer, protocol string, port int, clashConfigJSON, inboundTag string) bool {
+func (h *RemoteManageHandler) tryClaimExternalNodeForSync(ctx context.Context, server *storage.RemoteServer, protocol string, port int, clashConfigJSON, inboundTag, mutationID string) bool {
 	candidates := map[string]bool{}
 	for _, a := range []string{server.IPAddress, server.Domain, server.PullAddress} {
 		a = strings.TrimSpace(a)
@@ -4190,7 +4420,7 @@ func (h *RemoteManageHandler) tryClaimExternalNodeForSync(ctx context.Context, s
 				mergedConfig = string(updated)
 			}
 		}
-		if err := h.repo.ClaimExternalNode(ctx, n.ID, server.Name, inboundTag, fmt.Sprintf("远程:%s", server.Name), mergedConfig); err != nil {
+		if err := h.repo.ClaimExternalNode(ctx, n.ID, server.Name, inboundTag, mutationID, fmt.Sprintf("远程:%s", server.Name), mergedConfig); err != nil {
 			log.Printf("[Remote Manage] tryClaim node %d failed: %v", n.ID, err)
 			continue
 		}
@@ -4310,26 +4540,6 @@ func chooseClashServerHost(server *storage.RemoteServer) string {
 		return p
 	}
 	return strings.TrimSpace(server.IPAddress)
-}
-
-// silentlyRemoveOrphanInbound 在后台静默删除 agent 上的"孤儿入站"(listInbounds 返回但 settings 缺失)。
-// 触发场景:agent 的 xray runtime 里残留只有 tag/protocol/port 没 settings 的入站,通常来自:
-//   - 手动 SSH 操作时半截写入的入站
-//   - 历史 bug 留下的损坏入站
-//   - confdir 下 *.json 文件丢失但 runtime 还在跑
-//
-// 这类入站既无法生成节点配置,留着只会每次扫描污染 SkippedCount/Errors,用户也看不懂。
-// 直接调 agent 的 inbounds remove RPC 清掉,跟 deleteRemoteInbound 同款路径。
-// 失败只 log,不阻塞 sync 流程;成功也只 log,前端无感。
-func (h *RemoteManageHandler) silentlyRemoveOrphanInbound(serverID int64, tag string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	body, _ := json.Marshal(map[string]string{"action": "remove", "tag": tag})
-	if _, err := h.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/inbounds", body); err != nil {
-		log.Printf("[SyncInbounds] silent cleanup of orphan inbound %s on server=%d failed: %v", tag, serverID, err)
-		return
-	}
-	log.Printf("[SyncInbounds] silently removed orphan inbound %s on server=%d (no settings found)", tag, serverID)
 }
 
 // inboundToClashProxy 将 Xray 入站配置转换为 Clash 代理配置。

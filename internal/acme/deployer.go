@@ -59,23 +59,32 @@ func RestartXray() error {
 	return nil
 }
 
-// 部署写入证书文件并可选择重新加载服务。
-// reloadTarget：“nginx”、“xray”、“两者”或“无”。
-func Deploy(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
+// DeployWithXrayRestarter lets callers serialize the Xray restart with other
+// runtime/config mutations. A nil callback preserves the standalone behavior.
+func DeployWithXrayRestarter(certPEM, keyPEM, certPath, keyPath, reloadTarget string, restartXray func() error) error {
 	if err := DeployCertFiles(certPEM, keyPEM, certPath, keyPath); err != nil {
 		return err
+	}
+	if restartXray == nil {
+		restartXray = RestartXray
 	}
 
 	switch reloadTarget {
 	case "nginx":
 		return ReloadNginx()
 	case "xray":
-		return RestartXray()
+		return restartXray()
 	case "both":
 		if err := ReloadNginx(); err != nil {
 			return err
 		}
-		return RestartXray()
+		return restartXray()
 	}
 	return nil
+}
+
+// 部署写入证书文件并可选择重新加载服务。
+// reloadTarget：“nginx”、“xray”、“两者”或“无”。
+func Deploy(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
+	return DeployWithXrayRestarter(certPEM, keyPEM, certPath, keyPath, reloadTarget, nil)
 }

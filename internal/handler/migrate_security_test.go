@@ -303,6 +303,7 @@ func TestImportMmwSubscribeCopyFailureLeavesDatabaseRetryable(t *testing.T) {
 }
 
 func TestCopySubscribesDirIsAtomicAndIdempotent(t *testing.T) {
+	repo, _ := newWireGuardSubscriptionTestRepo(t)
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
 	destination := filepath.Join(root, "destination")
@@ -312,11 +313,11 @@ func TestCopySubscribesDirIsAtomicAndIdempotent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, "sample.yaml"), []byte("proxies: []\n"), migrateTempFilePerm); err != nil {
 		t.Fatal(err)
 	}
-	copied, skipped, err := copySubscribesDir(source, destination)
+	copied, skipped, err := copySubscribesDir(context.Background(), repo, source, destination)
 	if err != nil || copied != 1 || len(skipped) != 0 {
 		t.Fatalf("first copy copied=%d skipped=%v err=%v", copied, skipped, err)
 	}
-	copied, skipped, err = copySubscribesDir(source, destination)
+	copied, skipped, err = copySubscribesDir(context.Background(), repo, source, destination)
 	if err != nil || copied != 0 || len(skipped) != 1 || skipped[0] != "sample.yaml" {
 		t.Fatalf("retry copied=%d skipped=%v err=%v", copied, skipped, err)
 	}

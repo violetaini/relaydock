@@ -67,6 +67,7 @@ func TestManagedInboundResourceCRUDAndUpsertPreservesDisplayName(t *testing.T) {
 	updated.EndpointHost = "203.0.113.9"
 	updated.EndpointPort = 51821
 	updated.CreatedBy = "system-sync"
+	updated.MutationID = ""
 	upserted, err := repo.UpsertManagedInboundResource(ctx, updated)
 	if err != nil {
 		t.Fatalf("UpsertManagedInboundResource: %v", err)
@@ -88,6 +89,34 @@ func TestManagedInboundResourceCRUDAndUpsertPreservesDisplayName(t *testing.T) {
 	}
 	if _, err := repo.GetManagedInboundResource(ctx, created.ID); !errors.Is(err, ErrManagedInboundResourceNotFound) {
 		t.Fatalf("GetManagedInboundResource after delete error=%v", err)
+	}
+}
+
+func TestManagedInboundResourceMutationFencesStaleDelete(t *testing.T) {
+	repo, server := newManagedInboundResourceTestRepository(t)
+	ctx := context.Background()
+	old := managedInboundResourceFixture(server.ID)
+	old.MutationID = "generation-old"
+	created, err := repo.CreateManagedInboundResource(ctx, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newGeneration := managedInboundResourceFixture(server.ID)
+	newGeneration.MutationID = "generation-new"
+	if _, err := repo.UpsertManagedInboundResource(ctx, newGeneration); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := repo.DeleteManagedInboundResourceByServerTagMutation(ctx, server.ID, old.InboundTag, old.MutationID)
+	if err != nil || deleted != 0 {
+		t.Fatalf("stale delete affected=%d err=%v", deleted, err)
+	}
+	current, err := repo.GetManagedInboundResource(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.MutationID != newGeneration.MutationID {
+		t.Fatalf("new generation mutation=%q", current.MutationID)
 	}
 }
 

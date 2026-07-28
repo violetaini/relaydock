@@ -777,7 +777,7 @@ func (h *MigrateHandler) ImportMmw(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimSpace(destination) == "" {
 			destination = mmwxSubscribesDir
 		}
-		copied, skipped, err = copySubscribesDir(subsDir, destination)
+		copied, skipped, err = copySubscribesDir(r.Context(), h.repo, subsDir, destination)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("拷贝 subscribes 失败，未导入数据库，可直接重试: %v", err))
 			return
@@ -805,7 +805,10 @@ func (h *MigrateHandler) ImportMmw(w http.ResponseWriter, r *http.Request) {
 // copySubscribesDir 把 src 目录里所有非隐藏常规文件拷贝到 dst。
 // 同名文件已存在 → 跳过(保留 mmwx 现有的,不覆盖),并把文件名加入 skipped 列表。
 // dst 目录不存在会自动建。
-func copySubscribesDir(src, dst string) (int, []string, error) {
+func copySubscribesDir(ctx context.Context, repo *storage.TrafficRepository, src, dst string) (int, []string, error) {
+	if repo == nil {
+		return 0, nil, errors.New("订阅私钥存储不可用")
+	}
 	if err := os.MkdirAll(dst, migrateWorkPerm); err != nil {
 		return 0, nil, err
 	}
@@ -831,7 +834,15 @@ func copySubscribesDir(src, dst string) (int, []string, error) {
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return copied, skipped, err
 		}
-		created, err := copyMigrationFile(srcPath, dstPath)
+		content, err := os.ReadFile(srcPath)
+		if err != nil {
+			return copied, skipped, err
+		}
+		protected, err := protectWireGuardSubscriptionContent(ctx, repo, name, string(content), true)
+		if err != nil {
+			return copied, skipped, fmt.Errorf("保护订阅 %s 的 WireGuard 私钥失败: %w", name, err)
+		}
+		created, err := copyMigrationFile([]byte(protected), dstPath)
 		if err != nil {
 			return copied, skipped, err
 		}
@@ -844,13 +855,7 @@ func copySubscribesDir(src, dst string) (int, []string, error) {
 	return copied, skipped, nil
 }
 
-func copyMigrationFile(src, dst string) (created bool, err error) {
-	source, err := os.Open(src)
-	if err != nil {
-		return false, err
-	}
-	defer source.Close()
-
+func copyMigrationFile(content []byte, dst string) (created bool, err error) {
 	temporary, err := os.CreateTemp(filepath.Dir(dst), ".arcway-migrate-*")
 	if err != nil {
 		return false, err
@@ -861,7 +866,7 @@ func copyMigrationFile(src, dst string) (created bool, err error) {
 		_ = temporary.Close()
 		return false, err
 	}
-	if _, err := io.Copy(temporary, source); err != nil {
+	if _, err := temporary.Write(content); err != nil {
 		_ = temporary.Close()
 		return false, err
 	}
@@ -1096,61 +1101,88 @@ func (h *MigrateHandler) PatchClientEmails(w http.ResponseWriter, r *http.Reques
 	}
 
 	for _, s := range servers {
-		inbounds, err := fetchAgentInbounds(r.Context(), h.rm, s.ID)
-		if err != nil {
-			resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s(%d): %v", s.Name, s.ID, err))
+		leasedCtx, release, leaseErr := h.repo.AcquireRemoteServerExclusiveMutationLease(r.Context(), s.ID)
+		if leaseErr != nil {
+			resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s(%d): acquire mutation lease: %v", s.Name, s.ID, leaseErr))
 			continue
 		}
-		resp.InboundsTotal += len(inbounds)
-		for _, ib := range inbounds {
-			tag, _ := ib["tag"].(string)
-			protocol, _ := ib["protocol"].(string)
-			patched, allClients, isSS2022, method, err := patchInboundClientEmails(ib, admin)
-			if isSS2022 {
-				resp.SS2022Inbounds = append(resp.SS2022Inbounds, ss2022InboundInfo{
-					ServerID: s.ID, ServerName: s.Name, InboundTag: tag, Method: method,
-				})
+		func() {
+			defer release()
+			inbounds, fetchErr := fetchAgentInbounds(leasedCtx, h.rm, s.ID)
+			if fetchErr != nil {
+				resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s(%d): %v", s.Name, s.ID, fetchErr))
+				return
 			}
-			if err != nil {
-				resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s inbound %s: patch err: %v", s.Name, tag, err))
-				continue
-			}
-			// 只有真的 patch 了 email 才需要 write back 到 agent;否则只做 DB 侧 user_inbound_configs 绑定
-			if len(patched) > 0 {
-				body, _ := json.Marshal(map[string]any{"action": "add", "inbound": ib})
-				if _, err := h.rm.forwardToRemoteServer(r.Context(), s.ID, "POST", "/api/child/inbounds", body); err != nil {
-					resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s inbound %s: write back err: %v", s.Name, tag, err))
+			resp.InboundsTotal += len(inbounds)
+			for _, ib := range inbounds {
+				tag, _ := ib["tag"].(string)
+				protocol, _ := ib["protocol"].(string)
+				fenceKnown, _ := ib["_mutation_fence_known"].(bool)
+				mutationID := strings.TrimSpace(wireGuardStringValue(ib["_mutation_id"]))
+				patched, allClients, isSS2022, method, patchErr := patchInboundClientEmails(ib, admin)
+				if isSS2022 {
+					resp.SS2022Inbounds = append(resp.SS2022Inbounds, ss2022InboundInfo{
+						ServerID: s.ID, ServerName: s.Name, InboundTag: tag, Method: method,
+					})
+				}
+				if patchErr != nil {
+					resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s inbound %s: patch err: %v", s.Name, tag, patchErr))
 					continue
 				}
-			}
-			for _, p := range patched {
-				resp.ClientsPatched = append(resp.ClientsPatched, patchedClient{
-					ServerID:   s.ID,
-					ServerName: s.Name,
-					InboundTag: tag,
-					OldEmail:   p.oldEmail,
-					NewEmail:   p.newEmail,
-				})
-			}
-			// 把所有 client 登记到 user_inbound_configs(归属 admin),用于流量统计/管理
-			for _, cli := range allClients {
-				if strings.TrimSpace(cli.email) == "" {
-					continue
+				// Inventory-only ownership annotations are never part of an Xray inbound.
+				delete(ib, "_mutation_fence_known")
+				delete(ib, "_mutation_id")
+				// 只有真的 patch 了 email 才需要 write back 到 agent;否则只做 DB 侧 user_inbound_configs 绑定。
+				// A whole-inbound replacement is accepted only for the exact authenticated generation.
+				if len(patched) > 0 {
+					if !fenceKnown || mutationID == "" {
+						resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s inbound %s: Agent 未提供可信的当前代次，拒绝整份覆盖", s.Name, tag))
+						continue
+					}
+					body, marshalErr := json.Marshal(map[string]any{"action": "add", "inbound": ib, "mutation_id": mutationID})
+					if marshalErr != nil {
+						resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s inbound %s: encode write back: %v", s.Name, tag, marshalErr))
+						continue
+					}
+					result, forwardErr := h.rm.forwardToRemoteServer(leasedCtx, s.ID, "POST", "/api/child/inbounds", body)
+					if forwardErr != nil {
+						resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s inbound %s: write back err: %v", s.Name, tag, forwardErr))
+						continue
+					}
+					if ackErr := validateManagedWireGuardMutationACK(result, mutationID); ackErr != nil {
+						resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s inbound %s: write back not confirmed: %v", s.Name, tag, ackErr))
+						continue
+					}
 				}
-				credJSON, err := json.Marshal(cli.credential)
-				if err != nil {
-					continue
+				for _, p := range patched {
+					resp.ClientsPatched = append(resp.ClientsPatched, patchedClient{
+						ServerID:   s.ID,
+						ServerName: s.Name,
+						InboundTag: tag,
+						OldEmail:   p.oldEmail,
+						NewEmail:   p.newEmail,
+					})
 				}
-				wasNew, err := h.repo.EnsureAdminInboundClient(r.Context(), admin, s.ID, tag, protocol, string(credJSON))
-				if err != nil {
-					resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s inbound %s email %s: bind admin err: %v", s.Name, tag, cli.email, err))
-					continue
+				// 把所有 client 登记到 user_inbound_configs(归属 admin),用于流量统计/管理
+				for _, cli := range allClients {
+					if strings.TrimSpace(cli.email) == "" {
+						continue
+					}
+					credJSON, marshalErr := json.Marshal(cli.credential)
+					if marshalErr != nil {
+						continue
+					}
+					wasNew, bindErr := h.repo.EnsureAdminInboundClient(leasedCtx, admin, s.ID, tag, protocol, string(credJSON))
+					if bindErr != nil {
+						resp.ServerErrors = append(resp.ServerErrors, fmt.Sprintf("server %s inbound %s email %s: bind admin err: %v", s.Name, tag, cli.email, bindErr))
+						continue
+					}
+					resp.AdminSubaccountsLinked = append(resp.AdminSubaccountsLinked, adminSubaccount{
+						ServerID: s.ID, ServerName: s.Name, InboundTag: tag, Email: cli.email, WasNew: wasNew,
+					})
 				}
-				resp.AdminSubaccountsLinked = append(resp.AdminSubaccountsLinked, adminSubaccount{
-					ServerID: s.ID, ServerName: s.Name, InboundTag: tag, Email: cli.email, WasNew: wasNew,
-				})
 			}
-		}
+		}()
 	}
 
 	log.Printf("[Migrate] patch-client-emails: scanned %d servers, patched %d clients, %d ss2022 inbounds, %d errors",

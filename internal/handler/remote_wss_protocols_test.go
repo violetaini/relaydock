@@ -315,7 +315,7 @@ func TestNodeDeletionDoesNotSyncNginxForDirectWebSocket(t *testing.T) {
 	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
 	createRemoteDomainCertificate(t, repo, server.ID, "edge.example.test")
 	handler := &nodesHandler{repo: repo, remoteManage: NewRemoteManageHandler(repo, nil)}
-	handler.deleteRemoteInbound(context.Background(), server.Name, "plain-vmess-ws")
+	handler.deleteRemoteInbound(context.Background(), server.Name, "plain-vmess-ws", "")
 
 	if !removed.Load() {
 		t.Fatal("plain WS inbound was not removed")
@@ -359,7 +359,7 @@ func TestNodeDeletionSyncsNginxForManagedWSS(t *testing.T) {
 	remote := NewRemoteManageHandler(repo, nil)
 	attachRemoteCertificateHandler(t, repo, remote)
 	handler := &nodesHandler{repo: repo, remoteManage: remote}
-	handler.deleteRemoteInbound(context.Background(), server.Name, "managed-vmess-wss")
+	handler.deleteRemoteInbound(context.Background(), server.Name, "managed-vmess-wss", "")
 
 	if !removed.Load() {
 		t.Fatal("managed WSS inbound was not removed")
@@ -417,17 +417,18 @@ func TestHandleInboundsLeavesDirectWebSocketConfigurationIntact(t *testing.T) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
 			var request struct {
-				Inbound map[string]interface{} `json:"inbound"`
+				Inbound    map[string]interface{} `json:"inbound"`
+				MutationID string                 `json:"mutation_id"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 			forwarded <- request.Inbound
-			_, _ = w.Write([]byte(`{"success":true}`))
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "mutation_id": request.MutationID})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/child/inbounds":
 			inboundGets.Add(1)
-			_, _ = w.Write([]byte(`{"success":true,"inbounds":[]}`))
+			_, _ = w.Write([]byte(`{"success":true,"inbounds":[],"mutation_fence_known":true,"mutation_owners":{}}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/nginx/setup-ssl":
 			nginxWrites.Add(1)
 			_, _ = w.Write([]byte(`{"success":true}`))

@@ -172,6 +172,9 @@ func scanSubscriptionLink(scanner rowScanner) (SubscriptionLink, error) {
 	if err := scanner.Scan(&link.ID, &link.Name, &link.Type, &link.Description, &link.RuleFilename, &buttons, &link.ShortURL, &link.CreatedAt, &link.UpdatedAt); err != nil {
 		return SubscriptionLink{}, err
 	}
+	if err := ValidateSubscribeFilename(link.RuleFilename); err != nil {
+		return SubscriptionLink{}, fmt.Errorf("invalid stored subscription rule filename for id %d: %w", link.ID, err)
+	}
 
 	link.Buttons = decodeSubscriptionButtons(buttons)
 
@@ -186,8 +189,11 @@ var (
 	ErrSubscriptionNotFound          = errors.New("subscription link not found")
 	ErrSubscriptionExists            = errors.New("subscription link already exists")
 	ErrNodeNotFound                  = errors.New("node not found")
+	ErrNodeMutationChanged           = errors.New("node inbound mutation changed during operation")
 	ErrSubscribeFileNotFound         = errors.New("subscribe file not found")
 	ErrSubscribeFileExists           = errors.New("subscribe file already exists")
+	ErrSubscribeFileChanged          = errors.New("subscribe file changed during operation")
+	ErrSubscribeFilenameHistory      = errors.New("subscribe filename has archived history")
 	ErrCustomShortCodeExists         = errors.New("该短码已被占用，请更换一个")
 	ErrSharedServerNotFound          = errors.New("shared server not found")
 	ErrFederatedServerNotFound       = errors.New("federated server not found")
@@ -481,6 +487,7 @@ type Node struct {
 	OriginalServer    string
 	OriginalDomain    string // IP 解析功能专用：解析为 IP 前的原始域名（用于"恢复域名"）。与 OriginalServer（服务器名/路由键）严格区分
 	InboundTag        string // 关联入站标签（用于将节点链接到入站）
+	InboundMutationID string // 创建该远端入站的 mutation_id；删除时作为所有权 fencing token
 	ChainProxyNodeID  *int64 // 链式代理目标节点 ID
 	NodeType          string // 'physical' (默认) 或 'routed' (路由出站虚拟节点)
 	ParentNodeID      *int64 // routed 节点指向其父物理节点
@@ -1407,6 +1414,9 @@ CREATE INDEX IF NOT EXISTS idx_nodes_enabled ON nodes(enabled);
 	if err := r.ensureNodeColumn("inbound_tag", "TEXT"); err != nil {
 		return err
 	}
+	if err := r.ensureNodeColumn("inbound_mutation_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	if err := r.ensureNodeColumn("chain_proxy_node_id", "INTEGER"); err != nil {
 		return err
 	}
@@ -1496,6 +1506,9 @@ CREATE INDEX IF NOT EXISTS idx_subscribe_files_type ON subscribe_files(type);
 
 	if _, err := r.db.Exec(subscribeFilesSchema); err != nil {
 		return fmt.Errorf("migrate subscribe_files: %w", err)
+	}
+	if err := r.ensureUniqueSubscribeFilenames(); err != nil {
+		return err
 	}
 
 	// 用户-订阅关联表（多对多关系）
@@ -2887,6 +2900,9 @@ CREATE TABLE IF NOT EXISTS traffic_threshold_notified (
 	if err := r.migrateManagedInboundResources(); err != nil {
 		return err
 	}
+	if err := r.migrateRemoteInboundOwnership(); err != nil {
+		return err
+	}
 	if err := r.migrateForwarding(); err != nil {
 		return err
 	}
@@ -3088,6 +3104,9 @@ func (r *TrafficRepository) CreateSubscriptionLink(ctx context.Context, link Sub
 	if link.RuleFilename == "" {
 		return SubscriptionLink{}, errors.New("rule filename is required")
 	}
+	if err := ValidateSubscribeFilename(link.RuleFilename); err != nil {
+		return SubscriptionLink{}, err
+	}
 
 	encodedButtons, err := encodeSubscriptionButtons(link.Buttons)
 	if err != nil {
@@ -3134,6 +3153,9 @@ func (r *TrafficRepository) UpdateSubscriptionLink(ctx context.Context, link Sub
 	}
 	if link.RuleFilename == "" {
 		return SubscriptionLink{}, errors.New("rule filename is required")
+	}
+	if err := ValidateSubscribeFilename(link.RuleFilename); err != nil {
+		return SubscriptionLink{}, err
 	}
 
 	encodedButtons, err := encodeSubscriptionButtons(link.Buttons)
@@ -3195,6 +3217,9 @@ func (r *TrafficRepository) CountSubscriptionsByFilename(ctx context.Context, fi
 	filename = strings.TrimSpace(filename)
 	if filename == "" {
 		return 0, errors.New("rule filename is required")
+	}
+	if err := ValidateSubscribeFilename(filename); err != nil {
+		return 0, err
 	}
 
 	var count int64
@@ -4362,6 +4387,9 @@ func (r *TrafficRepository) GetSubscriptionByShortURL(ctx context.Context, short
 		}
 		return "", fmt.Errorf("query subscription by short URL: %w", err)
 	}
+	if err := ValidateSubscribeFilename(filename); err != nil {
+		return "", fmt.Errorf("invalid stored subscription rule filename: %w", err)
+	}
 
 	return filename, nil
 }
@@ -4383,6 +4411,9 @@ func (r *TrafficRepository) GetFilenameByFileShortCode(ctx context.Context, file
 			return "", ErrSubscribeFileNotFound
 		}
 		return "", fmt.Errorf("query subscribe file by file short code: %w", err)
+	}
+	if err := ValidateSubscribeFilename(filename); err != nil {
+		return "", fmt.Errorf("invalid stored subscribe filename: %w", err)
 	}
 
 	return filename, nil
@@ -4593,6 +4624,9 @@ func (r *TrafficRepository) GetFilenameByCustomShortCode(ctx context.Context, co
 		}
 		return "", fmt.Errorf("query subscribe file by custom short code: %w", err)
 	}
+	if err := ValidateSubscribeFilename(filename); err != nil {
+		return "", fmt.Errorf("invalid stored subscribe filename: %w", err)
+	}
 	return filename, nil
 }
 
@@ -4606,6 +4640,9 @@ func (r *TrafficRepository) SaveRuleVersion(ctx context.Context, filename, conte
 	createdBy = strings.TrimSpace(createdBy)
 	if filename == "" {
 		return 0, errors.New("filename is required")
+	}
+	if err := ValidateSubscribeFilename(filename); err != nil {
+		return 0, err
 	}
 	if createdBy == "" {
 		return 0, errors.New("createdBy is required")
@@ -4640,6 +4677,204 @@ func (r *TrafficRepository) SaveRuleVersion(ctx context.Context, filename, conte
 	return newVersion, nil
 }
 
+// SaveRuleVersionWithoutSubscribe archives a standalone rule only while no
+// subscription owns the filename. The single INSERT statement is the database
+// fence: if create/rename wins first it inserts zero rows; if this insert wins,
+// create/rename observes the new history and refuses to claim the scope.
+func (r *TrafficRepository) SaveRuleVersionWithoutSubscribe(ctx context.Context, filename, content, createdBy string) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("traffic repository not initialized")
+	}
+	filename = strings.TrimSpace(filename)
+	createdBy = strings.TrimSpace(createdBy)
+	if err := ValidateSubscribeFilename(filename); err != nil {
+		return 0, err
+	}
+	if createdBy == "" {
+		return 0, errors.New("createdBy is required")
+	}
+	var version int64
+	err := r.db.QueryRowContext(ctx, `INSERT INTO rule_versions (filename, version, content, created_by)
+		SELECT ?, COALESCE((SELECT MAX(version) FROM rule_versions WHERE filename = ?), 0) + 1, ?, ?
+		WHERE NOT EXISTS (SELECT 1 FROM subscribe_files WHERE filename = ?)
+		RETURNING version`, filename, filename, content, createdBy, filename).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrSubscribeFileChanged
+	}
+	if err != nil {
+		return 0, fmt.Errorf("insert standalone rule version: %w", err)
+	}
+	return version, nil
+}
+
+// SaveRuleVersionForSubscribe fences an archived write to the subscription ID
+// and filename observed by the caller. A concurrent rename that commits first
+// makes the insert fail closed instead of recreating history under the old
+// filename/scope.
+func (r *TrafficRepository) SaveRuleVersionForSubscribe(ctx context.Context, subscribeID int64, filename, content, createdBy string) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("traffic repository not initialized")
+	}
+	filename = strings.TrimSpace(filename)
+	createdBy = strings.TrimSpace(createdBy)
+	if subscribeID <= 0 || filename == "" || createdBy == "" {
+		return 0, errors.New("subscription id, filename and createdBy are required")
+	}
+	if err := ValidateSubscribeFilename(filename); err != nil {
+		return 0, err
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin fenced rule version: %w", err)
+	}
+	defer tx.Rollback()
+	var active int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM subscribe_files WHERE id = ? AND filename = ?`, subscribeID, filename).Scan(&active); err != nil {
+		return 0, fmt.Errorf("verify fenced rule version subscription: %w", err)
+	}
+	if active != 1 {
+		return 0, ErrSubscribeFileChanged
+	}
+
+	var currentVersion sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(version) FROM rule_versions WHERE filename = ?`, filename).Scan(&currentVersion); err != nil {
+		return 0, fmt.Errorf("query fenced max version: %w", err)
+	}
+	newVersion := int64(1)
+	if currentVersion.Valid {
+		newVersion = currentVersion.Int64 + 1
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rule_versions (filename, version, content, created_by) VALUES (?, ?, ?, ?)`, filename, newVersion, content, createdBy); err != nil {
+		return 0, fmt.Errorf("insert fenced rule version: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit fenced rule version: %w", err)
+	}
+	return newVersion, nil
+}
+
+// ListAllRuleVersionContents returns every archived rule payload. It is kept
+// separate from ListRuleVersions because startup migrations need the stable DB
+// row ID and must not be limited to one filename or a display-oriented limit.
+func (r *TrafficRepository) ListAllRuleVersionContents(ctx context.Context) ([]RuleVersionContent, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+
+	rows, err := r.db.QueryContext(ctx, `SELECT id, filename, content FROM rule_versions ORDER BY id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query all rule version contents: %w", err)
+	}
+	defer rows.Close()
+
+	var versions []RuleVersionContent
+	for rows.Next() {
+		var version RuleVersionContent
+		if err := rows.Scan(&version.ID, &version.Filename, &version.Content); err != nil {
+			return nil, fmt.Errorf("scan rule version content: %w", err)
+		}
+		if err := ValidateSubscribeFilename(version.Filename); err != nil {
+			return nil, fmt.Errorf("invalid stored rule version filename for id %d: %w", version.ID, err)
+		}
+		versions = append(versions, version)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rule version contents: %w", err)
+	}
+	return versions, nil
+}
+
+// ListRuleVersionContentsByFilename returns every archived payload and its
+// stable row ID for a filename-scoped secret rebind.
+func (r *TrafficRepository) ListRuleVersionContentsByFilename(ctx context.Context, filename string) ([]RuleVersionContent, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	filename = strings.TrimSpace(filename)
+	if filename == "" {
+		return nil, errors.New("filename is required")
+	}
+	if err := ValidateSubscribeFilename(filename); err != nil {
+		return nil, err
+	}
+
+	rows, err := r.db.QueryContext(ctx, `SELECT id, filename, content FROM rule_versions WHERE filename = ? ORDER BY id ASC`, filename)
+	if err != nil {
+		return nil, fmt.Errorf("query rule version contents by filename: %w", err)
+	}
+	defer rows.Close()
+
+	var versions []RuleVersionContent
+	for rows.Next() {
+		var version RuleVersionContent
+		if err := rows.Scan(&version.ID, &version.Filename, &version.Content); err != nil {
+			return nil, fmt.Errorf("scan rule version content by filename: %w", err)
+		}
+		versions = append(versions, version)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rule version contents by filename: %w", err)
+	}
+	return versions, nil
+}
+
+// UpdateRuleVersionContents applies a startup content migration atomically.
+// A missing row is treated as an error so a partially stale migration plan can
+// never leave only some archived subscription versions updated.
+func (r *TrafficRepository) UpdateRuleVersionContents(ctx context.Context, updates map[int64]string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+
+	ids := make([]int64, 0, len(updates))
+	for id := range updates {
+		if id <= 0 {
+			return fmt.Errorf("rule version id must be positive: %d", id)
+		}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin rule version content update: %w", err)
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		result, err := tx.ExecContext(ctx, `UPDATE rule_versions SET content = ? WHERE id = ?`, updates[id], id)
+		if err != nil {
+			return fmt.Errorf("update rule version %d content: %w", id, err)
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("verify rule version %d content update: %w", id, err)
+		}
+		if updated != 1 {
+			return fmt.Errorf("rule version %d not found", id)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit rule version content update: %w", err)
+	}
+	// Rule-version migrations can replace legacy plaintext secret material.
+	// Compact after commit so the previous payload is not recoverable from WAL
+	// frames or freed SQLite pages.
+	if _, err := r.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("checkpoint rule version content update: %w", err)
+	}
+	if _, err := r.db.ExecContext(ctx, `VACUUM`); err != nil {
+		return fmt.Errorf("compact rule version content update: %w", err)
+	}
+	if _, err := r.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("finalize rule version content update: %w", err)
+	}
+	return nil
+}
+
 // 返回文件的最新规则版本。
 func (r *TrafficRepository) ListRuleVersions(ctx context.Context, filename string, limit int) ([]RuleVersion, error) {
 	if r == nil || r.db == nil {
@@ -4649,6 +4884,9 @@ func (r *TrafficRepository) ListRuleVersions(ctx context.Context, filename strin
 	filename = strings.TrimSpace(filename)
 	if filename == "" {
 		return nil, errors.New("filename is required")
+	}
+	if err := ValidateSubscribeFilename(filename); err != nil {
+		return nil, err
 	}
 
 	if limit <= 0 {
@@ -4697,6 +4935,13 @@ type RuleVersion struct {
 	Content   string
 	CreatedBy string
 	CreatedAt time.Time
+}
+
+// RuleVersionContent is the minimal stable record used by content migrations.
+type RuleVersionContent struct {
+	ID       int64
+	Filename string
+	Content  string
 }
 
 // 用户代表存储在存储库中的经过身份验证的帐户。

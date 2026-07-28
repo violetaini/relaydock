@@ -22,6 +22,7 @@ type ManagedInboundResource struct {
 	DisplayName        string          `json:"display_name"`
 	Protocol           string          `json:"protocol"`
 	InboundTag         string          `json:"inbound_tag"`
+	MutationID         string          `json:"-"`
 	EndpointHost       string          `json:"endpoint_host"`
 	EndpointPort       int             `json:"endpoint_port"`
 	PublicMetadataJSON json.RawMessage `json:"-"`
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS managed_inbound_resources (
     display_name TEXT NOT NULL,
     protocol TEXT NOT NULL,
     inbound_tag TEXT NOT NULL,
+    mutation_id TEXT NOT NULL DEFAULT '',
     endpoint_host TEXT NOT NULL DEFAULT '',
     endpoint_port INTEGER NOT NULL,
     public_metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -55,6 +57,9 @@ CREATE INDEX IF NOT EXISTS idx_managed_inbound_resources_server
 	if _, err := r.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate managed_inbound_resources: %w", err)
 	}
+	if err := r.ensureTableColumn("managed_inbound_resources", "mutation_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate managed_inbound_resources mutation_id: %w", err)
+	}
 	return nil
 }
 
@@ -65,6 +70,7 @@ func normalizeManagedInboundResource(resource *ManagedInboundResource) error {
 	resource.DisplayName = strings.TrimSpace(resource.DisplayName)
 	resource.Protocol = strings.ToLower(strings.TrimSpace(resource.Protocol))
 	resource.InboundTag = strings.TrimSpace(resource.InboundTag)
+	resource.MutationID = strings.TrimSpace(resource.MutationID)
 	resource.EndpointHost = strings.TrimSpace(resource.EndpointHost)
 	resource.CreatedBy = strings.TrimSpace(resource.CreatedBy)
 	if resource.ServerID <= 0 {
@@ -128,7 +134,7 @@ func managedInboundSecretKey(value interface{}) string {
 
 const managedInboundResourceSelect = `
 SELECT r.id, r.server_id, COALESCE(s.name, ''), r.display_name, r.protocol,
-       r.inbound_tag, r.endpoint_host, r.endpoint_port, r.public_metadata_json,
+       r.inbound_tag, COALESCE(r.mutation_id, ''), r.endpoint_host, r.endpoint_port, r.public_metadata_json,
        r.created_by, r.created_at, r.updated_at
 FROM managed_inbound_resources r
 LEFT JOIN remote_servers s ON s.id = r.server_id`
@@ -147,6 +153,7 @@ func scanManagedInboundResource(scanner managedInboundResourceScanner) (*Managed
 		&resource.DisplayName,
 		&resource.Protocol,
 		&resource.InboundTag,
+		&resource.MutationID,
 		&resource.EndpointHost,
 		&resource.EndpointPort,
 		&metadata,
@@ -173,11 +180,11 @@ func (r *TrafficRepository) CreateManagedInboundResource(ctx context.Context, re
 	now := time.Now().UTC()
 	result, err := r.db.ExecContext(ctx, `
 INSERT INTO managed_inbound_resources
-    (server_id, display_name, protocol, inbound_tag, endpoint_host, endpoint_port,
+    (server_id, display_name, protocol, inbound_tag, mutation_id, endpoint_host, endpoint_port,
      public_metadata_json, created_by, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		resource.ServerID, resource.DisplayName, resource.Protocol, resource.InboundTag,
-		resource.EndpointHost, resource.EndpointPort, string(resource.PublicMetadataJSON),
+		resource.MutationID, resource.EndpointHost, resource.EndpointPort, string(resource.PublicMetadataJSON),
 		resource.CreatedBy, now, now,
 	)
 	if err != nil {
@@ -202,17 +209,21 @@ func (r *TrafficRepository) UpsertManagedInboundResource(ctx context.Context, re
 	now := time.Now().UTC()
 	_, err := r.db.ExecContext(ctx, `
 INSERT INTO managed_inbound_resources
-    (server_id, display_name, protocol, inbound_tag, endpoint_host, endpoint_port,
+    (server_id, display_name, protocol, inbound_tag, mutation_id, endpoint_host, endpoint_port,
      public_metadata_json, created_by, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(server_id, inbound_tag) DO UPDATE SET
     protocol = excluded.protocol,
+    mutation_id = CASE
+        WHEN excluded.mutation_id != '' THEN excluded.mutation_id
+        ELSE managed_inbound_resources.mutation_id
+    END,
     endpoint_host = excluded.endpoint_host,
     endpoint_port = excluded.endpoint_port,
     public_metadata_json = excluded.public_metadata_json,
     updated_at = excluded.updated_at`,
 		resource.ServerID, resource.DisplayName, resource.Protocol, resource.InboundTag,
-		resource.EndpointHost, resource.EndpointPort, string(resource.PublicMetadataJSON),
+		resource.MutationID, resource.EndpointHost, resource.EndpointPort, string(resource.PublicMetadataJSON),
 		resource.CreatedBy, now, now,
 	)
 	if err != nil {
@@ -312,6 +323,42 @@ func (r *TrafficRepository) DeleteManagedInboundResourceByServerTag(ctx context.
 	result, err := r.db.ExecContext(ctx, `DELETE FROM managed_inbound_resources WHERE server_id = ? AND inbound_tag = ?`, serverID, strings.TrimSpace(inboundTag))
 	if err != nil {
 		return 0, fmt.Errorf("delete managed inbound resource by server and tag: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read deleted managed inbound resource count: %w", err)
+	}
+	return count, nil
+}
+
+func (r *TrafficRepository) DeleteManagedInboundResourceIfMutation(ctx context.Context, id int64, mutationID string) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("traffic repository not initialized")
+	}
+	result, err := r.db.ExecContext(ctx,
+		`DELETE FROM managed_inbound_resources WHERE id = ? AND COALESCE(mutation_id, '') = ?`,
+		id, strings.TrimSpace(mutationID),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("delete managed inbound resource by mutation: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read deleted managed inbound resource count: %w", err)
+	}
+	return count, nil
+}
+
+func (r *TrafficRepository) DeleteManagedInboundResourceByServerTagMutation(ctx context.Context, serverID int64, inboundTag, mutationID string) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("traffic repository not initialized")
+	}
+	result, err := r.db.ExecContext(ctx,
+		`DELETE FROM managed_inbound_resources WHERE server_id = ? AND inbound_tag = ? AND COALESCE(mutation_id, '') = ?`,
+		serverID, strings.TrimSpace(inboundTag), strings.TrimSpace(mutationID),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("delete managed inbound resource by server, tag, and mutation: %w", err)
 	}
 	count, err := result.RowsAffected()
 	if err != nil {

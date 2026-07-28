@@ -678,11 +678,8 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 	}
 	// 删除该用户残留的套餐订阅(历史 auto-gen 文件)
 	if sf, err := repo.GetUserPackageSubscription(ctx, username); err == nil && sf.ID > 0 {
-		if derr := repo.DeleteSubscribeFile(ctx, sf.ID); derr != nil {
+		if derr := deleteSubscribeFileAndPhysical(ctx, repo, "subscribes", sf); derr != nil {
 			log.Printf("[PackageUnbind] 删除用户 %s 套餐订阅记录失败: %v", username, derr)
-		}
-		if sf.Filename != "" {
-			_ = os.Remove(filepath.Join("subscribes", sf.Filename))
 		}
 	}
 	return nil
@@ -1240,21 +1237,65 @@ func (h *PackageAssignHandler) autoGenerateSubscription(ctx context.Context, use
 
 	existing, err := h.repo.GetUserPackageSubscription(ctx, username)
 	if err == nil {
+		if err := storage.ValidateSubscribeFilename(existing.Filename); err != nil {
+			log.Printf("[PackageAssign] 自动生成订阅失败: 无效文件名: %v", err)
+			return
+		}
+		unlock, err := lockSubscriptionFilenames(existing.Filename)
+		if err != nil {
+			log.Printf("[PackageAssign] 自动生成订阅失败: 锁定文件错误: %v", err)
+			return
+		}
+		defer unlock()
+		fresh, err := h.repo.GetSubscribeFileByID(ctx, existing.ID)
+		if err != nil {
+			log.Printf("[PackageAssign] 自动生成订阅失败: 重新读取订阅错误: %v", err)
+			return
+		}
+		existing = fresh
+		if err := storage.ValidateSubscribeFilename(existing.Filename); err != nil {
+			log.Printf("[PackageAssign] 自动生成订阅失败: 无效文件名: %v", err)
+			return
+		}
 		filePath := filepath.Join("subscribes", existing.Filename)
-		if err := os.WriteFile(filePath, []byte(result), 0600); err != nil {
+		protected, protectErr := protectWireGuardSubscriptionContent(ctx, h.repo, existing.Filename, result, false)
+		if protectErr != nil {
+			log.Printf("[PackageAssign] 自动生成订阅失败: WireGuard 私钥保护错误: %v", protectErr)
+			return
+		}
+		if err := writePrivateSubscriptionFileUnlocked(filePath, []byte(protected)); err != nil {
 			log.Printf("[PackageAssign] 自动生成订阅失败: 写入文件错误: %v", err)
 			return
 		}
 		existing.Name = fmt.Sprintf("%s - %s", username, pkg.Name)
 		existing.Description = "套餐自动生成"
-		h.repo.UpdateSubscribeFile(ctx, existing)
+		if _, err := h.repo.UpdateSubscribeFile(ctx, existing); err != nil {
+			log.Printf("[PackageAssign] 自动生成订阅失败: 更新记录错误: %v", err)
+			return
+		}
 		log.Printf("[PackageAssign] 已更新用户 %s 的套餐订阅文件", username)
 		return
 	}
 
 	filename := fmt.Sprintf("pkg_%s.yaml", username)
+	if err := storage.ValidateSubscribeFilename(filename); err != nil {
+		log.Printf("[PackageAssign] 自动生成订阅失败: 无效文件名: %v", err)
+		return
+	}
+	unlock, err := lockSubscriptionFilenames(filename)
+	if err != nil {
+		log.Printf("[PackageAssign] 自动生成订阅失败: 锁定文件错误: %v", err)
+		return
+	}
+	defer unlock()
 	filePath := filepath.Join("subscribes", filename)
-	if err := os.WriteFile(filePath, []byte(result), 0600); err != nil {
+	protected, protectErr := protectWireGuardSubscriptionContent(ctx, h.repo, filename, result, false)
+	if protectErr != nil {
+		log.Printf("[PackageAssign] 自动生成订阅失败: WireGuard 私钥保护错误: %v", protectErr)
+		return
+	}
+	ownership, err := writeNewPrivateSubscriptionFile(filePath, []byte(protected))
+	if err != nil {
 		log.Printf("[PackageAssign] 自动生成订阅失败: 写入文件错误: %v", err)
 		return
 	}
@@ -1268,6 +1309,7 @@ func (h *PackageAssignHandler) autoGenerateSubscription(ctx context.Context, use
 	}
 	created, err := h.repo.CreateSubscribeFile(ctx, file)
 	if err != nil {
+		_ = removeSubscriptionFileIfOwned(filePath, ownership)
 		log.Printf("[PackageAssign] 自动生成订阅失败: 创建记录错误: %v", err)
 		return
 	}

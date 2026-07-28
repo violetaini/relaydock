@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -236,6 +237,10 @@ func (h *RuleTemplatesHandler) handleUpdateTemplate(w http.ResponseWriter, r *ht
 		})
 		return
 	}
+	if err := validateRuleTemplateSecrets(payload.Content); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
 
 	// 将内容写入文件
 	if err := os.WriteFile(templatePath, []byte(payload.Content), 0644); err != nil {
@@ -460,27 +465,26 @@ func (h *RuleTemplatesHandler) handleUploadTemplate(w http.ResponseWriter, r *ht
 		return
 	}
 
-	dst, err := os.Create(templatePath)
+	// 读取文件内容(限制大小,防止 multipart 头部声明不实)
+	content, err := io.ReadAll(io.LimitReader(file, ruleTemplateMaxFileSize+1))
 	if err != nil {
-		http.Error(w, "Failed to create template file", http.StatusInternalServerError)
+		http.Error(w, "Failed to read template file", http.StatusInternalServerError)
 		return
 	}
-	defer dst.Close()
-
-	// 复制文件内容(限制大小,防止 multipart 头部声明不实)
-	written, err := io.Copy(dst, io.LimitReader(file, ruleTemplateMaxFileSize+1))
-	if err != nil {
-		os.Remove(templatePath)
-		http.Error(w, "Failed to save template file", http.StatusInternalServerError)
-		return
-	}
-	if written > ruleTemplateMaxFileSize {
-		os.Remove(templatePath)
+	if len(content) > ruleTemplateMaxFileSize {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"error": fmt.Sprintf("模板文件过大,单文件不能超过 %dMB", ruleTemplateMaxFileSize>>20),
 		})
+		return
+	}
+	if err := validateRuleTemplateSecrets(string(content)); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	if err := os.WriteFile(templatePath, content, 0644); err != nil {
+		http.Error(w, "Failed to save template file", http.StatusInternalServerError)
 		return
 	}
 
@@ -493,4 +497,62 @@ func (h *RuleTemplatesHandler) handleUploadTemplate(w http.ResponseWriter, r *ht
 		"filename": filename,
 		"message":  "模板上传成功",
 	})
+}
+
+func validateRuleTemplateSecrets(content string) error {
+	root, sources, err := wireGuardProxyPrivateKeySources(content)
+	if err != nil {
+		return fmt.Errorf("模板 YAML 无效: %w", err)
+	}
+	if len(sources) > 0 || len(scalarNodesWithPrefix(root, wireGuardSubscriptionSecretPrefix)) > 0 {
+		return fmt.Errorf("规则模板不能保存 WireGuard 客户端私钥，请在节点管理中创建节点")
+	}
+	if err := ensureNoUnprotectedPrivateKeyFields(root); err != nil {
+		return fmt.Errorf("规则模板不能保存 WireGuard 客户端私钥，请在节点管理中创建节点: %w", err)
+	}
+	return nil
+}
+
+// ValidatePersistedRuleTemplateSecrets fails startup when an existing template
+// contains a WireGuard client identity. Templates are reusable policy, not a
+// node-secret container, so encrypting a historical key in place would preserve
+// an unsafe and ambiguous template meaning. Operators must remove the identity
+// from the named template before the panel serves requests again.
+func ValidatePersistedRuleTemplateSecrets(templatesDir string) error {
+	templatesDir = filepath.Clean(strings.TrimSpace(templatesDir))
+	if templatesDir == "" || templatesDir == "." {
+		return errors.New("规则模板目录不能为空")
+	}
+	entries, err := os.ReadDir(templatesDir)
+	if err != nil {
+		return fmt.Errorf("读取规则模板目录失败: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		lowerName := strings.ToLower(name)
+		if !strings.HasSuffix(lowerName, ".yaml") && !strings.HasSuffix(lowerName, ".yml") {
+			continue
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("规则模板 %s 必须是普通文件，禁止符号链接", name)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("读取规则模板 %s 信息失败: %w", name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("规则模板 %s 必须是普通文件", name)
+		}
+		if info.Size() > ruleTemplateMaxFileSize {
+			return fmt.Errorf("规则模板 %s 超过 %dMB 上限", name, ruleTemplateMaxFileSize>>20)
+		}
+		content, err := os.ReadFile(filepath.Join(templatesDir, name))
+		if err != nil {
+			return fmt.Errorf("读取规则模板 %s 失败: %w", name, err)
+		}
+		if err := validateRuleTemplateSecrets(string(content)); err != nil {
+			return fmt.Errorf("规则模板 %s 含有禁止的客户端身份，面板已拒绝启动: %w", name, err)
+		}
+	}
+	return nil
 }

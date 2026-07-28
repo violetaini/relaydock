@@ -39,9 +39,19 @@ func (a *realitySyncAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		inbounds := cloneRealitySyncInbounds(a.inbounds)
 		a.mu.Unlock()
+		owners := make(map[string]string, len(inbounds))
+		for _, inbound := range inbounds {
+			tag, _ := inbound["tag"].(string)
+			if tag == "" {
+				continue
+			}
+			inbound["_mutation_fence_known"] = true
+			inbound["_mutation_id"] = "reality-sync-generation"
+			owners[tag] = "reality-sync-generation"
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":  true,
-			"inbounds": inbounds,
+			"success": true, "inbounds": inbounds,
+			"mutation_fence_known": true, "mutation_owners": owners,
 		})
 
 	case r.Method == http.MethodGet && r.URL.Path == "/api/child/xray/config":
@@ -52,10 +62,11 @@ func (a *realitySyncAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
 		var request struct {
-			Action  string                 `json:"action"`
-			Tag     string                 `json:"tag"`
-			Client  map[string]interface{} `json:"client"`
-			Inbound map[string]interface{} `json:"inbound"`
+			Action     string                 `json:"action"`
+			Tag        string                 `json:"tag"`
+			MutationID string                 `json:"mutation_id"`
+			Client     map[string]interface{} `json:"client"`
+			Inbound    map[string]interface{} `json:"inbound"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			http.Error(w, `{"success":false,"error":"invalid JSON"}`, http.StatusBadRequest)
@@ -74,13 +85,13 @@ func (a *realitySyncAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if inboundTag, _ := inbound["tag"].(string); inboundTag == tag {
 					a.inbounds[i] = cloneRealitySyncMap(request.Inbound)
 					a.actions = append(a.actions, realitySyncAction{Action: request.Action, Tag: tag})
-					_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "changed": true})
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "changed": true, "mutation_id": request.MutationID})
 					return
 				}
 			}
 			a.inbounds = append(a.inbounds, cloneRealitySyncMap(request.Inbound))
 			a.actions = append(a.actions, realitySyncAction{Action: request.Action, Tag: tag})
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "changed": true})
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "changed": true, "mutation_id": request.MutationID})
 			return
 		}
 		if request.Action != "add-client" && request.Action != "remove-client" {

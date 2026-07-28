@@ -79,6 +79,12 @@ func (h *RuleEditorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *RuleEditorHandler) handleList(w http.ResponseWriter, r *http.Request) {
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		http.Error(w, "锁定规则目录失败", http.StatusInternalServerError)
+		return
+	}
+	defer unlock()
 	entries, err := os.ReadDir(h.baseDir)
 	if err != nil {
 		http.Error(w, "读取规则目录失败", http.StatusInternalServerError)
@@ -132,6 +138,12 @@ func (h *RuleEditorHandler) handleGet(w http.ResponseWriter, r *http.Request, fi
 		writeBadRequest(w, err.Error())
 		return
 	}
+	unlock, err := lockSubscriptionFilenames(filename)
+	if err != nil {
+		http.Error(w, "锁定规则文件失败", http.StatusInternalServerError)
+		return
+	}
+	defer unlock()
 
 	content, err := os.ReadFile(resolved)
 	if err != nil {
@@ -142,7 +154,7 @@ func (h *RuleEditorHandler) handleGet(w http.ResponseWriter, r *http.Request, fi
 		http.Error(w, "读取规则文件失败", http.StatusInternalServerError)
 		return
 	}
-	hydratedContent, err := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, string(content))
+	hydratedContent, err := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, filename, string(content))
 	if err != nil {
 		http.Error(w, "WireGuard 节点配置暂不可用", http.StatusServiceUnavailable)
 		return
@@ -168,6 +180,12 @@ func (h *RuleEditorHandler) handleHistory(w http.ResponseWriter, r *http.Request
 		writeBadRequest(w, err.Error())
 		return
 	}
+	unlock, err := lockSubscriptionFilenames(filename)
+	if err != nil {
+		http.Error(w, "锁定规则文件失败", http.StatusInternalServerError)
+		return
+	}
+	defer unlock()
 
 	if _, err := os.Stat(resolved); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -189,7 +207,7 @@ func (h *RuleEditorHandler) handleHistory(w http.ResponseWriter, r *http.Request
 		return
 	}
 	for index := range versions {
-		hydrated, hydrateErr := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, versions[index].Content)
+		hydrated, hydrateErr := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, filename, versions[index].Content)
 		if hydrateErr != nil {
 			http.Error(w, "WireGuard 节点配置暂不可用", http.StatusServiceUnavailable)
 			return
@@ -206,6 +224,12 @@ func (h *RuleEditorHandler) handleUpdate(w http.ResponseWriter, r *http.Request,
 		writeBadRequest(w, err.Error())
 		return
 	}
+	unlock, err := lockSubscriptionFilenames(filename)
+	if err != nil {
+		http.Error(w, "锁定规则文件失败", http.StatusInternalServerError)
+		return
+	}
+	defer unlock()
 
 	if _, err := os.Stat(resolved); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -241,13 +265,13 @@ func (h *RuleEditorHandler) handleUpdate(w http.ResponseWriter, r *http.Request,
 		writeBadRequest(w, "YAML 解析失败: "+err.Error())
 		return
 	}
-	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, payload.Content)
+	protectedContent, err := protectWireGuardSubscriptionContent(r.Context(), h.repo, filename, payload.Content, false)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err)
 		return
 	}
 
-	if err := writePrivateSubscriptionFile(resolved, []byte(protectedContent)); err != nil {
+	if err := writePrivateSubscriptionFileUnlocked(resolved, []byte(protectedContent)); err != nil {
 		http.Error(w, "写入规则文件失败", http.StatusInternalServerError)
 		return
 	}
@@ -256,7 +280,15 @@ func (h *RuleEditorHandler) handleUpdate(w http.ResponseWriter, r *http.Request,
 
 	var newVersion int64
 	if h.repo != nil {
-		v, saveErr := h.repo.SaveRuleVersion(r.Context(), filename, protectedContent, username)
+		var v int64
+		var saveErr error
+		if subscribeFile, lookupErr := h.repo.GetSubscribeFileByFilename(r.Context(), filename); lookupErr == nil {
+			v, saveErr = h.repo.SaveRuleVersionForSubscribe(r.Context(), subscribeFile.ID, filename, protectedContent, username)
+		} else if errors.Is(lookupErr, storage.ErrSubscribeFileNotFound) {
+			v, saveErr = h.repo.SaveRuleVersionWithoutSubscribe(r.Context(), filename, protectedContent, username)
+		} else {
+			saveErr = lookupErr
+		}
 		if saveErr != nil {
 			http.Error(w, "保存历史版本失败", http.StatusInternalServerError)
 			return

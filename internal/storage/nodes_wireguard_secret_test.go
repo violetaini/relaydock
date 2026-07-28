@@ -36,6 +36,40 @@ func configureTestNodeSecretEncryption(t *testing.T, repo *TrafficRepository, fi
 	}
 }
 
+func TestWireGuardSubscriptionPrivateKeyIsBoundToScopeAndAuthenticated(t *testing.T) {
+	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "wireguard-subscription-secret.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	configureTestNodeSecretEncryption(t, repo, 0x2a)
+
+	ciphertext, err := repo.SealWireGuardSubscriptionPrivateKey("first.yaml", testWireGuardPrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(ciphertext, testWireGuardPrivateKey) {
+		t.Fatal("subscription ciphertext contains the plaintext private key")
+	}
+	opened, err := repo.OpenWireGuardSubscriptionPrivateKey("first.yaml", ciphertext)
+	if err != nil || opened != testWireGuardPrivateKey {
+		t.Fatalf("opened=%q err=%v", opened, err)
+	}
+	if _, err := repo.OpenWireGuardSubscriptionPrivateKey("second.yaml", ciphertext); err == nil {
+		t.Fatal("subscription ciphertext opened under a different scope")
+	}
+
+	tampered := []byte(ciphertext)
+	if tampered[len(tampered)-1] == 'A' {
+		tampered[len(tampered)-1] = 'B'
+	} else {
+		tampered[len(tampered)-1] = 'A'
+	}
+	if _, err := repo.OpenWireGuardSubscriptionPrivateKey("first.yaml", string(tampered)); err == nil {
+		t.Fatal("tampered subscription ciphertext was accepted")
+	}
+}
+
 func TestWireGuardNodePrivateKeyEncryptedAtRestAndHydrated(t *testing.T) {
 	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "wireguard-secret.db"))
 	if err != nil {
@@ -98,6 +132,89 @@ func TestWireGuardNodeWriteFailsClosedWithoutEncryption(t *testing.T) {
 	}
 }
 
+func TestWireGuardNodeRejectsDeclaredProtocolMismatchAndAcceptsWGAlias(t *testing.T) {
+	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "wireguard-protocol-evidence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	configureTestNodeSecretEncryption(t, repo, 0x35)
+	config := testWireGuardNodeConfig("WG")
+
+	for _, candidate := range []Node{
+		{Username: "admin", NodeName: "Disguised type", Protocol: "vless", ParsedConfig: config, ClashConfig: config, Enabled: true},
+		{Username: "admin", NodeName: "Disguised URL", Protocol: "vless", RawURL: "wg://" + testWireGuardPrivateKey + "@203.0.113.10:51820", ClashConfig: `{"name":"ordinary","type":"vless"}`, Enabled: true},
+		{Username: "admin", NodeName: "Conflicting config", Protocol: "wireguard", ParsedConfig: config, ClashConfig: `{"name":"wrong","type":"vless"}`, Enabled: true},
+	} {
+		if _, err := repo.CreateNode(context.Background(), candidate); err == nil || !strings.Contains(err.Error(), "conflict") {
+			t.Fatalf("CreateNode(%s) err=%v, want protocol conflict", candidate.NodeName, err)
+		}
+	}
+	var count int
+	if err := repo.db.QueryRow(`SELECT COUNT(1) FROM nodes`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rejected protocol mismatches left %d rows: %v", count, err)
+	}
+
+	created, err := repo.CreateNode(context.Background(), Node{
+		Username: "admin", NodeName: "Alias WG", Protocol: "wg",
+		ParsedConfig: strings.ReplaceAll(config, `"type":"wireguard"`, `"type":"wg"`),
+		ClashConfig:  strings.ReplaceAll(config, `"type":"wireguard"`, `"type":"wg"`),
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Protocol != "wireguard" || !strings.Contains(created.ClashConfig, testWireGuardPrivateKey) {
+		t.Fatalf("wg alias was not canonicalized and hydrated: %+v", created)
+	}
+}
+
+func TestWireGuardStartupRejectsDisguisedLegacyPlaintextAndMigratesWGAlias(t *testing.T) {
+	t.Run("disguised protocol fails closed", func(t *testing.T) {
+		repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "wireguard-disguised-startup.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer repo.Close()
+		config := testWireGuardNodeConfig("Disguised")
+		if _, err := repo.db.Exec(`INSERT INTO nodes(username, raw_url, node_name, protocol, parsed_config, clash_config, enabled) VALUES('admin', '', 'Disguised', 'vless', ?, ?, 1)`, config, config); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.ConfigureNodeSecretEncryption(bytes.Repeat([]byte{0x36}, 32)); err == nil || !strings.Contains(err.Error(), "conflict") {
+			t.Fatalf("ConfigureNodeSecretEncryption err=%v, want fail-closed protocol conflict", err)
+		}
+		var stored string
+		if err := repo.db.QueryRow(`SELECT clash_config FROM nodes WHERE node_name = 'Disguised'`).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(stored, testWireGuardPrivateKey) {
+			t.Fatal("rejected startup partially modified the disguised row")
+		}
+	})
+
+	t.Run("wg alias is canonicalized", func(t *testing.T) {
+		repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "wireguard-alias-startup.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer repo.Close()
+		config := strings.ReplaceAll(testWireGuardNodeConfig("Alias"), `"type":"wireguard"`, `"type":"wg"`)
+		result, err := repo.db.Exec(`INSERT INTO nodes(username, raw_url, node_name, protocol, parsed_config, clash_config, enabled) VALUES('admin', '', 'Alias', 'wg', ?, ?, 1)`, config, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, _ := result.LastInsertId()
+		configureTestNodeSecretEncryption(t, repo, 0x37)
+		var protocol, stored string
+		if err := repo.db.QueryRow(`SELECT protocol, clash_config FROM nodes WHERE id = ?`, id).Scan(&protocol, &stored); err != nil {
+			t.Fatal(err)
+		}
+		if protocol != "wireguard" || strings.Contains(stored, testWireGuardPrivateKey) {
+			t.Fatalf("alias migration protocol=%q config=%s", protocol, stored)
+		}
+	})
+}
+
 func TestWireGuardNodeRequiresPrivateKeyAndRejectsProtocolChange(t *testing.T) {
 	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "wireguard-required-key.db"))
 	if err != nil {
@@ -138,6 +255,80 @@ func TestWireGuardNodeRequiresPrivateKeyAndRejectsProtocolChange(t *testing.T) {
 	}
 	if err := repo.MarkNodeAsRouted(context.Background(), created.ID, "blocked-outbound", 0); err == nil || !strings.Contains(err.Error(), "cannot be converted") {
 		t.Fatalf("WireGuard routed conversion err=%v", err)
+	}
+}
+
+func TestStagedWireGuardNodeMutationCAS(t *testing.T) {
+	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "wireguard-staged-cas.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	configureTestNodeSecretEncryption(t, repo, 0x5a)
+	ctx := context.Background()
+	config := testWireGuardNodeConfig("staged")
+	staged, err := repo.CreateNode(ctx, Node{
+		Username: "admin", NodeName: "staged", Protocol: "wireguard",
+		ParsedConfig: config, ClashConfig: config, Enabled: false,
+		InboundMutationID: "managed-wireguard:generation-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, err := repo.GetStagedWireGuardNodeByMutation(ctx, staged.InboundMutationID)
+	if err != nil || found.ID != staged.ID || !strings.Contains(found.ClashConfig, testWireGuardPrivateKey) {
+		t.Fatalf("found=%+v err=%v", found, err)
+	}
+	attached, err := repo.AttachStagedWireGuardNodeIfMutation(ctx, staged.ID, staged.InboundMutationID, "edge-a", "wireguard-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !attached.Enabled || attached.OriginalServer != "edge-a" || attached.InboundTag != "wireguard-a" {
+		t.Fatalf("attached=%+v", attached)
+	}
+	if deleted, err := repo.DeleteStagedWireGuardNodeIfMutation(ctx, staged.ID, staged.InboundMutationID); err != nil || deleted {
+		t.Fatalf("attached node deleted=%v err=%v", deleted, err)
+	}
+	if _, err := repo.GetNodeByID(ctx, staged.ID); err != nil {
+		t.Fatalf("attached node disappeared: %v", err)
+	}
+}
+
+func TestDeleteStagedWireGuardNodeRejectsOtherRowsAndDuplicateMutation(t *testing.T) {
+	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "wireguard-staged-guard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	configureTestNodeSecretEncryption(t, repo, 0x5b)
+	ctx := context.Background()
+	config := testWireGuardNodeConfig("staged")
+	first, err := repo.CreateNode(ctx, Node{
+		Username: "admin", NodeName: "first", Protocol: "wireguard",
+		ParsedConfig: config, ClashConfig: config, Enabled: false, InboundMutationID: "duplicate",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondConfig := strings.ReplaceAll(config, `"name":"staged"`, `"name":"second"`)
+	second, err := repo.CreateNode(ctx, Node{
+		Username: "admin", NodeName: "second", Protocol: "wireguard",
+		ParsedConfig: secondConfig, ClashConfig: secondConfig, Enabled: false, InboundMutationID: "duplicate",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.GetStagedWireGuardNodeByMutation(ctx, "duplicate"); err == nil || !strings.Contains(err.Error(), "multiple staged") {
+		t.Fatalf("duplicate lookup err=%v", err)
+	}
+	if deleted, err := repo.DeleteStagedWireGuardNodeIfMutation(ctx, first.ID, "wrong"); err != nil || deleted {
+		t.Fatalf("wrong mutation deleted=%v err=%v", deleted, err)
+	}
+	if deleted, err := repo.DeleteStagedWireGuardNodeIfMutation(ctx, second.ID, "duplicate"); err != nil || !deleted {
+		t.Fatalf("exact staged delete=%v err=%v", deleted, err)
+	}
+	if _, err := repo.GetNodeByID(ctx, first.ID); err != nil {
+		t.Fatalf("other staged row was removed: %v", err)
 	}
 }
 

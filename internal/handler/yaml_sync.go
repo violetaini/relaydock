@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"miaomiaowux/internal/logger"
+	"miaomiaowux/internal/storage"
 	"os"
 	"path/filepath"
 
@@ -304,7 +306,7 @@ func fixShortIdStyleInNode(node *yaml.Node) {
 }
 
 // 更新所有 YAML 订阅文件中的节点信息
-func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashConfigJSON string) error {
+func syncNodeToYAMLFiles(repo *storage.TrafficRepository, subscribeDir, oldNodeName, newNodeName string, clashConfigJSON string) error {
 	if subscribeDir == "" {
 		return fmt.Errorf("subscribe directory is empty")
 	}
@@ -318,10 +320,20 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 	// 将 nil 值转换为空字符串（例如，对于短 id 字段）
 	convertNilToEmptyString(newClashConfig)
 
-	// 获取订阅目录中的所有 YAML 文件
+	// A store-wide lock must be held before ReadDir so recovery/rename cannot
+	// change directory membership between the scan and subsequent writes.
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	entries, err := os.ReadDir(subscribeDir)
 	if err != nil {
 		return fmt.Errorf("read subscribe directory: %w", err)
+	}
+	canonical, err := canonicalSubscriptionFilenames(context.Background(), repo)
+	if err != nil {
+		return fmt.Errorf("list canonical subscriptions: %w", err)
 	}
 
 	// 处理每个 YAML 文件
@@ -336,6 +348,9 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 			continue
 		}
 		if filename == ".keep.yaml" {
+			continue
+		}
+		if _, ok := canonical[filename]; !ok {
 			continue
 		}
 
@@ -576,8 +591,12 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 		// 修复表情符号转义和引用的数字
 		fixed := RemoveUnicodeEscapeQuotes(string(output))
 
-		if err := os.WriteFile(filePath, []byte(fixed), 0644); err != nil {
-			continue // 跳过我们无法写入的文件
+		protected, err := protectWireGuardSubscriptionContent(context.Background(), repo, filename, fixed, true)
+		if err != nil {
+			return fmt.Errorf("protect WireGuard secrets in %s: %w", filename, err)
+		}
+		if err := writePrivateSubscriptionFileUnlocked(filePath, []byte(protected)); err != nil {
+			return fmt.Errorf("write subscription %s: %w", filename, err)
 		}
 	}
 
@@ -585,7 +604,7 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 }
 
 // 批量同步多个节点更新到 YAML 文件，只读写每个文件一次，避免大量节点时耗时特别高
-func batchSyncNodesToYAMLFiles(subscribeDir string, updates []NodeUpdate) error {
+func batchSyncNodesToYAMLFiles(repo *storage.TrafficRepository, subscribeDir string, updates []NodeUpdate) error {
 	if subscribeDir == "" || len(updates) == 0 {
 		return nil
 	}
@@ -620,10 +639,19 @@ func batchSyncNodesToYAMLFiles(subscribeDir string, updates []NodeUpdate) error 
 		updateMap[u.oldName] = u
 	}
 
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	// 获取所有 YAML 文件
 	entries, err := os.ReadDir(subscribeDir)
 	if err != nil {
 		return fmt.Errorf("read subscribe directory: %w", err)
+	}
+	canonical, err := canonicalSubscriptionFilenames(context.Background(), repo)
+	if err != nil {
+		return fmt.Errorf("list canonical subscriptions: %w", err)
 	}
 
 	// 处理每个 YAML 文件
@@ -637,6 +665,9 @@ func batchSyncNodesToYAMLFiles(subscribeDir string, updates []NodeUpdate) error 
 			continue
 		}
 		if filename == ".keep.yaml" {
+			continue
+		}
+		if _, ok := canonical[filename]; !ok {
 			continue
 		}
 
@@ -774,8 +805,12 @@ func batchSyncNodesToYAMLFiles(subscribeDir string, updates []NodeUpdate) error 
 		// 修复 emoji 转义和引号数字
 		fixed := RemoveUnicodeEscapeQuotes(string(output))
 
-		if err := os.WriteFile(filePath, []byte(fixed), 0644); err != nil {
-			continue
+		protected, err := protectWireGuardSubscriptionContent(context.Background(), repo, filename, fixed, true)
+		if err != nil {
+			return fmt.Errorf("protect WireGuard secrets in %s: %w", filename, err)
+		}
+		if err := writePrivateSubscriptionFileUnlocked(filePath, []byte(protected)); err != nil {
+			return fmt.Errorf("write subscription %s: %w", filename, err)
 		}
 
 		logger.Info("[YAML同步] 批量更新文件", "filename", filename)
@@ -974,16 +1009,25 @@ func reorderTopLevelFields(docNode *yaml.Node) {
 }
 
 // 从所有 YAML 订阅文件中删除节点并返回受影响的文件
-func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, error) {
+func deleteNodeFromYAMLFilesWithLog(repo *storage.TrafficRepository, subscribeDir, nodeName string) ([]string, error) {
 	affectedFiles := []string{}
 	if subscribeDir == "" {
 		return affectedFiles, fmt.Errorf("subscribe directory is empty")
 	}
 
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		return affectedFiles, err
+	}
+	defer unlock()
 	// 获取订阅目录中的所有 YAML 文件
 	entries, err := os.ReadDir(subscribeDir)
 	if err != nil {
 		return affectedFiles, fmt.Errorf("read subscribe directory: %w", err)
+	}
+	canonical, err := canonicalSubscriptionFilenames(context.Background(), repo)
+	if err != nil {
+		return affectedFiles, fmt.Errorf("list canonical subscriptions: %w", err)
 	}
 
 	// 处理每个 YAML 文件
@@ -998,6 +1042,9 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 			continue
 		}
 		if filename == ".keep.yaml" {
+			continue
+		}
+		if _, ok := canonical[filename]; !ok {
 			continue
 		}
 
@@ -1195,8 +1242,12 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 		// 后处理以修复表情符号和短 ID 格式
 		result := RemoveUnicodeEscapeQuotes(string(output))
 
-		if err := os.WriteFile(filePath, []byte(result), 0644); err != nil {
-			continue // 跳过我们无法写入的文件
+		protected, err := protectWireGuardSubscriptionContent(context.Background(), repo, filename, result, true)
+		if err != nil {
+			return affectedFiles, fmt.Errorf("protect WireGuard secrets in %s: %w", filename, err)
+		}
+		if err := writePrivateSubscriptionFileUnlocked(filePath, []byte(protected)); err != nil {
+			return affectedFiles, fmt.Errorf("write subscription %s: %w", filename, err)
 		}
 	}
 
@@ -1204,8 +1255,8 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 }
 
 // 从所有 YAML 订阅文件中删除节点（传统包装器以实现兼容性）
-func deleteNodeFromYAMLFiles(subscribeDir, nodeName string) error {
-	_, err := deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName)
+func deleteNodeFromYAMLFiles(repo *storage.TrafficRepository, subscribeDir, nodeName string) error {
+	_, err := deleteNodeFromYAMLFilesWithLog(repo, subscribeDir, nodeName)
 	return err
 }
 

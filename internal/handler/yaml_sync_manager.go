@@ -2,6 +2,7 @@ package handler
 
 import (
 	"miaomiaowux/internal/logger"
+	"miaomiaowux/internal/storage"
 	"sync"
 )
 
@@ -9,12 +10,14 @@ import (
 type YAMLSyncManager struct {
 	mu           sync.Mutex
 	subscribeDir string
+	repo         *storage.TrafficRepository
 }
 
 // 创建一个新的 YAML 同步管理器
-func NewYAMLSyncManager(subscribeDir string) *YAMLSyncManager {
+func NewYAMLSyncManager(subscribeDir string, repo *storage.TrafficRepository) *YAMLSyncManager {
 	return &YAMLSyncManager{
 		subscribeDir: subscribeDir,
+		repo:         repo,
 	}
 }
 
@@ -28,7 +31,7 @@ func (m *YAMLSyncManager) SyncNode(oldNodeName, newNodeName string, clashConfigJ
 	defer m.mu.Unlock()
 
 	logger.Info("[YAML同步] 开始同步节点", "old_name", oldNodeName, "new_name", newNodeName)
-	err := syncNodeToYAMLFiles(m.subscribeDir, oldNodeName, newNodeName, clashConfigJSON)
+	err := syncNodeToYAMLFiles(m.repo, m.subscribeDir, oldNodeName, newNodeName, clashConfigJSON)
 	if err != nil {
 		logger.Info("[YAML同步] 节点同步失败", "node_name", oldNodeName, "error", err)
 	} else {
@@ -47,7 +50,7 @@ func (m *YAMLSyncManager) DeleteNode(nodeName string) error {
 	defer m.mu.Unlock()
 
 	logger.Info("[YAML同步] 开始删除节点", "node_name", nodeName)
-	affectedFiles, err := deleteNodeFromYAMLFilesWithLog(m.subscribeDir, nodeName)
+	affectedFiles, err := deleteNodeFromYAMLFilesWithLog(m.repo, m.subscribeDir, nodeName)
 	if err != nil {
 		logger.Info("[YAML同步] 节点删除失败", "node_name", nodeName, "error", err)
 	} else if len(affectedFiles) > 0 {
@@ -75,7 +78,7 @@ func (m *YAMLSyncManager) BatchDeleteNodes(nodeNames []string) error {
 
 	// 在单个锁定操作中删除所有节点
 	for _, nodeName := range nodeNames {
-		affectedFiles, err := deleteNodeFromYAMLFilesWithLog(m.subscribeDir, nodeName)
+		affectedFiles, err := deleteNodeFromYAMLFilesWithLog(m.repo, m.subscribeDir, nodeName)
 		if err != nil {
 			logger.Info("[YAML同步] 批量删除中节点失败", "node_name", nodeName, "error", err)
 			failCount++
@@ -122,7 +125,7 @@ func (m *YAMLSyncManager) BatchSyncNodes(updates []NodeUpdate) error {
 
 	logger.Info("[YAML同步] 开始批量同步节点", "count", len(updates))
 
-	err := batchSyncNodesToYAMLFiles(m.subscribeDir, updates)
+	err := batchSyncNodesToYAMLFiles(m.repo, m.subscribeDir, updates)
 	if err != nil {
 		logger.Info("[YAML同步] 批量同步失败", "error", err)
 		return err

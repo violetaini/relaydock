@@ -59,6 +59,12 @@ func (h *subscriptionAdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Requ
 }
 
 func (h *subscriptionAdminHandler) handleList(w http.ResponseWriter, r *http.Request) {
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
 	links, err := h.repo.ListSubscriptionLinks(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -87,8 +93,14 @@ func (h *subscriptionAdminHandler) handleCreate(w http.ResponseWriter, r *http.R
 		return
 	}
 	defer file.Close()
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
 
-	filename, err := h.persistRuleFile(name, header, file, "")
+	filename, ownership, err := h.persistRuleFileLocked(r.Context(), name, header, file, "")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -104,6 +116,7 @@ func (h *subscriptionAdminHandler) handleCreate(w http.ResponseWriter, r *http.R
 
 	created, err := h.repo.CreateSubscriptionLink(r.Context(), link)
 	if err != nil {
+		_ = removeSubscriptionFileIfOwned(filepath.Join(h.baseDir, filename), ownership)
 		switch {
 		case errors.Is(err, storage.ErrSubscriptionExists):
 			writeError(w, http.StatusConflict, err)
@@ -124,6 +137,12 @@ func (h *subscriptionAdminHandler) handleUpdate(w http.ResponseWriter, r *http.R
 		writeBadRequest(w, "无效的订阅标识")
 		return
 	}
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
 
 	existing, err := h.repo.GetSubscriptionByID(r.Context(), id)
 	if err != nil {
@@ -150,6 +169,7 @@ func (h *subscriptionAdminHandler) handleUpdate(w http.ResponseWriter, r *http.R
 
 	var filename = existing.RuleFilename
 	var uploadedNewFile bool
+	var newOwnership os.FileInfo
 	if header, err := fileHeader(r.MultipartForm.File["rule_file"]); err == nil {
 		file, openErr := header.Open()
 		if openErr != nil {
@@ -158,12 +178,13 @@ func (h *subscriptionAdminHandler) handleUpdate(w http.ResponseWriter, r *http.R
 		}
 		defer file.Close()
 
-		persisted, persistErr := h.persistRuleFile(name, header, file, existing.RuleFilename)
+		persisted, ownership, persistErr := h.persistRuleFileLocked(r.Context(), name, header, file, existing.RuleFilename)
 		if persistErr != nil {
 			writeError(w, http.StatusBadRequest, persistErr)
 			return
 		}
 		filename = persisted
+		newOwnership = ownership
 		uploadedNewFile = true
 	}
 
@@ -176,6 +197,9 @@ func (h *subscriptionAdminHandler) handleUpdate(w http.ResponseWriter, r *http.R
 		RuleFilename: filename,
 	})
 	if err != nil {
+		if newOwnership != nil {
+			_ = removeSubscriptionFileIfOwned(filepath.Join(h.baseDir, filename), newOwnership)
+		}
 		status := http.StatusBadRequest
 		if errors.Is(err, storage.ErrSubscriptionNotFound) {
 			status = http.StatusNotFound
@@ -187,7 +211,7 @@ func (h *subscriptionAdminHandler) handleUpdate(w http.ResponseWriter, r *http.R
 	}
 
 	if uploadedNewFile && filename != existing.RuleFilename {
-		h.cleanupRuleFile(r.Context(), existing.RuleFilename)
+		h.cleanupRuleFileLocked(r.Context(), existing.RuleFilename)
 	}
 
 	respondJSON(w, http.StatusOK, map[string]any{
@@ -201,6 +225,12 @@ func (h *subscriptionAdminHandler) handleDelete(w http.ResponseWriter, r *http.R
 		writeBadRequest(w, "无效的订阅标识")
 		return
 	}
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer unlock()
 
 	existing, err := h.repo.GetSubscriptionByID(r.Context(), id)
 	if err != nil {
@@ -221,70 +251,87 @@ func (h *subscriptionAdminHandler) handleDelete(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	h.cleanupRuleFile(r.Context(), existing.RuleFilename)
+	h.cleanupRuleFileLocked(r.Context(), existing.RuleFilename)
 
 	respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
-func (h *subscriptionAdminHandler) persistRuleFile(name string, header *multipart.FileHeader, src multipart.File, fallback string) (string, error) {
+func (h *subscriptionAdminHandler) persistRuleFileLocked(ctx context.Context, name string, header *multipart.FileHeader, src multipart.File, fallback string) (string, os.FileInfo, error) {
 	if header == nil {
-		return fallback, nil
+		return fallback, nil, nil
 	}
 
 	ext := strings.ToLower(filepath.Ext(header.Filename))
 	if ext != ".yaml" && ext != ".yml" {
-		return "", errors.New("仅支持 YAML 规则文件")
+		return "", nil, errors.New("仅支持 YAML 规则文件")
 	}
 	if ext == ".yml" {
 		ext = ".yaml"
 	}
 
 	if header.Size > 10<<20 { // 详见上下文
-		return "", errors.New("规则文件大小不可超过 10MB")
+		return "", nil, errors.New("规则文件大小不可超过 10MB")
 	}
 
 	filename := buildRuleFilename(name, ext)
-	if err := os.MkdirAll(h.baseDir, 0o755); err != nil {
-		return "", fmt.Errorf("创建规则目录失败: %w", err)
+	if err := storage.ValidateSubscribeFilename(filename); err != nil {
+		return "", nil, err
+	}
+	content, err := io.ReadAll(io.LimitReader(src, (10<<20)+1))
+	if err != nil {
+		return "", nil, fmt.Errorf("读取规则文件失败: %w", err)
+	}
+	if len(content) > 10<<20 {
+		return "", nil, errors.New("规则文件大小不可超过 10MB")
+	}
+	protected, err := protectWireGuardSubscriptionContent(ctx, h.repo, filename, string(content), false)
+	if err != nil {
+		return "", nil, err
 	}
 
 	destination := filepath.Join(h.baseDir, filename)
-	if err := writeToFile(destination, src); err != nil {
-		return "", err
+	if filename == fallback && fallback != "" {
+		if err := writePrivateSubscriptionFileUnlocked(destination, []byte(protected)); err != nil {
+			return "", nil, fmt.Errorf("保存规则文件失败: %w", err)
+		}
+		return filename, nil, nil
 	}
-
-	return filename, nil
+	ownership, err := writeNewPrivateSubscriptionFile(destination, []byte(protected))
+	if err != nil {
+		return "", nil, fmt.Errorf("保存规则文件失败: %w", err)
+	}
+	return filename, ownership, nil
 }
 
-func (h *subscriptionAdminHandler) cleanupRuleFile(ctx context.Context, filename string) {
+func (h *subscriptionAdminHandler) cleanupRuleFileLocked(ctx context.Context, filename string) {
 	filename = strings.TrimSpace(filename)
 	if filename == "" {
 		return
 	}
-
+	if err := storage.ValidateSubscribeFilename(filename); err != nil {
+		return
+	}
 	count, err := h.repo.CountSubscriptionsByFilename(ctx, filename)
 	if err != nil || count > 0 {
 		return
 	}
-
-	path := filepath.Join(h.baseDir, filename)
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if _, err := h.repo.GetSubscribeFileByFilename(ctx, filename); err == nil {
+		return
+	} else if !errors.Is(err, storage.ErrSubscribeFileNotFound) {
 		return
 	}
-}
 
-func writeToFile(path string, src multipart.File) error {
-	out, err := os.Create(path)
+	path := filepath.Join(h.baseDir, filename)
+	ownership, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
 	if err != nil {
-		return fmt.Errorf("保存规则文件失败: %w", err)
+		return
 	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, src); err != nil {
-		return fmt.Errorf("写入规则文件失败: %w", err)
+	if err := removeSubscriptionFileIfOwned(path, ownership); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return
 	}
-
-	return nil
 }
 
 func buildRuleFilename(name, ext string) string {

@@ -42,7 +42,10 @@ func TestInboundEventDoesNotClaimOrdinaryUserNode(t *testing.T) {
 	}
 
 	listener := NewNodeSyncListener(repo, nil)
-	matched := listener.tryClaimExternalNode(ctx, server, InboundEvent{Tag: "vless-in", Protocol: "vless", Port: 443}, config)
+	matched, err := listener.tryClaimExternalNode(ctx, server, InboundEvent{Tag: "vless-in", Protocol: "vless", Port: 443}, config)
+	if err != nil {
+		t.Fatalf("claim external node: %v", err)
+	}
 	if !matched {
 		t.Fatal("expected the administrator node to be claimed")
 	}

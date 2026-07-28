@@ -16,10 +16,13 @@ import (
 	"sync"
 	"time"
 
+	"miaomiaowux/internal/acme"
 	"miaomiaowux/internal/xrpc/client"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
 	"github.com/xtls/xray-core/infra/conf"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // ChildManageHandler 处理子服务器的管理 API 请求
@@ -27,8 +30,12 @@ type ChildManageHandler struct {
 	configToken                 string // 用于身份验证的令牌
 	inboundsMu                  sync.Mutex
 	inboundMutationFencePath    string
+	inboundMutationLegacyPaths  []string
+	inboundMutationActiveConfig func() string
 	inboundMutationFencesLoaded bool
 	inboundMutationFences       map[string]inboundMutationFenceState
+	inboundMutationFenceWriter  func(string, interface{}) error
+	serviceControlCommand       func(service, action string) ([]byte, error)
 	clientExpiryMu              sync.Mutex
 	clientExpirations           map[string]managedClientExpiration
 	clientExpiryConfigPath      string
@@ -42,6 +49,12 @@ const (
 	arcwayFirewallHelperPath       = "/usr/local/sbin/arcway-agent-firewall"
 	arcwayFirewallEnvironmentPath  = "/etc/arcway-port-firewall.env"
 )
+
+var childXrayConfigPaths = []string{
+	"/usr/local/etc/xray/config.json",
+	"/etc/xray/config.json",
+	"/opt/xray/config.json",
+}
 
 type managedClientExpiration struct {
 	Tag           string    `json:"tag"`
@@ -59,11 +72,14 @@ type managedClientExpirationFile struct {
 // 创建一个新的子管理处理程序
 func NewChildManageHandler(configToken string) *ChildManageHandler {
 	h := &ChildManageHandler{
-		configToken:           configToken,
-		inboundMutationFences: make(map[string]inboundMutationFenceState),
-		clientExpirations:     make(map[string]managedClientExpiration),
-		clientExpiryWake:      make(chan struct{}, 1),
-		inboundFirewallSync:   syncArcwayInboundFirewall,
+		configToken:                 configToken,
+		inboundMutationFencePath:    defaultChildInboundMutationFencePath(),
+		inboundMutationLegacyPaths:  childInboundMutationLegacySidecars(),
+		inboundMutationActiveConfig: findChildXrayConfigPath,
+		inboundMutationFences:       make(map[string]inboundMutationFenceState),
+		clientExpirations:           make(map[string]managedClientExpiration),
+		clientExpiryWake:            make(chan struct{}, 1),
+		inboundFirewallSync:         syncArcwayInboundFirewall,
 	}
 	if configPath := h.findXrayConfigPath(); configPath != "" {
 		h.clientExpiryMu.Lock()
@@ -71,6 +87,11 @@ func NewChildManageHandler(configToken string) *ChildManageHandler {
 			log.Printf("[Child Manage] Failed to restore managed client expirations: %v", err)
 		}
 		h.clientExpiryMu.Unlock()
+		h.inboundsMu.Lock()
+		if err := h.recoverPendingInboundMutationsWithRuntimeLocked(); err != nil {
+			log.Printf("[Child Manage] Failed to recover inbound mutation ownership at startup: %v", err)
+		}
+		h.inboundsMu.Unlock()
 	}
 	go h.runManagedClientExpiryScheduler()
 	return h
@@ -122,6 +143,64 @@ func (h *ChildManageHandler) reconcileInboundFirewall() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	return h.inboundFirewallSync(ctx)
+}
+
+func (h *ChildManageHandler) lockXrayConfigMutation() error {
+	h.inboundsMu.Lock()
+	if err := h.ensureInboundMutationFencesLocked(); err != nil {
+		h.inboundsMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (h *ChildManageHandler) unlockXrayConfigMutation() {
+	h.inboundsMu.Unlock()
+}
+
+func (h *ChildManageHandler) runServiceControl(service, action string) ([]byte, error) {
+	if h.serviceControlCommand != nil {
+		return h.serviceControlCommand(service, action)
+	}
+	return exec.Command("systemctl", action, service).CombinedOutput()
+}
+
+// controlXrayServiceLocked must be called while inboundsMu is held. Starting
+// Xray can make durable config live before a crashed inbound transaction has
+// finalized its owner, so recovery is completed in the same exclusion domain.
+func (h *ChildManageHandler) controlXrayServiceLocked(action string) ([]byte, error) {
+	output, err := h.runServiceControl("xray", action)
+	if err != nil {
+		return output, err
+	}
+	if action == "start" || action == "restart" {
+		if err := h.recoverPendingInboundMutationsWithRuntimeLocked(); err != nil {
+			return output, fmt.Errorf("recover pending inbound mutations after Xray %s: %w", action, err)
+		}
+	}
+	return output, nil
+}
+
+// DeployCertificateFiles serializes the entire certificate write/restart
+// sequence with inbound mutations when Xray consumes the certificate. Keeping
+// both PEM writes inside the mutex also prevents another restart from loading a
+// temporarily mismatched certificate/key pair.
+func (h *ChildManageHandler) DeployCertificateFiles(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
+	if reloadTarget != "xray" && reloadTarget != "both" {
+		return acme.Deploy(certPEM, keyPEM, certPath, keyPath, reloadTarget)
+	}
+	if err := h.lockXrayConfigMutation(); err != nil {
+		return fmt.Errorf("inbound mutation recovery must complete before deploying an Xray certificate: %w", err)
+	}
+	defer h.unlockXrayConfigMutation()
+
+	return acme.DeployWithXrayRestarter(certPEM, keyPEM, certPath, keyPath, reloadTarget, func() error {
+		output, err := h.controlXrayServiceLocked("restart")
+		if err != nil {
+			return fmt.Errorf("restart Xray after certificate deployment: %w - %s", err, strings.TrimSpace(string(output)))
+		}
+		return nil
+	})
 }
 
 // 验证检查请求是否被授权
@@ -300,9 +379,18 @@ func (h *ChildManageHandler) HandleServiceControl(w http.ResponseWriter, r *http
 		return
 	}
 
-	// 执行systemctl命令
-	cmd := exec.Command("systemctl", req.Action, req.Service)
-	output, err := cmd.CombinedOutput()
+	var output []byte
+	var err error
+	if req.Service == "xray" {
+		// Xray lifecycle changes and inbound runtime/config mutations must never
+		// cross: a restart between runtime apply and durable config commit would
+		// otherwise resurrect the wrong generation.
+		h.inboundsMu.Lock()
+		output, err = h.controlXrayServiceLocked(req.Action)
+		h.inboundsMu.Unlock()
+	} else {
+		output, err = h.runServiceControl(req.Service, req.Action)
+	}
 	if err != nil {
 		childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to %s %s: %v - %s", req.Action, req.Service, err, string(output)))
 		return
@@ -329,6 +417,11 @@ func (h *ChildManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.Re
 		childWriteError(w, http.StatusUnauthorized, "Unauthorized")
 		return
 	}
+	if err := h.lockXrayConfigMutation(); err != nil {
+		childWriteError(w, http.StatusConflict, fmt.Sprintf("Inbound mutation recovery must complete before installing Xray: %v", err))
+		return
+	}
+	defer h.unlockXrayConfigMutation()
 
 	log.Printf("[Child Manage] Installing Xray...")
 
@@ -367,6 +460,11 @@ func (h *ChildManageHandler) HandleXrayRemove(w http.ResponseWriter, r *http.Req
 		childWriteError(w, http.StatusUnauthorized, "Unauthorized")
 		return
 	}
+	if err := h.lockXrayConfigMutation(); err != nil {
+		childWriteError(w, http.StatusConflict, fmt.Sprintf("Inbound mutation recovery must complete before removing Xray: %v", err))
+		return
+	}
+	defer h.unlockXrayConfigMutation()
 
 	log.Printf("[Child Manage] Removing Xray...")
 
@@ -462,6 +560,11 @@ func (h *ChildManageHandler) setXrayConfig(w http.ResponseWriter, r *http.Reques
 		childWriteError(w, http.StatusBadRequest, "Invalid JSON config")
 		return
 	}
+	if err := h.lockXrayConfigMutation(); err != nil {
+		childWriteError(w, http.StatusConflict, fmt.Sprintf("Inbound mutation recovery must complete before replacing Xray config: %v", err))
+		return
+	}
+	defer h.unlockXrayConfigMutation()
 
 	// 确定配置路径
 	configPath := req.Path
@@ -591,6 +694,11 @@ func (h *ChildManageHandler) updateXraySystemConfig(w http.ResponseWriter, r *ht
 		childWriteError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+	if err := h.lockXrayConfigMutation(); err != nil {
+		childWriteError(w, http.StatusConflict, fmt.Sprintf("Inbound mutation recovery must complete before updating Xray system config: %v", err))
+		return
+	}
+	defer h.unlockXrayConfigMutation()
 
 	configPath := h.findXrayConfigPath()
 	if configPath == "" {
@@ -728,10 +836,11 @@ func (h *ChildManageHandler) updateXraySystemConfig(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// 重启 Xray
-	cmd := exec.Command("systemctl", "restart", "xray")
-	if err := cmd.Run(); err != nil {
-		log.Printf("[Child Manage] Warning: failed to restart xray: %v", err)
+	// Keep config persistence and the restart in one exclusion domain.
+	output, err := h.controlXrayServiceLocked("restart")
+	if err != nil {
+		childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to restart Xray after system config update: %v - %s", err, strings.TrimSpace(string(output))))
+		return
 	}
 
 	log.Printf("[Child Manage] Xray system config updated: metrics=%v, stats=%v, grpc=%v",
@@ -1193,6 +1302,11 @@ func (h *ChildManageHandler) saveXrayConfigFile(w http.ResponseWriter, r *http.R
 		childWriteError(w, http.StatusBadRequest, "File name required")
 		return
 	}
+	if err := h.lockXrayConfigMutation(); err != nil {
+		childWriteError(w, http.StatusConflict, fmt.Sprintf("Inbound mutation recovery must complete before saving Xray config files: %v", err))
+		return
+	}
+	defer h.unlockXrayConfigMutation()
 
 	// 清理文件名
 	req.File = filepath.Base(req.File)
@@ -1485,6 +1599,12 @@ func (h *ChildManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *ChildManageHandler) listInbounds(w http.ResponseWriter, r *http.Request) {
+	h.inboundsMu.Lock()
+	defer h.inboundsMu.Unlock()
+	if err := h.recoverPendingInboundMutationsWithRuntimeLocked(); err != nil {
+		childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to recover inbound mutation ownership: %v", err))
+		return
+	}
 	// 1. 从配置文件读取入站
 	configInbounds := h.getInboundsFromConfig()
 
@@ -1493,10 +1613,79 @@ func (h *ChildManageHandler) listInbounds(w http.ResponseWriter, r *http.Request
 
 	// 3. 合并：以配置文件为基础，标记运行时状态
 	mergedInbounds := h.mergeInbounds(configInbounds, runtimeTags)
+	for _, inbound := range mergedInbounds {
+		tag, _ := inbound["tag"].(string)
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		// This authenticated inventory evidence lets the control plane recover
+		// ownership after upgrading or restoring its database. The explicit known
+		// bit distinguishes a new Agent with no owner from an old Agent that never
+		// implemented mutation fencing.
+		inbound["_mutation_fence_known"] = true
+		if owner := strings.TrimSpace(h.inboundMutationFences[tag].Owner); owner != "" {
+			inbound["_mutation_id"] = owner
+		}
+	}
+	mutationOwners := make(map[string]string)
+	for tag, state := range h.inboundMutationFences {
+		if owner := strings.TrimSpace(state.Owner); owner != "" {
+			mutationOwners[tag] = owner
+		}
+	}
 
 	childWriteJSON(w, http.StatusOK, map[string]interface{}{
-		"success":  true,
-		"inbounds": mergedInbounds,
+		"success":              true,
+		"inbounds":             mergedInbounds,
+		"mutation_fence_known": true,
+		"mutation_owners":      mutationOwners,
+	})
+}
+
+// recoverPendingInboundMutationsWithRuntimeLocked first forces the Xray
+// runtime to match its durable config, then commits or restores the owner in
+// the WAL. Clearing pending before this convergence would expose an owner for
+// a different runtime generation after a runtime-first crash.
+func (h *ChildManageHandler) recoverPendingInboundMutationsWithRuntimeLocked() error {
+	if err := h.loadInboundMutationFencesLocked(); err != nil {
+		return err
+	}
+	hasPending := false
+	for _, state := range h.inboundMutationFences {
+		if state.Pending != nil {
+			hasPending = true
+			break
+		}
+	}
+	if !hasPending {
+		return nil
+	}
+
+	apiPort := h.findXrayAPIPort()
+	if apiPort == 0 {
+		return fmt.Errorf("Xray API not available for inbound mutation recovery")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	clients, err := client.New(ctx, "127.0.0.1", uint16(apiPort))
+	if err != nil {
+		return fmt.Errorf("connect to Xray for inbound mutation recovery: %w", err)
+	}
+	defer clients.Connection.Close()
+
+	return h.resolvePendingInboundMutationsLocked(func(_ string, tag string, inbound map[string]interface{}, present bool) error {
+		if present {
+			if err := h.addInbound(ctx, clients.Handler, inbound); err != nil {
+				return fmt.Errorf("restore durable inbound %s: %w", tag, err)
+			}
+		} else if err := h.removeInbound(ctx, clients.Handler, tag); err != nil && !isInboundRuntimeAbsentError(err) {
+			return fmt.Errorf("remove non-durable inbound %s: %w", tag, err)
+		}
+		if err := h.reconcileInboundFirewall(); err != nil {
+			return fmt.Errorf("synchronize firewall with durable inbound config: %w", err)
+		}
+		return nil
 	})
 }
 
@@ -1999,6 +2188,9 @@ func (h *ChildManageHandler) expireManagedClient(entry managedClientExpiration) 
 	// Keep the same lock order as HTTP mutations: inbound first, expiry state second.
 	h.inboundsMu.Lock()
 	defer h.inboundsMu.Unlock()
+	if err := h.ensureInboundMutationFencesLocked(); err != nil {
+		return fmt.Errorf("inbound mutation recovery must complete before expiring clients: %w", err)
+	}
 
 	configPath := h.findXrayConfigPath()
 	if configPath == "" {
@@ -2247,16 +2439,29 @@ func (h *ChildManageHandler) manageInbound(w http.ResponseWriter, r *http.Reques
 	// prevents concurrent package or self-service requests from losing clients.
 	h.inboundsMu.Lock()
 	defer h.inboundsMu.Unlock()
-	if skipRemove, err := h.beginInboundMutationLocked(action, &req); err != nil {
-		childWriteError(w, http.StatusConflict, err.Error())
-		return
-	} else if skipRemove {
-		response := map[string]interface{}{"success": true, "message": "Inbound removal superseded by a newer mutation"}
-		if req.MutationID != "" {
-			response["mutation_id"] = req.MutationID
+	if action == "add-client" || action == "remove-client" {
+		if err := h.ensureInboundMutationFencesLocked(); err != nil {
+			childWriteError(w, http.StatusConflict, fmt.Sprintf("Inbound mutation recovery must complete before changing clients: %v", err))
+			return
 		}
-		childWriteJSON(w, http.StatusOK, response)
-		return
+	}
+	if action == "remove" {
+		if skipRemove, _, err := h.beginInboundMutationLocked(action, &req); err != nil {
+			childWriteError(w, http.StatusConflict, err.Error())
+			return
+		} else if skipRemove {
+			response := map[string]interface{}{
+				"success":    true,
+				"message":    "Inbound removal superseded by a newer mutation",
+				"superseded": true,
+				"changed":    false,
+			}
+			if req.MutationID != "" {
+				response["mutation_id"] = req.MutationID
+			}
+			childWriteJSON(w, http.StatusOK, response)
+			return
+		}
 	}
 
 	// 连接到本地 Xray gRPC API
@@ -2405,70 +2610,13 @@ func (h *ChildManageHandler) manageInbound(w http.ResponseWriter, r *http.Reques
 			}
 		}
 
-		// 通过 gRPC 添加
-		if err := h.addInbound(ctx, clients.Handler, req.Inbound); err != nil {
-			if original != nil {
-				if rollbackErr := h.addInbound(ctx, clients.Handler, original); rollbackErr != nil {
-					childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to add inbound: %v; failed to restore previous runtime inbound: %v", err, rollbackErr))
-					return
-				}
+		if err := h.applyInboundAddLocked(ctx, clients.Handler, configPath, &req, original); err != nil {
+			status := http.StatusInternalServerError
+			var reservationErr *inboundMutationReservationError
+			if errors.As(err, &reservationErr) {
+				status = http.StatusConflict
 			}
-			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to add inbound: %v", err))
-			return
-		}
-
-		// Only acknowledge the mutation after the on-disk config is durable. If
-		// persistence fails, restore the prior runtime state before returning an
-		// error so callers never mistake a restart-unsafe mutation for success.
-		if err := h.persistInbound(req.Inbound); err != nil {
-			var rollbackErr error
-			if original != nil {
-				rollbackErr = h.addInbound(ctx, clients.Handler, original)
-			} else {
-				rollbackErr = h.removeInbound(ctx, clients.Handler, tag)
-			}
-			if rollbackErr != nil {
-				childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist inbound: %v; failed to restore runtime state: %v", err, rollbackErr))
-				return
-			}
-			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist inbound: %v; runtime state restored", err))
-			return
-		}
-		if firewallErr := h.reconcileInboundFirewall(); firewallErr != nil {
-			rollbackFailures := make([]string, 0, 3)
-			var configRollbackErr error
-			if original != nil {
-				configRollbackErr = upsertInboundConfigFile(configPath, original)
-			} else {
-				configRollbackErr = removeInboundConfigFile(configPath, tag)
-			}
-			if configRollbackErr != nil {
-				rollbackFailures = append(rollbackFailures, "config: "+configRollbackErr.Error())
-			}
-
-			rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			var runtimeRollbackErr error
-			if original != nil {
-				runtimeRollbackErr = h.addInbound(rollbackCtx, clients.Handler, original)
-			} else {
-				runtimeRollbackErr = h.removeInbound(rollbackCtx, clients.Handler, tag)
-			}
-			rollbackCancel()
-			if runtimeRollbackErr != nil {
-				rollbackFailures = append(rollbackFailures, "runtime: "+runtimeRollbackErr.Error())
-			}
-			if configRollbackErr == nil {
-				if rollbackFirewallErr := h.reconcileInboundFirewall(); rollbackFirewallErr != nil {
-					rollbackFailures = append(rollbackFailures, "firewall: "+rollbackFirewallErr.Error())
-				}
-			}
-			message := fmt.Sprintf("Failed to synchronize inbound firewall: %v", firewallErr)
-			if len(rollbackFailures) == 0 {
-				message += "; runtime, config, and firewall state restored"
-			} else {
-				message += "; rollback failures: " + strings.Join(rollbackFailures, "; ")
-			}
-			childWriteError(w, http.StatusInternalServerError, message)
+			childWriteError(w, status, err.Error())
 			return
 		}
 
@@ -2504,8 +2652,10 @@ func (h *ChildManageHandler) manageInbound(w http.ResponseWriter, r *http.Reques
 			}
 		}
 
-		// 通过 gRPC 删除
-		if err := h.removeInbound(ctx, clients.Handler, req.Tag); err != nil {
+		// Runtime removal is idempotent. A staged control-plane record may exist
+		// even when the remote add never reached Xray; retrying its cleanup must
+		// still advance through durable config and mutation-fence cleanup.
+		if err := h.removeInbound(ctx, clients.Handler, req.Tag); err != nil && !isInboundRuntimeAbsentError(err) {
 			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove inbound: %v", err))
 			return
 		}
@@ -2582,6 +2732,133 @@ func (h *ChildManageHandler) manageInbound(w http.ResponseWriter, r *http.Reques
 	}
 }
 
+type inboundMutationReservationError struct {
+	err error
+}
+
+func (err *inboundMutationReservationError) Error() string {
+	return fmt.Sprintf("Failed to reserve inbound mutation: %v", err.err)
+}
+
+func (err *inboundMutationReservationError) Unwrap() error {
+	return err.err
+}
+
+func (h *ChildManageHandler) applyInboundAddLocked(
+	ctx context.Context,
+	handlerClient command.HandlerServiceClient,
+	configPath string,
+	req *ChildInboundRequest,
+	original map[string]interface{},
+) (returnErr error) {
+	fenceTransaction, err := h.beginInboundAddMutationLocked(req, configPath, original)
+	if err != nil {
+		return &inboundMutationReservationError{err: err}
+	}
+	defer func() {
+		if fenceTransaction == nil || !fenceTransaction.active {
+			return
+		}
+		if rollbackErr := h.rollbackInboundMutationLocked(fenceTransaction); rollbackErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("failed to restore inbound mutation ownership: %w", rollbackErr))
+		}
+	}()
+
+	tag, _ := req.Inbound["tag"].(string)
+	tag = strings.TrimSpace(tag)
+	if err := h.addInbound(ctx, handlerClient, req.Inbound); err != nil {
+		var rollbackErr error
+		if original != nil {
+			rollbackErr = h.addInbound(ctx, handlerClient, original)
+		} else {
+			rollbackErr = h.removeInbound(ctx, handlerClient, tag)
+			if isInboundRuntimeAbsentError(rollbackErr) {
+				rollbackErr = nil
+			}
+		}
+		if rollbackErr != nil {
+			// Runtime ownership is unresolved. Keep pending and let the durable
+			// config digest choose the generation after a restart or inventory read.
+			fenceTransaction.abandonForRecovery()
+			return fmt.Errorf("Failed to add inbound: %v; failed to restore previous runtime inbound: %v", err, rollbackErr)
+		}
+		return fmt.Errorf("Failed to add inbound: %w", err)
+	}
+
+	// Only acknowledge the mutation after the on-disk config is durable. If
+	// persistence fails, restore the prior runtime state before returning an
+	// error so callers never mistake a restart-unsafe mutation for success.
+	if err := upsertInboundConfigFile(configPath, req.Inbound); err != nil {
+		if atomicRenameWasApplied(err) {
+			// The intended complete config is visible, but directory durability is
+			// uncertain. Leave pending so the actual post-crash file decides owner.
+			fenceTransaction.abandonForRecovery()
+			return fmt.Errorf("Failed to durably persist inbound after config rename: %w", err)
+		}
+		var rollbackErr error
+		if original != nil {
+			rollbackErr = h.addInbound(ctx, handlerClient, original)
+		} else {
+			rollbackErr = h.removeInbound(ctx, handlerClient, tag)
+			if isInboundRuntimeAbsentError(rollbackErr) {
+				rollbackErr = nil
+			}
+		}
+		if rollbackErr != nil {
+			fenceTransaction.abandonForRecovery()
+			return fmt.Errorf("Failed to persist inbound: %v; failed to restore runtime state: %v", err, rollbackErr)
+		}
+		return fmt.Errorf("Failed to persist inbound: %v; runtime state restored", err)
+	}
+	if firewallErr := h.reconcileInboundFirewall(); firewallErr != nil {
+		rollbackFailures := make([]string, 0, 3)
+		var configRollbackErr error
+		if original != nil {
+			configRollbackErr = upsertInboundConfigFile(configPath, original)
+		} else {
+			configRollbackErr = removeInboundConfigFile(configPath, tag)
+		}
+		if configRollbackErr != nil {
+			rollbackFailures = append(rollbackFailures, "config: "+configRollbackErr.Error())
+		}
+
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		var runtimeRollbackErr error
+		if original != nil {
+			runtimeRollbackErr = h.addInbound(rollbackCtx, handlerClient, original)
+		} else {
+			runtimeRollbackErr = h.removeInbound(rollbackCtx, handlerClient, tag)
+			if isInboundRuntimeAbsentError(runtimeRollbackErr) {
+				runtimeRollbackErr = nil
+			}
+		}
+		rollbackCancel()
+		if runtimeRollbackErr != nil {
+			rollbackFailures = append(rollbackFailures, "runtime: "+runtimeRollbackErr.Error())
+		}
+		if configRollbackErr == nil {
+			if rollbackFirewallErr := h.reconcileInboundFirewall(); rollbackFirewallErr != nil {
+				rollbackFailures = append(rollbackFailures, "firewall: "+rollbackFirewallErr.Error())
+			}
+		}
+		message := fmt.Sprintf("Failed to synchronize inbound firewall: %v", firewallErr)
+		if len(rollbackFailures) == 0 {
+			message += "; runtime, config, and firewall state restored"
+		} else {
+			// At least one side effect is unresolved. The WAL must remain pending;
+			// publishing either owner here could authorize a stale deletion.
+			fenceTransaction.abandonForRecovery()
+			message += "; rollback failures: " + strings.Join(rollbackFailures, "; ")
+		}
+		return errors.New(message)
+	}
+
+	if err := h.commitInboundMutationLocked(fenceTransaction); err != nil {
+		return fmt.Errorf("Failed to commit inbound mutation ownership: %w", err)
+	}
+	return nil
+}
+
 // ================== X 射线出库管理 ==================
 
 // ChildOutboundRequest 表示出站管理请求
@@ -2647,6 +2924,11 @@ func (h *ChildManageHandler) manageOutbound(w http.ResponseWriter, r *http.Reque
 	if action == "" {
 		action = "add"
 	}
+	if err := h.lockXrayConfigMutation(); err != nil {
+		childWriteError(w, http.StatusConflict, fmt.Sprintf("Inbound mutation recovery must complete before changing outbounds: %v", err))
+		return
+	}
+	defer h.unlockXrayConfigMutation()
 
 	apiPort := h.findXrayAPIPort()
 	if apiPort == 0 {
@@ -2794,6 +3076,11 @@ func (h *ChildManageHandler) manageRouting(w http.ResponseWriter, r *http.Reques
 	if action == "" {
 		action = "set"
 	}
+	if err := h.lockXrayConfigMutation(); err != nil {
+		childWriteError(w, http.StatusConflict, fmt.Sprintf("Inbound mutation recovery must complete before changing routing: %v", err))
+		return
+	}
+	defer h.unlockXrayConfigMutation()
 
 	configPath := h.findXrayConfigPath()
 	if configPath == "" {
@@ -2880,13 +3167,11 @@ func (h *ChildManageHandler) manageRouting(w http.ResponseWriter, r *http.Reques
 // ================== 辅助函数 ==================
 
 func (h *ChildManageHandler) findXrayConfigPath() string {
-	configPaths := []string{
-		"/usr/local/etc/xray/config.json",
-		"/etc/xray/config.json",
-		"/opt/xray/config.json",
-	}
+	return findChildXrayConfigPath()
+}
 
-	for _, p := range configPaths {
+func findChildXrayConfigPath() string {
+	for _, p := range childXrayConfigPaths {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
@@ -2970,6 +3255,19 @@ func (h *ChildManageHandler) removeInbound(ctx context.Context, handlerClient co
 		Tag: tag,
 	})
 	return err
+}
+
+func isInboundRuntimeAbsentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if status.Code(err) == codes.NotFound {
+		return true
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(message, "not found") ||
+		strings.Contains(message, "does not exist") ||
+		strings.Contains(message, "not exist")
 }
 
 func (h *ChildManageHandler) addOutbound(ctx context.Context, handlerClient command.HandlerServiceClient, outbound map[string]interface{}) error {
@@ -3144,7 +3442,25 @@ func writeJSONFileAtomic(path string, value interface{}) (returnErr error) {
 	if err := os.Rename(tmpPath, path); err != nil {
 		return err
 	}
+	if err := syncRenamedFileDirectory(path); err != nil {
+		return &atomicRenameAppliedError{err: err}
+	}
 	return nil
+}
+
+// atomicRenameAppliedError means the target already contains the new complete
+// file, but syncing its parent directory failed. Callers must keep memory on
+// the new state while withholding success from the remote caller.
+type atomicRenameAppliedError struct {
+	err error
+}
+
+func (err *atomicRenameAppliedError) Error() string { return err.err.Error() }
+func (err *atomicRenameAppliedError) Unwrap() error { return err.err }
+
+func atomicRenameWasApplied(err error) bool {
+	var applied *atomicRenameAppliedError
+	return errors.As(err, &applied)
 }
 
 func (h *ChildManageHandler) removeInboundFromConfig(tag string) error {
@@ -3299,15 +3615,12 @@ func (h *ChildManageHandler) HandleScan(w http.ResponseWriter, r *http.Request) 
 		response.ConfigModified = true
 		response.ConfigAddedSections = configResult.AddedSections
 		log.Printf("[Child Manage] Xray config auto-completed, added sections: %v", configResult.AddedSections)
-		// 配置修改后需要重启 Xray
-		cmd := exec.Command("systemctl", "restart", "xray")
-		if err := cmd.Run(); err != nil {
-			log.Printf("[Child Manage] Failed to restart xray after config update: %v", err)
-		} else {
+		if configResult.Error == "" {
 			log.Printf("[Child Manage] Xray restarted after config update")
-			time.Sleep(1 * time.Second) // 等待重启完成
+			time.Sleep(1 * time.Second) // 等待状态探测稳定
 		}
-	} else if configResult.Error != "" {
+	}
+	if configResult.Error != "" {
 		log.Printf("[Child Manage] Xray config check warning: %s", configResult.Error)
 	}
 
@@ -3375,6 +3688,11 @@ type EnsureXrayConfigResult struct {
 // 这是一个公开方法，可以在 main.go 中调用
 func (h *ChildManageHandler) EnsureXrayConfig() *EnsureXrayConfigResult {
 	result := &EnsureXrayConfigResult{}
+	if err := h.lockXrayConfigMutation(); err != nil {
+		result.Error = fmt.Sprintf("Inbound mutation recovery must complete before normalizing Xray config: %v", err)
+		return result
+	}
+	defer h.unlockXrayConfigMutation()
 
 	// 1. 查找配置文件路径
 	configPath := h.findXrayConfigPath()
@@ -3464,6 +3782,15 @@ func (h *ChildManageHandler) EnsureXrayConfig() *EnsureXrayConfigResult {
 		}
 		result.Modified = true
 		log.Printf("[Child Manage] Xray config updated, added: %v", result.AddedSections)
+
+		// The caller previously restarted after this method released inboundsMu,
+		// leaving a window where an inbound mutation could interleave. Restart
+		// here while the config write is still protected by the same mutex.
+		output, err := h.controlXrayServiceLocked("restart")
+		if err != nil {
+			result.Error = fmt.Sprintf("Failed to restart Xray after config update: %v - %s", err, strings.TrimSpace(string(output)))
+			return result
+		}
 	}
 
 	return result

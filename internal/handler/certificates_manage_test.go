@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,6 +16,24 @@ import (
 	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/storage"
 )
+
+func TestCertificateHandlerUsesInjectedLocalDeployer(t *testing.T) {
+	handler := &CertificateHandler{}
+	called := false
+	handler.SetLocalDeployer(func(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
+		called = true
+		if certPEM != "certificate" || keyPEM != "private-key" || certPath != "/cert" || keyPath != "/key" || reloadTarget != "xray" {
+			return fmt.Errorf("unexpected deployment arguments")
+		}
+		return nil
+	})
+	if err := handler.deployLocal("certificate", "private-key", "/cert", "/key", "xray"); err != nil {
+		t.Fatalf("deployLocal: %v", err)
+	}
+	if !called {
+		t.Fatal("injected local deployer was not called")
+	}
+}
 
 func TestPublicDNSProviderNeverSerializesCredentials(t *testing.T) {
 	provider := storage.DNSProvider{

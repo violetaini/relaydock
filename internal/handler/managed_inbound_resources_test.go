@@ -40,11 +40,21 @@ func (a *managedWireGuardAgent) ServeHTTP(w http.ResponseWriter, r *http.Request
 	case r.Method == http.MethodGet && r.URL.Path == "/api/child/inbounds":
 		a.mu.Lock()
 		inbounds := make([]map[string]interface{}, 0, 1)
+		owners := make(map[string]string)
 		if a.inbound != nil {
-			inbounds = append(inbounds, cloneManagedWireGuardInbound(a.inbound))
+			inbound := cloneManagedWireGuardInbound(a.inbound)
+			inbound["_mutation_fence_known"] = true
+			if tag := strings.TrimSpace(wireGuardStringValue(inbound["tag"])); tag != "" && a.ownerMutationID != "" {
+				inbound["_mutation_id"] = a.ownerMutationID
+				owners[tag] = a.ownerMutationID
+			}
+			inbounds = append(inbounds, inbound)
 		}
 		a.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "inbounds": inbounds})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true, "inbounds": inbounds,
+			"mutation_fence_known": true, "mutation_owners": owners,
+		})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/child/xray/config":
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "config": `{"inbounds":[],"routing":{"rules":[]}}`})
 	case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
@@ -94,7 +104,8 @@ func (a *managedWireGuardAgent) ServeHTTP(w http.ResponseWriter, r *http.Request
 				a.mu.Unlock()
 				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"success": true, "mutation_id": mutationID,
-					"message": "Inbound removal superseded by a newer mutation",
+					"message":    "Inbound removal superseded by a newer mutation",
+					"superseded": true, "changed": false,
 				})
 				return
 			}
@@ -364,6 +375,157 @@ WHERE lower(n.protocol) = 'wireguard' AND n.node_name = 'Hong Kong WireGuard'`).
 	}
 	if actions := agent.actionSnapshot(); len(actions) != 2 || actions[0] != "add" || actions[1] != "remove" {
 		t.Fatalf("agent actions=%v, want [add remove]", actions)
+	}
+}
+
+func TestManagedWireGuardCreateRecoversMatchingStagedGenerationWithoutReadding(t *testing.T) {
+	handler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	body := managedWireGuardCreateBody(t, "Recovered WireGuard")
+	inbound := body["inbound"].(map[string]interface{})
+	mutationID := "managed-wireguard:recover-generation"
+	resource, err := handler.upsertWireGuardManagedResource(context.Background(), server.ID, "Recovered WireGuard", "admin", inbound, mutationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var client managedWireGuardClient
+	clientJSON, _ := json.Marshal(body["client"])
+	if err := json.Unmarshal(clientJSON, &client); err != nil {
+		t.Fatal(err)
+	}
+	client, err = validateManagedWireGuardClient(inbound, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clashConfig, _, err := buildManagedWireGuardClientConfigs(resource.DisplayName, resource.EndpointHost, resource.EndpointPort, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := repo.CreateNode(context.Background(), storage.Node{
+		Username: repo.GetSystemNodeOwner(context.Background()), NodeName: resource.DisplayName,
+		Protocol: "wireguard", ParsedConfig: clashConfig, ClashConfig: clashConfig,
+		Enabled: false, InboundMutationID: mutationID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.setInbound(inbound, mutationID)
+
+	response := httptest.NewRecorder()
+	handler.HandleManagedInboundResources(response, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10), body))
+	if response.Code != http.StatusOK {
+		t.Fatalf("recover status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Success   bool    `json:"success"`
+		Recovered bool    `json:"recovered"`
+		Node      nodeDTO `json:"node"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.Success || !payload.Recovered || payload.Node.ID != staged.ID {
+		t.Fatalf("recovery payload=%+v", payload)
+	}
+	if actions := agent.actionSnapshot(); len(actions) != 0 {
+		t.Fatalf("recovery resent mutation to Agent: %v", actions)
+	}
+	attached, err := repo.GetNodeByID(context.Background(), staged.ID)
+	if err != nil || !attached.Enabled || attached.OriginalServer != server.Name || attached.InboundTag != resource.InboundTag ||
+		!strings.Contains(attached.ClashConfig, `"private-key"`) {
+		t.Fatalf("attached=%+v err=%v", attached, err)
+	}
+}
+
+func TestManagedWireGuardCreateRefusesStagedRecoveryWhenLiveConfigDiffers(t *testing.T) {
+	handler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	body := managedWireGuardCreateBody(t, "Uncertain WireGuard")
+	inbound := body["inbound"].(map[string]interface{})
+	mutationID := "managed-wireguard:uncertain-generation"
+	resource, err := handler.upsertWireGuardManagedResource(context.Background(), server.ID, "Uncertain WireGuard", "admin", inbound, mutationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var client managedWireGuardClient
+	clientJSON, _ := json.Marshal(body["client"])
+	if err := json.Unmarshal(clientJSON, &client); err != nil {
+		t.Fatal(err)
+	}
+	client, err = validateManagedWireGuardClient(inbound, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clashConfig, _, err := buildManagedWireGuardClientConfigs(resource.DisplayName, resource.EndpointHost, resource.EndpointPort, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := repo.CreateNode(context.Background(), storage.Node{
+		Username: repo.GetSystemNodeOwner(context.Background()), NodeName: resource.DisplayName,
+		Protocol: "wireguard", ParsedConfig: clashConfig, ClashConfig: clashConfig,
+		Enabled: false, InboundMutationID: mutationID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveInbound := cloneManagedWireGuardInbound(inbound)
+	liveInbound["port"] = float64(resource.EndpointPort + 1)
+	agent.setInbound(liveInbound, mutationID)
+
+	response := httptest.NewRecorder()
+	handler.HandleManagedInboundResources(response, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10), body))
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "配置与预存记录不一致") {
+		t.Fatalf("recover mismatch status=%d body=%s", response.Code, response.Body.String())
+	}
+	if actions := agent.actionSnapshot(); len(actions) != 0 {
+		t.Fatalf("uncertain recovery mutated Agent: %v", actions)
+	}
+	remained, err := repo.GetNodeByID(context.Background(), staged.ID)
+	if err != nil || remained.Enabled || remained.OriginalServer != "" || remained.InboundTag != "" {
+		t.Fatalf("uncertain staged node was attached: node=%+v err=%v", remained, err)
+	}
+}
+
+func TestManagedWireGuardDeleteCleansPreAttachStagedIdentity(t *testing.T) {
+	handler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	body := managedWireGuardCreateBody(t, "Staged Delete")
+	inbound := body["inbound"].(map[string]interface{})
+	mutationID := "managed-wireguard:staged-delete"
+	resource, err := handler.upsertWireGuardManagedResource(context.Background(), server.ID, "Staged Delete", "admin", inbound, mutationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var client managedWireGuardClient
+	clientJSON, _ := json.Marshal(body["client"])
+	_ = json.Unmarshal(clientJSON, &client)
+	client, err = validateManagedWireGuardClient(inbound, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clashConfig, _, err := buildManagedWireGuardClientConfigs(resource.DisplayName, resource.EndpointHost, resource.EndpointPort, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, err := repo.CreateNode(context.Background(), storage.Node{
+		Username: repo.GetSystemNodeOwner(context.Background()), NodeName: resource.DisplayName,
+		Protocol: "wireguard", ParsedConfig: clashConfig, ClashConfig: clashConfig,
+		Enabled: false, InboundMutationID: mutationID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.setInbound(inbound, mutationID)
+	response := httptest.NewRecorder()
+	handler.HandleManagedInboundResources(response, managedWireGuardRequest(t, http.MethodDelete,
+		managedInboundResourcesPath+"/"+strconv.FormatInt(resource.ID, 10), nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := repo.GetNodeByID(context.Background(), staged.ID); !errors.Is(err, storage.ErrNodeNotFound) {
+		t.Fatalf("staged node survived delete: %v", err)
+	}
+	if _, err := repo.GetManagedInboundResource(context.Background(), resource.ID); !errors.Is(err, storage.ErrManagedInboundResourceNotFound) {
+		t.Fatalf("resource survived delete: %v", err)
 	}
 }
 
@@ -680,7 +842,7 @@ func TestManagedWireGuardOrdinaryNodeDeleteClosesRemoteLifecycle(t *testing.T) {
 	if err := json.Unmarshal(createResponse.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
-	nodesHandler := NewNodesHandler(repo, t.TempDir(), remoteHandler)
+	nodesHandler := NewNodesHandler(repo, t.TempDir(), remoteHandler).(*nodesHandler)
 	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/admin/nodes/"+strconv.FormatInt(created.Node.ID, 10), nil)
 	deleteRequest = deleteRequest.WithContext(auth.ContextWithUsername(deleteRequest.Context(), "admin"))
 	deleteResponse := httptest.NewRecorder()
@@ -696,6 +858,62 @@ func TestManagedWireGuardOrdinaryNodeDeleteClosesRemoteLifecycle(t *testing.T) {
 	}
 	if actions := agent.actionSnapshot(); len(actions) != 2 || actions[0] != "add" || actions[1] != "remove" {
 		t.Fatalf("agent actions=%v, want [add remove]", actions)
+	}
+}
+
+func TestStaleOrdinaryNodeCleanupCannotDeleteNewSameTagGeneration(t *testing.T) {
+	remoteHandler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	createResponse := httptest.NewRecorder()
+	remoteHandler.HandleManagedInboundResources(createResponse, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10),
+		managedWireGuardCreateBody(t, "Replace WG")))
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", createResponse.Code, createResponse.Body.String())
+	}
+	var created struct {
+		Resource managedInboundResourceDTO `json:"resource"`
+		Node     nodeDTO                   `json:"node"`
+	}
+	if err := json.Unmarshal(createResponse.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	staleNode, err := repo.GetNodeByID(context.Background(), created.Node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newMutationID := "managed-wireguard:generation-new"
+	currentNode := staleNode
+	currentNode.InboundMutationID = newMutationID
+	if _, err := repo.UpdateNode(context.Background(), currentNode); err != nil {
+		t.Fatal(err)
+	}
+	resource, err := repo.GetManagedInboundResource(context.Background(), created.Resource.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource.MutationID = newMutationID
+	if _, err := repo.UpsertManagedInboundResource(context.Background(), *resource); err != nil {
+		t.Fatal(err)
+	}
+	agent.mu.Lock()
+	agent.ownerMutationID = newMutationID
+	agent.mu.Unlock()
+
+	nodesHandler := NewNodesHandler(repo, t.TempDir(), remoteHandler).(*nodesHandler)
+	err = nodesHandler.cleanupRemoteInboundForNode(context.Background(), &staleNode)
+	if err == nil || !strings.Contains(err.Error(), "新一代") {
+		t.Fatalf("stale cleanup err=%v", err)
+	}
+	if !agent.hasInbound() {
+		t.Fatal("stale cleanup removed the newer remote inbound")
+	}
+	keptNode, err := repo.GetNodeByID(context.Background(), staleNode.ID)
+	if err != nil || keptNode.InboundMutationID != newMutationID {
+		t.Fatalf("new node generation lost: node=%+v err=%v", keptNode, err)
+	}
+	keptResource, err := repo.GetManagedInboundResource(context.Background(), resource.ID)
+	if err != nil || keptResource.MutationID != newMutationID {
+		t.Fatalf("new resource generation lost: resource=%+v err=%v", keptResource, err)
 	}
 }
 

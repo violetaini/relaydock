@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -121,14 +122,19 @@ func sanitizeInboundForAgent(inbound map[string]interface{}) (map[string]interfa
 	return candidate, nil
 }
 
-func (h *RemoteManageHandler) replaceInboundForSync(ctx context.Context, serverID int64, inbound map[string]interface{}) error {
+func (h *RemoteManageHandler) replaceInboundForSync(ctx context.Context, serverID int64, inbound map[string]interface{}, mutationID string) error {
+	mutationID = strings.TrimSpace(mutationID)
+	if mutationID == "" {
+		return errors.New("mutation_id is required for inbound replacement")
+	}
 	candidate, err := sanitizeInboundForAgent(inbound)
 	if err != nil {
 		return fmt.Errorf("sanitize inbound: %w", err)
 	}
 	body, err := json.Marshal(map[string]interface{}{
-		"action":  "add",
-		"inbound": candidate,
+		"action":      "add",
+		"inbound":     candidate,
+		"mutation_id": mutationID,
 	})
 	if err != nil {
 		return fmt.Errorf("encode inbound replacement: %w", err)
@@ -136,6 +142,9 @@ func (h *RemoteManageHandler) replaceInboundForSync(ctx context.Context, serverI
 	response, err := h.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/inbounds", body)
 	if err != nil {
 		return fmt.Errorf("replace inbound: %w", err)
+	}
+	if err := validateManagedWireGuardMutationACK(response, mutationID); err != nil {
+		return fmt.Errorf("replace inbound ownership ACK: %w", err)
 	}
 	if err := applyAgentConfigMutationACK(ctx, h, serverID, "ManagedRealityCredentialRepair", response); err != nil {
 		return fmt.Errorf("replace inbound ACK: %w", err)
@@ -157,9 +166,16 @@ func mergeManagedPhysicalNodeConfig(node storage.Node, liveProxy map[string]inte
 	}
 	// These fields may intentionally point at a relay, a chained proxy, or a
 	// user-selected endpoint. Runtime inbound discovery cannot reconstruct them.
-	for _, key := range []string{"name", "server", "port", "dialer-proxy", "interface-name", "routing-mark"} {
+	for _, key := range []string{"name", "server", "dialer-proxy", "interface-name", "routing-mark"} {
 		if value, ok := existing[key]; ok {
 			merged[key] = value
+		}
+	}
+	// A relay node exposes a separate endpoint and must preserve that port. A
+	// direct node follows the newly acknowledged inbound port.
+	if strings.TrimSpace(node.RelayOrigServer) != "" {
+		if value, ok := existing["port"]; ok {
+			merged["port"] = value
 		}
 	}
 	merged["name"] = node.NodeName

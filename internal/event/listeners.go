@@ -3,6 +3,7 @@ package event
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -20,6 +21,14 @@ type NodeSyncListener struct {
 	inboundToClash InboundToClashFunc
 }
 
+type managedNodePlan struct {
+	name          string
+	host          string
+	port          int
+	relayOrigHost string
+	relayOrigPort int
+}
+
 // 创建节点同步监听器
 func NewNodeSyncListener(repo *storage.TrafficRepository, converter InboundToClashFunc) *NodeSyncListener {
 	return &NodeSyncListener{
@@ -29,42 +38,49 @@ func NewNodeSyncListener(repo *storage.TrafficRepository, converter InboundToCla
 }
 
 // 处理入站事件
-func (l *NodeSyncListener) Handle(event InboundEvent) {
+func (l *NodeSyncListener) Handle(event InboundEvent) error {
 	ctx := context.Background()
 
 	switch event.Type {
 	case EventInboundAdded:
-		l.handleAdded(ctx, event)
+		return l.handleAdded(ctx, event)
 	case EventInboundRemoved:
-		l.handleRemoved(ctx, event)
+		return l.handleRemoved(ctx, event)
 	case EventInboundUpdated:
-		l.handleUpdated(ctx, event)
+		return l.handleUpdated(ctx, event)
 	}
+	return nil
 }
 
-func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) {
+func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) error {
 	// 获取服务器信息
 	server, err := l.repo.GetRemoteServer(ctx, event.ServerID)
 	if err != nil {
 		log.Printf("[NodeSync] Failed to get server %d: %v", event.ServerID, err)
-		return
+		return fmt.Errorf("读取服务器 %d 失败: %w", event.ServerID, err)
 	}
 
 	if event.Tag == "api" {
-		return
+		return nil
+	}
+	if strings.TrimSpace(event.MutationID) != "" {
+		if err := l.repo.SetRemoteInboundOwnership(ctx, event.ServerID, event.Tag, event.MutationID); err != nil {
+			log.Printf("[NodeSync] Failed to persist inbound ownership for %s: %v", event.Tag, err)
+			return fmt.Errorf("保存入站 %s 所有权失败: %w", event.Tag, err)
+		}
 	}
 	// The dedicated WireGuard creation endpoint creates the ordinary node only
 	// after it has encrypted the client private key. Inventory events contain no
 	// client secret, so converting them here would create a broken duplicate.
 	if strings.EqualFold(strings.TrimSpace(event.Protocol), "wireguard") {
-		return
+		return nil
 	}
 	// 端口转发入站默认不进节点表；「转发已有节点」才克隆源节点生成配套节点。
 	if isTunnelProtocol(event.Protocol) {
 		if event.ForwardNodeID > 0 {
-			l.createForwardTunnelNode(ctx, event, server)
+			return l.createForwardTunnelNode(ctx, event, server)
 		}
-		return
+		return nil
 	}
 
 	// 生成节点名称：优先使用自定义名称，否则使用 tag 或 protocol:port
@@ -84,15 +100,7 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 	clashConfig, err := l.inboundToClash(event.ServerID, event.Inbound)
 	if err != nil {
 		log.Printf("[NodeSync] Failed to convert inbound to clash: %v", err)
-		return
-	}
-
-	// 先扫所有"外部节点"(从 mmw 迁移过来的、original_server='' 的节点),
-	// 按 server 地址(可能是 IP / Domain / PullAddress 之一)+ port + protocol 匹配,
-	// 命中即把外部节点"升级"为受管节点(填上 original_server + inbound_tag),
-	// 而不是新建一条重复节点。
-	if matched := l.tryClaimExternalNode(ctx, server, event, clashConfig); matched {
-		return
+		return fmt.Errorf("转换入站 %s 为节点失败: %w", event.Tag, err)
 	}
 
 	// 解析 clash 配置 — inboundToClash 已用 chooseClashServerHost 把 server 填成 v4 host
@@ -100,20 +108,13 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 	var clashMap map[string]any
 	if err := json.Unmarshal([]byte(clashConfig), &clashMap); err != nil {
 		log.Printf("[NodeSync] Failed to parse clash config: %v", err)
-		return
+		return fmt.Errorf("解析入站 %s 的节点配置失败: %w", event.Tag, err)
 	}
 	v4Host, _ := clashMap["server"].(string)
 	v6Host := strings.TrimSpace(server.IPAddressV6)
 
 	// 按 ip_version / 中转 决定要建哪些节点(name + clash server host + 可选 port 覆盖 + 中转原值)
-	type nodePlan struct {
-		name          string
-		host          string
-		port          int    // >0 覆盖 clash port(中转用);0=沿用原 port
-		relayOrigHost string // 非空=中转节点,记原服务器 host 到 relay_orig_server
-		relayOrigPort int
-	}
-	var plans []nodePlan
+	var plans []managedNodePlan
 	if relayHost := strings.TrimSpace(event.RelayServer); relayHost != "" {
 		// 中转:单节点,clash server/port=中转地址;原服务器=v4Host + 原 clash 端口记到 relay_orig_*。
 		// 中转优先,忽略 ip_version(中转是单一地址,不分 v4/v6)。
@@ -122,36 +123,60 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 		if relayPort <= 0 {
 			relayPort = origPort // 端口默认填节点端口
 		}
-		plans = []nodePlan{{name: nodeName, host: relayHost, port: relayPort, relayOrigHost: v4Host, relayOrigPort: origPort}}
+		plans = []managedNodePlan{{name: nodeName, host: relayHost, port: relayPort, relayOrigHost: v4Host, relayOrigPort: origPort}}
 	} else {
 		switch event.IPVersion {
 		case "v6":
 			// 勾 v6:强制用 IPv6 字面地址,忽略 Domain/PullAddress
 			if v6Host == "" {
 				log.Printf("[NodeSync] server %s 无 IPv6,ip_version=v6 跳过创建", server.Name)
-				return
+				return fmt.Errorf("服务器 %s 未配置 IPv6，无法创建 IPv6 节点", server.Name)
 			}
-			plans = []nodePlan{{name: nodeName, host: v6Host}}
+			plans = []managedNodePlan{{name: nodeName, host: v6Host}}
 		case "both":
-			plans = []nodePlan{{name: nodeName, host: v4Host}}
+			plans = []managedNodePlan{{name: nodeName, host: v4Host}}
 			if v6Host != "" {
-				plans = append(plans, nodePlan{name: nodeName + "(v6)", host: v6Host})
+				plans = append(plans, managedNodePlan{name: nodeName + "(v6)", host: v6Host})
 			} else {
 				log.Printf("[NodeSync] server %s 无 IPv6,both 退化为仅 v4", server.Name)
 			}
 		default: // "" / "v4" —— 现状行为
-			plans = []nodePlan{{name: nodeName, host: v4Host}}
+			plans = []managedNodePlan{{name: nodeName, host: v4Host}}
 		}
 	}
 
 	// admin 已同步过的同 server 节点(按 server-host + protocol + port 去重)
-	existingNodes, _ := l.repo.ListNodes(ctx, sysOwner)
+	existingNodes, err := l.repo.ListNodes(ctx, sysOwner)
+	if err != nil {
+		return fmt.Errorf("读取现有节点失败: %w", err)
+	}
 	// 已占用的节点名集合 —— 撞名(不同物理节点碰巧同名)时用 UniqueNodeName 加后缀,保证订阅侧 proxy name 唯一
 	takenNames := make(map[string]bool, len(existingNodes))
 	for _, n := range existingNodes {
 		takenNames[n.NodeName] = true
 	}
 
+	// Replacing an inbound reuses the same tag. Keep the stable node IDs (package
+	// assignments and saved subscriptions may reference them), but replace every
+	// connection field from the newly acknowledged inbound. Merely updating the
+	// mutation token would leave an old UUID/Reality key behind and publish a node
+	// that can no longer connect.
+	if reconciled, reconcileErr := l.reconcileAddedManagedNodes(ctx, server, event, clashMap, plans, existingNodes); reconciled {
+		return reconcileErr
+	} else if reconcileErr != nil {
+		return reconcileErr
+	}
+
+	// Only an inbound with no existing managed node may claim a legacy external
+	// node. Otherwise a same-coordinate external row could short-circuit the
+	// replacement above and leave the actual managed node stale.
+	if matched, claimErr := l.tryClaimExternalNode(ctx, server, event, clashConfig); matched {
+		return claimErr
+	} else if claimErr != nil {
+		return claimErr
+	}
+
+	var createErrors []error
 	for _, p := range plans {
 		// 真重复(同 server-host + protocol + port)才 skip —— 带上 host,避免「both」时 v4/v6 同 proto+port 互相误杀
 		if nodeWithHostProtoPortExists(existingNodes, server.Name, p.host, event.Protocol, event.Port) {
@@ -164,18 +189,20 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 		cfg, err := cloneClashWithServerPort(clashMap, name, p.host, p.port)
 		if err != nil {
 			log.Printf("[NodeSync] Failed to build clash config for %s: %v", name, err)
+			createErrors = append(createErrors, fmt.Errorf("构建节点 %s 配置失败: %w", name, err))
 			continue
 		}
 		node := storage.Node{
-			Username:       sysOwner,
-			NodeName:       name,
-			Protocol:       event.Protocol,
-			ClashConfig:    cfg,
-			ParsedConfig:   cfg,
-			Enabled:        true,
-			Tag:            fmt.Sprintf("远程:%s", server.Name),
-			OriginalServer: server.Name,
-			InboundTag:     event.Tag,
+			Username:          sysOwner,
+			NodeName:          name,
+			Protocol:          event.Protocol,
+			ClashConfig:       cfg,
+			ParsedConfig:      cfg,
+			Enabled:           true,
+			Tag:               fmt.Sprintf("远程:%s", server.Name),
+			OriginalServer:    server.Name,
+			InboundTag:        event.Tag,
+			InboundMutationID: event.MutationID,
 		}
 		if p.relayOrigHost != "" {
 			node.RelayOrigServer = p.relayOrigHost
@@ -184,12 +211,125 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 		created, err := l.repo.CreateNode(ctx, node)
 		if err != nil {
 			log.Printf("[NodeSync] Failed to create node %s: %v", name, err)
+			createErrors = append(createErrors, fmt.Errorf("创建节点 %s 失败: %w", name, err))
 			continue
 		}
 		takenNames[name] = true
 		log.Printf("[NodeSync] Created node: %s", name)
 		l.prependNodeOrder(ctx, sysOwner, created.ID)
 	}
+	return errors.Join(createErrors...)
+}
+
+func (l *NodeSyncListener) reconcileAddedManagedNodes(
+	ctx context.Context,
+	server *storage.RemoteServer,
+	event InboundEvent,
+	clashMap map[string]any,
+	plans []managedNodePlan,
+	existingNodes []storage.Node,
+) (bool, error) {
+	managed := make([]storage.Node, 0, len(plans))
+	for _, node := range existingNodes {
+		if node.OriginalServer != server.Name || node.InboundTag != event.Tag ||
+			(node.NodeType != "" && node.NodeType != "physical") {
+			continue
+		}
+		managed = append(managed, node)
+	}
+	if len(managed) == 0 {
+		return false, nil
+	}
+
+	var reconcileErrors []error
+	used := make([]bool, len(managed))
+	takenNames := make(map[string]bool, len(existingNodes)+len(plans))
+	for _, node := range existingNodes {
+		takenNames[node.NodeName] = true
+	}
+	for _, plan := range plans {
+		candidate := -1
+		planV6 := strings.Contains(plan.host, ":")
+		for index := range managed {
+			if used[index] {
+				continue
+			}
+			var current map[string]any
+			_ = json.Unmarshal([]byte(managed[index].ClashConfig), &current)
+			currentHost, _ := current["server"].(string)
+			if currentHost == plan.host {
+				candidate = index
+				break
+			}
+			if candidate < 0 && strings.Contains(currentHost, ":") == planV6 {
+				candidate = index
+			}
+		}
+		if candidate < 0 {
+			for index := range managed {
+				if !used[index] {
+					candidate = index
+					break
+				}
+			}
+		}
+		if candidate < 0 {
+			name := storage.UniqueNodeName(plan.name, event.Protocol, takenNames)
+			config, err := cloneClashWithServerPort(clashMap, name, plan.host, plan.port)
+			if err != nil {
+				log.Printf("[NodeSync] Failed to build replacement node for %s: %v", event.Tag, err)
+				reconcileErrors = append(reconcileErrors, fmt.Errorf("构建替换节点 %s 失败: %w", event.Tag, err))
+				continue
+			}
+			created, err := l.repo.CreateNode(ctx, storage.Node{
+				Username:          l.repo.GetSystemNodeOwner(ctx),
+				NodeName:          name,
+				Protocol:          event.Protocol,
+				ClashConfig:       config,
+				ParsedConfig:      config,
+				Enabled:           true,
+				Tag:               fmt.Sprintf("远程:%s", server.Name),
+				OriginalServer:    server.Name,
+				InboundTag:        event.Tag,
+				InboundMutationID: event.MutationID,
+				RelayOrigServer:   plan.relayOrigHost,
+				RelayOrigPort:     plan.relayOrigPort,
+			})
+			if err != nil {
+				log.Printf("[NodeSync] Failed to create replacement node for %s: %v", event.Tag, err)
+				reconcileErrors = append(reconcileErrors, fmt.Errorf("创建替换节点 %s 失败: %w", event.Tag, err))
+				continue
+			}
+			takenNames[name] = true
+			l.prependNodeOrder(ctx, created.Username, created.ID)
+			continue
+		}
+		used[candidate] = true
+		node := managed[candidate]
+		config, err := cloneClashWithServerPort(clashMap, node.NodeName, plan.host, plan.port)
+		if err != nil {
+			log.Printf("[NodeSync] Failed to rebuild managed node %d: %v", node.ID, err)
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("重建节点 %d 失败: %w", node.ID, err))
+			continue
+		}
+		node.Protocol = event.Protocol
+		node.ClashConfig = config
+		node.ParsedConfig = config
+		node.OriginalServer = server.Name
+		node.InboundTag = event.Tag
+		node.InboundMutationID = event.MutationID
+		node.RelayOrigServer = plan.relayOrigHost
+		node.RelayOrigPort = plan.relayOrigPort
+		if _, err := l.repo.UpdateNode(ctx, node); err != nil {
+			log.Printf("[NodeSync] Failed to replace managed node %d for %s: %v", node.ID, event.Tag, err)
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("更新节点 %d 失败: %w", node.ID, err))
+		}
+	}
+
+	// Historical duplicates are left in place. They may own routed children or
+	// package references, so deleting them requires a separate reference-aware
+	// cleanup rather than guessing during an inbound replacement.
+	return true, errors.Join(reconcileErrors...)
 }
 
 // cloneClashWithServer 浅拷贝 clash proxy map,覆盖顶层 name 与 server,返回 JSON。
@@ -281,11 +421,11 @@ func (l *NodeSyncListener) prependNodeOrder(ctx context.Context, owner string, n
 // createForwardTunnelNode 为「转发已有节点」生成的 tunnel 创建配套节点:
 // 配置克隆源节点,但 name 拼接 " | Tunnel"、server 改为 tunnel 服务器 IP、port 改为 tunnel 监听端口、
 // inbound_tag = tunnel tag、original_server = tunnel 服务器名(便于管理/删除时定位)。
-func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event InboundEvent, server *storage.RemoteServer) {
+func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event InboundEvent, server *storage.RemoteServer) error {
 	src, err := l.repo.GetNodeByID(ctx, event.ForwardNodeID)
 	if err != nil {
 		log.Printf("[NodeSync] forward-tunnel: 源节点 %d 不存在: %v", event.ForwardNodeID, err)
-		return
+		return fmt.Errorf("读取转发源节点 %d 失败: %w", event.ForwardNodeID, err)
 	}
 	// 与 syncInboundsToNodes / InboundToClashProxyByServerID 同优先序:
 	// Domain → 非私有 PullAddress → IPAddress;不能用 chooseClashServerHost(在 handler 包,跨包麻烦)就内联一遍
@@ -302,7 +442,7 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 	}
 	if serverHost == "" {
 		log.Printf("[NodeSync] forward-tunnel: 服务器 %s 无 IP/域名,跳过", server.Name)
-		return
+		return fmt.Errorf("服务器 %s 没有可用 IP 或域名", server.Name)
 	}
 
 	sysOwner := l.repo.GetSystemNodeOwner(ctx)
@@ -311,7 +451,7 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 	existingNodes, err := l.repo.ListNodes(ctx, sysOwner)
 	if err != nil {
 		log.Printf("[NodeSync] forward-tunnel: 读取现有节点失败，跳过幂等更新: %v", err)
-		return
+		return fmt.Errorf("读取转发配套节点失败: %w", err)
 	}
 	var existingClone *storage.Node
 	takenNames := make(map[string]bool, len(existingNodes))
@@ -339,7 +479,7 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 	var clashMap map[string]any
 	if err := json.Unmarshal([]byte(src.ClashConfig), &clashMap); err != nil {
 		log.Printf("[NodeSync] forward-tunnel: 解析源节点 clash 配置失败: %v", err)
-		return
+		return fmt.Errorf("解析转发源节点配置失败: %w", err)
 	}
 	clashMap["name"] = nodeName
 	clashMap["server"] = serverHost
@@ -347,7 +487,7 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 	clashJSON, err := json.Marshal(clashMap)
 	if err != nil {
 		log.Printf("[NodeSync] forward-tunnel: 序列化 clash 配置失败: %v", err)
-		return
+		return fmt.Errorf("生成转发配套节点配置失败: %w", err)
 	}
 
 	if existingClone != nil {
@@ -361,29 +501,34 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 		node.ParsedConfig = string(clashJSON)
 		node.OriginalServer = server.Name
 		node.InboundTag = event.Tag
+		node.InboundMutationID = event.MutationID
 		if _, err := l.repo.UpdateNode(ctx, node); err != nil {
 			log.Printf("[NodeSync] forward-tunnel: 更新配套节点失败: %v", err)
+			return fmt.Errorf("更新转发配套节点失败: %w", err)
 		} else {
 			log.Printf("[NodeSync] forward-tunnel: 已更新配套节点: %s (-> %s:%d)", nodeName, serverHost, event.Port)
 		}
-		return
+		return nil
 	}
 	node := storage.Node{
-		Username:       sysOwner,
-		NodeName:       nodeName,
-		Protocol:       src.Protocol,
-		ClashConfig:    string(clashJSON),
-		ParsedConfig:   string(clashJSON),
-		Enabled:        true,
-		Tag:            fmt.Sprintf("远程:%s", server.Name),
-		OriginalServer: server.Name,
-		InboundTag:     event.Tag,
+		Username:          sysOwner,
+		NodeName:          nodeName,
+		Protocol:          src.Protocol,
+		ClashConfig:       string(clashJSON),
+		ParsedConfig:      string(clashJSON),
+		Enabled:           true,
+		Tag:               fmt.Sprintf("远程:%s", server.Name),
+		OriginalServer:    server.Name,
+		InboundTag:        event.Tag,
+		InboundMutationID: event.MutationID,
 	}
 	if _, err := l.repo.CreateNode(ctx, node); err != nil {
 		log.Printf("[NodeSync] forward-tunnel: 创建配套节点失败: %v", err)
+		return fmt.Errorf("创建转发配套节点失败: %w", err)
 	} else {
 		log.Printf("[NodeSync] forward-tunnel: 已创建配套节点: %s (-> %s:%d)", nodeName, serverHost, event.Port)
 	}
+	return nil
 }
 
 func isTunnelProtocol(protocol string) bool {
@@ -416,7 +561,7 @@ func protocolEquivalent(clashType, xrayProtocol string) bool {
 // 看是否有节点的 clash_config 指向 (server 的 IP/Domain/PullAddress 之一) + 同 port + 同 protocol,
 // 命中即把该节点 UPDATE 为受管节点(填上 original_server + inbound_tag),返回 true。
 // 这避免迁移场景下:mmw 原有节点 + agent 扫描新创建节点 → 重复 2 条节点的问题。
-func (l *NodeSyncListener) tryClaimExternalNode(ctx context.Context, server *storage.RemoteServer, event InboundEvent, agentClashConfig string) bool {
+func (l *NodeSyncListener) tryClaimExternalNode(ctx context.Context, server *storage.RemoteServer, event InboundEvent, agentClashConfig string) (bool, error) {
 	// 候选地址:能让外部节点 server 字段命中该 remote_server 的所有可能形式
 	candidates := map[string]bool{}
 	for _, a := range []string{server.IPAddress, server.Domain, server.PullAddress} {
@@ -425,13 +570,13 @@ func (l *NodeSyncListener) tryClaimExternalNode(ctx context.Context, server *sto
 		}
 	}
 	if len(candidates) == 0 {
-		return false
+		return false, nil
 	}
 
 	allNodes, err := l.repo.ListAllNodes(ctx)
 	if err != nil {
 		log.Printf("[NodeSync] tryClaimExternalNode: list all nodes failed: %v", err)
-		return false
+		return false, fmt.Errorf("读取可认领节点失败: %w", err)
 	}
 	for _, n := range allNodes {
 		// Agent events must never claim an ordinary user's imported node, even
@@ -483,55 +628,77 @@ func (l *NodeSyncListener) tryClaimExternalNode(ctx context.Context, server *sto
 				agentClashConfig = string(updated)
 			}
 		}
-		if err := l.repo.ClaimExternalNode(ctx, n.ID, server.Name, event.Tag, fmt.Sprintf("远程:%s", server.Name), agentClashConfig); err != nil {
+		if err := l.repo.ClaimExternalNode(ctx, n.ID, server.Name, event.Tag, event.MutationID, fmt.Sprintf("远程:%s", server.Name), agentClashConfig); err != nil {
 			log.Printf("[NodeSync] ClaimExternalNode failed: %v", err)
-			return false
+			return false, fmt.Errorf("认领外部节点 %d 失败: %w", n.ID, err)
 		}
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
-func (l *NodeSyncListener) handleRemoved(ctx context.Context, event InboundEvent) {
+func (l *NodeSyncListener) handleRemoved(ctx context.Context, event InboundEvent) error {
 	server, err := l.repo.GetRemoteServer(ctx, event.ServerID)
 	if err != nil {
 		log.Printf("[NodeSync] Failed to get server %d: %v", event.ServerID, err)
-		return
+		return fmt.Errorf("读取服务器 %d 失败: %w", event.ServerID, err)
 	}
 
-	// 删除对应节点
-	if _, err := l.repo.DeleteNodesByInboundTag(ctx, server.Name, event.Tag); err != nil {
-		log.Printf("[NodeSync] Failed to delete nodes: %v", err)
+	// Delete only the generation that emitted this event. Legacy unfenced
+	// events are accepted only after the Agent confirms the tag has no owner.
+	var deleteErr error
+	if strings.TrimSpace(event.MutationID) != "" {
+		_, deleteErr = l.repo.DeleteNodesByInboundTagMutation(ctx, server.Name, event.Tag, event.MutationID)
+	} else {
+		_, deleteErr = l.repo.DeleteNodesByInboundTag(ctx, server.Name, event.Tag)
+	}
+	if deleteErr != nil {
+		log.Printf("[NodeSync] Failed to delete nodes: %v", deleteErr)
 	} else {
 		log.Printf("[NodeSync] Deleted nodes for inbound: %s/%s", server.Name, event.Tag)
 	}
-	if _, err := l.repo.DeleteManagedInboundResourceByServerTag(ctx, event.ServerID, event.Tag); err != nil {
+	if strings.TrimSpace(event.MutationID) != "" {
+		_, err = l.repo.DeleteManagedInboundResourceByServerTagMutation(ctx, event.ServerID, event.Tag, event.MutationID)
+	} else {
+		_, err = l.repo.DeleteManagedInboundResourceByServerTag(ctx, event.ServerID, event.Tag)
+	}
+	if err != nil {
 		log.Printf("[NodeSync] Failed to delete managed inbound resource: %v", err)
 	}
+	var ownershipErr error
+	if strings.TrimSpace(event.MutationID) != "" {
+		if _, deleteOwnershipErr := l.repo.DeleteRemoteInboundOwnershipIfMutation(ctx, event.ServerID, event.Tag, event.MutationID); deleteOwnershipErr != nil {
+			ownershipErr = deleteOwnershipErr
+			log.Printf("[NodeSync] Failed to delete inbound ownership: %v", deleteOwnershipErr)
+		}
+	}
+	return errors.Join(deleteErr, err, ownershipErr)
 }
 
-func (l *NodeSyncListener) handleUpdated(ctx context.Context, event InboundEvent) {
+func (l *NodeSyncListener) handleUpdated(ctx context.Context, event InboundEvent) error {
 	server, err := l.repo.GetRemoteServer(ctx, event.ServerID)
 	if err != nil {
 		log.Printf("[NodeSync] Failed to get server %d: %v", event.ServerID, err)
-		return
+		return fmt.Errorf("读取服务器 %d 失败: %w", event.ServerID, err)
 	}
 	// Agent inventory only contains server-side WireGuard data. Rebuilding the
 	// client proxy from it would discard the encrypted client identity.
 	if strings.EqualFold(strings.TrimSpace(event.Protocol), "wireguard") {
-		return
+		return nil
 	}
 
 	clashConfig, err := l.inboundToClash(event.ServerID, event.Inbound)
 	if err != nil {
 		log.Printf("[NodeSync] Failed to convert inbound to clash: %v", err)
-		return
+		return fmt.Errorf("转换入站 %s 为节点失败: %w", event.Tag, err)
 	}
 
 	// v4/域名节点:用 base 配置(server = chooseClashServerHost)更新。
 	// 订阅生成时 proxy 名取 node_name 列(subscription.go:988),clash_config 内的 name 仅内部用,无需特意保留。
-	if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, clashConfig, "v4"); err != nil {
-		log.Printf("[NodeSync] Failed to update v4 node: %v", err)
+	var updateErrors []error
+	if updateErr := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, clashConfig, "v4"); updateErr != nil {
+		log.Printf("[NodeSync] Failed to update v4 node: %v", updateErr)
+		updateErrors = append(updateErrors, fmt.Errorf("更新 IPv4 节点失败: %w", updateErr))
 	}
 
 	// IPv6 节点:同一 inbound_tag 下若存在 v6 节点,用相同入站配置但 server 改回 v6 字面地址更新,
@@ -541,11 +708,13 @@ func (l *NodeSyncListener) handleUpdated(ctx context.Context, event InboundEvent
 		if json.Unmarshal([]byte(clashConfig), &m) == nil {
 			name, _ := m["name"].(string)
 			if v6cfg, cerr := cloneClashWithServer(m, name, v6Host); cerr == nil {
-				if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, v6cfg, "v6"); err != nil {
-					log.Printf("[NodeSync] Failed to update v6 node: %v", err)
+				if updateErr := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, v6cfg, "v6"); updateErr != nil {
+					log.Printf("[NodeSync] Failed to update v6 node: %v", updateErr)
+					updateErrors = append(updateErrors, fmt.Errorf("更新 IPv6 节点失败: %w", updateErr))
 				}
 			}
 		}
 	}
 	log.Printf("[NodeSync] Updated node(s) for inbound: %s/%s", server.Name, event.Tag)
+	return errors.Join(updateErrors...)
 }

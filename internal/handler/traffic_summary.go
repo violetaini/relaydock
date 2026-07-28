@@ -490,6 +490,12 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTraffic(ctx context.Con
 	if err != nil || !settings.SyncTraffic {
 		return 0, 0
 	}
+	unlock, err := lockSubscriptionStore()
+	if err != nil {
+		logger.Info("[流量] 锁定订阅存储失败", "error", err)
+		return 0, 0
+	}
+	defer unlock()
 
 	subscribeFiles, err := h.repo.ListSubscribeFiles(ctx)
 	if err != nil {
@@ -500,6 +506,10 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTraffic(ctx context.Con
 	// 收集所有订阅文件中使用的所有外部订阅 URL
 	usedExternalURLs := make(map[string]bool)
 	for _, file := range subscribeFiles {
+		if err := storage.ValidateSubscribeFilename(file.Filename); err != nil {
+			logger.Info("[流量] 拒绝非法订阅文件名", "filename", file.Filename, "error", err)
+			return 0, 0
+		}
 		// 读取订阅文件内容
 		filePath := filepath.Join("subscribes", file.Filename)
 		data, err := os.ReadFile(filePath)

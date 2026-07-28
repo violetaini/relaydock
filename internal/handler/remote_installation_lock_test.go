@@ -341,6 +341,36 @@ func TestHandleScanResultSkipsInboundSyncDuringInstallation(t *testing.T) {
 	}
 }
 
+func TestHandleScanResultUsesExclusiveLeaseWithoutUpgradeFailure(t *testing.T) {
+	requested := make(chan string, 4)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested <- r.URL.Path
+		switch r.URL.Path {
+		case "/api/child/inbounds":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true, "inbounds": []any{},
+				"mutation_fence_known": true, "mutation_owners": map[string]string{},
+			})
+		case "/api/child/xray/config":
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "config": `{"inbounds":[],"routing":{"rules":[]}}`})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer agent.Close()
+	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
+
+	NewRemoteManageHandler(repo, nil).HandleScanResult(server.ID, WSScanResultPayload{XrayRunning: true})
+	select {
+	case path := <-requested:
+		if path != "/api/child/inbounds" {
+			t.Fatalf("first sync request=%q", path)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("scan_result did not reach Agent inbound inventory; lease upgrade likely failed")
+	}
+}
+
 func TestFinalizeRemoteInstallationRefreshesXrayStatusAfterLeaseRelease(t *testing.T) {
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/child/services/status" || r.Method != http.MethodGet {

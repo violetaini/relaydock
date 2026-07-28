@@ -118,7 +118,7 @@ func (r *TrafficRepository) ListNodes(ctx context.Context, username string) ([]N
 		return nil, errors.New("username is required")
 	}
 
-	rows, err := r.db.QueryContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes WHERE username = ? ORDER BY created_at DESC`, username)
+	rows, err := r.db.QueryContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), COALESCE(inbound_mutation_id, ''), chain_proxy_node_id, COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes WHERE username = ? ORDER BY created_at DESC`, username)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
@@ -129,7 +129,7 @@ func (r *TrafficRepository) ListNodes(ctx context.Context, username string) ([]N
 		var node Node
 		var enabled int
 		var tagsJSON string
-		if err := rows.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
+		if err := rows.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.InboundMutationID, &node.ChainProxyNodeID, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		node.Enabled = enabled != 0
@@ -174,7 +174,7 @@ func (r *TrafficRepository) ListSharedRoutedByParentIDs(ctx context.Context, par
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	query := `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes WHERE node_type = 'routed' AND COALESCE(routed_owner, 'shared') = 'shared' AND parent_node_id IN (` + strings.Join(placeholders, ",") + `) ORDER BY created_at DESC`
+	query := `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), COALESCE(inbound_mutation_id, ''), chain_proxy_node_id, COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes WHERE node_type = 'routed' AND COALESCE(routed_owner, 'shared') = 'shared' AND parent_node_id IN (` + strings.Join(placeholders, ",") + `) ORDER BY created_at DESC`
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list shared routed by parents: %w", err)
@@ -185,7 +185,7 @@ func (r *TrafficRepository) ListSharedRoutedByParentIDs(ctx context.Context, par
 		var node Node
 		var enabled int
 		var tagsJSON string
-		if err := rows.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
+		if err := rows.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.InboundMutationID, &node.ChainProxyNodeID, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		node.Enabled = enabled != 0
@@ -207,7 +207,7 @@ func (r *TrafficRepository) ListAllNodes(ctx context.Context) ([]Node, error) {
 		return nil, errors.New("traffic repository not initialized")
 	}
 
-	rows, err := r.db.QueryContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes ORDER BY created_at DESC`)
+	rows, err := r.db.QueryContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), COALESCE(inbound_mutation_id, ''), chain_proxy_node_id, COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list all nodes: %w", err)
 	}
@@ -218,7 +218,7 @@ func (r *TrafficRepository) ListAllNodes(ctx context.Context) ([]Node, error) {
 		var node Node
 		var enabled int
 		var tagsJSON string
-		if err := rows.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
+		if err := rows.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.InboundMutationID, &node.ChainProxyNodeID, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		node.Enabled = enabled != 0
@@ -254,8 +254,8 @@ func (r *TrafficRepository) GetNode(ctx context.Context, id int64, username stri
 
 	var enabled int
 	var tagsJSON string
-	row := r.db.QueryRowContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes WHERE id = ? AND username = ? LIMIT 1`, id, username)
-	if err := row.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
+	row := r.db.QueryRowContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), COALESCE(inbound_mutation_id, ''), chain_proxy_node_id, COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes WHERE id = ? AND username = ? LIMIT 1`, id, username)
+	if err := row.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.InboundMutationID, &node.ChainProxyNodeID, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return node, ErrNodeNotFound
 		}
@@ -284,8 +284,8 @@ func (r *TrafficRepository) GetNodeByID(ctx context.Context, id int64) (Node, er
 
 	var enabled int
 	var tagsJSON string
-	row := r.db.QueryRowContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes WHERE id = ? LIMIT 1`, id)
-	if err := row.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
+	row := r.db.QueryRowContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), COALESCE(inbound_mutation_id, ''), chain_proxy_node_id, COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes WHERE id = ? LIMIT 1`, id)
+	if err := row.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.InboundMutationID, &node.ChainProxyNodeID, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return node, ErrNodeNotFound
 		}
@@ -309,9 +309,10 @@ func (r *TrafficRepository) CreateNode(ctx context.Context, node Node) (Node, er
 	node.Username = strings.TrimSpace(node.Username)
 	node.RawURL = strings.TrimSpace(node.RawURL)
 	node.NodeName = strings.TrimSpace(node.NodeName)
-	node.Protocol = strings.ToLower(strings.TrimSpace(node.Protocol))
+	node.Protocol = canonicalNodeProtocol(node.Protocol)
 	node.Tag = strings.TrimSpace(node.Tag)
 	node.InboundTag = strings.TrimSpace(node.InboundTag)
+	node.InboundMutationID = strings.TrimSpace(node.InboundMutationID)
 
 	if node.Username == "" {
 		return Node{}, errors.New("username is required")
@@ -354,7 +355,7 @@ func (r *TrafficRepository) CreateNode(ctx context.Context, node Node) (Node, er
 		return Node{}, fmt.Errorf("begin create node: %w", err)
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `INSERT INTO nodes (username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, tag, tags, original_server, original_domain, inbound_tag, chain_proxy_node_id, relay_orig_server, relay_orig_port) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, node.Username, node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, tagsJSON, node.OriginalServer, node.OriginalDomain, node.InboundTag, node.ChainProxyNodeID, node.RelayOrigServer, node.RelayOrigPort)
+	res, err := tx.ExecContext(ctx, `INSERT INTO nodes (username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, tag, tags, original_server, original_domain, inbound_tag, inbound_mutation_id, chain_proxy_node_id, relay_orig_server, relay_orig_port) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, node.Username, node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, tagsJSON, node.OriginalServer, node.OriginalDomain, node.InboundTag, node.InboundMutationID, node.ChainProxyNodeID, node.RelayOrigServer, node.RelayOrigPort)
 	if err != nil {
 		return Node{}, fmt.Errorf("create node: %w", err)
 	}
@@ -392,9 +393,10 @@ func (r *TrafficRepository) UpdateNode(ctx context.Context, node Node) (Node, er
 	node.Username = strings.TrimSpace(node.Username)
 	node.RawURL = strings.TrimSpace(node.RawURL)
 	node.NodeName = strings.TrimSpace(node.NodeName)
-	node.Protocol = strings.ToLower(strings.TrimSpace(node.Protocol))
+	node.Protocol = canonicalNodeProtocol(node.Protocol)
 	node.Tag = strings.TrimSpace(node.Tag)
 	node.InboundTag = strings.TrimSpace(node.InboundTag)
+	node.InboundMutationID = strings.TrimSpace(node.InboundMutationID)
 
 	if node.Username == "" {
 		return Node{}, errors.New("username is required")
@@ -455,7 +457,7 @@ func (r *TrafficRepository) UpdateNode(ctx context.Context, node Node) (Node, er
 		return Node{}, fmt.Errorf("begin update node: %w", err)
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE nodes SET raw_url = ?, node_name = ?, protocol = ?, parsed_config = ?, clash_config = ?, enabled = ?, tag = ?, tags = ?, original_server = ?, original_domain = ?, inbound_tag = ?, chain_proxy_node_id = ?, relay_orig_server = ?, relay_orig_port = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND username = ?`, node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, tagsJSON, node.OriginalServer, node.OriginalDomain, node.InboundTag, node.ChainProxyNodeID, node.RelayOrigServer, node.RelayOrigPort, node.ID, node.Username)
+	res, err := tx.ExecContext(ctx, `UPDATE nodes SET raw_url = ?, node_name = ?, protocol = ?, parsed_config = ?, clash_config = ?, enabled = ?, tag = ?, tags = ?, original_server = ?, original_domain = ?, inbound_tag = ?, inbound_mutation_id = ?, chain_proxy_node_id = ?, relay_orig_server = ?, relay_orig_port = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND username = ?`, node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, tagsJSON, node.OriginalServer, node.OriginalDomain, node.InboundTag, node.InboundMutationID, node.ChainProxyNodeID, node.RelayOrigServer, node.RelayOrigPort, node.ID, node.Username)
 	if err != nil {
 		return Node{}, fmt.Errorf("update node: %w", err)
 	}
@@ -653,6 +655,191 @@ func (r *TrafficRepository) DeleteNodeByID(ctx context.Context, id int64) error 
 	return nil
 }
 
+// DeleteNodeIfMutation and DeleteNodeByIDIfMutation close the gap between a
+// remote remove ACK and local deletion. A concurrent same-ID replacement must
+// survive an older request that only owned the previous inbound generation.
+func (r *TrafficRepository) DeleteNodeIfMutation(ctx context.Context, id int64, username, expectedMutationID string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("username is required")
+	}
+	return r.deleteNodeWithMutation(ctx, id, username, true, expectedMutationID)
+}
+
+func (r *TrafficRepository) DeleteNodeByIDIfMutation(ctx context.Context, id int64, expectedMutationID string) error {
+	return r.deleteNodeWithMutation(ctx, id, "", false, expectedMutationID)
+}
+
+// GetStagedWireGuardNodeByMutation finds the one encrypted identity staged by
+// the dedicated WireGuard workflow before a remote ACK. Matching every staging
+// invariant prevents an ordinary or already-attached node from being adopted.
+func (r *TrafficRepository) GetStagedWireGuardNodeByMutation(ctx context.Context, mutationID string) (Node, error) {
+	if r == nil || r.db == nil {
+		return Node{}, errors.New("traffic repository not initialized")
+	}
+	mutationID = strings.TrimSpace(mutationID)
+	if mutationID == "" {
+		return Node{}, ErrNodeNotFound
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id FROM nodes
+		WHERE LOWER(TRIM(protocol)) = 'wireguard'
+		  AND enabled = 0
+		  AND TRIM(COALESCE(original_server, '')) = ''
+		  AND TRIM(COALESCE(inbound_tag, '')) = ''
+		  AND COALESCE(inbound_mutation_id, '') = ?
+		ORDER BY id LIMIT 2`, mutationID)
+	if err != nil {
+		return Node{}, fmt.Errorf("find staged WireGuard node: %w", err)
+	}
+	defer rows.Close()
+	ids := make([]int64, 0, 2)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return Node{}, fmt.Errorf("scan staged WireGuard node: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return Node{}, fmt.Errorf("iterate staged WireGuard nodes: %w", err)
+	}
+	if len(ids) == 0 {
+		return Node{}, ErrNodeNotFound
+	}
+	if len(ids) != 1 {
+		return Node{}, errors.New("multiple staged WireGuard nodes share one mutation id")
+	}
+	return r.GetNodeByID(ctx, ids[0])
+}
+
+// AttachStagedWireGuardNodeIfMutation atomically promotes only the exact staged
+// identity after the Agent inventory confirms the same generation owns the tag.
+func (r *TrafficRepository) AttachStagedWireGuardNodeIfMutation(ctx context.Context, id int64, mutationID, serverName, inboundTag string) (Node, error) {
+	if r == nil || r.db == nil {
+		return Node{}, errors.New("traffic repository not initialized")
+	}
+	mutationID = strings.TrimSpace(mutationID)
+	serverName = strings.TrimSpace(serverName)
+	inboundTag = strings.TrimSpace(inboundTag)
+	if id <= 0 || mutationID == "" || serverName == "" || inboundTag == "" {
+		return Node{}, errors.New("staged WireGuard node coordinates are required")
+	}
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE nodes SET
+			original_server = ?, inbound_tag = ?, tag = ?, enabled = 1,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+		  AND LOWER(TRIM(protocol)) = 'wireguard'
+		  AND enabled = 0
+		  AND TRIM(COALESCE(original_server, '')) = ''
+		  AND TRIM(COALESCE(inbound_tag, '')) = ''
+		  AND COALESCE(inbound_mutation_id, '') = ?`,
+		serverName, inboundTag, "远程:"+serverName, id, mutationID)
+	if err != nil {
+		return Node{}, fmt.Errorf("attach staged WireGuard node: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return Node{}, fmt.Errorf("read attached WireGuard node count: %w", err)
+	}
+	if affected != 1 {
+		return Node{}, ErrNodeMutationChanged
+	}
+	return r.GetNodeByID(ctx, id)
+}
+
+// DeleteStagedWireGuardNodeIfMutation is a single compare-and-delete. If the
+// node was concurrently attached after a lookup, zero rows are affected and the
+// now-live identity survives.
+func (r *TrafficRepository) DeleteStagedWireGuardNodeIfMutation(ctx context.Context, id int64, mutationID string) (bool, error) {
+	if r == nil || r.db == nil {
+		return false, errors.New("traffic repository not initialized")
+	}
+	mutationID = strings.TrimSpace(mutationID)
+	if id <= 0 || mutationID == "" {
+		return false, nil
+	}
+	result, err := r.db.ExecContext(ctx, `
+		DELETE FROM nodes
+		WHERE id = ?
+		  AND LOWER(TRIM(protocol)) = 'wireguard'
+		  AND enabled = 0
+		  AND TRIM(COALESCE(original_server, '')) = ''
+		  AND TRIM(COALESCE(inbound_tag, '')) = ''
+		  AND COALESCE(inbound_mutation_id, '') = ?`, id, mutationID)
+	if err != nil {
+		return false, fmt.Errorf("delete staged WireGuard node: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read deleted staged WireGuard node count: %w", err)
+	}
+	return affected == 1, nil
+}
+
+func (r *TrafficRepository) deleteNodeWithMutation(ctx context.Context, id int64, username string, restrictUsername bool, expectedMutationID string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if id <= 0 {
+		return errors.New("node id is required")
+	}
+	expectedMutationID = strings.TrimSpace(expectedMutationID)
+	query := `SELECT raw_url, username, COALESCE(inbound_mutation_id, '') FROM nodes WHERE id = ?`
+	args := []interface{}{id}
+	if restrictUsername {
+		query += ` AND username = ?`
+		args = append(args, username)
+	}
+	var rawURL, owner, currentMutationID string
+	if err := r.db.QueryRowContext(ctx, query, args...).Scan(&rawURL, &owner, &currentMutationID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNodeNotFound
+		}
+		return fmt.Errorf("get node mutation ownership: %w", err)
+	}
+	if strings.TrimSpace(currentMutationID) != expectedMutationID {
+		return ErrNodeMutationChanged
+	}
+
+	deleteQuery := `DELETE FROM nodes WHERE id = ? AND COALESCE(inbound_mutation_id, '') = ?`
+	deleteArgs := []interface{}{id, expectedMutationID}
+	if restrictUsername {
+		deleteQuery += ` AND username = ?`
+		deleteArgs = append(deleteArgs, username)
+	}
+	result, err := r.db.ExecContext(ctx, deleteQuery, deleteArgs...)
+	if err != nil {
+		return fmt.Errorf("delete node by mutation: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("node mutation delete rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNodeMutationChanged
+	}
+
+	if restrictUsername {
+		_, _ = r.db.ExecContext(ctx, `UPDATE nodes SET chain_proxy_node_id = NULL WHERE chain_proxy_node_id = ? AND username = ?`, id, username)
+	} else {
+		_, _ = r.db.ExecContext(ctx, `UPDATE nodes SET chain_proxy_node_id = NULL WHERE chain_proxy_node_id = ?`, id)
+	}
+	_, _ = r.db.ExecContext(ctx, `DELETE FROM user_subaccounts WHERE routed_node_id = ?`, id)
+	if rawURL != "" && owner != "" {
+		var count int
+		if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE username = ? AND raw_url = ?`, owner, rawURL).Scan(&count); err == nil && count == 0 {
+			var subscriptionID int64
+			if err := r.db.QueryRowContext(ctx, `SELECT id FROM external_subscriptions WHERE username = ? AND url = ?`, owner, rawURL).Scan(&subscriptionID); err == nil && subscriptionID > 0 {
+				_, _ = r.db.ExecContext(ctx, `DELETE FROM proxy_provider_configs WHERE external_subscription_id = ?`, subscriptionID)
+			}
+			_, _ = r.db.ExecContext(ctx, `DELETE FROM external_subscriptions WHERE username = ? AND url = ?`, owner, rawURL)
+		}
+	}
+	return nil
+}
+
 // 在单个事务中创建多个节点。
 func (r *TrafficRepository) BatchCreateNodes(ctx context.Context, nodes []Node) ([]Node, error) {
 	if r == nil || r.db == nil {
@@ -669,7 +856,7 @@ func (r *TrafficRepository) BatchCreateNodes(ctx context.Context, nodes []Node) 
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO nodes (username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, tag, tags, original_server, original_domain, inbound_tag, chain_proxy_node_id, relay_orig_server, relay_orig_port) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO nodes (username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, tag, tags, original_server, original_domain, inbound_tag, inbound_mutation_id, chain_proxy_node_id, relay_orig_server, relay_orig_port) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return nil, fmt.Errorf("prepare insert node: %w", err)
 	}
@@ -680,9 +867,10 @@ func (r *TrafficRepository) BatchCreateNodes(ctx context.Context, nodes []Node) 
 		node.Username = strings.TrimSpace(node.Username)
 		node.RawURL = strings.TrimSpace(node.RawURL)
 		node.NodeName = strings.TrimSpace(node.NodeName)
-		node.Protocol = strings.ToLower(strings.TrimSpace(node.Protocol))
+		node.Protocol = canonicalNodeProtocol(node.Protocol)
 		node.Tag = strings.TrimSpace(node.Tag)
 		node.InboundTag = strings.TrimSpace(node.InboundTag)
+		node.InboundMutationID = strings.TrimSpace(node.InboundMutationID)
 
 		if node.Username == "" {
 			return nil, fmt.Errorf("node %d: username is required", idx+1)
@@ -719,7 +907,7 @@ func (r *TrafficRepository) BatchCreateNodes(ctx context.Context, nodes []Node) 
 			enabled = 1
 		}
 
-		res, err := stmt.ExecContext(ctx, node.Username, node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, tagsJSON, node.OriginalServer, node.OriginalDomain, node.InboundTag, node.ChainProxyNodeID, node.RelayOrigServer, node.RelayOrigPort)
+		res, err := stmt.ExecContext(ctx, node.Username, node.RawURL, node.NodeName, node.Protocol, node.ParsedConfig, node.ClashConfig, enabled, node.Tag, tagsJSON, node.OriginalServer, node.OriginalDomain, node.InboundTag, node.InboundMutationID, node.ChainProxyNodeID, node.RelayOrigServer, node.RelayOrigPort)
 		if err != nil {
 			return nil, fmt.Errorf("insert node %d: %w", idx+1, err)
 		}
@@ -802,6 +990,83 @@ func (r *TrafficRepository) DeleteNodesByInboundTag(ctx context.Context, serverN
 	}
 
 	return affected, nil
+}
+
+// DeleteNodesByInboundTagMutation removes only the generation that created the
+// inbound. A stale removal event must not delete a newer same-tag replacement.
+func (r *TrafficRepository) DeleteNodesByInboundTagMutation(ctx context.Context, serverName, inboundTag, mutationID string) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("traffic repository not initialized")
+	}
+	serverName = strings.TrimSpace(serverName)
+	inboundTag = strings.TrimSpace(inboundTag)
+	mutationID = strings.TrimSpace(mutationID)
+	if serverName == "" || inboundTag == "" {
+		return 0, errors.New("server name and inbound tag are required")
+	}
+	res, err := r.db.ExecContext(ctx,
+		`DELETE FROM nodes WHERE original_server = ? AND inbound_tag = ? AND COALESCE(inbound_mutation_id, '') = ?`,
+		serverName, inboundTag, mutationID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("delete nodes by inbound tag mutation: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("delete nodes rows affected: %w", err)
+	}
+	return affected, nil
+}
+
+// FindInboundMutationID resolves the current ownership token from both local
+// inventories. Multiple non-empty values indicate corrupt/stale ownership and
+// fail closed instead of guessing which generation a delete targets.
+func (r *TrafficRepository) FindInboundMutationID(ctx context.Context, serverID int64, inboundTag string) (string, error) {
+	if r == nil || r.db == nil {
+		return "", errors.New("traffic repository not initialized")
+	}
+	inboundTag = strings.TrimSpace(inboundTag)
+	if serverID <= 0 || inboundTag == "" {
+		return "", nil
+	}
+	// The universal ownership row covers both node-producing and tunnel-only
+	// inbounds. Older denormalized rows below remain a migration fallback.
+	if mutationID, err := r.GetRemoteInboundOwnership(ctx, serverID, inboundTag); err != nil {
+		return "", err
+	} else if mutationID != "" {
+		return mutationID, nil
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT mutation_id FROM (
+			SELECT COALESCE(mutation_id, '') AS mutation_id
+			FROM managed_inbound_resources
+			WHERE server_id = ? AND inbound_tag = ?
+			UNION
+			SELECT COALESCE(n.inbound_mutation_id, '') AS mutation_id
+			FROM nodes n
+			JOIN remote_servers s ON s.name = n.original_server
+			WHERE s.id = ? AND n.inbound_tag = ?
+		) WHERE mutation_id != ''`, serverID, inboundTag, serverID, inboundTag)
+	if err != nil {
+		return "", fmt.Errorf("resolve inbound mutation id: %w", err)
+	}
+	defer rows.Close()
+	var mutationID string
+	for rows.Next() {
+		var current string
+		if err := rows.Scan(&current); err != nil {
+			return "", fmt.Errorf("scan inbound mutation id: %w", err)
+		}
+		current = strings.TrimSpace(current)
+		if mutationID != "" && current != mutationID {
+			return "", errors.New("conflicting inbound mutation ownership records")
+		}
+		mutationID = current
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterate inbound mutation ids: %w", err)
+	}
+	return mutationID, nil
 }
 
 // RefreshNodesServerAddress 把指定服务器下所有节点的 clash_config.server 字段批量替换为 newAddr。
@@ -926,10 +1191,7 @@ func (r *TrafficRepository) UpdateNodeByInboundTag(ctx context.Context, serverNa
 		return errors.New("server name and inbound tag are required")
 	}
 
-	query := `
-		UPDATE nodes
-		SET clash_config = ?, parsed_config = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE original_server = ? AND inbound_tag = ?`
+	query := `SELECT id FROM nodes WHERE original_server = ? AND inbound_tag = ?`
 	switch family {
 	case "v4":
 		query += ` AND IFNULL(json_extract(clash_config, '$.server'), '') NOT LIKE '%:%'`
@@ -937,9 +1199,35 @@ func (r *TrafficRepository) UpdateNodeByInboundTag(ctx context.Context, serverNa
 		query += ` AND IFNULL(json_extract(clash_config, '$.server'), '') LIKE '%:%'`
 	}
 
-	_, err := r.db.ExecContext(ctx, query, clashConfig, clashConfig, serverName, inboundTag)
+	rows, err := r.db.QueryContext(ctx, query, serverName, inboundTag)
 	if err != nil {
-		return fmt.Errorf("update node by inbound tag: %w", err)
+		return fmt.Errorf("list nodes by inbound tag: %w", err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan node by inbound tag: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close nodes by inbound tag: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate nodes by inbound tag: %w", err)
+	}
+	for _, id := range ids {
+		node, err := r.GetNodeByID(ctx, id)
+		if err != nil {
+			return fmt.Errorf("read node %d by inbound tag: %w", id, err)
+		}
+		node.ClashConfig = clashConfig
+		node.ParsedConfig = clashConfig
+		if _, err := r.UpdateNode(ctx, node); err != nil {
+			return fmt.Errorf("update node %d by inbound tag: %w", id, err)
+		}
 	}
 
 	return nil
@@ -956,7 +1244,12 @@ func (r *TrafficRepository) CreateRoutedNode(ctx context.Context, detail RoutedN
 		return RoutedNodeDetail{}, errors.New("traffic repository not initialized")
 	}
 	n := detail.Node
-	if strings.EqualFold(strings.TrimSpace(n.Protocol), "wireguard") {
+	protected, _, err := protectWireGuardNodeForStorage(n)
+	if err != nil {
+		return RoutedNodeDetail{}, fmt.Errorf("validate routed node protocol: %w", err)
+	}
+	n = protected
+	if n.Protocol == "wireguard" {
 		return RoutedNodeDetail{}, errors.New("WireGuard nodes cannot be converted into routed nodes")
 	}
 	n.NodeName = strings.TrimSpace(n.NodeName)
@@ -989,13 +1282,13 @@ func (r *TrafficRepository) CreateRoutedNode(ctx context.Context, detail RoutedN
 	res, err := r.db.ExecContext(ctx, `
 		INSERT INTO nodes (
 			username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, tag, tags,
-			original_server, original_domain, inbound_tag, chain_proxy_node_id,
+			original_server, original_domain, inbound_tag, inbound_mutation_id, chain_proxy_node_id,
 			node_type, parent_node_id,
 			routed_outbound_tag, routed_outbound_json, routed_rule_marktag,
 			routed_admin_email, routed_admin_credential, routed_owner
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'routed', ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'routed', ?, ?, ?, ?, ?, ?, ?)`,
 		n.Username, n.RawURL, n.NodeName, n.Protocol, n.ParsedConfig, n.ClashConfig, enabled, n.Tag, tagsJSON,
-		n.OriginalServer, n.OriginalDomain, n.InboundTag, n.ChainProxyNodeID,
+		n.OriginalServer, n.OriginalDomain, n.InboundTag, n.InboundMutationID, n.ChainProxyNodeID,
 		*n.ParentNodeID,
 		detail.RoutedOutboundTag, detail.RoutedOutboundJSON, detail.RoutedRuleMarktag,
 		detail.RoutedAdminEmail, detail.RoutedAdminCredential, owner,
@@ -1020,7 +1313,7 @@ func (r *TrafficRepository) GetRoutedNodeDetail(ctx context.Context, id int64) (
 	err := r.db.QueryRowContext(ctx, `
 		SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled,
 		       COALESCE(tag, ''), COALESCE(original_server, ''), COALESCE(original_domain, ''),
-		       COALESCE(inbound_tag, ''), chain_proxy_node_id,
+		       COALESCE(inbound_tag, ''), COALESCE(inbound_mutation_id, ''), chain_proxy_node_id,
 		       COALESCE(node_type, 'physical'), parent_node_id,
 		       COALESCE(routed_outbound_tag, ''), COALESCE(routed_outbound_json, ''),
 		       COALESCE(routed_rule_marktag, ''),
@@ -1030,7 +1323,7 @@ func (r *TrafficRepository) GetRoutedNodeDetail(ctx context.Context, id int64) (
 		FROM nodes WHERE id = ? LIMIT 1`, id).Scan(
 		&d.ID, &d.Username, &d.RawURL, &d.NodeName, &d.Protocol, &d.ParsedConfig, &d.ClashConfig, &enabled,
 		&d.Tag, &d.OriginalServer, &d.OriginalDomain,
-		&d.InboundTag, &d.ChainProxyNodeID,
+		&d.InboundTag, &d.InboundMutationID, &d.ChainProxyNodeID,
 		&d.NodeType, &d.ParentNodeID,
 		&d.RoutedOutboundTag, &d.RoutedOutboundJSON,
 		&d.RoutedRuleMarktag,
@@ -1059,7 +1352,7 @@ func (r *TrafficRepository) ListRoutedNodesByParent(ctx context.Context, parentN
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled,
 		       COALESCE(tag, ''), COALESCE(original_server, ''), COALESCE(original_domain, ''),
-		       COALESCE(inbound_tag, ''), chain_proxy_node_id,
+		       COALESCE(inbound_tag, ''), COALESCE(inbound_mutation_id, ''), chain_proxy_node_id,
 		       COALESCE(node_type, 'physical'), parent_node_id,
 		       COALESCE(routed_outbound_tag, ''), COALESCE(routed_outbound_json, ''),
 		       COALESCE(routed_rule_marktag, ''),
@@ -1078,7 +1371,7 @@ func (r *TrafficRepository) ListRoutedNodesByParent(ctx context.Context, parentN
 		if err := rows.Scan(
 			&d.ID, &d.Username, &d.RawURL, &d.NodeName, &d.Protocol, &d.ParsedConfig, &d.ClashConfig, &enabled,
 			&d.Tag, &d.OriginalServer, &d.OriginalDomain,
-			&d.InboundTag, &d.ChainProxyNodeID,
+			&d.InboundTag, &d.InboundMutationID, &d.ChainProxyNodeID,
 			&d.NodeType, &d.ParentNodeID,
 			&d.RoutedOutboundTag, &d.RoutedOutboundJSON,
 			&d.RoutedRuleMarktag,
@@ -1224,16 +1517,24 @@ func (r *TrafficRepository) UpdateNodeInboundTag(ctx context.Context, nodeID int
 // ClaimExternalNode 把一个"外部节点"(original_server=” AND inbound_tag=”)升级为受管节点:
 // 填上 original_server / inbound_tag / tag / clash_config(用 agent 转出来的新 config 覆盖)。
 // 用于迁移场景下,把 mmw 时代手工录入的节点跟 agent 扫描出来的同 server:port 入站绑定。
-func (r *TrafficRepository) ClaimExternalNode(ctx context.Context, nodeID int64, originalServer, inboundTag, tag, clashConfig string) error {
+func (r *TrafficRepository) ClaimExternalNode(ctx context.Context, nodeID int64, originalServer, inboundTag, mutationID, tag, clashConfig string) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
-	_, err := r.db.ExecContext(ctx,
-		`UPDATE nodes SET original_server = ?, inbound_tag = ?, tag = ?, clash_config = ?, parsed_config = ?, updated_at = CURRENT_TIMESTAMP
-		 WHERE id = ? AND (original_server IS NULL OR original_server = '')
-		   AND (inbound_tag IS NULL OR inbound_tag = '')`,
-		originalServer, inboundTag, tag, clashConfig, clashConfig, nodeID,
-	)
+	node, err := r.GetNodeByID(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(node.OriginalServer) != "" || strings.TrimSpace(node.InboundTag) != "" {
+		return errors.New("node is already managed by a remote inbound")
+	}
+	node.OriginalServer = strings.TrimSpace(originalServer)
+	node.InboundTag = strings.TrimSpace(inboundTag)
+	node.InboundMutationID = strings.TrimSpace(mutationID)
+	node.Tag = strings.TrimSpace(tag)
+	node.ClashConfig = clashConfig
+	node.ParsedConfig = clashConfig
+	_, err = r.UpdateNode(ctx, node)
 	return err
 }
 
@@ -1258,7 +1559,7 @@ func (r *TrafficRepository) ListUserRoutedOutbounds(ctx context.Context, usernam
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled,
 		       COALESCE(tag, ''), COALESCE(original_server, ''), COALESCE(original_domain, ''),
-		       COALESCE(inbound_tag, ''), chain_proxy_node_id,
+		       COALESCE(inbound_tag, ''), COALESCE(inbound_mutation_id, ''), chain_proxy_node_id,
 		       COALESCE(node_type, 'physical'), parent_node_id,
 		       COALESCE(routed_outbound_tag, ''), COALESCE(routed_outbound_json, ''),
 		       COALESCE(routed_rule_marktag, ''),
@@ -1277,7 +1578,7 @@ func (r *TrafficRepository) ListUserRoutedOutbounds(ctx context.Context, usernam
 		if err := rows.Scan(
 			&d.ID, &d.Username, &d.RawURL, &d.NodeName, &d.Protocol, &d.ParsedConfig, &d.ClashConfig, &enabled,
 			&d.Tag, &d.OriginalServer, &d.OriginalDomain,
-			&d.InboundTag, &d.ChainProxyNodeID,
+			&d.InboundTag, &d.InboundMutationID, &d.ChainProxyNodeID,
 			&d.NodeType, &d.ParentNodeID,
 			&d.RoutedOutboundTag, &d.RoutedOutboundJSON,
 			&d.RoutedRuleMarktag,

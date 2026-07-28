@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,7 +25,7 @@ func TestSyncExternalNodeUpdateToLegacyYAMLSkipsHydratedWireGuard(t *testing.T) 
 		ClashConfig: `{"name":"managed-wg","type":"wireguard","server":"198.51.100.20","port":51820,` +
 			`"private-key":"` + privateKey + `"}`,
 	}
-	if err := syncExternalNodeUpdateToLegacyYAML(dir, node.NodeName, node); err != nil {
+	if err := syncExternalNodeUpdateToLegacyYAML(nil, dir, node.NodeName, node); err != nil {
 		t.Fatalf("sync hydrated WireGuard node: %v", err)
 	}
 
@@ -41,9 +42,15 @@ func TestSyncExternalNodeUpdateToLegacyYAMLSkipsHydratedWireGuard(t *testing.T) 
 }
 
 func TestSyncExternalNodeUpdateToLegacyYAMLPersistsOrdinaryNode(t *testing.T) {
+	repo, _ := newWireGuardSubscriptionTestRepo(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "legacy.yaml")
 	if err := os.WriteFile(path, []byte("proxies:\n  - name: edge\n    type: vless\n    server: 192.0.2.10\n    port: 80\n    uuid: old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateSubscribeFile(context.Background(), storage.SubscribeFile{
+		Name: "legacy", Type: storage.SubscribeTypeUpload, Filename: "legacy.yaml",
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -52,7 +59,7 @@ func TestSyncExternalNodeUpdateToLegacyYAMLPersistsOrdinaryNode(t *testing.T) {
 		Protocol:    "vless",
 		ClashConfig: `{"name":"edge","type":"vless","server":"198.51.100.20","port":443,"uuid":"ordinary"}`,
 	}
-	if err := syncExternalNodeUpdateToLegacyYAML(dir, node.NodeName, node); err != nil {
+	if err := syncExternalNodeUpdateToLegacyYAML(repo, dir, node.NodeName, node); err != nil {
 		t.Fatalf("sync ordinary node: %v", err)
 	}
 

@@ -43,6 +43,7 @@ type CertificateHandler struct {
 	acmeClient         *acme.Client
 	onMasterURLChanged func(ctx context.Context, newURL string)
 	remoteManage       *RemoteManageHandler // 联邦(分享)服务器证书下发时,复用其 ForwardToAgent 走拥有方主控
+	localDeployer      func(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error
 }
 
 func (h *CertificateHandler) SetOnMasterURLChanged(fn func(ctx context.Context, newURL string)) {
@@ -52,6 +53,19 @@ func (h *CertificateHandler) SetOnMasterURLChanged(fn func(ctx context.Context, 
 // SetRemoteManage 注入 RemoteManageHandler,用于把证书下发转发到联邦(分享)服务器的拥有方主控。
 func (h *CertificateHandler) SetRemoteManage(rm *RemoteManageHandler) {
 	h.remoteManage = rm
+}
+
+// SetLocalDeployer injects child-mode service serialization for certificates
+// deployed on this host. Remote certificate delivery continues through Agent.
+func (h *CertificateHandler) SetLocalDeployer(deployer func(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error) {
+	h.localDeployer = deployer
+}
+
+func (h *CertificateHandler) deployLocal(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
+	if h.localDeployer != nil {
+		return h.localDeployer(certPEM, keyPEM, certPath, keyPath, reloadTarget)
+	}
+	return acme.Deploy(certPEM, keyPEM, certPath, keyPath, reloadTarget)
 }
 
 // 创建一个新的CertificateHandler。
@@ -923,7 +937,7 @@ func (h *CertificateHandler) HandleCertUpdate(serverID int64, payload WSCertUpda
 				deployTarget = "both"
 			}
 			if deployTarget != "" && deployTarget != "none" {
-				if deployErr := acme.Deploy(payload.CertPEM, payload.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget); deployErr != nil {
+				if deployErr := h.deployLocal(payload.CertPEM, payload.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget); deployErr != nil {
 					log.Printf("[Certificate] Local deploy from cert_update failed: %v", deployErr)
 				}
 				h.deployToAllRemotes(cert.Domain, payload.CertPEM, payload.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget)
@@ -982,7 +996,7 @@ func (h *CertificateHandler) deployAfterIssue(cert *storage.Certificate, result 
 	}
 
 	// 本地部署（主）
-	if err := acme.Deploy(result.CertPEM, result.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget); err != nil {
+	if err := h.deployLocal(result.CertPEM, result.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget); err != nil {
 		log.Printf("[Certificate] Local deploy failed for %s: %v", cert.Domain, err)
 	} else {
 		log.Printf("[Certificate] Local deploy succeeded for %s to %s", cert.Domain, cert.DeployCertPath)
@@ -1250,7 +1264,7 @@ func (h *CertificateHandler) DeployCertificate(w http.ResponseWriter, r *http.Re
 	}
 
 	// 本地部署（主）
-	if err := acme.Deploy(cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget); err != nil {
+	if err := h.deployLocal(cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget); err != nil {
 		log.Printf("[Certificate] Local deploy failed for %s: %v", cert.Domain, err)
 	}
 

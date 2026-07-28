@@ -172,13 +172,14 @@ func TestHandleInboundsHoldsLeaseThroughWSSPostSync(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "inbounds": inbounds})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
 			var request struct {
-				Inbound map[string]any `json:"inbound"`
+				Inbound    map[string]any `json:"inbound"`
+				MutationID string         `json:"mutation_id"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&request)
 			inboundMu.Lock()
 			storedInbound = request.Inbound
 			inboundMu.Unlock()
-			_, _ = w.Write([]byte(`{"success":true}`))
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "mutation_id": request.MutationID})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/cert/deploy":
 			_, _ = w.Write([]byte(`{"success":true}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/nginx/setup-ssl":
@@ -259,11 +260,12 @@ func TestHandleInboundsRollsBackWSSWhenPostSyncFails(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "inbounds": inbounds})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
 			var request struct {
-				Action string `json:"action"`
+				Action     string `json:"action"`
+				MutationID string `json:"mutation_id"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&request)
 			added.Store(request.Action != "remove")
-			_, _ = w.Write([]byte(`{"success":true}`))
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "mutation_id": request.MutationID})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/cert/deploy":
 			_, _ = w.Write([]byte(`{"success":true}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/nginx/setup-ssl":

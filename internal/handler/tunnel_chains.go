@@ -211,6 +211,9 @@ func (h *TunnelChainHandler) create(w http.ResponseWriter, r *http.Request) {
 			if err == nil {
 				err = validateTunnelChainMutationACK(result)
 			}
+			if err == nil {
+				_, err = h.repo.DeleteRemoteInboundOwnershipIfMutation(ctx, c.sid, c.tag, c.mutationID)
+			}
 			if err != nil {
 				rollbackErrors = append(rollbackErrors, fmt.Errorf("服务器 %d 删除 %s: %w", c.sid, c.tag, err))
 			}
@@ -245,6 +248,14 @@ func (h *TunnelChainHandler) create(w http.ResponseWriter, r *http.Request) {
 			},
 		}
 		body, _ := json.Marshal(map[string]any{"action": "add", "inbound": inbound, "mutation_id": mutationID})
+		if err := h.repo.SetRemoteInboundOwnership(ctx, req.ServerIDs[i], tag, mutationID); err != nil {
+			if rollbackErr := rollback(); rollbackErr != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("第 %d 跳(%s)无法预存入站所有权: %v; 已建入站回滚未完整确认: %v", i+1, servers[i].Name, err, rollbackErr))
+			} else {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("第 %d 跳(%s)无法预存入站所有权: %v", i+1, servers[i].Name, err))
+			}
+			return
+		}
 		// The request can reach the Agent and mutate runtime state before a
 		// transport error (for example a dropped response) reaches us. Treat this
 		// hop as possibly created before sending it so rollback confirms removal
@@ -300,7 +311,7 @@ func (h *TunnelChainHandler) acquireMutationLeases(ctx context.Context, serverID
 		}
 	}
 	for _, serverID := range orderedIDs {
-		nextCtx, release, err := h.repo.AcquireRemoteServerMutationLease(leasedCtx, serverID)
+		nextCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(leasedCtx, serverID)
 		if err != nil {
 			releaseAll()
 			return nil, func() {}, err

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -210,6 +211,15 @@ func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string,
 		if len(missing) > 0 {
 			report.Warnings = append(report.Warnings, fmt.Sprintf("%s: mmw 库缺少列 %v,这些列将取 mmwx 默认值", spec.dest, missing))
 		}
+		if spec.dest == "nodes" {
+			imported, err := r.importMmwNodesTx(ctx, tx, useCols)
+			if err != nil {
+				rollback()
+				return nil, fmt.Errorf("import nodes: %w", err)
+			}
+			*spec.target = imported
+			continue
+		}
 
 		colList := joinCols(useCols)
 		stmt := fmt.Sprintf(
@@ -262,6 +272,175 @@ func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string,
 		return nil, fmt.Errorf("commit: %w", err)
 	}
 	return report, nil
+}
+
+// importMmwNodesTx imports legacy nodes row by row so WireGuard client
+// identities never pass through the target nodes table in plaintext. The
+// sanitized node and its encrypted node_secrets row share the caller's import
+// transaction, therefore one malformed or unprotectable key rolls back every
+// table imported from the legacy database.
+func (r *TrafficRepository) importMmwNodesTx(ctx context.Context, tx *sql.Tx, columns []string) (int, error) {
+	if len(columns) == 0 {
+		return 0, errors.New("no compatible node columns")
+	}
+	columnIndex := make(map[string]int, len(columns))
+	for index, column := range columns {
+		columnIndex[column] = index
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT `+joinCols(columns)+` FROM src.nodes`)
+	if err != nil {
+		return 0, fmt.Errorf("read source nodes: %w", err)
+	}
+	type sourceNodeRow struct {
+		values []any
+	}
+	var sourceRows []sourceNodeRow
+	for rows.Next() {
+		values := make([]any, len(columns))
+		destinations := make([]any, len(columns))
+		for index := range values {
+			destinations[index] = &values[index]
+		}
+		if err := rows.Scan(destinations...); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("scan source node: %w", err)
+		}
+		for index, value := range values {
+			if raw, ok := value.([]byte); ok {
+				values[index] = append([]byte(nil), raw...)
+			}
+		}
+		sourceRows = append(sourceRows, sourceNodeRow{values: values})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("iterate source nodes: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("close source node scan: %w", err)
+	}
+
+	placeholders := make([]string, len(columns))
+	for index := range placeholders {
+		placeholders[index] = "?"
+	}
+	insertStatement := `INSERT OR IGNORE INTO main.nodes (` + joinCols(columns) + `) VALUES (` + strings.Join(placeholders, ", ") + `)`
+	imported := 0
+	for rowIndex, sourceRow := range sourceRows {
+		values := sourceRow.values
+		protocol := mmwDatabaseString(valueAtColumn(values, columnIndex, "protocol"))
+		node := Node{
+			Protocol:     protocol,
+			RawURL:       mmwDatabaseString(valueAtColumn(values, columnIndex, "raw_url")),
+			ParsedConfig: mmwDatabaseString(valueAtColumn(values, columnIndex, "parsed_config")),
+			ClashConfig:  mmwDatabaseString(valueAtColumn(values, columnIndex, "clash_config")),
+		}
+		protected, privateKey, err := protectWireGuardNodeForStorage(node)
+		if err != nil {
+			return 0, fmt.Errorf("validate source node row %d protocol: %w", rowIndex+1, err)
+		}
+		isWireGuard := protected.Protocol == "wireguard"
+		var nodeID int64
+		var ciphertext string
+		if isWireGuard {
+			idValue, ok := columnIndex["id"]
+			if !ok {
+				return 0, fmt.Errorf("WireGuard source row %d has no id column", rowIndex+1)
+			}
+			var err error
+			nodeID, err = mmwDatabaseInt64(values[idValue])
+			if err != nil || nodeID <= 0 {
+				return 0, fmt.Errorf("WireGuard source row %d has invalid id: %v", rowIndex+1, err)
+			}
+			if privateKey == "" {
+				return 0, fmt.Errorf("protect WireGuard node %d: private key is required", nodeID)
+			}
+			ciphertext, err = r.sealWireGuardPrivateKey(nodeID, privateKey)
+			if err != nil {
+				return 0, fmt.Errorf("encrypt WireGuard node %d: %w", nodeID, err)
+			}
+		}
+		setColumnValue(values, columnIndex, "protocol", protected.Protocol)
+		setColumnValue(values, columnIndex, "raw_url", protected.RawURL)
+		setColumnValue(values, columnIndex, "parsed_config", protected.ParsedConfig)
+		setColumnValue(values, columnIndex, "clash_config", protected.ClashConfig)
+
+		result, err := tx.ExecContext(ctx, insertStatement, values...)
+		if err != nil {
+			return 0, fmt.Errorf("insert source node row %d: %w", rowIndex+1, err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("verify source node row %d insert: %w", rowIndex+1, err)
+		}
+		if affected == 0 {
+			if isWireGuard {
+				var existing int
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM main.nodes WHERE id = ?`, nodeID).Scan(&existing); err != nil {
+					return 0, fmt.Errorf("verify ignored WireGuard node %d: %w", nodeID, err)
+				}
+				if existing == 0 {
+					return 0, fmt.Errorf("WireGuard node %d was rejected by the target schema", nodeID)
+				}
+			}
+			continue
+		}
+		imported += int(affected)
+		if isWireGuard {
+			if err := upsertNodeSecret(ctx, tx, nodeID, ciphertext); err != nil {
+				return 0, fmt.Errorf("store WireGuard node %d secret: %w", nodeID, err)
+			}
+		}
+	}
+	return imported, nil
+}
+
+func valueAtColumn(values []any, columns map[string]int, column string) any {
+	index, ok := columns[column]
+	if !ok || index < 0 || index >= len(values) {
+		return nil
+	}
+	return values[index]
+}
+
+func setColumnValue(values []any, columns map[string]int, column string, value any) {
+	if index, ok := columns[column]; ok && index >= 0 && index < len(values) {
+		values[index] = value
+	}
+}
+
+func mmwDatabaseString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case []byte:
+		return string(typed)
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func mmwDatabaseInt64(value any) (int64, error) {
+	switch typed := value.(type) {
+	case int64:
+		return typed, nil
+	case int:
+		return int64(typed), nil
+	case float64:
+		if typed != float64(int64(typed)) {
+			return 0, fmt.Errorf("not an integer: %v", typed)
+		}
+		return int64(typed), nil
+	case string:
+		return strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+	case []byte:
+		return strconv.ParseInt(strings.TrimSpace(string(typed)), 10, 64)
+	default:
+		return 0, fmt.Errorf("unsupported integer value %T", value)
+	}
 }
 
 // MmwImportBlockingCounts returns only non-zero business rows that make the

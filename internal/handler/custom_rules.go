@@ -379,6 +379,23 @@ func triggerAutoSync(repo *storage.TrafficRepository, ruleID int64) []string {
 // syncCustomRulesToFile 将所有自定义规则同步到特定的订阅文件
 // 返回已添加代理组的列表
 func syncCustomRulesToFile(ctx context.Context, repo *storage.TrafficRepository, file storage.SubscribeFile) ([]string, error) {
+	if err := storage.ValidateSubscribeFilename(file.Filename); err != nil {
+		return nil, err
+	}
+	unlock, err := lockSubscriptionFilenames(file.Filename)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	current, err := repo.GetSubscribeFileByID(ctx, file.ID)
+	if err != nil {
+		return nil, err
+	}
+	file = current
+	if err := storage.ValidateSubscribeFilename(file.Filename); err != nil {
+		return nil, err
+	}
+
 	// 读取订阅文件
 	filePath := filepath.Join("subscribes", file.Filename)
 	data, err := os.ReadFile(filePath)
@@ -392,8 +409,12 @@ func syncCustomRulesToFile(ctx context.Context, repo *storage.TrafficRepository,
 		return nil, fmt.Errorf("apply custom rules: %w", err)
 	}
 
+	protected, err := protectWireGuardSubscriptionContent(ctx, repo, file.Filename, string(modified), true)
+	if err != nil {
+		return nil, fmt.Errorf("protect WireGuard secrets: %w", err)
+	}
 	// 写回文件
-	if err := os.WriteFile(filePath, modified, 0644); err != nil {
+	if err := writePrivateSubscriptionFileUnlocked(filePath, []byte(protected)); err != nil {
 		return nil, fmt.Errorf("write file: %w", err)
 	}
 
@@ -420,6 +441,22 @@ func checkAndAddMissingProxyGroupsForRule(ctx context.Context, repo *storage.Tra
 	}
 
 	addedGroups := make(map[string]bool)
+	filenames := make([]string, 0, len(files))
+	for _, file := range files {
+		if err := storage.ValidateSubscribeFilename(file.Filename); err != nil {
+			return nil, err
+		}
+		filenames = append(filenames, file.Filename)
+	}
+	unlock, err := lockSubscriptionFilenames(filenames...)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	files, err = repo.ListSubscribeFiles(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reload subscribe files: %w", err)
+	}
 
 	// 处理每个文件
 	for _, file := range files {
@@ -518,7 +555,12 @@ func checkAndAddMissingProxyGroupsForRule(ctx context.Context, repo *storage.Tra
 			}
 
 			result := RemoveUnicodeEscapeQuotes(string(modifiedData))
-			if err := os.WriteFile(filePath, []byte(result), 0644); err != nil {
+			protected, err := protectWireGuardSubscriptionContent(ctx, repo, file.Filename, result, true)
+			if err != nil {
+				logger.Info("Warning: failed to protect WireGuard secrets", "value", filePath, "error", err)
+				continue
+			}
+			if err := writePrivateSubscriptionFileUnlocked(filePath, []byte(protected)); err != nil {
 				logger.Info("Warning: failed to write file", "value", filePath, "error", err)
 				continue
 			}

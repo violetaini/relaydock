@@ -18,6 +18,8 @@ import (
 
 const wireGuardPrivateKeySecretKind = "wireguard-private-key-v1"
 
+const wireGuardSubscriptionSecretPurpose = "arcway:subscription:wireguard-private-key:v1:"
+
 // ConfigureNodeSecretEncryption derives the at-rest node-secret key from the
 // persistent panel master key and atomically protects any legacy plaintext
 // WireGuard node configs. Call this once immediately after loading the panel
@@ -61,8 +63,6 @@ func (r *TrafficRepository) verifyExistingWireGuardNodeSecrets(ctx context.Conte
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT ns.node_id, ns.kind, ns.ciphertext
 		FROM node_secrets ns
-		JOIN nodes n ON n.id = ns.node_id
-		WHERE lower(trim(n.protocol)) = 'wireguard'
 		ORDER BY ns.node_id`)
 	if err != nil {
 		return fmt.Errorf("scan existing encrypted WireGuard node secrets: %w", err)
@@ -123,6 +123,60 @@ func (r *TrafficRepository) openWireGuardPrivateKey(nodeID int64, ciphertext str
 	return privateKey, nil
 }
 
+// SealWireGuardSubscriptionPrivateKey encrypts a static subscription snapshot.
+// The scope is the subscription filename, so a ciphertext copied to a different
+// subscription cannot be decrypted. Static snapshots deliberately do not point
+// back to a mutable node: rotating a node key must never grant an old link the
+// replacement private key.
+func (r *TrafficRepository) SealWireGuardSubscriptionPrivateKey(scope, privateKey string) (string, error) {
+	if r == nil || r.db == nil {
+		return "", errors.New("traffic repository not initialized")
+	}
+	scope = strings.TrimSpace(scope)
+	privateKey = strings.TrimSpace(privateKey)
+	if scope == "" {
+		return "", errors.New("subscription secret scope is required")
+	}
+	if !validStoredWireGuardPrivateKey(privateKey) {
+		return "", errors.New("WireGuard private key must contain 32 bytes")
+	}
+	r.nodeSecretMu.RLock()
+	box := r.nodeSecretBox
+	r.nodeSecretMu.RUnlock()
+	if box == nil {
+		return "", errors.New("WireGuard 私钥加密尚未初始化")
+	}
+	return box.Seal([]byte(privateKey), []byte(wireGuardSubscriptionSecretPurpose+scope))
+}
+
+// OpenWireGuardSubscriptionPrivateKey decrypts an authenticated static
+// snapshot. Decryption fails when either the envelope or filename scope was
+// changed.
+func (r *TrafficRepository) OpenWireGuardSubscriptionPrivateKey(scope, ciphertext string) (string, error) {
+	if r == nil || r.db == nil {
+		return "", errors.New("traffic repository not initialized")
+	}
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return "", errors.New("subscription secret scope is required")
+	}
+	r.nodeSecretMu.RLock()
+	box := r.nodeSecretBox
+	r.nodeSecretMu.RUnlock()
+	if box == nil {
+		return "", errors.New("WireGuard 私钥加密尚未初始化")
+	}
+	plaintext, err := box.Open(strings.TrimSpace(ciphertext), []byte(wireGuardSubscriptionSecretPurpose+scope))
+	if err != nil {
+		return "", fmt.Errorf("解密 WireGuard 订阅私钥失败: %w", err)
+	}
+	privateKey := strings.TrimSpace(string(plaintext))
+	if !validStoredWireGuardPrivateKey(privateKey) {
+		return "", errors.New("WireGuard 订阅私钥格式无效")
+	}
+	return privateKey, nil
+}
+
 func validStoredWireGuardPrivateKey(value string) bool {
 	_, err := decodeStoredWireGuardPrivateKey(value)
 	return err == nil
@@ -152,30 +206,52 @@ func equalStoredWireGuardPrivateKeys(first, second string) bool {
 
 func (r *TrafficRepository) verifyWireGuardNodeSecrets(ctx context.Context) error {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT n.id, COALESCE(ns.kind, ''), COALESCE(ns.ciphertext, '')
+		SELECT n.id, n.username, n.raw_url, n.node_name, n.protocol,
+		       n.parsed_config, n.clash_config,
+		       COALESCE(ns.kind, ''), COALESCE(ns.ciphertext, '')
 		FROM nodes n
 		LEFT JOIN node_secrets ns ON ns.node_id = n.id
-		WHERE lower(trim(n.protocol)) = 'wireguard'
 		ORDER BY n.id`)
 	if err != nil {
 		return fmt.Errorf("scan encrypted WireGuard node secrets: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var nodeID int64
+		var node Node
 		var kind, ciphertext string
-		if err := rows.Scan(&nodeID, &kind, &ciphertext); err != nil {
+		if err := rows.Scan(
+			&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol,
+			&node.ParsedConfig, &node.ClashConfig, &kind, &ciphertext,
+		); err != nil {
 			return fmt.Errorf("scan encrypted WireGuard node secret: %w", err)
 		}
-		if kind != wireGuardPrivateKeySecretKind || strings.TrimSpace(ciphertext) == "" {
-			return fmt.Errorf("WireGuard 节点 %d 缺少有效的加密私钥记录", nodeID)
+		isWireGuard, err := validateNodeProtocolEvidence(&node)
+		if err != nil {
+			return fmt.Errorf("validate node %d protocol: %w", node.ID, err)
 		}
-		privateKey, err := r.openWireGuardPrivateKey(nodeID, ciphertext)
+		if !isWireGuard {
+			if kind != "" || ciphertext != "" {
+				return fmt.Errorf("non-WireGuard node %d contains an encrypted WireGuard secret", node.ID)
+			}
+			continue
+		}
+		if node.Protocol != "wireguard" {
+			return fmt.Errorf("WireGuard node %d protocol is not canonical", node.ID)
+		}
+		if plaintext, err := findWireGuardPlaintextPrivateKey(node); err != nil {
+			return fmt.Errorf("inspect WireGuard node %d private key: %w", node.ID, err)
+		} else if plaintext != "" {
+			return fmt.Errorf("WireGuard node %d still contains an unprotected private key", node.ID)
+		}
+		if kind != wireGuardPrivateKeySecretKind || strings.TrimSpace(ciphertext) == "" {
+			return fmt.Errorf("WireGuard 节点 %d 缺少有效的加密私钥记录", node.ID)
+		}
+		privateKey, err := r.openWireGuardPrivateKey(node.ID, ciphertext)
 		if err != nil {
 			return err
 		}
 		if !validStoredWireGuardPrivateKey(privateKey) {
-			return fmt.Errorf("WireGuard 节点 %d 的加密私钥格式无效", nodeID)
+			return fmt.Errorf("WireGuard 节点 %d 的加密私钥格式无效", node.ID)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -198,6 +274,128 @@ func (r *TrafficRepository) nodeSecretKind(ctx context.Context, nodeID int64) (s
 
 func normalizePrivateKeyField(key string) string {
 	return strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.ToLower(strings.TrimSpace(key)))
+}
+
+func canonicalNodeProtocol(protocol string) string {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	if protocol == "wg" {
+		return "wireguard"
+	}
+	return protocol
+}
+
+type nodeConfigProtocolEvidence struct {
+	wireGuard            bool
+	explicitNonWireGuard string
+}
+
+func containsPrivateKeyField(value interface{}) bool {
+	switch current := value.(type) {
+	case map[string]interface{}:
+		for key, child := range current {
+			if normalizePrivateKeyField(key) == "privatekey" || containsPrivateKeyField(child) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, child := range current {
+			if containsPrivateKeyField(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func inspectNodeConfigProtocol(label, config string) (nodeConfigProtocolEvidence, error) {
+	config = strings.TrimSpace(config)
+	if config == "" {
+		return nodeConfigProtocolEvidence{}, nil
+	}
+	var value interface{}
+	if err := json.Unmarshal([]byte(config), &value); err != nil {
+		// Ordinary legacy nodes were not required to keep parsed_config as JSON.
+		// Preserve that compatibility, but fail closed when malformed input still
+		// advertises a private-key field that could contain a WireGuard identity.
+		normalized := normalizePrivateKeyField(config)
+		if strings.Contains(normalized, "privatekey") {
+			return nodeConfigProtocolEvidence{}, fmt.Errorf("%s contains an unreadable private-key field", label)
+		}
+		return nodeConfigProtocolEvidence{}, nil
+	}
+	evidence := nodeConfigProtocolEvidence{wireGuard: containsPrivateKeyField(value)}
+	mapping, ok := value.(map[string]interface{})
+	if !ok || mapping == nil {
+		return evidence, nil
+	}
+	var explicit string
+	for key, raw := range mapping {
+		normalizedKey := normalizePrivateKeyField(key)
+		if normalizedKey != "type" && normalizedKey != "protocol" {
+			continue
+		}
+		protocol, ok := raw.(string)
+		if !ok {
+			return nodeConfigProtocolEvidence{}, fmt.Errorf("%s %s must be a string", label, key)
+		}
+		protocol = canonicalNodeProtocol(protocol)
+		if protocol == "" {
+			continue
+		}
+		if explicit != "" && explicit != protocol {
+			return nodeConfigProtocolEvidence{}, fmt.Errorf("%s contains conflicting type/protocol values", label)
+		}
+		explicit = protocol
+	}
+	if explicit == "wireguard" {
+		evidence.wireGuard = true
+	} else if explicit != "" {
+		evidence.explicitNonWireGuard = explicit
+	}
+	if evidence.wireGuard && evidence.explicitNonWireGuard != "" {
+		return nodeConfigProtocolEvidence{}, fmt.Errorf("%s declares %s but contains WireGuard private material", label, evidence.explicitNonWireGuard)
+	}
+	return evidence, nil
+}
+
+// validateNodeProtocolEvidence makes the database protocol an assertion rather
+// than a trust boundary. WireGuard evidence in any persisted representation
+// must agree with the declared protocol, and the historical wg alias is
+// canonicalized before storage.
+func validateNodeProtocolEvidence(node *Node) (bool, error) {
+	if node == nil {
+		return false, errors.New("node is required")
+	}
+	node.Protocol = canonicalNodeProtocol(node.Protocol)
+	declaredWireGuard := node.Protocol == "wireguard"
+	actualWireGuard := false
+	for _, candidate := range []struct {
+		label  string
+		config string
+	}{
+		{label: "parsed_config", config: node.ParsedConfig},
+		{label: "clash_config", config: node.ClashConfig},
+	} {
+		evidence, err := inspectNodeConfigProtocol(candidate.label, candidate.config)
+		if err != nil {
+			return false, err
+		}
+		if evidence.wireGuard {
+			actualWireGuard = true
+		}
+		if declaredWireGuard && evidence.explicitNonWireGuard != "" {
+			return false, fmt.Errorf("protocol wireguard conflicts with %s type %s", candidate.label, evidence.explicitNonWireGuard)
+		}
+	}
+	if _, isWireGuardURL, err := privateKeyFromWireGuardURL(node.RawURL); err != nil {
+		return false, err
+	} else if isWireGuardURL {
+		actualWireGuard = true
+	}
+	if actualWireGuard && !declaredWireGuard {
+		return false, fmt.Errorf("protocol %q conflicts with WireGuard config", node.Protocol)
+	}
+	return declaredWireGuard, nil
 }
 
 func stripPrivateKeyFields(value interface{}, found *string) error {
@@ -277,11 +475,14 @@ func privateKeyFromWireGuardURL(rawURL string) (string, bool, error) {
 // nodes. The returned key must be sealed into node_secrets in the same DB
 // transaction as the node write.
 func protectWireGuardNodeForStorage(node Node) (Node, string, error) {
-	if !strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard") {
+	isWireGuard, err := validateNodeProtocolEvidence(&node)
+	if err != nil {
+		return Node{}, "", err
+	}
+	if !isWireGuard {
 		return node, "", nil
 	}
 	privateKey := ""
-	var err error
 	node.ParsedConfig, err = stripWireGuardPrivateKeyJSON(node.ParsedConfig, &privateKey)
 	if err != nil {
 		return Node{}, "", err
@@ -325,7 +526,11 @@ func injectWireGuardPrivateKeyJSON(config, privateKey string) (string, error) {
 }
 
 func findWireGuardPlaintextPrivateKey(node Node) (string, error) {
-	if !strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard") {
+	isWireGuard, err := validateNodeProtocolEvidence(&node)
+	if err != nil {
+		return "", err
+	}
+	if !isWireGuard {
 		return "", nil
 	}
 	privateKey := ""
@@ -347,7 +552,14 @@ func findWireGuardPlaintextPrivateKey(node Node) (string, error) {
 }
 
 func (r *TrafficRepository) hydrateWireGuardNodeSecret(ctx context.Context, node *Node) error {
-	if node == nil || !strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard") {
+	if node == nil {
+		return nil
+	}
+	isWireGuard, err := validateNodeProtocolEvidence(node)
+	if err != nil {
+		return fmt.Errorf("validate node %d protocol: %w", node.ID, err)
+	}
+	if !isWireGuard {
 		return nil
 	}
 	if plaintext, err := findWireGuardPlaintextPrivateKey(*node); err != nil {
@@ -356,7 +568,7 @@ func (r *TrafficRepository) hydrateWireGuardNodeSecret(ctx context.Context, node
 		return fmt.Errorf("WireGuard node %d still contains an unprotected private key", node.ID)
 	}
 	var ciphertext string
-	err := r.db.QueryRowContext(ctx,
+	err = r.db.QueryRowContext(ctx,
 		`SELECT ciphertext FROM node_secrets WHERE node_id = ? AND kind = ? LIMIT 1`,
 		node.ID, wireGuardPrivateKeySecretKind,
 	).Scan(&ciphertext)
@@ -410,23 +622,27 @@ func (r *TrafficRepository) ProtectWireGuardNodeSecrets(ctx context.Context) err
 	}
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT n.id, n.username, n.raw_url, n.node_name, n.protocol, n.parsed_config, n.clash_config,
-		       COALESCE(ns.ciphertext, '')
+		       COALESCE(ns.kind, ''), COALESCE(ns.ciphertext, '')
 		FROM nodes n
 		LEFT JOIN node_secrets ns ON ns.node_id = n.id
-		WHERE lower(trim(n.protocol)) = 'wireguard'`)
+		ORDER BY n.id`)
 	if err != nil {
 		return fmt.Errorf("scan legacy WireGuard secrets: %w", err)
 	}
 	type migration struct {
 		node            Node
 		ciphertext      string
+		updateNode      bool
 		writeCiphertext bool
 	}
 	var migrations []migration
 	for rows.Next() {
 		var node Node
-		var existingCiphertext string
-		if err := rows.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &existingCiphertext); err != nil {
+		var existingKind, existingCiphertext string
+		if err := rows.Scan(
+			&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol,
+			&node.ParsedConfig, &node.ClashConfig, &existingKind, &existingCiphertext,
+		); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("scan legacy WireGuard node: %w", err)
 		}
@@ -435,7 +651,28 @@ func (r *TrafficRepository) ProtectWireGuardNodeSecrets(ctx context.Context) err
 			_ = rows.Close()
 			return fmt.Errorf("protect legacy WireGuard node %d: %w", node.ID, err)
 		}
+		isWireGuard := protected.Protocol == "wireguard"
+		if !isWireGuard {
+			if existingKind != "" || existingCiphertext != "" {
+				_ = rows.Close()
+				return fmt.Errorf("non-WireGuard node %d contains an encrypted WireGuard secret", node.ID)
+			}
+			continue
+		}
+		if existingKind != "" && existingKind != wireGuardPrivateKeySecretKind {
+			_ = rows.Close()
+			return fmt.Errorf("WireGuard node %d contains an unsupported encrypted secret", node.ID)
+		}
+		updateNode := protected.Protocol != strings.ToLower(strings.TrimSpace(node.Protocol)) ||
+			protected.RawURL != node.RawURL || protected.ParsedConfig != node.ParsedConfig || protected.ClashConfig != node.ClashConfig
 		if privateKey == "" {
+			if existingCiphertext == "" {
+				_ = rows.Close()
+				return fmt.Errorf("WireGuard 节点 %d 缺少有效的加密私钥记录", node.ID)
+			}
+			if updateNode {
+				migrations = append(migrations, migration{node: protected, ciphertext: existingCiphertext, updateNode: true})
+			}
 			continue
 		}
 		if existingCiphertext != "" {
@@ -448,7 +685,7 @@ func (r *TrafficRepository) ProtectWireGuardNodeSecrets(ctx context.Context) err
 				_ = rows.Close()
 				return fmt.Errorf("WireGuard node %d plaintext private key conflicts with its encrypted identity", node.ID)
 			}
-			migrations = append(migrations, migration{node: protected, ciphertext: existingCiphertext})
+			migrations = append(migrations, migration{node: protected, ciphertext: existingCiphertext, updateNode: updateNode})
 			continue
 		}
 		ciphertext, err := r.sealWireGuardPrivateKey(node.ID, privateKey)
@@ -456,7 +693,7 @@ func (r *TrafficRepository) ProtectWireGuardNodeSecrets(ctx context.Context) err
 			_ = rows.Close()
 			return fmt.Errorf("encrypt legacy WireGuard node %d: %w", node.ID, err)
 		}
-		migrations = append(migrations, migration{node: protected, ciphertext: ciphertext, writeCiphertext: true})
+		migrations = append(migrations, migration{node: protected, ciphertext: ciphertext, updateNode: updateNode, writeCiphertext: true})
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -474,12 +711,14 @@ func (r *TrafficRepository) ProtectWireGuardNodeSecrets(ctx context.Context) err
 	}
 	defer tx.Rollback()
 	for _, item := range migrations {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE nodes SET raw_url = ?, parsed_config = ?, clash_config = ?, updated_at = CURRENT_TIMESTAMP
-			WHERE id = ?`,
-			item.node.RawURL, item.node.ParsedConfig, item.node.ClashConfig, item.node.ID,
-		); err != nil {
-			return fmt.Errorf("strip legacy WireGuard node %d secret: %w", item.node.ID, err)
+		if item.updateNode {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE nodes SET protocol = ?, raw_url = ?, parsed_config = ?, clash_config = ?, updated_at = CURRENT_TIMESTAMP
+				WHERE id = ?`,
+				item.node.Protocol, item.node.RawURL, item.node.ParsedConfig, item.node.ClashConfig, item.node.ID,
+			); err != nil {
+				return fmt.Errorf("strip legacy WireGuard node %d secret: %w", item.node.ID, err)
+			}
 		}
 		if item.writeCiphertext {
 			if err := upsertNodeSecret(ctx, tx, item.node.ID, item.ciphertext); err != nil {

@@ -3,13 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -191,6 +189,18 @@ func main() {
 		logger.Error("订阅文件准备失败", "error", err)
 		os.Exit(1)
 	}
+	recovery, err := handler.ReconcileSubscriptionStore(ctx, repo, subscribeDir)
+	if err != nil {
+		logger.Error("订阅文件与数据库一致性恢复失败", "error", err)
+		os.Exit(1)
+	}
+	if recovery.Imported > 0 || recovery.Orphaned > 0 {
+		logger.Info("订阅存储恢复完成", "legacy_imported", recovery.Imported, "orphaned", recovery.Orphaned)
+	}
+	if err := handler.ProtectPersistedWireGuardSubscriptionSecrets(ctx, repo, subscribeDir); err != nil {
+		logger.Error("WireGuard 订阅私钥迁移失败", "error", err)
+		os.Exit(1)
+	}
 
 	ruleTemplatesDir := filepath.Join("rule_templates")
 	if err := ruletemplates.Ensure(ruleTemplatesDir); err != nil {
@@ -204,6 +214,10 @@ func main() {
 		logger.Warn("DNS 模板补丁应用过程出错(不影响启动)", "error", err)
 	} else if patched > 0 {
 		logger.Info("DNS 模板补丁已应用", "count", patched)
+	}
+	if err := handler.ValidatePersistedRuleTemplateSecrets(ruleTemplatesDir); err != nil {
+		logger.Error("规则模板 WireGuard 私钥校验失败", "error", err)
+		os.Exit(1)
 	}
 
 	// 初始化代理组配置 Store（纯内存存储）
@@ -266,8 +280,6 @@ func main() {
 		}
 		logger.Info("代理组配置加载成功", "source", resolvedURL)
 	}
-
-	syncSubscribeFilesToDatabase(repo, subscribeDir)
 
 	trafficHandler := handler.NewTrafficSummaryHandler(repo)
 	packageSubscribeHandler := handler.NewPackageSubscribeHandler(repo)
@@ -713,6 +725,7 @@ func main() {
 	// 1. 配置文件设置了remote_token，或者
 	// 2.环境变量MMWX_MODE=child
 	var childClient *child.Client
+	var childManageHandler *handler.ChildManageHandler
 	isChildMode := false
 	var masterURL, masterToken, connectionMode, childAPIToken string
 
@@ -773,7 +786,7 @@ func main() {
 		}
 
 		// 注册子管理API（用于主机远程控制）
-		childManageHandler := handler.NewChildManageHandler(masterToken)
+		childManageHandler = handler.NewChildManageHandler(masterToken)
 
 		// 启动时检查并补全 Xray 配置
 		go func() {
@@ -782,16 +795,13 @@ func main() {
 			result := childManageHandler.EnsureXrayConfig()
 			if result.Modified {
 				log.Printf("[Child Mode] Xray config auto-completed: added %v", result.AddedSections)
-				// 尝试重启 Xray 使配置生效
-				cmd := exec.Command("systemctl", "restart", "xray")
-				if err := cmd.Run(); err != nil {
-					log.Printf("[Child Mode] Failed to restart xray: %v", err)
-				} else {
+				if result.Error == "" {
 					log.Printf("[Child Mode] Xray restarted after config update")
 				}
-			} else if result.Error != "" {
+			}
+			if result.Error != "" {
 				log.Printf("[Child Mode] Xray config check: %s", result.Error)
-			} else {
+			} else if !result.Modified {
 				log.Printf("[Child Mode] Xray config OK, no changes needed")
 			}
 		}()
@@ -1048,6 +1058,9 @@ func main() {
 
 	// 证书管理 API（仅限管理员）
 	certHandler := handler.NewCertificateHandler(repo, remoteWSHandler)
+	if childManageHandler != nil {
+		certHandler.SetLocalDeployer(childManageHandler.DeployCertificateFiles)
+	}
 	certHandler.SetOnMasterURLChanged(remoteManageHandler.BroadcastMasterURLUpdate)
 	certHandler.SetRemoteManage(remoteManageHandler) // 联邦服务器证书下发走拥有方主控
 	remoteManageHandler.SetCertificateHandler(certHandler)
@@ -1537,74 +1550,6 @@ func startDailySnapshotTask(ctx context.Context, trafficHandler *handler.Traffic
 		case <-ticker.C:
 			runWithRetry()
 		}
-	}
-}
-
-// syncSubscribeFilesToDatabase 扫描订阅目录并确保
-// 每个 YAML 文件在 subscribe_files 表中都有相应的记录。
-// 这有助于从旧版本升级时向后兼容。
-func syncSubscribeFilesToDatabase(repo *storage.TrafficRepository, subscribeDir string) {
-	if repo == nil {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// 读取订阅目录中的所有文件
-	entries, err := os.ReadDir(subscribeDir)
-	if err != nil {
-		logger.Warn("读取订阅目录失败", "dir", subscribeDir, "error", err)
-		return
-	}
-
-	synced := 0
-	for _, entry := range entries {
-		// 跳过目录和非 YAML 文件
-		if entry.IsDir() {
-			continue
-		}
-		filename := entry.Name()
-		if filepath.Ext(filename) != ".yaml" && filepath.Ext(filename) != ".yml" {
-			continue
-		}
-
-		// 跳过 .keep.yaml 占位符文件
-		if filename == ".keep.yaml" {
-			continue
-		}
-
-		// 检查该文件是否已有数据库记录
-		if _, err := repo.GetSubscribeFileByFilename(ctx, filename); err == nil {
-			// 文件已存在于数据库中，跳过
-			continue
-		} else if !errors.Is(err, storage.ErrSubscribeFileNotFound) {
-			logger.Warn("检查订阅文件失败", "filename", filename, "error", err)
-			continue
-		}
-
-		// 数据库中不存在文件，创建一条新记录
-		// 使用不带扩展名的文件名作为名称
-		name := filename[:len(filename)-len(filepath.Ext(filename))]
-
-		file := storage.SubscribeFile{
-			Name:        name,
-			Description: "自动同步的订阅文件",
-			URL:         "",                          // 没有旧文件的 URL
-			Type:        storage.SubscribeTypeUpload, // 标记为上传类型
-			Filename:    filename,
-		}
-
-		if _, err := repo.CreateSubscribeFile(ctx, file); err != nil {
-			logger.Warn("同步订阅文件到数据库失败", "filename", filename, "error", err)
-			continue
-		}
-
-		synced++
-	}
-
-	if synced > 0 {
-		logger.Info("订阅文件同步完成", "count", synced)
 	}
 }
 
