@@ -152,7 +152,7 @@ func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/admin/nodes")
 	path = strings.Trim(path, "/")
 
-	// 普通用户开放:列表 / 标签 / 解析订阅 / 批量导入(自己的外部节点) / 查看关联入站。
+	// 普通用户开放:列表 / 单节点分享 URI / 标签 / 解析订阅 / 批量导入(自己的外部节点) / 查看关联入站。
 	// 仅管理员:手动单个新增、改名/改标签/改服务器/改配置、删除/清空/批量删改
 	//（这些写操作会同步到共享 YAML 订阅文件,影响管理员)。
 	isAdmin := userIsAdmin(r.Context(), h.repo, auth.UsernameFromContext(r.Context()))
@@ -181,6 +181,9 @@ func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(path, "/related-inbounds") && r.Method == http.MethodGet:
 		idSegment := strings.TrimSuffix(path, "/related-inbounds")
 		h.handleGetRelatedInbounds(w, r, idSegment)
+	case strings.HasSuffix(path, "/uri") && r.Method == http.MethodGet:
+		idSegment := strings.TrimSuffix(path, "/uri")
+		h.handleGetURI(w, r, idSegment)
 	case strings.HasSuffix(path, "/server") && r.Method == http.MethodPut:
 		if denyNonAdmin() {
 			return
@@ -239,6 +242,54 @@ func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		allowed := []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}
 		methodNotAllowed(w, allowed...)
 	}
+}
+
+func (h *nodesHandler) handleGetURI(w http.ResponseWriter, r *http.Request, idSegment string) {
+	username := auth.UsernameFromContext(r.Context())
+	if username == "" {
+		writeError(w, http.StatusUnauthorized, errors.New("用户未认证"))
+		return
+	}
+	nodeID, err := strconv.ParseInt(strings.Trim(idSegment, "/"), 10, 64)
+	if err != nil || nodeID <= 0 {
+		writeBadRequest(w, "无效的节点 ID")
+		return
+	}
+
+	var node storage.Node
+	if userIsAdmin(r.Context(), h.repo, username) {
+		node, err = h.repo.GetNodeByID(r.Context(), nodeID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, errors.New("节点不存在"))
+			return
+		}
+	} else {
+		visible, listErr := collectUserVisibleNodes(r.Context(), h.repo, username)
+		if listErr != nil {
+			writeError(w, http.StatusInternalServerError, listErr)
+			return
+		}
+		visible = substituteNodesForUser(r.Context(), h.repo, username, visible)
+		found := false
+		for _, candidate := range visible {
+			if candidate.ID == nodeID {
+				node = candidate
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeError(w, http.StatusNotFound, errors.New("节点不存在或当前用户无权访问"))
+			return
+		}
+	}
+
+	item, err := makeNodeURIItem(username, node, substore.NewURIProducer())
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"item": item})
 }
 
 func (h *nodesHandler) handleList(w http.ResponseWriter, r *http.Request) {
@@ -1930,6 +1981,52 @@ type nodeDTO struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 }
 
+type nodeURIItem struct {
+	Username string `json:"username"`
+	NodeID   int64  `json:"node_id"`
+	NodeName string `json:"node_name"`
+	Protocol string `json:"protocol"`
+	NodeType string `json:"node_type"`
+	URI      string `json:"uri"`
+}
+
+func makeNodeURIItem(username string, node storage.Node, producer *substore.URIProducer) (nodeURIItem, error) {
+	if strings.TrimSpace(node.ClashConfig) == "" {
+		return nodeURIItem{}, errors.New("当前节点没有可用于生成二维码的客户端配置")
+	}
+	var proxy map[string]any
+	if err := json.Unmarshal([]byte(node.ClashConfig), &proxy); err != nil {
+		return nodeURIItem{}, errors.New("当前节点的客户端配置格式无效")
+	}
+	protocol, _ := proxy["type"].(string)
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	if protocol == "" {
+		protocol = strings.ToLower(strings.TrimSpace(node.Protocol))
+		proxy["type"] = protocol
+	}
+	// Clash 使用 socks，URI producer 使用 socks5；两者表示同一协议。
+	if protocol == "socks" {
+		protocol = "socks5"
+		proxy["type"] = protocol
+	}
+	uri, err := producer.ProduceOne(substore.Proxy(proxy))
+	if err != nil || strings.TrimSpace(uri) == "" {
+		label := strings.ToUpper(strings.TrimSpace(node.Protocol))
+		if label == "" {
+			label = "当前协议"
+		}
+		return nodeURIItem{}, fmt.Errorf("%s 暂不支持生成单节点分享二维码", label)
+	}
+	return nodeURIItem{
+		Username: username,
+		NodeID:   node.ID,
+		NodeName: node.NodeName,
+		Protocol: node.Protocol,
+		NodeType: node.NodeType,
+		URI:      uri,
+	}, nil
+}
+
 // NewNodeURIsHandler GET /api/admin/node-uris(admin):返回 每个用户 × 其可见节点 的成品分享 URI。
 // 凭据用各用户子账户填充(substituteNodesForUser),URI 由后端 substore.URIProducer 生成 —— 不走前端。
 func NewNodeURIsHandler(repo *storage.TrafficRepository) http.Handler {
@@ -1944,16 +2041,8 @@ func NewNodeURIsHandler(repo *storage.TrafficRepository) http.Handler {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		type uriItem struct {
-			Username string `json:"username"`
-			NodeID   int64  `json:"node_id"`
-			NodeName string `json:"node_name"`
-			Protocol string `json:"protocol"`
-			NodeType string `json:"node_type"`
-			URI      string `json:"uri"`
-		}
 		prod := substore.NewURIProducer()
-		items := make([]uriItem, 0)
+		items := make([]nodeURIItem, 0)
 		for _, u := range users {
 			nodes, nerr := collectUserVisibleNodes(ctx, repo, u.Username)
 			if nerr != nil {
@@ -1965,22 +2054,11 @@ func NewNodeURIsHandler(repo *storage.TrafficRepository) http.Handler {
 				if strings.TrimSpace(n.ClashConfig) == "" {
 					continue
 				}
-				var m map[string]any
-				if json.Unmarshal([]byte(n.ClashConfig), &m) != nil {
+				item, perr := makeNodeURIItem(u.Username, n, prod)
+				if perr != nil {
 					continue
 				}
-				uri, perr := prod.ProduceOne(substore.Proxy(m))
-				if perr != nil || strings.TrimSpace(uri) == "" {
-					continue
-				}
-				items = append(items, uriItem{
-					Username: u.Username,
-					NodeID:   n.ID,
-					NodeName: n.NodeName,
-					Protocol: n.Protocol,
-					NodeType: n.NodeType,
-					URI:      uri,
-				})
+				items = append(items, item)
 			}
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"items": items})
