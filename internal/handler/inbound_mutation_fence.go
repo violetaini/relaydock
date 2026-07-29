@@ -12,7 +12,7 @@ import (
 )
 
 const inboundMutationFenceVersion = 2
-const inboundMutationFenceSidecarName = ".mmwx-inbound-mutation-fences.json"
+const inboundMutationFenceSidecarName = ".relaydock-inbound-mutation-fences.json"
 
 func defaultChildInboundMutationFencePath() string {
 	path := filepath.Join("data", inboundMutationFenceSidecarName)

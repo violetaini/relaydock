@@ -59,7 +59,7 @@ const (
 	//   - journal_mode=WAL   多 reader 并发 + 1 writer,跟现有 pragmaJournalMode 一致
 	//   - synchronous=NORMAL WAL 推荐组合(FULL 仅在断电时多一层保护,代价是显著变慢)
 	//   - journal_size_limit=64MB  checkpoint 后把 -wal 文件截回 ≤64MB(默认 -1=无限,-wal 只涨不缩)。
-	//     配合 main.go 里周期性 wal_checkpoint(TRUNCATE),避免长跑容器里 mmwx.db-wal 无界膨胀。
+	//     配合 main.go 里周期性 wal_checkpoint(TRUNCATE),避免长跑容器里 arcway.db-wal 无界膨胀。
 	sqliteDSNPragma = "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(normal)&_pragma=journal_size_limit(67108864)&_pragma=secure_delete(ON)"
 
 	// 多连接数:实测 1 个 SQLite 数据库文件并发写仍串行(文件锁),但多 conn 让"读 / 短写"
@@ -545,7 +545,7 @@ type UserSettings struct {
 	CacheExpireMinutes   int        // 缓存过期时间（分钟）
 	SyncTraffic          bool       // 同步外部订阅的流量信息
 	NodeNameFilter       string     // 正则表达式过滤节点名称
-	AppendSubInfo        bool       // 同步外部订阅时把剩余流量/天数拼到节点名后(同步自 mmw v0.7.3)
+	AppendSubInfo        bool       // 同步外部订阅时把剩余流量/天数拼到节点名后
 	CustomRulesEnabled   bool       // 启用自定义规则功能
 	EnableShortLink      bool       // 启用订阅短链接功能
 	UseNewTemplateSystem bool       // 使用新的模板系统（基于数据库），默认true
@@ -599,10 +599,9 @@ type SystemConfig struct {
 	SilentModeTimeout             int    // 获取订阅后恢复访问的分钟数，默认15
 	EnableManagementFeatures      bool   // 启用管理功能（模板、订阅管理等菜单）
 	DefaultTemplateFilename       string // 默认模板文件名（rule_templates/目录下）
-	// 兼容旧版面板短链接:旧版 mmw 用 /<code> 形式,新版 mmwx 用 /x/<code>。
-	// 开启后,直接 GET /<code>(无 /x/ 前缀)会尝试匹配同 code 的 /x/ 短链;命中则放行,
+	// 根路径短链接:直接 GET /<code>(无 /x/ 前缀)会尝试匹配同 code 的 /x/ 短链;命中则放行,
 	// 未命中按安全规则计入暴力枚举失败计数。
-	EnableMmwShortLinkCompat bool
+	EnableRootShortLinks bool
 
 	// 节点名称倍率前缀:订阅生成时,套餐内 multiplier != 1 的节点 name 前面加
 	// "{Left}{multiplier}{Right}" 前缀;Left/Right 默认 「」,用户可改。
@@ -1640,7 +1639,7 @@ CREATE INDEX IF NOT EXISTS idx_external_subscriptions_url ON external_subscripti
 		return err
 	}
 
-	// 同步外部订阅时拼接订阅元信息(剩余流量/天数)到节点名(同步自 mmw v0.7.3)
+	// 同步外部订阅时拼接订阅元信息(剩余流量/天数)到节点名。
 	if err := r.ensureUserSettingsColumn("append_sub_info", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
@@ -1936,15 +1935,10 @@ CREATE INDEX IF NOT EXISTS idx_override_scripts_hook ON override_scripts(hook);
 	if err := r.ensureSystemConfigColumn("silent_mode_timeout", "INTEGER NOT NULL DEFAULT 15"); err != nil {
 		return err
 	}
-	legacyManagementFeaturesBrand := strings.Join([]string{"miao", "miao", "wu"}, "")
-	legacyManagementFeaturesColumn := strings.Join([]string{"enable", legacyManagementFeaturesBrand, "features"}, "_")
-	if err := r.renameSystemConfigColumnIfPresent(legacyManagementFeaturesColumn, "enable_management_features"); err != nil {
-		return err
-	}
 	if err := r.ensureSystemConfigColumn("enable_management_features", "INTEGER NOT NULL DEFAULT 1"); err != nil {
 		return err
 	}
-	if err := r.ensureSystemConfigColumn("enable_mmw_short_link_compat", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+	if err := r.ensureSystemConfigColumn("enable_root_short_links", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	if err := r.ensureSystemConfigColumn("default_template_filename", "TEXT NOT NULL DEFAULT ''"); err != nil {
@@ -2063,7 +2057,7 @@ CREATE TABLE IF NOT EXISTS system_settings (
 		return fmt.Errorf("初始化 api token: %w", err)
 	}
 
-	// 远程服务器表 - 存储远程 MMWX 服务器实例
+	// 远程服务器表 - 存储远程 RelayDock Agent 实例
 	const remoteServersSchema = `
 CREATE TABLE IF NOT EXISTS remote_servers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2529,7 +2523,7 @@ CREATE INDEX IF NOT EXISTS idx_node_traffic_snapshots_date ON node_traffic_snaps
 	}
 
 	// 老库快照表无 type 列 → 前端 serverOverviewList 无法过滤,sum(inbound+outbound snap) 远大于
-	// sum(inbound live) → 减出负数 clamp 0 → 全部 server 今日/本周流量显示 0(已在 mmw.2ha.me 实证)。
+	// sum(inbound live) → 减出负数 clamp 0 → 全部 server 今日/本周流量显示 0。
 	// 兜底:ADD COLUMN type DEFAULT 'inbound' + 用 node_traffic 当前 (server_id, tag, type) 映射 backfill。
 	// 已删除节点对应的历史 snapshot 行保持默认值 — server 视图也展示不到这些 tag,影响可忽略。
 	if err := r.ensureTableColumn("node_traffic_snapshots", "type", "TEXT NOT NULL DEFAULT 'inbound'"); err != nil {
@@ -2811,7 +2805,7 @@ CREATE TABLE IF NOT EXISTS user_outbounds (
 		return fmt.Errorf("migrate user_outbounds: %w", err)
 	}
 
-	// 用户子账号:一个 mmwx 用户在某 routed 节点上的 xray client 凭据。
+	// 用户子账号:一个 RelayDock 用户在某 routed 节点上的 Xray client 凭据。
 	// is_active=0 表示已下线(从 inbound clients + routing rule.user 移除),但凭据保留供续费恢复用。
 	const userSubaccountsSchema = `
 CREATE TABLE IF NOT EXISTS user_subaccounts (
@@ -3774,52 +3768,6 @@ func (r *TrafficRepository) ensureSystemConfigColumn(name, definition string) er
 		return fmt.Errorf("add column %s: %w", name, err)
 	}
 
-	return nil
-}
-
-func (r *TrafficRepository) renameSystemConfigColumnIfPresent(oldName, newName string) error {
-	rows, err := r.db.Query(`PRAGMA table_info(system_config)`)
-	if err != nil {
-		return fmt.Errorf("system_config table info: %w", err)
-	}
-	var oldExists, newExists bool
-	for rows.Next() {
-		var (
-			cid        int
-			colName    string
-			colType    string
-			notNull    int
-			defaultVal sql.NullString
-			pk         int
-		)
-		if err := rows.Scan(&cid, &colName, &colType, &notNull, &defaultVal, &pk); err != nil {
-			return fmt.Errorf("scan table info: %w", err)
-		}
-		oldExists = oldExists || strings.EqualFold(colName, oldName)
-		newExists = newExists || strings.EqualFold(colName, newName)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return fmt.Errorf("iterate system_config columns: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close system_config table info: %w", err)
-	}
-	if !oldExists {
-		return nil
-	}
-	if newExists {
-		statement := fmt.Sprintf("ALTER TABLE system_config DROP COLUMN %s", oldName)
-		if _, err := r.db.Exec(statement); err != nil {
-			return fmt.Errorf("drop superseded system_config column %s: %w", oldName, err)
-		}
-		return nil
-	}
-
-	statement := fmt.Sprintf("ALTER TABLE system_config RENAME COLUMN %s TO %s", oldName, newName)
-	if _, err := r.db.Exec(statement); err != nil {
-		return fmt.Errorf("rename system_config column %s: %w", oldName, err)
-	}
 	return nil
 }
 
@@ -5711,7 +5659,7 @@ func (r *TrafficRepository) GetUserSubscriptionIDs(ctx context.Context, username
 }
 
 // 使用提供的列表替换用户的所有订阅。
-// UserShortCodeInfo 用户短码信息(同步自 mmw v0.7.3)
+// UserShortCodeInfo 用户短码信息。
 type UserShortCodeInfo struct {
 	Username            string `json:"username"`
 	UserShortCode       string `json:"user_short_code"`
@@ -5719,7 +5667,7 @@ type UserShortCodeInfo struct {
 }
 
 // GetUsersBySubscriptionID 返回某订阅文件分配给哪些用户 + 每个用户的短码,
-// 用于管理 UI 集中编辑用户短码(同步自 mmw v0.7.3)。
+// 用于管理 UI 集中编辑用户短码。
 func (r *TrafficRepository) GetUsersBySubscriptionID(ctx context.Context, subscriptionID int64) ([]UserShortCodeInfo, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
@@ -6954,9 +6902,9 @@ func (r *TrafficRepository) ListProxyProviderConfigsBySubscription(ctx context.C
 	return configs, nil
 }
 
-// ListMMWProxyProviderConfigs 返回所有兼容模式的代理集合配置
+// ListServerProxyProviderConfigs 返回所有服务端处理模式的代理集合配置
 // 该方法用于定时同步器获取需要自动刷新的代理集合列表
-func (r *TrafficRepository) ListMMWProxyProviderConfigs(ctx context.Context) ([]ProxyProviderConfig, error) {
+func (r *TrafficRepository) ListServerProxyProviderConfigs(ctx context.Context) ([]ProxyProviderConfig, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
@@ -6968,11 +6916,11 @@ func (r *TrafficRepository) ListMMWProxyProviderConfigs(ctx context.Context) ([]
 			COALESCE(filter, ''), COALESCE(exclude_filter, ''), COALESCE(exclude_type, ''),
 			COALESCE(geo_ip_filter, ''), COALESCE(override, ''), process_mode, created_at, updated_at
 		FROM proxy_provider_configs
-		WHERE process_mode = 'mmw'
+		WHERE process_mode = 'server'
 		ORDER BY id ASC
 	`)
 	if err != nil {
-		return nil, fmt.Errorf("list mmw proxy provider configs: %w", err)
+		return nil, fmt.Errorf("list server proxy provider configs: %w", err)
 	}
 	defer rows.Close()
 
@@ -6989,7 +6937,7 @@ func (r *TrafficRepository) ListMMWProxyProviderConfigs(ctx context.Context) ([]
 			&config.GeoIPFilter, &config.Override, &config.ProcessMode, &config.CreatedAt, &config.UpdatedAt,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("scan mmw proxy provider config: %w", err)
+			return nil, fmt.Errorf("scan server proxy provider config: %w", err)
 		}
 		config.HealthCheckEnabled = healthCheckEnabled != 0
 		config.HealthCheckLazy = healthCheckLazy != 0
@@ -6997,7 +6945,7 @@ func (r *TrafficRepository) ListMMWProxyProviderConfigs(ctx context.Context) ([]
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate mmw proxy provider configs: %w", err)
+		return nil, fmt.Errorf("iterate server proxy provider configs: %w", err)
 	}
 
 	return configs, nil
@@ -7086,7 +7034,7 @@ SELECT proxy_groups_source_url, client_compatibility_mode, COALESCE(enable_short
        COALESCE(subscription_output_format, 'yaml'),
        COALESCE(silent_mode, 0), COALESCE(silent_mode_timeout, 15),
        COALESCE(enable_management_features, 1), COALESCE(default_template_filename, ''),
-       COALESCE(enable_mmw_short_link_compat, 0),
+		COALESCE(enable_root_short_links, 0),
        COALESCE(node_name_multiplier_prefix_enabled, 0),
        COALESCE(node_name_multiplier_left, '「'),
        COALESCE(node_name_multiplier_right, '」'),
@@ -7110,7 +7058,7 @@ WHERE id = 1
 	var notifyEnabled, notifyLogin, notifySubFetch, notifyDailyTraffic int
 	var notifyServerOffline, notifyServerOnline, notifyTrafficThreshold int
 	var enableOverrideScripts, silentMode, silentModeTimeout int
-	var enableManagementFeatures, enableMmwShortLinkCompat int
+	var enableManagementFeatures, enableRootShortLinks int
 	var nodeNameMultPrefixEnabled int
 	var notifyTH80, notifyOverLimit, notifyPkgExpiring, notifyPkgExpired int
 	var notifyUserReg, notifyTGBound, notifyCert, notifyAgentLO, notifyDeviceLimit int
@@ -7127,7 +7075,7 @@ WHERE id = 1
 		&cfg.SubscriptionOutputFormat,
 		&silentMode, &silentModeTimeout,
 		&enableManagementFeatures, &cfg.DefaultTemplateFilename,
-		&enableMmwShortLinkCompat,
+		&enableRootShortLinks,
 		&nodeNameMultPrefixEnabled, &cfg.NodeNameMultiplierLeft, &cfg.NodeNameMultiplierRight,
 		&notifyTH80, &notifyOverLimit, &notifyPkgExpiring, &cfg.NotifyPackageExpiringDays,
 		&notifyPkgExpired, &notifyUserReg, &notifyTGBound, &notifyCert, &notifyAgentLO,
@@ -7160,7 +7108,7 @@ WHERE id = 1
 		cfg.SilentModeTimeout = 15
 	}
 	cfg.EnableManagementFeatures = enableManagementFeatures != 0
-	cfg.EnableMmwShortLinkCompat = enableMmwShortLinkCompat != 0
+	cfg.EnableRootShortLinks = enableRootShortLinks != 0
 	cfg.NodeNameMultiplierPrefixEnabled = nodeNameMultPrefixEnabled != 0
 	cfg.NotifyTrafficThreshold80 = notifyTH80 != 0
 	cfg.NotifyOverLimit = notifyOverLimit != 0
@@ -7210,7 +7158,7 @@ SET proxy_groups_source_url = ?,
     silent_mode_timeout = ?,
     enable_management_features = ?,
     default_template_filename = ?,
-    enable_mmw_short_link_compat = ?,
+    enable_root_short_links = ?,
     node_name_multiplier_prefix_enabled = ?,
     node_name_multiplier_left = ?,
     node_name_multiplier_right = ?,
@@ -7291,7 +7239,7 @@ WHERE id = 1
 		subOutFmt,
 		boolToInt(cfg.SilentMode), silentModeTimeout,
 		boolToInt(cfg.EnableManagementFeatures), cfg.DefaultTemplateFilename,
-		boolToInt(cfg.EnableMmwShortLinkCompat),
+		boolToInt(cfg.EnableRootShortLinks),
 		boolToInt(cfg.NodeNameMultiplierPrefixEnabled), nnmLeft, nnmRight,
 		boolToInt(cfg.NotifyTrafficThreshold80), boolToInt(cfg.NotifyOverLimit),
 		boolToInt(cfg.NotifyPackageExpiring), pkgExpiringDays,
@@ -7316,7 +7264,7 @@ INSERT INTO system_config (id, proxy_groups_source_url, client_compatibility_mod
     notify_daily_traffic, notify_server_offline, notify_server_online, notify_traffic_threshold,
     notify_daily_traffic_time, notify_traffic_threshold_percent, enable_override_scripts,
     subscription_output_format,
-    silent_mode, silent_mode_timeout, enable_management_features, default_template_filename, enable_mmw_short_link_compat,
+    silent_mode, silent_mode_timeout, enable_management_features, default_template_filename, enable_root_short_links,
     node_name_multiplier_prefix_enabled, node_name_multiplier_left, node_name_multiplier_right,
     notify_traffic_threshold_80, notify_over_limit, notify_package_expiring, notify_package_expiring_days,
     notify_package_expired, notify_user_registered, notify_telegram_bound, notify_cert_result,
@@ -7333,7 +7281,7 @@ VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
 			subOutFmt,
 			boolToInt(cfg.SilentMode), silentModeTimeout,
 			boolToInt(cfg.EnableManagementFeatures), cfg.DefaultTemplateFilename,
-			boolToInt(cfg.EnableMmwShortLinkCompat),
+			boolToInt(cfg.EnableRootShortLinks),
 			boolToInt(cfg.NodeNameMultiplierPrefixEnabled), nnmLeft, nnmRight,
 			boolToInt(cfg.NotifyTrafficThreshold80), boolToInt(cfg.NotifyOverLimit),
 			boolToInt(cfg.NotifyPackageExpiring), pkgExpiringDays,
@@ -8497,7 +8445,7 @@ func (r *TrafficRepository) ListAllUserInboundConfigs(ctx context.Context) ([]Us
 
 // UpdateUserInboundCredentialJSONByID 按 user_inbound_configs.id 原地更新 credential_json。
 // 用 id 而非 (username, server_id, inbound_tag) 三元组 — 该三元组不是 UNIQUE,
-// 同 user 在同一 inbound 上可以有多条 client(EnsureAdminInboundClient 引入的 mmw 迁移 client、
+// 同 user 在同一 inbound 上可以有多条 client(EnsureAdminInboundClient 引入的导入 client、
 // 历史多 client 测试等),按三元组更新会一次性把多行变成同一 credential_json。
 func (r *TrafficRepository) UpdateUserInboundCredentialJSONByID(ctx context.Context, id int64, credJSON string) error {
 	_, err := r.db.ExecContext(ctx,
@@ -8515,8 +8463,8 @@ func (r *TrafficRepository) DeleteUserInboundConfig(ctx context.Context, usernam
 // 按 (username, server_id, inbound_tag, credential_json) 四元组去重 — 已存在则跳过,
 // 不存在才插入。返回 wasNew=true 表示本次新插入。
 //
-// 用途:迁移时把 server 上已存在 email 的 xray client(mmw 时代手工配的)绑定到系统 admin,
-// 让 mmwx 主控能识别这些 client 的归属、做流量统计 / routing 限定。
+// 用途:导入时把 server 上已存在 email 的 Xray client 绑定到系统 admin,
+// 让 RelayDock 主控能识别这些 client 的归属、做流量统计 / routing 限定。
 //
 // 一个 inbound 上多个 client 各算一行(不强 UNIQUE);credential_json 是去重 key,
 // 同 client 反复扫描不会重复入库。
@@ -8622,7 +8570,7 @@ func (r *TrafficRepository) DeleteUserOutboundByServerTag(ctx context.Context, s
 	return err
 }
 
-// UserSubaccount 记录一个 mmwx 用户在某 routed 节点上的 xray client 凭据。
+// UserSubaccount 记录一个 RelayDock 用户在某 routed 节点上的 Xray client 凭据。
 // is_active=0 表示已下线(凭据保留供续费恢复),=1 表示已下发到 inbound + routing rule.user。
 type UserSubaccount struct {
 	ID             int64
@@ -9155,7 +9103,7 @@ func (r *TrafficRepository) ListSubaccountEmailToUsername(ctx context.Context) (
 	return m, nil
 }
 
-// ResolveUsernameByEmail 把 xray 上报的 stats.User key (email) 反查到 mmwx 用户名。
+// ResolveUsernameByEmail 把 Xray 上报的 stats.User key (email) 反查到 RelayDock 用户名。
 // 优先级:
 //  1. user_subaccounts.email → username (子账号路径,包括 admin 把自己作为 routed 子账号的情况)
 //  2. _admin__ 占位 email 没命中 user_subaccounts → 反查 nodes.routed_admin_email 找到对应 routed 节点,
@@ -11213,15 +11161,15 @@ type HeartbeatUpdate struct {
 
 // HeartbeatResult 包含心跳更新的结果，包括重新启动检测。
 type HeartbeatResult struct {
-	ServerID         int64
-	ServerName       string
-	PreviousStatus   string
-	MmwxRestarted    bool
-	XrayRestarted    bool
-	BootCount        int
-	XrayBootCount    int
-	TokenExpiresSoon bool
-	TokenExpiresAt   *time.Time
+	ServerID           int64
+	ServerName         string
+	PreviousStatus     string
+	RelayDockRestarted bool
+	XrayRestarted      bool
+	BootCount          int
+	XrayBootCount      int
+	TokenExpiresSoon   bool
+	TokenExpiresAt     *time.Time
 	// IPChanged:本次心跳让 ip_address 或 ip_address_v6 字段发生变化。调用方据此触发 RefreshNodesServerAddress
 	// 同步已存在节点的 clash_config.server,避免小鸡换 IP 后旧节点配置还是旧 IP。
 	IPChanged bool
@@ -11369,7 +11317,7 @@ func (r *TrafficRepository) UpdateRemoteServerLastActivity(ctx context.Context, 
 }
 
 // UpdateRemoteServerHeartbeatWithRestart 通过重新启动检测来更新心跳。
-// 返回 HeartbeatResult 指示 mmwx 或 xray 是否已重新启动。
+// 返回 HeartbeatResult 指示 RelayDock Agent 或 Xray 是否已重新启动。
 func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.Context, update HeartbeatUpdate) (*HeartbeatResult, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
@@ -11404,10 +11352,10 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 		XrayBootCount:  server.XrayBootCount,
 	}
 
-	// 检测mmwx重启
+	// 检测 RelayDock Agent 重启。
 	if update.BootTime != nil {
 		if server.BootTime != nil && !update.BootTime.Equal(*server.BootTime) {
-			result.MmwxRestarted = true
+			result.RelayDockRestarted = true
 			result.BootCount++
 		}
 	}

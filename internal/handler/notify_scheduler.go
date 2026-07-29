@@ -21,14 +21,14 @@ import (
 // 关键:online 与 offline 各自独立 throttle —— 一次真实的"离线 → 恢复"两条都会照常发。
 // (此前 online/offline 共用同一 key,离线先发后,窗口内的上线通知被连带吞掉 → 用户"只有离线没有上线"。)
 //
-// 默认 5 分钟,可用 MMWX_SERVER_NOTIFY_THROTTLE_SECONDS 覆盖;<=0 → 禁用 throttle。
+// 默认 5 分钟,可用 RELAYDOCK_SERVER_NOTIFY_THROTTLE_SECONDS 覆盖;<=0 → 禁用 throttle。
 var (
 	serverNotifyMu       sync.Mutex
 	serverNotifyLastSent = make(map[string]time.Time) // key = 事件类型|serverName
 )
 
 func serverNotifyThrottleInterval() time.Duration {
-	if v := os.Getenv("MMWX_SERVER_NOTIFY_THROTTLE_SECONDS"); v != "" {
+	if v := os.Getenv("RELAYDOCK_SERVER_NOTIFY_THROTTLE_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			if n <= 0 {
 				return 0

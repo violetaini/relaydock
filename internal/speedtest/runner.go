@@ -380,7 +380,7 @@ func downloadSingle(ctx context.Context, dlURL string, maxBytes int64) (int64, t
 	if err != nil {
 		return 0, 0, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 mmwx-speedtest/1.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 relaydock-speedtest/1.0")
 	req.Header.Set("Accept-Encoding", "identity")
 	start := time.Now()
 	resp, err := client.Do(req)

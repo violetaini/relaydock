@@ -31,7 +31,7 @@ func (r *TrafficRepository) CreateUserAPIToken(ctx context.Context, username, na
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	token := "mmwx_" + base64.RawURLEncoding.EncodeToString(buf)
+	token := "relaydock_" + base64.RawURLEncoding.EncodeToString(buf)
 	if _, err := r.db.ExecContext(ctx,
 		`INSERT INTO user_api_tokens (username, name, token_hash) VALUES (?, ?, ?)`,
 		username, name, hashAPIToken(token)); err != nil {

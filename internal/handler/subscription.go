@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/scriptengine"
 	"github.com/violetaini/relaydock/internal/storage"
 
@@ -1641,12 +1641,12 @@ func (h *SubscriptionHandler) convertSubscription(ctx context.Context, yamlData 
 		return h.convertClashToSurge(config, proxies)
 	}
 
-	// clash-to-loon 类型使用 BuildCompleteLoonConfig 生成完整的 Loon 配置(同步自 mmw v0.7.2 #84)
+	// clash-to-loon 类型使用 BuildCompleteLoonConfig 生成完整的 Loon 配置。
 	if clientType == "clash-to-loon" {
 		return h.convertClashToLoon(config, proxies)
 	}
 
-	// clash-to-loon-kelee 使用 kelee 模板,只填充 Proxy 节点(同步自 mmw v0.7.2 #84)
+	// clash-to-loon-kelee 使用 kelee 模板,只填充 Proxy 节点。
 	if clientType == "clash-to-loon-kelee" {
 		result, err := substore.BuildLoonKeleeConfig(proxies)
 		if err != nil {
@@ -1817,7 +1817,7 @@ func (h *SubscriptionHandler) convertClashToSurge(config map[string]interface{},
 	return []byte(surgeConfig), nil
 }
 
-// convertClashToLoon 把 Clash config 转成完整 Loon 配置(同步自 mmw v0.7.2 #84)
+// convertClashToLoon 把 Clash config 转成完整 Loon 配置。
 func (h *SubscriptionHandler) convertClashToLoon(config map[string]interface{}, proxies []substore.Proxy) ([]byte, error) {
 	clashConfig := &substore.ClashConfig{}
 
@@ -2259,7 +2259,7 @@ func pruneUnreferencedProxies(data []byte) ([]byte, error) {
 }
 
 // stripDialerProxyGroup 把每个代理组的 dialer-proxy-group 字段移除
-// (MMW 自定义字段,不应出现在客户端订阅响应里)。
+// (RelayDock 自定义字段，不应出现在客户端订阅响应里)。
 func stripDialerProxyGroup(proxyGroupsNode *yaml.Node) {
 	if proxyGroupsNode == nil || proxyGroupsNode.Kind != yaml.SequenceNode {
 		return
@@ -2575,7 +2575,7 @@ func injectChainProxy(ctx context.Context, repo *storage.TrafficRepository, user
 	return []byte(fixed)
 }
 
-// ─── 订阅 YAML → JSON 序列化(兼容旧版逻辑,无 mmw 特化) ───
+// ─── 订阅 YAML → JSON 序列化 ───
 //
 // 用 yaml.Node 解析后手工写出 JSON,这样可以:
 //   1. 保留 proxies / proxy-groups 顶层数组的多行格式(可读性)

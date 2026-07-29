@@ -136,7 +136,7 @@ func newNginxBridgeFixture(t *testing.T) nginxBridgeFixture {
 	if err := os.WriteFile(agentConfig, []byte("nginx_mode: managed\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	helper = strings.ReplaceAll(helper, "/etc/mmw-agent/config.yaml", agentConfig)
+	helper = strings.ReplaceAll(helper, "/etc/relaydock-agent/config.yaml", agentConfig)
 	helper = strings.ReplaceAll(helper, "/www/server/panel/vhost/nginx", vhostDir)
 	helper = strings.ReplaceAll(helper, "/www/server/nginx", btPrefix)
 	helper = strings.ReplaceAll(helper, "/usr/local/nginx", managedRoot)
@@ -310,7 +310,7 @@ func TestNginxTemplatesUsePortableCertificateAndProxyHeaders(t *testing.T) {
 		"tunnel/domain_proxy.conf",
 		"tunnel/domain_static.conf",
 		"wss_domain.conf.tpl",
-		"mmwx_domain.conf",
+		"arcway_domain.conf",
 	} {
 		content, err := templates.ReadFile(name)
 		if err != nil {

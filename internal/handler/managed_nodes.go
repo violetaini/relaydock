@@ -329,7 +329,7 @@ func (h *ManagedNodesHandler) requireManagedAgentCapabilities(ctx context.Contex
 		return nil
 	}
 	if !capabilities.RPC {
-		return fmt.Errorf("%w: missing rpc capability; upgrade and reconnect mmw-agent", ErrManagedAgentIncompatible)
+		return fmt.Errorf("%w: missing rpc capability; upgrade and reconnect relaydock-agent", ErrManagedAgentIncompatible)
 	}
 	if err := h.requireManagedExpiryGuard(ctx, serverID); err != nil {
 		return fmt.Errorf("%w: durable client expiry guard is unavailable", ErrManagedAgentIncompatible)

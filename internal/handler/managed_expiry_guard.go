@@ -155,7 +155,7 @@ func (h *ManagedNodesHandler) callManagedExpiryGuard(ctx context.Context, server
 
 func (h *ManagedNodesHandler) managedConnectionCapabilities(serverID int64) (AgentCapabilities, error) {
 	if h.remoteManage == nil || h.remoteManage.wsHandler == nil {
-		return AgentCapabilities{}, errors.New("capability handshake is unavailable; reconnect mmw-agent")
+		return AgentCapabilities{}, errors.New("capability handshake is unavailable; reconnect relaydock-agent")
 	}
 	connection, ok := h.remoteManage.wsHandler.GetConnectionByServerID(serverID)
 	if !ok {

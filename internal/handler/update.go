@@ -213,7 +213,7 @@ func populateAgentEnvironment(environment updateEnvironment, agentAssetDir strin
 	}
 	var missing []string
 	for _, arch := range []string{"amd64", "arm64"} {
-		name := "mmw-agent-linux-" + arch
+		name := "relaydock-agent-linux-" + arch
 		if info, err := os.Stat(filepath.Join(agentAssetDir, name)); err != nil || !info.Mode().IsRegular() {
 			missing = append(missing, name)
 		}
@@ -759,7 +759,7 @@ func checkLatestVersion() (*UpdateInfo, error) {
 	}
 	if info.agentAssetDir != "" {
 		for _, arch := range []string{"amd64", "arm64"} {
-			name := "mmw-agent-linux-" + arch
+			name := "relaydock-agent-linux-" + arch
 			assetURL, digest, assetErr := selectReleaseAsset(release, name)
 			if assetErr != nil {
 				return nil, assetErr

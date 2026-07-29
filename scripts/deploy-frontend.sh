@@ -146,7 +146,7 @@ if find "$releases/$release" -type l -print -quit | grep -q .; then
     echo "ERROR: rollback release contains symbolic links: $release" >&2
     exit 1
 fi
-grep -q '__MMW_DEFAULT_THEME__' "$index" || {
+grep -q '__RELAYDOCK_DEFAULT_THEME__' "$index" || {
     echo "ERROR: rollback release has an invalid index.html" >&2
     exit 1
 }
@@ -194,7 +194,7 @@ DIST_DIR="$FRONTEND_DIR/dist"
     echo "ERROR: frontend dist is incomplete: $DIST_DIR" >&2
     exit 1
 }
-grep -q '__MMW_DEFAULT_THEME__' "$DIST_DIR/index.html" || {
+grep -q '__RELAYDOCK_DEFAULT_THEME__' "$DIST_DIR/index.html" || {
     echo "ERROR: frontend index.html is missing the theme placeholder" >&2
     exit 1
 }
@@ -330,7 +330,7 @@ fi
     echo "ERROR: uploaded frontend release is incomplete" >&2
     exit 1
 }
-grep -q '__MMW_DEFAULT_THEME__' "$staging/index.html" || {
+grep -q '__RELAYDOCK_DEFAULT_THEME__' "$staging/index.html" || {
     echo "ERROR: uploaded index.html is invalid" >&2
     exit 1
 }

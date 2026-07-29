@@ -11,10 +11,9 @@ import (
 	"testing"
 
 	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/proxyparser"
+	"github.com/violetaini/relaydock/internal/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/storage"
-
-	"github.com/MMWOrg/mmwX-plugins/proxyparser"
-	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 )
 
 func createNodeURITestNode(t *testing.T, repo *storage.TrafficRepository, username, name, protocol, config string) storage.Node {

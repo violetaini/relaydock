@@ -128,7 +128,7 @@ func main() {
 		log.Printf("Loaded configuration from %s", *configPath)
 	}
 
-	repo, err := storage.NewTrafficRepository(filepath.Join("data", "mmwx.db"))
+	repo, err := storage.NewTrafficRepository(filepath.Join("data", "arcway.db"))
 	if err != nil {
 		logger.Error("流量数据库初始化失败", "error", err)
 		os.Exit(1)
@@ -137,7 +137,7 @@ func main() {
 
 	addr := getAddr(config, repo)
 
-	masterIdentity, err := securechan.LoadOrGenerate(filepath.Join("data", "mmwx_master.key"))
+	masterIdentity, err := securechan.LoadOrGenerate(filepath.Join("data", "arcway_master.key"))
 	if err != nil {
 		logger.Error("加密密钥初始化失败", "error", err)
 		os.Exit(1)
@@ -257,7 +257,7 @@ func main() {
 		NotifyDeviceLimitExceeded: systemConfig.NotifyDeviceLimitExceeded,
 	})
 
-	// TG bot 已拆为独立项目 ../mmwX-tgbot,通过 /api/admin/tgbot/* HTTP 调主控。
+	// TG bot 已拆为独立项目,通过 /api/admin/tgbot/* HTTP 调主控。
 	// 主控仅保留 admin REST handler + 邀请码 web UI + storage 字段 + notify 裸 HTTP 通知。
 	tgbotAPIHandler := handler.NewTGBotAPIHandler(repo)
 
@@ -324,7 +324,7 @@ func main() {
 
 	// TG bot 相关 API(单前缀,handler 内部按 path 分发):
 	//   - invites CRUD(admin web UI 用)
-	//   - bind/unbind/user-by-tg/user-summary/user-subscriptions/user-nodes(独立 mmwX-tgbot 用)
+	//   - bind/unbind/user-by-tg/user-summary/user-subscriptions/user-nodes(独立 TG bot 用)
 	mux.Handle("/api/admin/tgbot/", auth.RequireAdmin(tokenStore, userRepo, tgbotAPIHandler))
 	mux.Handle("/api/admin/users", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserListHandler(repo)))
 	userCreateHandler := handler.NewUserCreateHandler(repo)
@@ -459,7 +459,7 @@ func main() {
 	mux.Handle("/api/remote/token/refresh", http.HandlerFunc(xrayServerHandler.RefreshRemoteToken))
 	mux.Handle("/api/remote/install.sh", http.HandlerFunc(xrayServerHandler.GetRemoteInstallScript))
 	mux.Handle("/api/remote/expiry-guard", http.HandlerFunc(xrayServerHandler.GetExpiryGuardAsset))
-	mux.Handle("/api/remote/mmw-agent", http.HandlerFunc(xrayServerHandler.GetAgentAsset))
+	mux.Handle("/api/remote/relaydock-agent", http.HandlerFunc(xrayServerHandler.GetAgentAsset))
 	mux.Handle("/api/remote/install-begin", http.HandlerFunc(xrayServerHandler.BeginRemoteInstallation))
 	mux.Handle("/api/remote/install-renew", http.HandlerFunc(xrayServerHandler.RenewRemoteInstallation))
 	mux.Handle("/api/remote/install-quiesce", http.HandlerFunc(xrayServerHandler.QuiesceRemoteInstallation))
@@ -604,6 +604,7 @@ func main() {
 	speedTesterWS := handler.NewSpeedTesterWSHandler(repo)
 	speedTesterWS.SetCapabilityManager(capabilityManager)
 	mux.Handle("/api/speedtest/tester/ws", speedTesterWS) // 家用测速端反向连入(token 认证,无 JWT)
+	mux.Handle("/api/public/relaydock-speedtester/", handler.NewSpeedtesterAssetHandler())
 	speedTestHandler := handler.NewSpeedTestHandler(repo, capabilityManager)
 	speedTestHandler.SetTesterWS(speedTesterWS)
 	mux.Handle("/api/admin/speedtest/", auth.RequireAdmin(tokenStore, userRepo, speedTestHandler))
@@ -641,12 +642,12 @@ func main() {
 	// 用户私有路由出站(routed_owner='user'):普通用户为自己创建/删除/查询专属出站
 	mux.Handle("/api/user/routed-outbound", auth.RequireToken(tokenStore, userRepo, handler.NewUserRoutedOutboundHandler(repo, remoteManageHandler)))
 
-	// 从旧版面板(mmw)迁移工具
+	// 从兼容面板备份导入数据。
 	migrateHandler := handler.NewMigrateHandler(repo, remoteManageHandler)
-	mux.Handle("/api/admin/migrate/fetch-mmw-backup", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.FetchMmwBackup)))
-	mux.Handle("/api/admin/migrate/upload-mmw-backup", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.UploadMmwBackup)))
-	mux.Handle("/api/admin/migrate/cleanup", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.CleanupMmwSession)))
-	mux.Handle("/api/admin/migrate/import-mmw", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.ImportMmw)))
+	mux.Handle("/api/admin/migrate/fetch-legacy-backup", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.FetchLegacyBackup)))
+	mux.Handle("/api/admin/migrate/upload-legacy-backup", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.UploadLegacyBackup)))
+	mux.Handle("/api/admin/migrate/cleanup", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.CleanupLegacySession)))
+	mux.Handle("/api/admin/migrate/import-legacy-backup", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.ImportLegacyBackup)))
 	mux.Handle("/api/admin/migrate/distinct-node-servers", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.DistinctNodeServers)))
 	mux.Handle("/api/admin/migrate/patch-client-emails", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.PatchClientEmails)))
 	mux.Handle("/api/admin/migrate/takeover-external-xray", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.TakeoverExternalXray)))
@@ -723,7 +724,7 @@ func main() {
 	// 子服务器模式配置
 	// 确定我们是否处于儿童/远程模式：
 	// 1. 配置文件设置了remote_token，或者
-	// 2.环境变量MMWX_MODE=child
+	// 2. 环境变量 RELAYDOCK_MODE=child
 	var childClient *child.Client
 	var childManageHandler *handler.ChildManageHandler
 	isChildMode := false
@@ -740,19 +741,19 @@ func main() {
 	}
 
 	// 环境变量可以覆盖或补充配置
-	if os.Getenv("MMWX_MODE") == "child" {
+	if os.Getenv("RELAYDOCK_MODE") == "child" {
 		isChildMode = true
 	}
-	if envMasterURL := os.Getenv("MMWX_MASTER_URL"); envMasterURL != "" {
+	if envMasterURL := os.Getenv("RELAYDOCK_MASTER_URL"); envMasterURL != "" {
 		masterURL = envMasterURL
 	}
-	if envMasterToken := os.Getenv("MMWX_MASTER_TOKEN"); envMasterToken != "" {
+	if envMasterToken := os.Getenv("RELAYDOCK_MASTER_TOKEN"); envMasterToken != "" {
 		masterToken = envMasterToken
 	}
-	if envConnectionMode := os.Getenv("MMWX_CONNECTION_MODE"); envConnectionMode != "" {
+	if envConnectionMode := os.Getenv("RELAYDOCK_CONNECTION_MODE"); envConnectionMode != "" {
 		connectionMode = envConnectionMode
 	}
-	if envChildAPIToken := os.Getenv("MMWX_CHILD_API_TOKEN"); envChildAPIToken != "" {
+	if envChildAPIToken := os.Getenv("RELAYDOCK_CHILD_API_TOKEN"); envChildAPIToken != "" {
 		childAPIToken = envChildAPIToken
 	}
 
@@ -1030,12 +1031,12 @@ func main() {
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
 	})))
-	mux.Handle("/api/admin/system-settings/mmw-short-link-compat", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/admin/system-settings/root-short-links", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			systemSettingsHandler.GetMmwShortLinkCompat(w, r)
+			systemSettingsHandler.GetRootShortLinks(w, r)
 		case http.MethodPut:
-			systemSettingsHandler.SetMmwShortLinkCompat(w, r)
+			systemSettingsHandler.SetRootShortLinks(w, r)
 		default:
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
@@ -1174,11 +1175,11 @@ func main() {
 			}
 		}
 
-		// 兼容旧版面板短链接:旧版 mmw 直接 GET /<code>(无 /x/ 前缀)。
+		// 可选根路径短链接:直接 GET /<code>(无 /x/ 前缀)。
 		// 系统设置启用后,把单段 alphanumeric 路径(看起来像短码)按 /x/<code> 试一遍,
 		// 命中即返回订阅内容。不命中**必须 fall-through 到 SPA**,因为 /nodes / /users / /packages
 		// 这些前端路由也是单段 alphanumeric,如果直接 404 会把整个前端路由废掉。
-		if cfg, cfgErr := repo.GetSystemConfig(r.Context()); cfgErr == nil && cfg.EnableMmwShortLinkCompat &&
+		if cfg, cfgErr := repo.GetSystemConfig(r.Context()); cfgErr == nil && cfg.EnableRootShortLinks &&
 			path != "" && !strings.Contains(path, "/") && !strings.Contains(path, ".") &&
 			len(path) >= 2 && isAlphanumeric(path) && subRateLimiter.Allow(clientIP) {
 			origURL := r.URL.Path
@@ -1229,7 +1230,7 @@ func main() {
 	go trafficCollector.StartSpeedCollection(collectorCtx)
 	// 启动每日快照和清理任务
 	go startDailySnapshotTask(collectorCtx, trafficHandler, trafficCollector)
-	// WAL 巡检:每 5 分钟 wal_checkpoint(TRUNCATE),把 -wal 抽干并截断,防止长跑容器里 mmwx.db-wal 无界膨胀。
+	// WAL 巡检:每 5 分钟 wal_checkpoint(TRUNCATE),把 -wal 抽干并截断,防止长跑容器里 arcway.db-wal 无界膨胀。
 	go startWALCheckpointTask(collectorCtx, repo)
 	// 一次性补:上一轮已切到 traffic_source='system' 但 daily snapshot baseline 缺失的 server。
 	// 行数 < 7 视为"切换时漏迁移"(覆盖本周维度);ON CONFLICT 覆盖,重启重跑也安全。
@@ -1456,7 +1457,7 @@ func backfillSystemSnapshotsForSwitchedServers(ctx context.Context, repo *storag
 // 创建每日快照并清理旧数据
 // startWALCheckpointTask 每 5 分钟做一次 wal_checkpoint(TRUNCATE):把 WAL 已提交帧写回主库并截断 -wal 文件。
 // SQLite 默认 PASSIVE 自动 checkpoint 在持续并发读下常抽不干、且从不截断文件;配合 DSN 里的 journal_size_limit,
-// 这个巡检保证长跑容器里 mmwx.db-wal 不会无界膨胀。TRUNCATE 会等 reader(有 5s busy_timeout),
+// 这个巡检保证长跑容器里 arcway.db-wal 不会无界膨胀。TRUNCATE 会等 reader(有 5s busy_timeout),
 // 偶发 SQLITE_BUSY 属正常,下一轮再来,非致命。
 func startWALCheckpointTask(ctx context.Context, repo *storage.TrafficRepository) {
 	ticker := time.NewTicker(5 * time.Minute)
@@ -1557,12 +1558,12 @@ func startDailySnapshotTask(ctx context.Context, trafficHandler *handler.Traffic
 func startLogCleanup() {
 	logManager := logger.NewLogManager("data/logs")
 
-	// 一轮清理：debug 日志(log_*, 7天) + lumberjack 主日志(mmwx*, 兜底保留最新2个)
+	// 一轮清理：debug 日志(log_*, 7天) + lumberjack 主日志(arcway*, 兜底保留最新2个)
 	runCleanup := func() {
 		if err := logManager.CleanupOldLogs(); err != nil {
 			logger.Error("[日志清理] 清理 debug 日志失败", "error", err)
 		}
-		if err := logManager.EnforceMaxFiles("mmwx", 2); err != nil {
+		if err := logManager.EnforceMaxFiles("arcway", 2); err != nil {
 			logger.Error("[日志清理] 清理主日志失败", "error", err)
 		}
 	}

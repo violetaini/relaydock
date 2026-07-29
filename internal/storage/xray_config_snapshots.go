@@ -293,7 +293,7 @@ func (r *TrafficRepository) ListXraySnapshots(ctx context.Context, serverID int6
 // deprecatedRoutingMarktags — 已废弃需要从 snapshot 中清理的路由规则 marktag 白名单。
 // 跟 agent 端 removeDeprecatedRoutingRules 的 deprecated map 保持一致。
 var deprecatedRoutingMarktags = map[string]bool{
-	"fix_openai": true, // mmw-agent 8a9f8c9 移除,geosite:openai → direct
+	"fix_openai": true, // relaydock-agent 8a9f8c9 移除,geosite:openai → direct
 }
 
 // MigrateRemoveDeprecatedRulesFromSnapshots 一次性扫 server_xray_config_snapshots,

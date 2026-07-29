@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -358,16 +357,6 @@ const defaultRedeemTemplate = `使用教程
 如果需要自定义出站落地，需要登录 RelayDock
 {主控域名}`
 
-var legacyRedeemBrandPattern = regexp.MustCompile("(?i)(" + strings.Join([]string{
-	regexp.QuoteMeta(strings.Join([]string{"妙", "妙", "屋"}, "")) + "x?",
-	regexp.QuoteMeta(strings.Join([]string{"miao", "miao", "wu"}, "")) + "x?",
-	regexp.QuoteMeta(strings.Join([]string{"miao", "miao", "x"}, "")),
-}, "|") + ")")
-
-func normalizeRedeemTemplate(value string) string {
-	return legacyRedeemBrandPattern.ReplaceAllString(value, "RelayDock")
-}
-
 // GetRedeemTemplate 返回兑换码复制文案模板;未配置时返回内置默认模板。
 func (h *SystemSettingsHandler) GetRedeemTemplate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -383,14 +372,6 @@ func (h *SystemSettingsHandler) GetRedeemTemplate(w http.ResponseWriter, r *http
 	}
 	if value == "" {
 		value = defaultRedeemTemplate
-	} else if normalized := normalizeRedeemTemplate(value); normalized != value {
-		if err := h.repo.SetSystemSetting(r.Context(), "redeem_copy_template", normalized); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "更新兑换码文案失败"})
-			return
-		}
-		value = normalized
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "redeem_template": value})
@@ -411,7 +392,6 @@ func (h *SystemSettingsHandler) SetRedeemTemplate(w http.ResponseWriter, r *http
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "请求格式错误"})
 		return
 	}
-	req.RedeemTemplate = normalizeRedeemTemplate(req.RedeemTemplate)
 	if err := h.repo.SetSystemSetting(r.Context(), "redeem_copy_template", req.RedeemTemplate); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -779,7 +759,7 @@ func (h *SystemSettingsHandler) SetSubscriptionOutputFormat(w http.ResponseWrite
 }
 
 // DefaultThemeKey 是「默认主题」系统设置的 KV 键。值:"flat"(现代扁平,默认)/ "pixel" / "anime"。
-// 无 mmw-theme-style cookie 的用户首屏用它决定初始主题(由 web.SetDefaultTheme 注入 index.html)。
+// 无主题 cookie 的用户首屏用它决定初始主题(由 web.SetDefaultTheme 注入 index.html)。
 const DefaultThemeKey = "default_theme"
 
 func (h *SystemSettingsHandler) GetDefaultTheme(w http.ResponseWriter, r *http.Request) {
@@ -986,9 +966,9 @@ func (h *SystemSettingsHandler) SetManagementFeaturesEnabled(w http.ResponseWrit
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "管理功能设置已更新"})
 }
 
-// 兼容旧版面板短链接(/<code> 自动尝试匹配 /x/<code>)— 默认 false。
+// 根路径短链接(/<code> 自动尝试匹配 /x/<code>)— 默认 false。
 // 开启后,根路径下单段 alphanumeric 路径会先尝试当作短链;命中返回订阅,未命中计入暴力枚举失败。
-func (h *SystemSettingsHandler) GetMmwShortLinkCompat(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsHandler) GetRootShortLinks(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -997,12 +977,12 @@ func (h *SystemSettingsHandler) GetMmwShortLinkCompat(w http.ResponseWriter, r *
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"success": true, "enable_mmw_short_link_compat": cfg.EnableMmwShortLinkCompat})
+	json.NewEncoder(w).Encode(map[string]any{"success": true, "enable_root_short_links": cfg.EnableRootShortLinks})
 }
 
-func (h *SystemSettingsHandler) SetMmwShortLinkCompat(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsHandler) SetRootShortLinks(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		EnableMmwShortLinkCompat bool `json:"enable_mmw_short_link_compat"`
+		EnableRootShortLinks bool `json:"enable_root_short_links"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1017,7 +997,7 @@ func (h *SystemSettingsHandler) SetMmwShortLinkCompat(w http.ResponseWriter, r *
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "获取设置失败"})
 		return
 	}
-	cfg.EnableMmwShortLinkCompat = req.EnableMmwShortLinkCompat
+	cfg.EnableRootShortLinks = req.EnableRootShortLinks
 	if err := h.repo.UpdateSystemConfig(r.Context(), cfg); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -1025,7 +1005,7 @@ func (h *SystemSettingsHandler) SetMmwShortLinkCompat(w http.ResponseWriter, r *
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "旧版短链接兼容设置已更新"})
+	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "根路径短链接设置已更新"})
 }
 
 func (h *SystemSettingsHandler) GetDefaultTemplate(w http.ResponseWriter, r *http.Request) {

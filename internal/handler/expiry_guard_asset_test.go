@@ -151,24 +151,24 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	}
 
 	script := response.Body.String()
-	agentSHA256AMD64, err := agentAssetSHA256("mmw-agent-linux-amd64")
+	agentSHA256AMD64, err := agentAssetSHA256("relaydock-agent-linux-amd64")
 	if err != nil {
 		t.Fatalf("agentAssetSHA256 amd64: %v", err)
 	}
-	agentSHA256ARM64, err := agentAssetSHA256("mmw-agent-linux-arm64")
+	agentSHA256ARM64, err := agentAssetSHA256("relaydock-agent-linux-arm64")
 	if err != nil {
 		t.Fatalf("agentAssetSHA256 arm64: %v", err)
 	}
 	for _, expected := range []string{
-		"/api/remote/mmw-agent?arch=${ARCH_NAME}",
+		"/api/remote/relaydock-agent?arch=${ARCH_NAME}",
 		agentSHA256AMD64,
 		agentSHA256ARM64,
 		"ASSET_RELEASE_BASE_URL='https://github.com/violetaini/relaydock/releases/download/v" + version.Version + "'",
-		"AGENT_GITHUB_URL=\"${ASSET_RELEASE_BASE_URL}/mmw-agent-linux-${ARCH_NAME}\"",
+		"AGENT_GITHUB_URL=\"${ASSET_RELEASE_BASE_URL}/relaydock-agent-linux-${ARCH_NAME}\"",
 		"GUARD_GITHUB_URL=\"${ASSET_RELEASE_BASE_URL}/arcway-expiry-guard-linux-${ARCH_NAME}\"",
 		"Downloading $label from GitHub Release...",
 		"Downloading $label from master fallback...",
-		"mmw-agent SHA-256 verification failed",
+		"relaydock-agent SHA-256 verification failed",
 		"/api/remote/expiry-guard?arch=${ARCH_NAME}",
 		"/api/remote/management-ready",
 		"/api/remote/install-begin",
@@ -208,7 +208,7 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"automatic rollback was incomplete",
 		"external Xray mode requires a working Xray installation",
 		"takeover mode requires a working Nginx installation",
-		"/var/lib/mmw-agent",
+		"/var/lib/relaydock-agent",
 		"/var/lib/arcway-expiry-guard",
 		"chmod 0600 /var/lib/arcway-expiry-guard/state.json",
 		"PANEL_SOURCE_IPS='203.0.113.10 2001:db8::10'",
@@ -226,8 +226,8 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"/usr/local/sbin/arcway-agent-firewall",
 		"ExecStartPre=/usr/local/sbin/arcway-agent-firewall",
 		"ExecStartPre=/usr/local/sbin/arcway-agent-firewall --nft-only",
-		"Requires=mmw-agent.service",
-		"depend() { need net mmw-agent; }",
+		"Requires=relaydock-agent.service",
+		"depend() { need net relaydock-agent; }",
 		"FIREWALL_RUNTIME_DIR=/var/lib/arcway-expiry-guard",
 		"chmod 0700 \"$FIREWALL_RUNTIME_DIR\"",
 		"FIREWALL_LOCK_FILE=\"$FIREWALL_RUNTIME_DIR/firewall.flock\"",
@@ -250,20 +250,20 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"ip saddr %s tcp dport { %s, %s } accept",
 		"ip6 saddr %s tcp dport { %s, %s } accept",
 		"tcp dport { %s, %s } drop",
-		"mmw-agent listen_port drifted from the protected Arcway port",
+		"relaydock-agent listen_port drifted from the protected Arcway port",
 		"/etc/systemd/system/arcway-expiry-guard.service",
-		"chmod 0644 /etc/systemd/system/mmw-agent.service /etc/systemd/system/arcway-expiry-guard.service",
+		"chmod 0644 /etc/systemd/system/relaydock-agent.service /etc/systemd/system/arcway-expiry-guard.service",
 		"/etc/init.d/arcway-expiry-guard",
 		"/usr/local/bin/arcway-expiry-guard-supervisor.sh",
 		"/usr/local/sbin/arcway-agent-firewall || return 1",
 		`supervisor="supervise-daemon"`,
 		"respawn_delay=5",
 		"respawn_max=0",
-		"mmw-agent was not registered in the OpenRC default runlevel",
+		"relaydock-agent was not registered in the OpenRC default runlevel",
 		"arcway-expiry-guard was not registered in the OpenRC default runlevel",
-		"systemctl disable mmw-agent",
+		"systemctl disable relaydock-agent",
 		"systemctl disable arcway-expiry-guard",
-		"rc-update del mmw-agent default",
+		"rc-update del relaydock-agent default",
 		"rc-update del arcway-expiry-guard default",
 		"cleanup_legacy_firewall()",
 		"SCRIPT_PROTOCOL='https'",
@@ -282,12 +282,12 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	if strings.Contains(script, `-H "Authorization: Bearer ${TOKEN}"`) {
 		t.Fatal("install script exposes the long-lived token in curl argv")
 	}
-	if strings.Contains(script, "github.com/iluobei/mmw-agent") || strings.Contains(script, "AGENT_VERSION=") {
+	if strings.Contains(script, "AGENT_VERSION=") {
 		t.Fatal("install script depends on an independently moving upstream Agent release")
 	}
 	githubDownloadStart := strings.Index(script, `echo "Downloading $label from GitHub Release..."`)
 	masterFallbackStart := strings.Index(script, `echo "Downloading $label from master fallback..."`)
-	downloadHelperEnd := strings.Index(script, `AGENT_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/mmw-agent-linux-${ARCH_NAME}"`)
+	downloadHelperEnd := strings.Index(script, `AGENT_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/relaydock-agent-linux-${ARCH_NAME}"`)
 	if githubDownloadStart < 0 || masterFallbackStart <= githubDownloadStart || downloadHelperEnd <= masterFallbackStart {
 		t.Fatal("installer release download helper is incomplete")
 	}
@@ -350,7 +350,7 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		t.Fatal("install script reports success or removes rollback-only firewall state before semantic readiness")
 	}
 	firewallBootIndex := strings.LastIndex(script, `/usr/local/sbin/arcway-agent-firewall || exit 1`)
-	agentBootIndex := strings.LastIndex(script, `nohup /usr/local/bin/mmw-agent-supervisor.sh`)
+	agentBootIndex := strings.LastIndex(script, `nohup /usr/local/bin/relaydock-agent-supervisor.sh`)
 	guardBootIndex := strings.LastIndex(script, `nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh`)
 	if firewallBootIndex < 0 || agentBootIndex < firewallBootIndex || guardBootIndex < agentBootIndex {
 		t.Fatal("rc.local managed services are not ordered firewall, Agent, expiry guard")
@@ -514,7 +514,7 @@ func TestRemoteInstallHostFilterSurvivesLaterDefaultDrop(t *testing.T) {
 		t.Fatal("firewall helper does not apply nft before its sandbox-safe exit and host INPUT integration")
 	}
 
-	const agentUnitStart = "cat > /etc/systemd/system/mmw-agent.service << EOF\n"
+	const agentUnitStart = "cat > /etc/systemd/system/relaydock-agent.service << EOF\n"
 	_, agentTail, found := strings.Cut(script, agentUnitStart)
 	if !found {
 		t.Fatal("generated installer is missing the Agent unit")
@@ -530,7 +530,7 @@ func TestRemoteInstallHostFilterSurvivesLaterDefaultDrop(t *testing.T) {
 		t.Fatal("generated installer is missing the Guard unit")
 	}
 	guardUnit, _, found := strings.Cut(guardTail, "\nEOF\n")
-	if !found || !strings.Contains(guardUnit, "Requires=mmw-agent.service") ||
+	if !found || !strings.Contains(guardUnit, "Requires=relaydock-agent.service") ||
 		!strings.Contains(guardUnit, "ExecStartPre=/usr/local/sbin/arcway-agent-firewall --nft-only") {
 		t.Fatal("sandboxed Guard unit does not rely on the Agent's full firewall setup")
 	}
@@ -605,7 +605,7 @@ func TestRemoteInstallFirewallHelperReconcilesHostInputChain(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mockBin, "iptables"), []byte("#!/bin/sh\nexit 42\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	fakeAgentPath := filepath.Join(mockBin, "mmw-agent")
+	fakeAgentPath := filepath.Join(mockBin, "relaydock-agent")
 	if err := os.WriteFile(fakeAgentPath, []byte("#!/bin/sh\nprintf '%b\\n' \"${FAKE_ARCWAY_RULES:-tcp 2033\\nudp 2033\\nudp 51820}\"\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +621,7 @@ func TestRemoteInstallFirewallHelperReconcilesHostInputChain(t *testing.T) {
 	if err := os.WriteFile(firewallEnvPath, []byte("ARCWAY_AGENT_PORT=23889\nARCWAY_GUARD_PORT=23890\nARCWAY_PANEL_IPS='203.0.113.10'\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	helper = strings.ReplaceAll(helper, "/etc/mmw-agent/config.yaml", configPath)
+	helper = strings.ReplaceAll(helper, "/etc/relaydock-agent/config.yaml", configPath)
 	helper = strings.ReplaceAll(helper, "/etc/arcway-expiry-guard.env", guardEnvPath)
 	helper = strings.ReplaceAll(helper, "/etc/arcway-port-firewall.env", firewallEnvPath)
 	helper = strings.ReplaceAll(helper, "FIREWALL_RUNTIME_DIR=/var/lib/arcway-expiry-guard", "FIREWALL_RUNTIME_DIR="+runtimeDir)
@@ -926,8 +926,8 @@ esac
 		t.Fatal(err)
 	}
 	harness := restoreHelper + `
-restore_systemd_service_state mmw-agent disabled 0
-if FAKE_SYSTEMD_ACTIVE=1 restore_systemd_service_state mmw-agent disabled 0; then
+restore_systemd_service_state relaydock-agent disabled 0
+if FAKE_SYSTEMD_ACTIVE=1 restore_systemd_service_state relaydock-agent disabled 0; then
     echo "restore accepted a service that remained active" >&2
     exit 1
 fi
@@ -1033,7 +1033,7 @@ func TestRemoteInstallActiveUFWReapplyUsesDownloadedAgent(t *testing.T) {
 	fragment := script[start : start+blockEnd+len(blockEndMarker)]
 
 	testRoot := t.TempDir()
-	downloadedAgent := filepath.Join(testRoot, "mmw-agent.download")
+	downloadedAgent := filepath.Join(testRoot, "relaydock-agent.download")
 	if err := os.WriteFile(downloadedAgent, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -1062,7 +1062,7 @@ set -eu
 	if count := strings.Count(script, reapply); count < 2 {
 		t.Fatalf("downloaded Agent override count=%d want at least 2", count)
 	}
-	installIndex := strings.Index(script, `install -m 0755 "$AGENT_DOWNLOAD" /usr/local/bin/.mmw-agent.new`)
+	installIndex := strings.Index(script, `install -m 0755 "$AGENT_DOWNLOAD" /usr/local/bin/.relaydock-agent.new`)
 	if installIndex < 0 || start >= installIndex {
 		t.Fatal("active-UFW reapply no longer runs before the Agent is installed")
 	}

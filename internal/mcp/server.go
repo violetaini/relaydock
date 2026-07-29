@@ -24,12 +24,10 @@ func NewHandler(mux http.Handler) http.Handler {
 	return server.NewStreamableHTTPServer(s,
 		server.WithStateLess(true), // 无状态:每次请求独立,适配无会话的 agent 调用
 		server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
-			// 把 API 令牌从请求头提取进 context,供 bridge 在内部回放时携带
-			tok := strings.TrimSpace(r.Header.Get("MM-Authorization"))
-			if tok == "" {
-				if bearer := strings.TrimSpace(r.Header.Get("Authorization")); bearer != "" {
-					tok = strings.TrimSpace(strings.TrimPrefix(bearer, "Bearer "))
-				}
+			// 把标准 Bearer 令牌提取进 context,供 bridge 在内部回放时携带。
+			tok := ""
+			if bearer := strings.TrimSpace(r.Header.Get("Authorization")); bearer != "" {
+				tok = strings.TrimSpace(strings.TrimPrefix(bearer, "Bearer "))
 			}
 			return withToken(ctx, tok)
 		}),

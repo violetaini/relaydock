@@ -311,9 +311,9 @@ func deployLocalNginx(domain string, repo *storage.TrafficRepository) error {
 		return fmt.Errorf("读取 single_nginx.conf 模板失败: %w", err)
 	}
 
-	domainTpl, err := templates.ReadFile("mmwx_domain.conf")
+	domainTpl, err := templates.ReadFile("arcway_domain.conf")
 	if err != nil {
-		return fmt.Errorf("读取 mmwx_domain.conf 模板失败: %w", err)
+		return fmt.Errorf("读取 arcway_domain.conf 模板失败: %w", err)
 	}
 	domainConf := strings.ReplaceAll(string(domainTpl), "{domain}", domain)
 
@@ -365,9 +365,9 @@ func deployLocalNginxWithCert(domain string, cert *storage.Certificate) error {
 	if err != nil {
 		return fmt.Errorf("读取 single_nginx.conf 模板失败: %w", err)
 	}
-	domainTpl, err := templates.ReadFile("mmwx_domain.conf")
+	domainTpl, err := templates.ReadFile("arcway_domain.conf")
 	if err != nil {
-		return fmt.Errorf("读取 mmwx_domain.conf 模板失败: %w", err)
+		return fmt.Errorf("读取 arcway_domain.conf 模板失败: %w", err)
 	}
 	certName := domain
 	if cert != nil {

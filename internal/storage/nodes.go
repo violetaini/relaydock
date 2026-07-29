@@ -1516,7 +1516,7 @@ func (r *TrafficRepository) UpdateNodeInboundTag(ctx context.Context, nodeID int
 
 // ClaimExternalNode 把一个"外部节点"(original_server=” AND inbound_tag=”)升级为受管节点:
 // 填上 original_server / inbound_tag / tag / clash_config(用 agent 转出来的新 config 覆盖)。
-// 用于迁移场景下,把 mmw 时代手工录入的节点跟 agent 扫描出来的同 server:port 入站绑定。
+// 用于导入场景下,把手工录入的节点跟 Agent 扫描出来的同 server:port 入站绑定。
 func (r *TrafficRepository) ClaimExternalNode(ctx context.Context, nodeID int64, originalServer, inboundTag, mutationID, tag, clashConfig string) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")

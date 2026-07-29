@@ -1,4 +1,4 @@
-# MMX-100：管理员隧道与用户转发管理设计
+# RD-100：管理员隧道与用户转发管理设计
 
 ## 1. 状态与目标
 
@@ -637,6 +637,6 @@ both：（用户发往入口 + 入口发往用户）× 模板倍率
 
 ## 17. 参考
 
-- 现有服务器授权设计：`docs/design/MMX-090-user-server-grants.md`。
+- 现有服务器授权设计：`docs/design/RD-090-user-server-grants.md`。
 - 现有旧版链路实现：`internal/handler/tunnel_chains.go`、`internal/handler/tunnels.go`。
 - [Flux Panel 使用指南](https://brunuhville.github.io/flux-panel/guide.html)和[隧道数据模型](https://github.com/bqlpfy/flux-panel/blob/main/springboot-backend/src/main/java/com/admin/entity/Tunnel.java)的“管理员创建隧道、用户获得权限后创建转发”交互作为权限分层参考；RelayDock 不采用其固定双节点拓扑。

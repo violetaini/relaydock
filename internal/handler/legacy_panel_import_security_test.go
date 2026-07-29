@@ -18,7 +18,7 @@ import (
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
-func TestValidateMmwSourceURLAndRedirectOrigin(t *testing.T) {
+func TestValidateLegacyPanelSourceURLAndRedirectOrigin(t *testing.T) {
 	cases := []struct {
 		name string
 		raw  string
@@ -32,15 +32,15 @@ func TestValidateMmwSourceURLAndRedirectOrigin(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := validateMmwSourceURL(tc.raw, tc.name == "loopback explicit")
+			_, err := validateLegacyPanelSourceURL(tc.raw, tc.name == "loopback explicit")
 			if (err == nil) != tc.ok {
 				t.Fatalf("validate(%q) err=%v, want ok=%v", tc.raw, err, tc.ok)
 			}
 		})
 	}
 
-	source, _ := validateMmwSourceURL("https://panel.example.com", false)
-	client := newMmwHTTPClient(source)
+	source, _ := validateLegacyPanelSourceURL("https://panel.example.com", false)
+	client := newLegacyPanelHTTPClient(source)
 	same, _ := http.NewRequest(http.MethodGet, "https://panel.example.com/api/login", nil)
 	if err := client.CheckRedirect(same, []*http.Request{{URL: source}}); err != nil {
 		t.Fatalf("same-origin redirect rejected: %v", err)
@@ -77,13 +77,13 @@ func TestMigrationPathsAndCleanupAreConfined(t *testing.T) {
 	if _, _, err := resolveLegacyMigrationPaths("/etc/passwd", paths.Subs); err == nil {
 		t.Fatal("outside db path accepted")
 	}
-	if _, _, err := resolveLegacyMigrationPaths(paths.DB, "/tmp/mmwx-migrate/ffffffffffffffff-subs"); err == nil {
+	if _, _, err := resolveLegacyMigrationPaths(paths.DB, "/tmp/relaydock-migrate/ffffffffffffffff-subs"); err == nil {
 		t.Fatal("mismatched session directory accepted")
 	}
 
 	request := httptest.NewRequest(http.MethodDelete, "/api/admin/migrate/cleanup", strings.NewReader(`{"migration_id":"`+id+`"}`))
 	recorder := httptest.NewRecorder()
-	(&MigrateHandler{}).CleanupMmwSession(recorder, request)
+	(&MigrateHandler{}).CleanupLegacySession(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("cleanup status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -96,13 +96,13 @@ func TestMigrationPathsAndCleanupAreConfined(t *testing.T) {
 	// A path-like value must never be interpreted as an ID.
 	bad := httptest.NewRecorder()
 	badReq := httptest.NewRequest(http.MethodDelete, "/api/admin/migrate/cleanup", strings.NewReader(`{"migration_id":"../../etc/passwd"}`))
-	(&MigrateHandler{}).CleanupMmwSession(bad, badReq)
+	(&MigrateHandler{}).CleanupLegacySession(bad, badReq)
 	if bad.Code != http.StatusBadRequest {
 		t.Fatalf("invalid cleanup id status=%d", bad.Code)
 	}
 }
 
-func TestExtractMmwBackupSetsPrivateModesAndLimitsBombs(t *testing.T) {
+func TestExtractLegacyPanelBackupSetsPrivateModesAndLimitsBombs(t *testing.T) {
 	root := t.TempDir()
 	zipPath := filepath.Join(root, "source.zip")
 	file, err := os.Create(zipPath)
@@ -110,7 +110,7 @@ func TestExtractMmwBackupSetsPrivateModesAndLimitsBombs(t *testing.T) {
 		t.Fatal(err)
 	}
 	zw := zip.NewWriter(file)
-	entry, err := zw.Create("data/mmw.db")
+	entry, err := zw.Create("data/legacyPanel.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestExtractMmwBackupSetsPrivateModesAndLimitsBombs(t *testing.T) {
 	}
 	dbPath := filepath.Join(root, "out.db")
 	subsPath := filepath.Join(root, "subs")
-	if _, _, err := extractMmwBackup(zipPath, dbPath, subsPath); err != nil {
+	if _, _, err := extractLegacyPanelBackup(zipPath, dbPath, subsPath); err != nil {
 		t.Fatal(err)
 	}
 	if mode := mustMode(t, dbPath); mode.Perm() != migrateTempFilePerm {
@@ -173,7 +173,7 @@ func TestExtractMmwBackupSetsPrivateModesAndLimitsBombs(t *testing.T) {
 	}
 	_ = w.Close()
 	_ = f.Close()
-	if _, _, err := extractMmwBackup(tooMany, filepath.Join(root, "x.db"), filepath.Join(root, "x-subs")); err == nil {
+	if _, _, err := extractLegacyPanelBackup(tooMany, filepath.Join(root, "x.db"), filepath.Join(root, "x-subs")); err == nil {
 		t.Fatal("archive with too many entries was accepted")
 	}
 }
@@ -200,7 +200,7 @@ func TestExpiredOrphanMigrationArtifactsAreCleaned(t *testing.T) {
 	}
 }
 
-func TestImportMmwRejectsNonBlankTargetWithCounts(t *testing.T) {
+func TestImportLegacyPanelRejectsNonBlankTargetWithCounts(t *testing.T) {
 	if err := ensureMigrateWorkDir(); err != nil {
 		t.Fatal(err)
 	}
@@ -224,10 +224,10 @@ func TestImportMmwRejectsNonBlankTargetWithCounts(t *testing.T) {
 	defer removeMigrationSession(id)
 	h := NewMigrateHandler(repo, nil)
 	body, _ := json.Marshal(map[string]string{"migration_id": id})
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/migrate/import-mmw", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/migrate/import-legacyPanel", bytes.NewReader(body))
 	req = req.WithContext(auth.ContextWithUsername(req.Context(), "admin"))
 	recorder := httptest.NewRecorder()
-	h.ImportMmw(recorder, req)
+	h.ImportLegacyBackup(recorder, req)
 	if recorder.Code != http.StatusConflict {
 		t.Fatalf("non-blank import status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -236,7 +236,7 @@ func TestImportMmwRejectsNonBlankTargetWithCounts(t *testing.T) {
 	}
 }
 
-func TestImportMmwSubscribeCopyFailureLeavesDatabaseRetryable(t *testing.T) {
+func TestImportLegacyPanelSubscribeCopyFailureLeavesDatabaseRetryable(t *testing.T) {
 	if err := ensureMigrateWorkDir(); err != nil {
 		t.Fatal(err)
 	}
@@ -286,14 +286,14 @@ func TestImportMmwSubscribeCopyFailureLeavesDatabaseRetryable(t *testing.T) {
 	h := NewMigrateHandler(repo, nil)
 	h.subscribesDir = blockedDestination
 	body, _ := json.Marshal(map[string]string{"migration_id": id})
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/migrate/import-mmw", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/migrate/import-legacyPanel", bytes.NewReader(body))
 	req = req.WithContext(auth.ContextWithUsername(req.Context(), "admin"))
 	recorder := httptest.NewRecorder()
-	h.ImportMmw(recorder, req)
+	h.ImportLegacyBackup(recorder, req)
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("copy failure status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
-	blocking, err := repo.MmwImportBlockingCounts(ctx, "admin")
+	blocking, err := repo.LegacyPanelImportBlockingCounts(ctx, "admin")
 	if err != nil {
 		t.Fatal(err)
 	}

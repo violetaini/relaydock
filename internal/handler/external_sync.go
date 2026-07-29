@@ -402,7 +402,7 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 	}
 
 	// 节点名后缀:同步设置开启 append_sub_info 时,把"剩余流量 + 剩余天数"拼到节点名后
-	// (同步自 mmw v0.7.3 — user_settings.append_sub_info 字段以前在 mmwx 已存在但未接通)
+	// user_settings.append_sub_info 控制是否追加该信息。
 	subInfoSuffix := ""
 	if settings.AppendSubInfo && (sub.Total > 0 || sub.Expire != nil) {
 		subInfoSuffix = buildSubInfoSuffix(sub)
@@ -1003,7 +1003,7 @@ func (h *SyncExternalSubscriptionsHandler) ServeHTTP(w http.ResponseWriter, r *h
 	})
 }
 
-// buildSubInfoSuffix 生成节点名后缀:剩余流量 + 剩余天数(同步自 mmw v0.7.3)。
+// buildSubInfoSuffix 生成节点名后缀:剩余流量 + 剩余天数。
 // 例:" 398.22GB📊 26Days⏳"。Total/Expire 都没有时返回空串。
 func buildSubInfoSuffix(sub storage.ExternalSubscription) string {
 	var parts []string

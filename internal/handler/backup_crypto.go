@@ -18,7 +18,7 @@ import (
 //
 // 密钥 = scrypt(口令, salt, N=1<<15, r=8, p=1)。AAD = magic,防止头部被篡改。
 // 这样即便备份 zip 泄露(T2),没有口令也无法解出其中的 agent token 与 master 私钥。
-var backupMagic = []byte("MMWXBKP1")
+var backupMagic = []byte("RLDKBKP1")
 
 const (
 	backupSaltLen  = 16

@@ -11,7 +11,7 @@ import (
 func installAgentAssetFixtures(t *testing.T) {
 	t.Helper()
 	assetDirectory := t.TempDir()
-	for _, name := range []string{"mmw-agent-linux-amd64", "mmw-agent-linux-arm64"} {
+	for _, name := range []string{"relaydock-agent-linux-amd64", "relaydock-agent-linux-arm64"} {
 		if err := os.WriteFile(filepath.Join(assetDirectory, name), []byte("\x7fELF-test-"+name), 0755); err != nil {
 			t.Fatalf("write Agent fixture: %v", err)
 		}
@@ -20,7 +20,7 @@ func installAgentAssetFixtures(t *testing.T) {
 }
 
 func requestAgentAsset(handler *XrayServerHandler, method, arch, authorization string) *httptest.ResponseRecorder {
-	request := httptest.NewRequest(method, "/api/remote/mmw-agent?arch="+arch, nil)
+	request := httptest.NewRequest(method, "/api/remote/relaydock-agent?arch="+arch, nil)
 	if authorization != "" {
 		request.Header.Set("Authorization", authorization)
 	}
@@ -74,7 +74,7 @@ func TestAgentAssetServesConfiguredBinary(t *testing.T) {
 	directory := t.TempDir()
 	t.Setenv(agentAssetDirEnv, directory)
 	const content = "agent-binary-content"
-	name := "mmw-agent-linux-amd64"
+	name := "relaydock-agent-linux-amd64"
 	if err := os.WriteFile(filepath.Join(directory, name), []byte(content), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestAgentAssetRejectsNonRegularAsset(t *testing.T) {
 	handler, token := newExpiryGuardAssetHandler(t)
 	directory := t.TempDir()
 	t.Setenv(agentAssetDirEnv, directory)
-	name := "mmw-agent-linux-amd64"
+	name := "relaydock-agent-linux-amd64"
 	if err := os.Symlink(filepath.Join(directory, "does-not-matter"), filepath.Join(directory, name)); err != nil {
 		t.Fatal(err)
 	}

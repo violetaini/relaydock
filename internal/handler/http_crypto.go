@@ -122,9 +122,6 @@ func writeHTTPCryptoResponse(w http.ResponseWriter, session *securechan.Session,
 }
 
 func extractToken(r *http.Request) string {
-	if token := r.Header.Get("X-Remote-Token"); token != "" {
-		return token
-	}
 	auth := r.Header.Get("Authorization")
 	if after, ok := strings.CutPrefix(auth, "Bearer "); ok {
 		return after

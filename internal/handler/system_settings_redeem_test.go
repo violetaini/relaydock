@@ -6,22 +6,20 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
-func TestGetRedeemTemplateNormalizesAndPersistsLegacyBrand(t *testing.T) {
+func TestGetRedeemTemplateReturnsConfiguredValue(t *testing.T) {
 	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "redeem-template.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = repo.Close() })
 
-	legacyName := strings.Join([]string{"妙", "妙", "屋", "X"}, "")
-	legacyTemplate := "需要登录 " + legacyName + "\n{主控域名}"
-	if err := repo.SetSystemSetting(context.Background(), "redeem_copy_template", legacyTemplate); err != nil {
+	want := "需要登录 RelayDock\n{主控域名}"
+	if err := repo.SetSystemSetting(context.Background(), "redeem_copy_template", want); err != nil {
 		t.Fatal(err)
 	}
 
@@ -38,7 +36,6 @@ func TestGetRedeemTemplateNormalizesAndPersistsLegacyBrand(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	want := "需要登录 RelayDock\n{主控域名}"
 	if body.RedeemTemplate != want {
 		t.Fatalf("redeem template = %q, want %q", body.RedeemTemplate, want)
 	}

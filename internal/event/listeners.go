@@ -560,7 +560,7 @@ func protocolEquivalent(clashType, xrayProtocol string) bool {
 // tryClaimExternalNode 扫所有"外部节点"(original_server=” 且 inbound_tag=”),
 // 看是否有节点的 clash_config 指向 (server 的 IP/Domain/PullAddress 之一) + 同 port + 同 protocol,
 // 命中即把该节点 UPDATE 为受管节点(填上 original_server + inbound_tag),返回 true。
-// 这避免迁移场景下:mmw 原有节点 + agent 扫描新创建节点 → 重复 2 条节点的问题。
+// 这避免迁移场景下:relaydock 原有节点 + agent 扫描新创建节点 → 重复 2 条节点的问题。
 func (l *NodeSyncListener) tryClaimExternalNode(ctx context.Context, server *storage.RemoteServer, event InboundEvent, agentClashConfig string) (bool, error) {
 	// 候选地址:能让外部节点 server 字段命中该 remote_server 的所有可能形式
 	candidates := map[string]bool{}

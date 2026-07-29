@@ -12,9 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/violetaini/relaydock/internal/proxyparser"
 	"github.com/violetaini/relaydock/internal/storage"
-
-	"github.com/MMWOrg/mmwX-plugins/proxyparser"
 	"gopkg.in/yaml.v3"
 )
 

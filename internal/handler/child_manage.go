@@ -45,7 +45,7 @@ type ChildManageHandler struct {
 
 const (
 	managedClientExpiryVersion     = 1
-	managedClientExpirySidecarName = ".mmwx-managed-client-expirations.json"
+	managedClientExpirySidecarName = ".relaydock-managed-client-expirations.json"
 	arcwayFirewallHelperPath       = "/usr/local/sbin/arcway-agent-firewall"
 	arcwayFirewallEnvironmentPath  = "/etc/arcway-port-firewall.env"
 )
@@ -210,23 +210,12 @@ func (h *ChildManageHandler) authenticate(r *http.Request) bool {
 		return true
 	}
 
-	// 检查授权标头
-	auth := r.Header.Get("Authorization")
-	if auth == "" {
-		auth = r.Header.Get("MM-Remote-Token")
-	}
-	if auth == "" {
+	// 只接受标准 Bearer 标头。
+	token, ok := remoteBearerToken(r.Header.Get("Authorization"))
+	if !ok {
 		return false
 	}
-
-	// 支持“Bearer <token>”格式
-	if strings.HasPrefix(auth, "Bearer ") {
-		token := strings.TrimPrefix(auth, "Bearer ")
-		return token == h.configToken
-	}
-
-	// 还支持普通令牌
-	return auth == h.configToken
+	return token == h.configToken
 }
 
 // 写入 JSON 响应

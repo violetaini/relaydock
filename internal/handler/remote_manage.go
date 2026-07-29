@@ -1259,7 +1259,7 @@ func upgradeResult(preVersion, postVersion string, sawBinaryReplaced, timeoutHit
 		r["hint"] = "old_agent_stuck"
 	case !sawBinaryReplaced:
 		r["success"] = false
-		r["message"] = "升级失败:agent 未跑到 'Binary replaced'(脚本中途出错)。请检查日志 journalctl -u mmw-agent / /var/log/mmw-agent.log,或手工 ssh 跑 upgrade-agent.sh"
+		r["message"] = "升级失败:agent 未跑到 'Binary replaced'(脚本中途出错)。请检查日志 journalctl -u relaydock-agent / /var/log/relaydock-agent.log,或手工 ssh 跑 upgrade-agent.sh"
 		r["hint"] = "script_aborted"
 	case preVersion != "" && postVersion == preVersion:
 		r["success"] = false
@@ -1267,7 +1267,7 @@ func upgradeResult(preVersion, postVersion string, sawBinaryReplaced, timeoutHit
 		r["hint"] = "no_restart"
 	case preVersion == "" && postVersion == "":
 		r["success"] = false
-		r["message"] = "升级状态未知:agent 老版本不上报 version,无法自动确认。建议手工 ssh 检查 /usr/local/bin/mmw-agent 时间戳"
+		r["message"] = "升级状态未知:agent 老版本不上报 version,无法自动确认。建议手工 ssh 检查 /usr/local/bin/relaydock-agent 时间戳"
 		r["hint"] = "unknown_old_agent"
 	default:
 		// 兜底:脚本说看到 "Binary replaced" 但版本号没变 / 没拿到,认为"大概率成功",前端可正常 toast
@@ -1960,7 +1960,7 @@ func (h *RemoteManageHandler) getRemoteServerPort(server *storage.RemoteServer) 
 // 返回空字符串表示通过,否则返回错误信息。
 //
 // 身份口径:xray 的 vless/vmess/trojan/shadowsocks 用 client.email 标识用户;socks/http 用 account.user。
-// mmwx 约定 email/user == 用户名。校验要求每一条 client 的身份都等于当前登录用户名。
+// relaydock 约定 email/user == 用户名。校验要求每一条 client 的身份都等于当前登录用户名。
 // 允许 0 条(空 clients,纯创建 inbound 不挂用户的场景)。
 func validateInboundClientsSelfOnly(ctx context.Context, inboundReq map[string]interface{}) string {
 	username := auth.UsernameFromContext(ctx)
@@ -3656,7 +3656,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 	}
 
 	// 先确保 admin email 已经在 vless/vmess/trojan inbound 的 clients[] 里。
-	// 历史 inbound(从 mmw 迁过来 / 老 agent 手动加的)往往只有用户原始 client,没有 admin 的 — 流量统计会算到别人头上、
+	// 历史 inbound(从 relaydock 迁过来 / 老 agent 手动加的)往往只有用户原始 client,没有 admin 的 — 流量统计会算到别人头上、
 	// admin 也无法以"自己的身份"连。这里给缺失的 inbound 自动补一个 admin client,凭据现场生成,后续同步幂等不重复。
 	failedCredentialRepair := make(map[string]bool)
 	for index := range inboundsResp.Inbounds {
@@ -4309,7 +4309,7 @@ func normalizeProtocol(s string) string {
 
 // MatchRemoteServerByNodeHost 给定一个 clash 配置(JSON),如果它的 server 字段命中
 // 任一已注册 remote_server 的 IPAddress/Domain/PullAddress,返回那台 server。
-// 用于"导入节点时识别它是否指向 mmwx 已管理的 server",从而自动 claim。
+// 用于"导入节点时识别它是否指向 relaydock 已管理的 server",从而自动 claim。
 // overrideHost 非空时用它替代 clash.server 匹配 —— 中转节点 clash.server 是中转地址,必须用
 // 原始源站地址(relay_orig_server)才能匹配到真实 server。找不到返回 (nil, nil)。
 func (h *RemoteManageHandler) MatchRemoteServerByNodeHost(ctx context.Context, clashConfigJSON string, overrideHost string) (*storage.RemoteServer, error) {

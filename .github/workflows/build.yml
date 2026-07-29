@@ -121,6 +121,51 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  speedtester:
+    name: Build speedtester (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            output: relaydock-speedtester-linux-amd64
+          - goos: linux
+            goarch: arm64
+            output: relaydock-speedtester-linux-arm64
+          - goos: windows
+            goarch: amd64
+            output: relaydock-speedtester-windows-amd64.exe
+          - goos: windows
+            goarch: arm64
+            output: relaydock-speedtester-windows-arm64.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -ldflags="-s -w" -o build/${{ matrix.output }} ./cmd/relaydock-speedtester
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: build/${{ matrix.output }}
+          if-no-files-found: error
+          retention-days: 7
+
   agent:
     name: Build Agent (${{ matrix.goarch }})
     needs: verify
@@ -134,30 +179,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: violetaini/relaydock-agent
-          ref: 089658a76028b41a7f20943864611c8b8f769fda
+          ref: 81a5f531569f21fb6850915c2917fb107a21b602
           path: agent-src
-
-      # The Agent go.mod replaces xray-core with this sibling directory.
-      - name: Checkout pinned Xray fork
-        uses: actions/checkout@v4
-        with:
-          repository: iluobei/Xray-core-mmwx
-          ref: d3fdae5833a92070414db588ee9893264147b789
-          path: xray-core-vision-limiter
 
       - name: Verify pinned sources
         run: |
-          test "$(git -C agent-src rev-parse HEAD)" = "089658a76028b41a7f20943864611c8b8f769fda"
-          test "$(git -C xray-core-vision-limiter rev-parse HEAD)" = "d3fdae5833a92070414db588ee9893264147b789"
+          test "$(git -C agent-src rev-parse HEAD)" = "81a5f531569f21fb6850915c2917fb107a21b602"
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.26"
           cache: true
-          cache-dependency-path: |
-            agent-src/go.sum
-            xray-core-vision-limiter/go.sum
+          cache-dependency-path: agent-src/go.sum
 
       - name: Verify Agent modules
         working-directory: agent-src
@@ -169,13 +203,13 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
-        run: go build -trimpath -ldflags="-s -w" -o build/mmw-agent-linux-${{ matrix.goarch }} ./cmd/mmw-agent
+        run: go build -trimpath -ldflags="-s -w" -o build/relaydock-agent-linux-${{ matrix.goarch }} ./cmd/relaydock-agent
 
       - name: Upload Agent binary
         uses: actions/upload-artifact@v4
         with:
-          name: mmw-agent-linux-${{ matrix.goarch }}
-          path: agent-src/build/mmw-agent-linux-${{ matrix.goarch }}
+          name: relaydock-agent-linux-${{ matrix.goarch }}
+          path: agent-src/build/relaydock-agent-linux-${{ matrix.goarch }}
           if-no-files-found: error
           retention-days: 7
 
@@ -194,15 +228,15 @@ jobs:
       - name: Download Agent binaries
         uses: actions/download-artifact@v4
         with:
-          pattern: mmw-agent-linux-*
+          pattern: relaydock-agent-linux-*
           path: agent-assets
           merge-multiple: true
 
       - name: Verify Agent assets
         run: |
-          test -s agent-assets/mmw-agent-linux-amd64
-          test -s agent-assets/mmw-agent-linux-arm64
-          chmod 0755 agent-assets/mmw-agent-linux-amd64 agent-assets/mmw-agent-linux-arm64
+          test -s agent-assets/relaydock-agent-linux-amd64
+          test -s agent-assets/relaydock-agent-linux-arm64
+          chmod 0755 agent-assets/relaydock-agent-linux-amd64 agent-assets/relaydock-agent-linux-arm64
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -242,7 +276,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, guard, agent]
+    needs: [build, guard, agent, speedtester]
     if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
@@ -256,9 +290,9 @@ jobs:
 
       - name: Prepare checksums
         run: |
-          chmod +x release/arcway-linux-* release/arcway-darwin-* release/arcway-expiry-guard-linux-* release/mmw-agent-linux-*
+          chmod +x release/arcway-linux-* release/arcway-darwin-* release/arcway-expiry-guard-linux-* release/relaydock-agent-linux-* release/relaydock-speedtester-linux-*
           cd release
-          sha256sum arcway-* mmw-agent-linux-* > checksums.txt
+          sha256sum arcway-* relaydock-agent-linux-* relaydock-speedtester-* > checksums.txt
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -268,5 +302,6 @@ jobs:
           generate_release_notes: true
           files: |
             release/arcway-*
-            release/mmw-agent-linux-*
+            release/relaydock-agent-linux-*
+            release/relaydock-speedtester-*
             release/checksums.txt

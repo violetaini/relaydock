@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
+	"github.com/violetaini/relaydock/internal/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/storage"
 )
 

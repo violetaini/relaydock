@@ -101,7 +101,7 @@ type RemoteServerCreateRequest struct {
 	TrafficResetDay   int    `json:"traffic_reset_day"`   // 要重置的月份日期 (1-31)
 	IPAddress         string `json:"ip_address"`          // 子服务器 IP 地址
 	ConnectionMode    string `json:"connection_mode"`     // push | pull | websocket
-	ListenPort        int    `json:"listen_port"`         // Agent HTTP 监听端口(0 = 用默认 23889);通过 install 脚本注入 MMWX_LISTEN_PORT
+	ListenPort        int    `json:"listen_port"`         // Agent HTTP 监听端口(0 = 用默认 23889);通过 install 脚本注入 RELAYDOCK_LISTEN_PORT
 	PullAddress       string `json:"pull_address"`        // 对于pull模式
 	PullPort          int    `json:"pull_port"`           // 对于pull模式
 	PullToken         string `json:"pull_token"`          // 对于pull模式
@@ -507,7 +507,7 @@ func (h *XrayServerHandler) buildRemoteInstallCommand(r *stdhttp.Request, server
 		if agentToken == "" {
 			agentToken = server.PullToken
 		}
-		return fmt.Sprintf("# pull模式：主服务器将从 %s:%d 拉取流量数据\n# 请确保子服务器已配置 MMWX_MODE=child MMWX_CHILD_API_TOKEN=%s", shellCommentText(server.PullAddress), server.PullPort, shellCommentText(agentToken)), nil
+		return fmt.Sprintf("# pull模式：主服务器将从 %s:%d 拉取流量数据\n# 请确保子服务器已配置 RELAYDOCK_MODE=child RELAYDOCK_CHILD_API_TOKEN=%s", shellCommentText(server.PullAddress), server.PullPort, shellCommentText(agentToken)), nil
 	}
 	if len(panelSourceIPs) == 0 {
 		return "", errors.New("trusted panel source IPs are required")
@@ -646,23 +646,23 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "Nginx 模式必须为 managed 或 reuse_existing"})
 		return
 	}
-	mmwxDomain := getDomainFromMasterURL(h.repo, ctx)
+	relaydockDomain := getDomainFromMasterURL(h.repo, ctx)
 
 	isLocalByAddr := false
-	mmwxIPs := resolveIPs(mmwxDomain)
-	mmwxIPSet := make(map[string]struct{})
-	for _, ip := range mmwxIPs {
-		mmwxIPSet[ip] = struct{}{}
+	relaydockIPs := resolveIPs(relaydockDomain)
+	relaydockIPSet := make(map[string]struct{})
+	for _, ip := range relaydockIPs {
+		relaydockIPSet[ip] = struct{}{}
 	}
 	checkAddrLocal := func(addr string) bool {
 		for _, ip := range resolveIPs(addr) {
-			if _, ok := mmwxIPSet[ip]; ok {
+			if _, ok := relaydockIPSet[ip]; ok {
 				return true
 			}
 		}
 		return false
 	}
-	if mmwxDomain != "" {
+	if relaydockDomain != "" {
 		if req.IPAddress != "" {
 			isLocalByAddr = checkAddrLocal(req.IPAddress)
 		}
@@ -671,11 +671,11 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		}
 	}
 
-	if reqDomain != "" && mmwxDomain != "" && reqDomain == mmwxDomain && !isLocalByAddr {
+	if reqDomain != "" && relaydockDomain != "" && reqDomain == relaydockDomain && !isLocalByAddr {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(RemoteServerResponse{
 			Success: false,
-			Message: "域名不能与 MMWX 安装域名相同",
+			Message: "域名不能与 RelayDock 安装域名相同",
 		})
 		return
 	}
@@ -839,18 +839,18 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		return
 	}
 
-	// 本机检测：域名解析 IP 与 mmwx_domain 解析 IP 一致则为本机
+	// 本机检测：域名解析 IP 与 relaydock_domain 解析 IP 一致则为本机
 	isLocal := isLocalByAddr
-	if !isLocal && reqDomain != "" && mmwxDomain != "" {
+	if !isLocal && reqDomain != "" && relaydockDomain != "" {
 		reqIPs, err1 := net.LookupHost(reqDomain)
-		mmwxIPs, err2 := net.LookupHost(mmwxDomain)
+		relaydockIPs, err2 := net.LookupHost(relaydockDomain)
 		if err1 == nil && err2 == nil {
-			mmwxIPSet := make(map[string]struct{})
-			for _, ip := range mmwxIPs {
-				mmwxIPSet[ip] = struct{}{}
+			relaydockIPSet := make(map[string]struct{})
+			for _, ip := range relaydockIPs {
+				relaydockIPSet[ip] = struct{}{}
 			}
 			for _, ip := range reqIPs {
-				if _, ok := mmwxIPSet[ip]; ok {
+				if _, ok := relaydockIPSet[ip]; ok {
 					isLocal = true
 					break
 				}
@@ -2073,20 +2073,20 @@ func (h *XrayServerHandler) CheckSameIP(w stdhttp.ResponseWriter, r *stdhttp.Req
 	}
 
 	ctx := r.Context()
-	mmwxDomain := getDomainFromMasterURL(h.repo, ctx)
+	relaydockDomain := getDomainFromMasterURL(h.repo, ctx)
 	masterURL, _ := h.repo.GetSystemSetting(ctx, "master_url")
 	httpsEnabled := strings.HasPrefix(masterURL, "https://")
 
 	sameIP := false
-	if mmwxDomain != "" {
+	if relaydockDomain != "" {
 		addrIPs := resolveIPs(address)
-		mmwxIPs := resolveIPs(mmwxDomain)
-		mmwxIPSet := make(map[string]struct{})
-		for _, ip := range mmwxIPs {
-			mmwxIPSet[ip] = struct{}{}
+		relaydockIPs := resolveIPs(relaydockDomain)
+		relaydockIPSet := make(map[string]struct{})
+		for _, ip := range relaydockIPs {
+			relaydockIPSet[ip] = struct{}{}
 		}
 		for _, ip := range addrIPs {
-			if _, ok := mmwxIPSet[ip]; ok {
+			if _, ok := relaydockIPSet[ip]; ok {
 				sameIP = true
 				break
 			}
@@ -2097,7 +2097,7 @@ func (h *XrayServerHandler) CheckSameIP(w stdhttp.ResponseWriter, r *stdhttp.Req
 	json.NewEncoder(w).Encode(map[string]any{
 		"success":       true,
 		"same_ip":       sameIP,
-		"master_domain": mmwxDomain,
+		"master_domain": relaydockDomain,
 		"https_enabled": httpsEnabled,
 	})
 }

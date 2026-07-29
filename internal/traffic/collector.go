@@ -160,10 +160,10 @@ func (c *Collector) Start(ctx context.Context) {
 // offlineThreshold 返回标记 server 离线的"心跳过期"阈值。
 // 默认 90s — agent heartbeat 间隔 30s + 容忍 2 次延迟。原来硬编码 60s 太严格,只容 1 次,
 // 国际线路 1-2s 抖动就触发 offline → 立刻又 online → 用户被 spam 通知。
-// 通过 MMWX_OFFLINE_THRESHOLD_SECONDS 环境变量覆盖,值 < 30s 时回退默认避免低于心跳间隔。
+// 通过 RELAYDOCK_OFFLINE_THRESHOLD_SECONDS 环境变量覆盖,值 < 30s 时回退默认避免低于心跳间隔。
 func offlineThreshold() time.Duration {
 	const defaultThreshold = 90 * time.Second
-	if v := os.Getenv("MMWX_OFFLINE_THRESHOLD_SECONDS"); v != "" {
+	if v := os.Getenv("RELAYDOCK_OFFLINE_THRESHOLD_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 30 {
 			return time.Duration(n) * time.Second
 		}
@@ -360,7 +360,7 @@ func (c *Collector) ProcessMetrics(ctx context.Context, serverID int64, metrics 
 
 	// 处理用户流量。
 	// xray stats 的 key 是 email,可能是:
-	//   - 主账号 email(== mmwx username,历史约定),直接落库
+	//   - 主账号 email(== RelayDock username),直接落库
 	//   - 子账号 email(<username>__<routed_label>),通过 user_subaccounts 反查归到 username
 	//   - _admin__ 前缀的占位 client,流量丢弃(管理员测试用,不属任何用户)
 	aggregateAndUpsertUserTraffic(ctx, c.repo, serverID, stats.User, isRestart)

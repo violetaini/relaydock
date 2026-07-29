@@ -32,7 +32,7 @@ type BruteForceProtector struct {
 }
 
 // NewBruteForceProtector 用 hardcoded 默认值构造。
-// 加严:24h 窗口内 5 次失败 → 封 24h(同步自 mmw v0.7.3 #89,防订阅 token 枚举)。
+// 加严:24h 窗口内 5 次失败 → 封 24h,防订阅 token 枚举。
 // 启动时若 system_settings 里有自定义阈值,main.go 会改用 NewBruteForceProtectorWithConfig。
 func NewBruteForceProtector() *BruteForceProtector {
 	p := &BruteForceProtector{

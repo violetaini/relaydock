@@ -39,17 +39,17 @@ SERVER_BINARY="$ORIGINAL_SERVER"
 # Set DOCKER environment variable for in-app update detection
 export DOCKER=1
 
-# 权限策略:默认以 root 跑 — mmwx 业务路径(/usr/local/nginx/cert 证书部署、
+# 权限策略:默认以 root 跑 — RelayDock 业务路径(/usr/local/nginx/cert 证书部署、
 # /usr/local/etc/xray/ xray 配置、ACME HTTP-01 起 80/443、systemctl 控服务)
 # 天生就是 root 视野;降级 appuser 反而要给每个硬编码路径打补丁,治标不治本。
 # 容器内 root ≠ 宿主 root(namespace 隔离),安全风险可控。
 #
-# 安全意识强的用户:docker-compose 加 MMWX_DROP_PRIVS=1 切回 appuser 降权模式,
+# 安全意识强的用户:docker-compose 加 RELAYDOCK_DROP_PRIVS=1 切回 appuser 降权模式,
 # 但这种情况下证书 / 嵌入式 xray / ACME 等可能因路径权限失败,得自己挂 volume + chown。
-if [ "${MMWX_DROP_PRIVS:-0}" = "1" ]; then
-    echo "MMWX_DROP_PRIVS=1, dropping privileges to appuser..."
+if [ "${RELAYDOCK_DROP_PRIVS:-0}" = "1" ]; then
+    echo "RELAYDOCK_DROP_PRIVS=1, dropping privileges to appuser..."
     exec gosu appuser "$SERVER_BINARY"
 else
-    echo "Starting application as root (set MMWX_DROP_PRIVS=1 to run as appuser)..."
+    echo "Starting application as root (set RELAYDOCK_DROP_PRIVS=1 to run as appuser)..."
     exec "$SERVER_BINARY"
 fi

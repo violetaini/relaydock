@@ -66,7 +66,7 @@ class PanelAPI:
 
     def request(self, method: str, path: str, body: object | None = None) -> object:
         payload = None if body is None else json.dumps(body, separators=(",", ":")).encode()
-        headers = {"Accept": "application/json", "MM-Authorization": self.token}
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {self.token}"}
         if payload is not None:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.base_url + path, data=payload, headers=headers, method=method)

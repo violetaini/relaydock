@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/storage"
 
 	"github.com/google/uuid"

@@ -163,7 +163,7 @@ func (h *subscribeFilesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	case path == "create-from-config" && r.Method == http.MethodPost:
 		h.handleCreateFromConfig(w, r)
 	case strings.HasSuffix(path, "/users") && r.Method == http.MethodGet:
-		// GET /api/admin/subscribe-files/{id}/users — 列出该订阅分配给哪些用户(同步自 mmw v0.7.3)
+		// GET /api/admin/subscribe-files/{id}/users — 列出该订阅分配给哪些用户。
 		idStr := strings.TrimSuffix(path, "/users")
 		h.handleGetSubscriptionUsers(w, r, idStr)
 	case strings.HasSuffix(path, "/content") && r.Method == http.MethodGet:
@@ -1693,7 +1693,7 @@ func (h *subscribeFilesHandler) initializeCustomRuleApplications(ctx context.Con
 }
 
 // handleGetSubscriptionUsers GET /api/admin/subscribe-files/{id}/users
-// 返回该订阅文件分配给哪些用户 + 各自的 user_short_code / custom_user_short_code(同步自 mmw v0.7.3)
+// 返回该订阅文件分配给哪些用户 + 各自的 user_short_code / custom_user_short_code。
 func (h *subscribeFilesHandler) handleGetSubscriptionUsers(w http.ResponseWriter, r *http.Request, idStr string) {
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {

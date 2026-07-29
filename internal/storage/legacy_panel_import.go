@@ -11,8 +11,8 @@ import (
 	"strings"
 )
 
-// MmwImportReport 每张表迁移结果。
-type MmwImportReport struct {
+// LegacyPanelImportReport 每张表迁移结果。
+type LegacyPanelImportReport struct {
 	Users           int      `json:"users"`
 	UserTokens      int      `json:"user_tokens"`
 	Nodes           int      `json:"nodes"`
@@ -26,24 +26,24 @@ type MmwImportReport struct {
 	Warnings        []string `json:"warnings,omitempty"`
 }
 
-// ImportFromMmw 从一个 mmw.db 文件读取核心数据,合并写入当前 mmwx 数据库。
+// ImportFromLegacyPanel 从一个 legacyPanel.db 文件读取核心数据,合并写入当前 relaydock 数据库。
 //
 // 策略:
-//   - 用 ATTACH DATABASE 在同一连接上挂载 mmw.db 为 src
+//   - 用 ATTACH DATABASE 在同一连接上挂载 legacyPanel.db 为 src
 //   - 每张表用 INSERT OR IGNORE INTO main.X(cols...) SELECT cols... FROM src.X
-//     列名只取 mmw 表已有的列(两边交集);mmwx 多出来的列走默认值
+//     列名只取 legacyPanel 表已有的列(两边交集);relaydock 多出来的列走默认值
 //   - 整体在事务里执行,失败回滚
-//   - 已存在(同 PRIMARY KEY / UNIQUE)的行用 IGNORE 跳过 — 不覆盖现有 mmwx 数据
+//   - 已存在(同 PRIMARY KEY / UNIQUE)的行用 IGNORE 跳过 — 不覆盖现有 relaydock 数据
 //
-// 调用方应在调用前调用 MmwImportBlockingCounts 确认目标库为空白实例。
+// 调用方应在调用前调用 LegacyPanelImportBlockingCounts 确认目标库为空白实例。
 // currentAdmin 非空时，导入事务内会保留该账号的管理员身份，将源库管理员降权，
 // 并把导入订阅/模板统一归属给该账号。使用可变参数仅为保持旧的内部调用兼容。
-func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string, currentAdmin ...string) (*MmwImportReport, error) {
+func (r *TrafficRepository) ImportFromLegacyPanel(ctx context.Context, legacyPanelDBPath string, currentAdmin ...string) (*LegacyPanelImportReport, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
-	if _, err := os.Stat(mmwDBPath); err != nil {
-		return nil, fmt.Errorf("打开 mmw.db 失败: %w", err)
+	if _, err := os.Stat(legacyPanelDBPath); err != nil {
+		return nil, fmt.Errorf("打开 legacyPanel.db 失败: %w", err)
 	}
 
 	conn, err := r.db.Conn(ctx)
@@ -53,18 +53,18 @@ func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string,
 	defer conn.Close()
 
 	// 用 quoted single quotes 防路径注入(虽然来源是 admin,但保守一些)
-	safePath := strings.ReplaceAll(mmwDBPath, "'", "''")
+	safePath := strings.ReplaceAll(legacyPanelDBPath, "'", "''")
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("ATTACH DATABASE '%s' AS src", safePath)); err != nil {
-		return nil, fmt.Errorf("ATTACH mmw.db: %w", err)
+		return nil, fmt.Errorf("ATTACH legacyPanel.db: %w", err)
 	}
 	defer conn.ExecContext(context.Background(), "DETACH DATABASE src")
 
-	report := &MmwImportReport{}
+	report := &LegacyPanelImportReport{}
 
 	// 每张表的 (target_cols, src_cols, into_table_alias) 定义。
-	// src_cols 列在 mmw 上必须全部存在(我们已经从样本 mmw.db 验证过 schema);
-	// target_cols 列在 mmwx 上必须全部存在。两边一致时直接用同一个列表。
-	// 单独写明列名而不是 `SELECT *`,这样 mmwx 后续加新列不会让 INSERT 报错。
+	// src_cols 列在 legacyPanel 上必须全部存在(我们已经从样本 legacyPanel.db 验证过 schema);
+	// target_cols 列在 relaydock 上必须全部存在。两边一致时直接用同一个列表。
+	// 单独写明列名而不是 `SELECT *`,这样 relaydock 后续加新列不会让 INSERT 报错。
 	type tableSpec struct {
 		dest   string
 		target *int     // report 字段指针
@@ -83,7 +83,7 @@ func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string,
 		},
 		{
 			// 用户短码 & 登录 token。username 是 PK,所以 INSERT OR IGNORE 会保留
-			// mmwx 已有的 admin token,只为 mmw 独有的用户带过来 user_short_code /
+			// relaydock 已有的 admin token,只为 legacyPanel 独有的用户带过来 user_short_code /
 			// custom_user_short_code,让分发出去的订阅短链(/x/<code>)继续可用。
 			dest:   "user_tokens",
 			target: &report.UserTokens,
@@ -173,7 +173,7 @@ func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string,
 	rollback := func() { _ = tx.Rollback() }
 	if len(currentAdmin) > 0 && strings.TrimSpace(currentAdmin[0]) != "" {
 		admin := strings.TrimSpace(currentAdmin[0])
-		blocking, err := mmwImportBlockingCountsTx(ctx, tx, admin)
+		blocking, err := legacyPanelImportBlockingCountsTx(ctx, tx, admin)
 		if err != nil {
 			rollback()
 			return nil, fmt.Errorf("migration preflight: %w", err)
@@ -205,14 +205,14 @@ func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string,
 			}
 		}
 		if len(useCols) == 0 {
-			report.Warnings = append(report.Warnings, fmt.Sprintf("跳过 %s: mmw 库无任何兼容列", spec.dest))
+			report.Warnings = append(report.Warnings, fmt.Sprintf("跳过 %s: legacyPanel 库无任何兼容列", spec.dest))
 			continue
 		}
 		if len(missing) > 0 {
-			report.Warnings = append(report.Warnings, fmt.Sprintf("%s: mmw 库缺少列 %v,这些列将取 mmwx 默认值", spec.dest, missing))
+			report.Warnings = append(report.Warnings, fmt.Sprintf("%s: legacyPanel 库缺少列 %v,这些列将取 relaydock 默认值", spec.dest, missing))
 		}
 		if spec.dest == "nodes" {
-			imported, err := r.importMmwNodesTx(ctx, tx, useCols)
+			imported, err := r.importLegacyPanelNodesTx(ctx, tx, useCols)
 			if err != nil {
 				rollback()
 				return nil, fmt.Errorf("import nodes: %w", err)
@@ -274,12 +274,12 @@ func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string,
 	return report, nil
 }
 
-// importMmwNodesTx imports legacy nodes row by row so WireGuard client
+// importLegacyPanelNodesTx imports legacy nodes row by row so WireGuard client
 // identities never pass through the target nodes table in plaintext. The
 // sanitized node and its encrypted node_secrets row share the caller's import
 // transaction, therefore one malformed or unprotectable key rolls back every
 // table imported from the legacy database.
-func (r *TrafficRepository) importMmwNodesTx(ctx context.Context, tx *sql.Tx, columns []string) (int, error) {
+func (r *TrafficRepository) importLegacyPanelNodesTx(ctx context.Context, tx *sql.Tx, columns []string) (int, error) {
 	if len(columns) == 0 {
 		return 0, errors.New("no compatible node columns")
 	}
@@ -329,12 +329,12 @@ func (r *TrafficRepository) importMmwNodesTx(ctx context.Context, tx *sql.Tx, co
 	imported := 0
 	for rowIndex, sourceRow := range sourceRows {
 		values := sourceRow.values
-		protocol := mmwDatabaseString(valueAtColumn(values, columnIndex, "protocol"))
+		protocol := legacyPanelDatabaseString(valueAtColumn(values, columnIndex, "protocol"))
 		node := Node{
 			Protocol:     protocol,
-			RawURL:       mmwDatabaseString(valueAtColumn(values, columnIndex, "raw_url")),
-			ParsedConfig: mmwDatabaseString(valueAtColumn(values, columnIndex, "parsed_config")),
-			ClashConfig:  mmwDatabaseString(valueAtColumn(values, columnIndex, "clash_config")),
+			RawURL:       legacyPanelDatabaseString(valueAtColumn(values, columnIndex, "raw_url")),
+			ParsedConfig: legacyPanelDatabaseString(valueAtColumn(values, columnIndex, "parsed_config")),
+			ClashConfig:  legacyPanelDatabaseString(valueAtColumn(values, columnIndex, "clash_config")),
 		}
 		protected, privateKey, err := protectWireGuardNodeForStorage(node)
 		if err != nil {
@@ -349,7 +349,7 @@ func (r *TrafficRepository) importMmwNodesTx(ctx context.Context, tx *sql.Tx, co
 				return 0, fmt.Errorf("WireGuard source row %d has no id column", rowIndex+1)
 			}
 			var err error
-			nodeID, err = mmwDatabaseInt64(values[idValue])
+			nodeID, err = legacyPanelDatabaseInt64(values[idValue])
 			if err != nil || nodeID <= 0 {
 				return 0, fmt.Errorf("WireGuard source row %d has invalid id: %v", rowIndex+1, err)
 			}
@@ -410,7 +410,7 @@ func setColumnValue(values []any, columns map[string]int, column string, value a
 	}
 }
 
-func mmwDatabaseString(value any) string {
+func legacyPanelDatabaseString(value any) string {
 	switch typed := value.(type) {
 	case nil:
 		return ""
@@ -423,7 +423,7 @@ func mmwDatabaseString(value any) string {
 	}
 }
 
-func mmwDatabaseInt64(value any) (int64, error) {
+func legacyPanelDatabaseInt64(value any) (int64, error) {
 	switch typed := value.(type) {
 	case int64:
 		return typed, nil
@@ -443,11 +443,11 @@ func mmwDatabaseInt64(value any) (int64, error) {
 	}
 }
 
-// MmwImportBlockingCounts returns only non-zero business rows that make the
+// LegacyPanelImportBlockingCounts returns only non-zero business rows that make the
 // destination unsafe for the legacy ID-preserving import. The authenticated
 // current admin, its token, and its own user_settings row are installation
 // scaffolding and are allowed on an otherwise blank instance.
-func (r *TrafficRepository) MmwImportBlockingCounts(ctx context.Context, currentAdmin string) (map[string]int64, error) {
+func (r *TrafficRepository) LegacyPanelImportBlockingCounts(ctx context.Context, currentAdmin string) (map[string]int64, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
@@ -455,18 +455,18 @@ func (r *TrafficRepository) MmwImportBlockingCounts(ctx context.Context, current
 	if currentAdmin == "" {
 		return nil, errors.New("current admin is required")
 	}
-	return mmwImportBlockingCountsDB(ctx, r.db, currentAdmin)
+	return legacyPanelImportBlockingCountsDB(ctx, r.db, currentAdmin)
 }
 
-type mmwImportCountQuerier interface {
+type legacyPanelImportCountQuerier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func mmwImportBlockingCountsTx(ctx context.Context, tx *sql.Tx, currentAdmin string) (map[string]int64, error) {
-	return mmwImportBlockingCountsDB(ctx, tx, currentAdmin)
+func legacyPanelImportBlockingCountsTx(ctx context.Context, tx *sql.Tx, currentAdmin string) (map[string]int64, error) {
+	return legacyPanelImportBlockingCountsDB(ctx, tx, currentAdmin)
 }
 
-func mmwImportBlockingCountsDB(ctx context.Context, db mmwImportCountQuerier, currentAdmin string) (map[string]int64, error) {
+func legacyPanelImportBlockingCountsDB(ctx context.Context, db legacyPanelImportCountQuerier, currentAdmin string) (map[string]int64, error) {
 	var role string
 	if err := db.QueryRowContext(ctx, `SELECT role FROM users WHERE username = ?`, currentAdmin).Scan(&role); err != nil {
 		return nil, fmt.Errorf("verify current admin: %w", err)
@@ -546,7 +546,7 @@ type DistinctNodeServer struct {
 	NodeCount        int
 	Ports            []int
 	Protocols        []string
-	ExistingServer   bool // mmwx 已有同名 remote_server 或同 IP / 同域名
+	ExistingServer   bool // relaydock 已有同名 remote_server 或同 IP / 同域名
 	ExistingServerID int64
 	SampleNodeName   string
 }
@@ -669,14 +669,14 @@ func jsonUnmarshalSafe(s string, out any) error {
 	return json.Unmarshal([]byte(s), out)
 }
 
-// AssignOwnershipForMmwImported 把 mmw 导入数据中 created_by 字段为空的行
+// AssignOwnershipForLegacyPanelImported 把 legacyPanel 导入数据中 created_by 字段为空的行
 // (subscribe_files / templates) 赋值给给定的管理员用户名。
-// mmw 数据库没有 created_by 概念,导入时落到 mmwx 是空字符串,会导致这些行
+// legacyPanel 数据库没有 created_by 概念,导入时落到 relaydock 是空字符串,会导致这些行
 // 在「我的订阅 / 我的模板」列表里没有归属。把它们绑给系统第一个 admin,
 // 之后管理员能在 UI 上看到并管理。
 //
 // 注意:只更新 created_by = ” 的行(导入前已有数据 / 普通用户创建的不动)。
-func (r *TrafficRepository) AssignOwnershipForMmwImported(ctx context.Context, adminUsername string) error {
+func (r *TrafficRepository) AssignOwnershipForLegacyPanelImported(ctx context.Context, adminUsername string) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
@@ -700,8 +700,8 @@ func (r *TrafficRepository) AssignOwnershipForMmwImported(ctx context.Context, a
 }
 
 // DemoteExtraAdmins 把除"第一个用户"外的所有管理员降级为普通用户。
-// 旧版面板迁移用 INSERT OR IGNORE 把 mmw 的用户(含它自己的 admin)原样带入,
-// 会让 mmwx 出现多个 role='admin' 的管理员。这里只保留本实例最早创建的那个用户
+// 旧版面板迁移用 INSERT OR IGNORE 把 legacyPanel 的用户(含它自己的 admin)原样带入,
+// 会让 relaydock 出现多个 role='admin' 的管理员。这里只保留本实例最早创建的那个用户
 // (按 rowid 升序取第一个 —— 导入的用户带原始 created_at,可能早于本机 admin,
 // 只有 rowid/插入顺序能可靠定位本实例最初创建的管理员),其余 admin 一律改普通用户。
 // 返回被降级的用户数。

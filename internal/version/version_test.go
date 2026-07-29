@@ -8,8 +8,7 @@ func TestIsAgentUserAgent(t *testing.T) {
 		userAgent string
 		want      bool
 	}{
-		{name: "current", userAgent: RelayDockAgentUserAgent, want: true},
-		{name: "legacy", userAgent: AgentUserAgent, want: true},
+		{name: "current", userAgent: AgentUserAgent, want: true},
 		{name: "unknown", userAgent: "other-agent/0.1", want: false},
 		{name: "empty", userAgent: "", want: false},
 	}

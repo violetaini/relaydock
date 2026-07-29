@@ -25,12 +25,12 @@ var (
 	fileWriter *lumberjack.Logger
 )
 
-// 初始化全局logger — 日志真实落地到 data/logs/mmwx.log（同时保留 stdout 供 journalctl/容器查看）
+// 初始化全局logger — 日志真实落地到 data/logs/arcway.log（同时保留 stdout 供 journalctl/容器查看）
 func Init() *Logger {
 	once.Do(func() {
 		_ = os.MkdirAll("data/logs", 0755)
 		fileWriter = &lumberjack.Logger{
-			Filename:   "data/logs/mmwx.log",
+			Filename:   "data/logs/arcway.log",
 			MaxSize:    50, // MB
 			MaxBackups: 1,  // 当前文件 + 1 个备份 = 最多 2 个文件
 			MaxAge:     0,  // 不按时间删，只看大小/数量

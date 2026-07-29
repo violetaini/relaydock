@@ -65,21 +65,20 @@ info "系统: $OS"
 #─── 2. 找到 Arcway 数据库 ─────────────────────────────────
 # 探测顺序:
 #   1) --db 参数显式指定
-#   2) /etc/mmwx/data/mmwx.db(一键安装默认)
-#   3) /etc/mmwx/mmwx.db(老版本兜底)
-#   4) Docker 容器挂载点:看 mmwx 进程的 mount,找宿主机映射
-#   5) 进程 cwd:从运行中的 mmwx 进程拿当前工作目录,拼 data/mmwx.db
-#   6) systemd unit:从 mmwx.service 读 WorkingDirectory,拼 data/mmwx.db
+#   2) /etc/arcway/data/arcway.db(一键安装默认)
+#   3) Docker 容器挂载点:看 Arcway 进程的 mount,找宿主机映射
+#   4) 进程 cwd:从运行中的 Arcway 进程拿当前工作目录,拼 data/arcway.db
+#   5) systemd unit:从 arcway.service 读 WorkingDirectory,拼 data/arcway.db
 #   7) find 兜底全盘扫描
 find_db_via_process() {
-    # 跑在宿主机:优先看 Arcway 进程,并兼容旧 mmwx 进程名
+    # 跑在宿主机:查找 Arcway 进程。
     local pids
-    pids=$(pgrep -f '(^|/)(arcway|mmwx)($|[[:space:]])' 2>/dev/null | head -3 || true)
+    pids=$(pgrep -f '(^|/)arcway($|[[:space:]])' 2>/dev/null | head -3 || true)
     for pid in $pids; do
         local cwd
         cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
         if [[ -n "$cwd" ]]; then
-            for cand in "$cwd/data/arcway.db" "$cwd/arcway.db" "$cwd/data/mmwx.db" "$cwd/mmwx.db"; do
+            for cand in "$cwd/data/arcway.db" "$cwd/arcway.db"; do
                 if [[ -f "$cand" ]]; then echo "$cand"; return 0; fi
             done
         fi
@@ -89,28 +88,28 @@ find_db_via_process() {
 
 find_db_via_docker() {
     if ! command -v docker &>/dev/null; then return 1; fi
-    # 找运行中的 Arcway 容器,并兼容旧 mmwx 名称
+    # 找运行中的 Arcway 容器。
     local cids
     cids=$(docker ps --filter "name=arcway" --format '{{.ID}}' 2>/dev/null | head -3 || true)
     if [[ -z "$cids" ]]; then
-        cids=$(docker ps --format '{{.ID}} {{.Image}}' 2>/dev/null | grep -Ei 'arcway|mmwx' | awk '{print $1}' | head -3 || true)
+        cids=$(docker ps --format '{{.ID}} {{.Image}}' 2>/dev/null | grep -Ei 'arcway' | awk '{print $1}' | head -3 || true)
     fi
     for cid in $cids; do
-        # docker inspect 看 mounts,找映射到 /etc/mmwx 或 /app 之类的卷
+        # docker inspect 看 mounts,找映射到 /etc/arcway 或 /app 之类的卷
         local mounts
         mounts=$(docker inspect "$cid" --format '{{range .Mounts}}{{.Source}}::{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null || true)
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
             local src="${line%%::*}"
             local dst="${line##*::}"
-            # dst 是容器内路径,常见 /etc/mmwx 或 /app/data
-            for cand in "$src/data/arcway.db" "$src/arcway.db" "$src/data/mmwx.db" "$src/mmwx.db"; do
+            # dst 是容器内路径,常见 /etc/arcway 或 /app/data
+            for cand in "$src/data/arcway.db" "$src/arcway.db"; do
                 if [[ -f "$cand" ]]; then echo "$cand"; return 0; fi
             done
-            # 如果 dst 是某个特定路径(/app, /etc/mmwx),按容器结构推
+            # 如果 dst 是某个特定路径(/app, /etc/arcway),按容器结构推
             case "$dst" in
-                /etc/arcway|/etc/mmwx|/etc/mmwx/data|/data|/app|/app/data)
-                    for cand in "$src/arcway.db" "$src/data/arcway.db" "$src/mmwx.db" "$src/data/mmwx.db"; do
+                /etc/arcway|/etc/arcway/data|/data|/app|/app/data)
+                    for cand in "$src/arcway.db" "$src/data/arcway.db"; do
                         if [[ -f "$cand" ]]; then echo "$cand"; return 0; fi
                     done
                     ;;
@@ -123,11 +122,8 @@ find_db_via_docker() {
 find_db_via_systemd() {
     local workdir
     workdir=$(systemctl show arcway 2>/dev/null | grep -E '^WorkingDirectory=' | head -1 | cut -d= -f2 || true)
-    if [[ -z "$workdir" || "$workdir" == "/" ]]; then
-        workdir=$(systemctl show mmwx 2>/dev/null | grep -E '^WorkingDirectory=' | head -1 | cut -d= -f2 || true)
-    fi
     if [[ -n "$workdir" && "$workdir" != "/" ]]; then
-        for cand in "$workdir/data/arcway.db" "$workdir/arcway.db" "$workdir/data/mmwx.db" "$workdir/mmwx.db"; do
+        for cand in "$workdir/data/arcway.db" "$workdir/arcway.db"; do
             if [[ -f "$cand" ]]; then echo "$cand"; return 0; fi
         done
     fi
@@ -137,7 +133,7 @@ find_db_via_systemd() {
 find_db_via_scan() {
     # 全盘扫描兜底 — 只搜常见路径以免无限慢
     local found
-    found=$(find /etc /opt /root /var /srv /home -maxdepth 5 \( -name 'arcway.db' -o -name 'mmwx.db' \) 2>/dev/null | head -3 || true)
+    found=$(find /etc /opt /root /var /srv /home -maxdepth 5 -name 'arcway.db' 2>/dev/null | head -3 || true)
     if [[ -z "$found" ]]; then return 1; fi
     if [[ $(echo "$found" | wc -l) -eq 1 ]]; then
         echo "$found"; return 0
@@ -157,7 +153,7 @@ find_db_via_scan() {
 
 if [[ -z "$DB_PATH" ]]; then
     info "探测 Arcway 数据库路径..."
-    for cand in /etc/arcway/arcway.db /etc/arcway/data/arcway.db /etc/mmwx/data/mmwx.db /etc/mmwx/mmwx.db; do
+    for cand in /etc/arcway/arcway.db /etc/arcway/data/arcway.db; do
         if [[ -f "$cand" ]]; then DB_PATH="$cand"; break; fi
     done
     if [[ -z "$DB_PATH" ]]; then DB_PATH=$(find_db_via_docker 2>/dev/null || true); fi
@@ -278,7 +274,7 @@ hash_password() {
     local plain="$1"
     case "$HASHER" in
         htpasswd)
-            # htpasswd -bnBC 10 '' 'pw' → 输出 ":$2y$10$..." ,改成 $2a$ 兼容 mmwx golang.org/x/crypto/bcrypt
+            # htpasswd -bnBC 10 '' 'pw' → 输出 ":$2y$10$..." ,改成 $2a$ 兼容 Go bcrypt。
             htpasswd -bnBC 10 '' "$plain" 2>/dev/null | tr -d ':\n' | sed 's/^\$2y\$/$2a$/'
             ;;
         python)
@@ -303,13 +299,13 @@ ok "已生成 bcrypt hash"
 SERVICE_TYPE=""  # systemd / docker-<cid> / none
 
 detect_running_service() {
-    if systemctl is-active --quiet mmwx 2>/dev/null; then
+    if systemctl is-active --quiet arcway 2>/dev/null; then
         SERVICE_TYPE="systemd"
         return
     fi
     if command -v docker &>/dev/null; then
         local cid
-        cid=$(docker ps --format '{{.ID}} {{.Image}} {{.Names}}' 2>/dev/null | grep -i mmwx | awk '{print $1}' | head -1 || true)
+        cid=$(docker ps --format '{{.ID}} {{.Image}} {{.Names}}' 2>/dev/null | grep -Ei 'arcway|relaydock' | awk '{print $1}' | head -1 || true)
         if [[ -n "$cid" ]]; then
             SERVICE_TYPE="docker-$cid"
             return
@@ -321,28 +317,28 @@ detect_running_service() {
 stop_service() {
     case "$SERVICE_TYPE" in
         systemd)
-            info "停止 systemd mmwx 服务..."
-            systemctl stop mmwx ;;
+            info "停止 systemd arcway 服务..."
+            systemctl stop arcway ;;
         docker-*)
             local cid="${SERVICE_TYPE#docker-}"
             info "停止 docker 容器 $cid..."
             docker stop "$cid" >/dev/null ;;
         none)
-            info "未发现运行中的 mmwx 服务,跳过停止" ;;
+            info "未发现运行中的 Arcway 服务,跳过停止" ;;
     esac
 }
 
 start_service() {
     case "$SERVICE_TYPE" in
         systemd)
-            info "启动 systemd mmwx 服务..."
-            systemctl start mmwx && ok "mmwx 服务已启动" || warn "systemctl start 失败,请手动启动" ;;
+            info "启动 systemd arcway 服务..."
+            systemctl start arcway && ok "Arcway 服务已启动" || warn "systemctl start 失败,请手动启动" ;;
         docker-*)
             local cid="${SERVICE_TYPE#docker-}"
             info "启动 docker 容器 $cid..."
-            docker start "$cid" >/dev/null && ok "mmwx 容器已启动" || warn "docker start 失败,请手动启动" ;;
+            docker start "$cid" >/dev/null && ok "RelayDock 容器已启动" || warn "docker start 失败,请手动启动" ;;
         none)
-            info "mmwx 之前未运行,无需启动" ;;
+            info "Arcway 之前未运行,无需启动" ;;
     esac
 }
 
@@ -358,7 +354,7 @@ BACKUP="${DB_PATH}.bak-$(date +%Y%m%d%H%M%S)"
 cp -a "$DB_PATH" "$BACKUP" || { err "备份失败"; start_service; exit 4; }
 ok "已备份: $BACKUP"
 
-# 写入 — 此时 mmwx 已停,sqlite3 独占写入,不会有 locked 错误
+# 写入 — 此时 Arcway 已停,sqlite3 独占写入,不会有 locked 错误
 if ! sqlite3 "$DB_PATH" <<SQL
 UPDATE users
 SET password_hash = '$HASH',
@@ -376,11 +372,11 @@ then
 fi
 ok "数据库已更新"
 
-#─── 8. 启动 mmwx 让新密码生效 ────────────────────────────
+#─── 8. 启动 Arcway 让新密码生效 ────────────────────────────
 if (( RESTART == 1 )); then
     start_service
 else
-    info "已跳过启动(--no-restart);记得手动启动 mmwx 才能用新密码登录"
+    info "已跳过启动(--no-restart);记得手动启动 Arcway 才能用新密码登录"
 fi
 
 #─── 9. 完成 ────────────────────────────────────────────
@@ -390,5 +386,5 @@ echo "  用户名: $TARGET"
 echo "  新密码: ${BOLD}(刚才你输入的那个)${NC}"
 echo "  备份  : $BACKUP"
 echo
-echo "下一步:打开 mmwx 主控登录页,用新密码登录。"
+echo "下一步:打开 RelayDock 主控登录页,用新密码登录。"
 echo "建议:登录后在「系统设置 → 修改密码」再手动设一次,并新建第二个 admin 账号作为备份。"

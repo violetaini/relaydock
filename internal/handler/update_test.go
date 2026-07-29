@@ -181,7 +181,7 @@ func TestPopulateUpdateEnvironmentDisablesIncompleteAgentRelease(t *testing.T) {
 	info := &UpdateInfo{
 		DownloadURL:   "https://github.com/violetaini/relaydock/releases/download/v1.2.3/arcway-linux-amd64",
 		agentAssetDir: "/opt/arcway/agent-assets",
-		missingAgents: []string{"mmw-agent-linux-arm64"},
+		missingAgents: []string{"relaydock-agent-linux-arm64"},
 	}
 	populateUpdateEnvironment(info, updateEnvironment{
 		DeploymentMode: updateDeploymentStandalone,
@@ -384,7 +384,7 @@ func TestSelectBothGuardReleaseAssets(t *testing.T) {
 func TestSelectBothAgentReleaseAssets(t *testing.T) {
 	release := GitHubRelease{TagName: "v1.2.3"}
 	for _, arch := range []string{"amd64", "arm64"} {
-		name := "mmw-agent-linux-" + arch
+		name := "relaydock-agent-linux-" + arch
 		release.Assets = append(release.Assets, GitHubReleaseAsset{
 			Name:               name,
 			BrowserDownloadURL: "https://github.com/violetaini/relaydock/releases/download/v1.2.3/" + name,

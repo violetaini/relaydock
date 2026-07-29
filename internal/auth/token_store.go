@@ -26,7 +26,7 @@ const (
 	userContextKey contextKey = "github.com/violetaini/relaydock/auth/username"
 )
 
-const AuthHeader = "MM-Authorization"
+const AuthHeader = "Authorization"
 
 type TokenStore struct {
 	mu     sync.RWMutex
@@ -262,13 +262,10 @@ func RequireToken(store *TokenStore, repo UserRepository, next http.Handler) htt
 			return true
 		}
 
-		// 首先尝试 MM-Authorization 标题
-		token := strings.TrimSpace(r.Header.Get(AuthHeader))
-		// 兼容 Authorization: Bearer <token>(OpenClaw / MCP 客户端习惯)
-		if token == "" {
-			if bearer := strings.TrimSpace(r.Header.Get("Authorization")); bearer != "" {
-				token = strings.TrimSpace(strings.TrimPrefix(bearer, "Bearer "))
-			}
+		// 使用标准 Authorization: Bearer <token>。
+		token := ""
+		if bearer := strings.TrimSpace(r.Header.Get(AuthHeader)); bearer != "" {
+			token = strings.TrimSpace(strings.TrimPrefix(bearer, "Bearer "))
 		}
 		// 回退到查询参数（对于不支持自定义标头的 SSE）
 		if token == "" {
@@ -288,7 +285,7 @@ func RequireToken(store *TokenStore, repo UserRepository, next http.Handler) htt
 				return
 			}
 
-			// 3) 全局 API token(兼容旧用法,授予管理员)
+			// 3) 全局 API token，授予管理员权限。
 			apiToken, err := repo.GetAPIToken(r.Context())
 			if err == nil && token == apiToken && apiToken != "" {
 				ctx := ContextWithUsername(r.Context(), "api-token-admin")

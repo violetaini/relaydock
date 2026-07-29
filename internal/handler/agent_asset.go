@@ -16,7 +16,7 @@ const agentAssetDirEnv = "ARCWAY_AGENT_ASSET_DIR"
 
 var errAgentAssetNotFound = errors.New("agent asset not found")
 
-// GetAgentAsset serves a panel-built mmw-agent binary to an authenticated
+// GetAgentAsset serves a panel-built relaydock-agent binary to an authenticated
 // remote server. The architecture allow-list keeps the resulting filename
 // independent from untrusted request input.
 func (h *XrayServerHandler) GetAgentAsset(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +47,7 @@ func (h *XrayServerHandler) GetAgentAsset(w http.ResponseWriter, r *http.Request
 		http.Error(w, "Unsupported architecture", http.StatusBadRequest)
 		return
 	}
-	name := "mmw-agent-linux-" + arch
+	name := "relaydock-agent-linux-" + arch
 	asset, err := openAgentAsset(name)
 	if errors.Is(err, errAgentAssetNotFound) {
 		http.Error(w, "Agent asset unavailable", http.StatusNotFound)
@@ -100,7 +100,7 @@ func agentAssetDirectories() []string {
 }
 
 func openAgentAsset(name string) (*os.File, error) {
-	if name != "mmw-agent-linux-amd64" && name != "mmw-agent-linux-arm64" {
+	if name != "relaydock-agent-linux-amd64" && name != "relaydock-agent-linux-arm64" {
 		return nil, errAgentAssetNotFound
 	}
 	for _, directory := range agentAssetDirectories() {

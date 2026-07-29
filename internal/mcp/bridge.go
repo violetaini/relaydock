@@ -18,7 +18,7 @@ import (
 
 type ctxKey string
 
-const tokenCtxKey ctxKey = "mmwx_api_token"
+const tokenCtxKey ctxKey = "relaydock_api_token"
 
 func withToken(ctx context.Context, token string) context.Context {
 	return context.WithValue(ctx, tokenCtxKey, token)
@@ -48,7 +48,7 @@ func (b *bridge) call(ctx context.Context, method, path string, body any) (int, 
 	req := httptest.NewRequest(method, path, reader)
 	req.Header.Set("Content-Type", "application/json")
 	if tok := tokenFromCtx(ctx); tok != "" {
-		req.Header.Set("MM-Authorization", tok)
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	rec := httptest.NewRecorder()
 	b.mux.ServeHTTP(rec, req)
@@ -68,7 +68,7 @@ func (b *bridge) get(ctx context.Context, path string) (*mcpgo.CallToolResult, e
 	return result(code, body)
 }
 
-// getWithQuery 把 argsBody 当 querystring 拼到 path 后,适配 mmwx 大量 query-style GET endpoint
+// getWithQuery 把 argsBody 当 querystring 拼到 path 后,适配 RelayDock 的 query-style GET endpoint
 // (例如 /api/admin/remote/inbounds?server_id=...)。基础类型(string/number/bool)直接 Set,
 // 复杂类型(map/array)JSON 序列化后 Set。omit 用来跳过控制字段(如 confirm)和已经在 path 里的字段。
 func (b *bridge) getWithQuery(ctx context.Context, path string, args map[string]any, omit ...string) (*mcpgo.CallToolResult, error) {

@@ -607,8 +607,6 @@ var reservedShortCodes = map[string]bool{
 	"guest":  true,
 	"null":   true,
 	"www":    true,
-	"mmw":    true,
-	"mmwx":   true,
 }
 
 // validateCustomUserShortCode 在所有"设置用户自定义短码"路径(admin 改任意用户 + user 改自己)前调用。

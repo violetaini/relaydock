@@ -72,7 +72,7 @@ func registerServerTools(s *server.MCPServer, b *bridge) {
 		})
 
 	// 写
-	s.AddTool(writeTool("server_create", "新增一台远程服务器(主控登记;真正接入需在该机器上跑 mmw-agent 并提供 token)。", false,
+	s.AddTool(writeTool("server_create", "新增一台远程服务器(主控登记;真正接入需在该机器上跑 relaydock-agent 并提供 token)。", false,
 		mcpgo.WithString("name", mcpgo.Required(), mcpgo.Description("服务器名称")),
 		mcpgo.WithString("ip_address", mcpgo.Description("IP 地址(可选)")),
 		mcpgo.WithString("domain", mcpgo.Description("域名(可选)")),
@@ -162,12 +162,12 @@ func registerServerTools(s *server.MCPServer, b *bridge) {
 			return b.send(ctx, http.MethodPost, "/api/admin/remote/nginx/install-stream", argsBody(req))
 		})
 
-	s.AddTool(writeTool("server_agent_upgrade", "升级远程 mmw-agent(SSE 等完成;升级期间该 agent 会重启,短暂失联)。", true,
+	s.AddTool(writeTool("server_agent_upgrade", "升级远程 relaydock-agent(SSE 等完成;升级期间该 agent 会重启,短暂失联)。", true,
 		mcpgo.WithString("server_id", mcpgo.Required(), mcpgo.Description("服务器 ID")),
 		mcpgo.WithBoolean("confirm", mcpgo.Description("必须为 true 才执行")),
 	),
 		func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-			if msg, ok := confirmGate(req, "升级 mmw-agent"); !ok {
+			if msg, ok := confirmGate(req, "升级 relaydock-agent"); !ok {
 				return msg, nil
 			}
 			return b.send(ctx, http.MethodPost, "/api/admin/remote/agent/upgrade-stream", argsBody(req))

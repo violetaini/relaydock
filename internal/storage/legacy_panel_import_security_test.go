@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-type mmwSecurityTestNode struct {
+type legacyPanelSecurityTestNode struct {
 	id       int64
 	name     string
 	protocol string
@@ -16,7 +16,7 @@ type mmwSecurityTestNode struct {
 	config   string
 }
 
-func createMmwSecurityTestSource(t *testing.T, path string, nodes []mmwSecurityTestNode) {
+func createLegacyPanelSecurityTestSource(t *testing.T, path string, nodes []legacyPanelSecurityTestNode) {
 	t.Helper()
 	source, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -59,7 +59,7 @@ func createMmwSecurityTestSource(t *testing.T, path string, nodes []mmwSecurityT
 	}
 }
 
-func TestImportFromMmwEncryptsWireGuardNodeInImportTransaction(t *testing.T) {
+func TestImportFromLegacyPanelEncryptsWireGuardNodeInImportTransaction(t *testing.T) {
 	root := t.TempDir()
 	repo, err := NewTrafficRepository(filepath.Join(root, "target.db"))
 	if err != nil {
@@ -69,13 +69,13 @@ func TestImportFromMmwEncryptsWireGuardNodeInImportTransaction(t *testing.T) {
 	configureTestNodeSecretEncryption(t, repo, 0x37)
 	config := testWireGuardNodeConfig("Imported WG")
 	sourcePath := filepath.Join(root, "source.db")
-	createMmwSecurityTestSource(t, sourcePath, []mmwSecurityTestNode{{
+	createLegacyPanelSecurityTestSource(t, sourcePath, []legacyPanelSecurityTestNode{{
 		id: 51, name: "Imported WG", protocol: "wireguard",
 		rawURL: "wireguard://" + testWireGuardPrivateKey + "@203.0.113.10:51820#wg",
 		config: config,
 	}})
 
-	report, err := repo.ImportFromMmw(context.Background(), sourcePath)
+	report, err := repo.ImportFromLegacyPanel(context.Background(), sourcePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestImportFromMmwEncryptsWireGuardNodeInImportTransaction(t *testing.T) {
 	}
 }
 
-func TestImportFromMmwRollsBackEveryTableWhenWireGuardProtectionFails(t *testing.T) {
+func TestImportFromLegacyPanelRollsBackEveryTableWhenWireGuardProtectionFails(t *testing.T) {
 	root := t.TempDir()
 	repo, err := NewTrafficRepository(filepath.Join(root, "target.db"))
 	if err != nil {
@@ -117,13 +117,13 @@ func TestImportFromMmwRollsBackEveryTableWhenWireGuardProtectionFails(t *testing
 	configureTestNodeSecretEncryption(t, repo, 0x48)
 	invalidConfig := strings.ReplaceAll(testWireGuardNodeConfig("Invalid WG"), testWireGuardPrivateKey, "not-a-private-key")
 	sourcePath := filepath.Join(root, "source.db")
-	createMmwSecurityTestSource(t, sourcePath, []mmwSecurityTestNode{
+	createLegacyPanelSecurityTestSource(t, sourcePath, []legacyPanelSecurityTestNode{
 		{id: 61, name: "Imported SS", protocol: "ss", rawURL: "ss://example", config: `{"name":"Imported SS","type":"ss"}`},
 		{id: 62, name: "Invalid WG", protocol: "wireguard", config: invalidConfig},
 	})
 
-	if _, err := repo.ImportFromMmw(context.Background(), sourcePath); err == nil {
-		t.Fatal("MMW import with an invalid WireGuard private key unexpectedly succeeded")
+	if _, err := repo.ImportFromLegacyPanel(context.Background(), sourcePath); err == nil {
+		t.Fatal("LegacyPanel import with an invalid WireGuard private key unexpectedly succeeded")
 	}
 	for _, table := range []string{"users", "nodes", "node_secrets"} {
 		var count int
@@ -136,7 +136,7 @@ func TestImportFromMmwRollsBackEveryTableWhenWireGuardProtectionFails(t *testing
 	}
 }
 
-func TestImportFromMmwWireGuardFailsClosedWithoutSecretEncryption(t *testing.T) {
+func TestImportFromLegacyPanelWireGuardFailsClosedWithoutSecretEncryption(t *testing.T) {
 	root := t.TempDir()
 	repo, err := NewTrafficRepository(filepath.Join(root, "target.db"))
 	if err != nil {
@@ -144,12 +144,12 @@ func TestImportFromMmwWireGuardFailsClosedWithoutSecretEncryption(t *testing.T) 
 	}
 	defer repo.Close()
 	sourcePath := filepath.Join(root, "source.db")
-	createMmwSecurityTestSource(t, sourcePath, []mmwSecurityTestNode{{
+	createLegacyPanelSecurityTestSource(t, sourcePath, []legacyPanelSecurityTestNode{{
 		id: 71, name: "Imported WG", protocol: "wireguard", config: testWireGuardNodeConfig("Imported WG"),
 	}})
 
-	if _, err := repo.ImportFromMmw(context.Background(), sourcePath); err == nil || !strings.Contains(err.Error(), "加密尚未初始化") {
-		t.Fatalf("MMW import without node-secret encryption err=%v", err)
+	if _, err := repo.ImportFromLegacyPanel(context.Background(), sourcePath); err == nil || !strings.Contains(err.Error(), "加密尚未初始化") {
+		t.Fatalf("LegacyPanel import without node-secret encryption err=%v", err)
 	}
 	var nodes, users int
 	if err := repo.db.QueryRow(`SELECT COUNT(1) FROM nodes`).Scan(&nodes); err != nil {
@@ -163,7 +163,7 @@ func TestImportFromMmwWireGuardFailsClosedWithoutSecretEncryption(t *testing.T) 
 	}
 }
 
-func TestMmwImportBlockingCountsAllowsOnlyCurrentAdminScaffolding(t *testing.T) {
+func TestLegacyPanelImportBlockingCountsAllowsOnlyCurrentAdminScaffolding(t *testing.T) {
 	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "target.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +176,7 @@ func TestMmwImportBlockingCountsAllowsOnlyCurrentAdminScaffolding(t *testing.T) 
 	if _, err := repo.db.ExecContext(ctx, `INSERT INTO user_settings(username) VALUES (?)`, "owner"); err != nil {
 		t.Fatal(err)
 	}
-	counts, err := repo.MmwImportBlockingCounts(ctx, "owner")
+	counts, err := repo.LegacyPanelImportBlockingCounts(ctx, "owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +186,7 @@ func TestMmwImportBlockingCountsAllowsOnlyCurrentAdminScaffolding(t *testing.T) 
 	if err := repo.CreateUser(ctx, "existing", "", "Existing", "hash", RoleUser, ""); err != nil {
 		t.Fatal(err)
 	}
-	counts, err = repo.MmwImportBlockingCounts(ctx, "owner")
+	counts, err = repo.LegacyPanelImportBlockingCounts(ctx, "owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestMmwImportBlockingCountsAllowsOnlyCurrentAdminScaffolding(t *testing.T) 
 	}
 }
 
-func TestImportFromMmwKeepsAuthenticatedAdminAndAssignsOwnership(t *testing.T) {
+func TestImportFromLegacyPanelKeepsAuthenticatedAdminAndAssignsOwnership(t *testing.T) {
 	root := t.TempDir()
 	repo, err := NewTrafficRepository(filepath.Join(root, "target.db"))
 	if err != nil {
@@ -231,7 +231,7 @@ func TestImportFromMmwKeepsAuthenticatedAdminAndAssignsOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := repo.ImportFromMmw(ctx, sourcePath, "current-admin"); err != nil {
+	if _, err := repo.ImportFromLegacyPanel(ctx, sourcePath, "current-admin"); err != nil {
 		t.Fatal(err)
 	}
 	current, err := repo.GetUser(ctx, "current-admin")

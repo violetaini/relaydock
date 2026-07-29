@@ -130,7 +130,7 @@ func (h *ChildAPIHandler) authenticate(r *http.Request) bool {
 
 // RemoteHeartbeatRequest代表来自远程服务器的心跳请求
 type RemoteHeartbeatRequest struct {
-	BootTime     int64 `json:"boot_time"`      // MMWX进程启动时间（Unix时间戳）
+	BootTime     int64 `json:"boot_time"`      // RelayDock Agent 进程启动时间（Unix时间戳）
 	XrayBootTime int64 `json:"xray_boot_time"` // Xray 进程开始时间（Unix 时间戳）
 	XrayPID      int   `json:"xray_pid"`       // 当前 X 射线进程 ID
 	ListenPort   int   `json:"listen_port"`    // 代理HTTP监听端口
@@ -144,13 +144,13 @@ type RemoteHeartbeatRequest struct {
 
 // RemoteHeartbeatResponse 表示心跳响应
 type RemoteHeartbeatResponse struct {
-	Success          bool   `json:"success"`
-	Message          string `json:"message"`
-	MmwxRestarted    bool   `json:"mmwx_restarted,omitempty"`     // 检测到 MMWX 重启
-	XrayRestarted    bool   `json:"xray_restarted,omitempty"`     // 检测到 X 射线重新启动
-	TokenExpiresSoon bool   `json:"token_expires_soon,omitempty"` // 令牌将在 24 小时内过期
-	TokenExpiresAt   int64  `json:"token_expires_at,omitempty"`   // 令牌过期时间戳
-	ServerTime       int64  `json:"server_time"`                  // 当前服务器时间
+	Success            bool   `json:"success"`
+	Message            string `json:"message"`
+	RelayDockRestarted bool   `json:"relaydock_restarted,omitempty"` // 检测到 RelayDock Agent 重启
+	XrayRestarted      bool   `json:"xray_restarted,omitempty"`      // 检测到 X 射线重新启动
+	TokenExpiresSoon   bool   `json:"token_expires_soon,omitempty"`  // 令牌将在 24 小时内过期
+	TokenExpiresAt     int64  `json:"token_expires_at,omitempty"`    // 令牌过期时间戳
+	ServerTime         int64  `json:"server_time"`                   // 当前服务器时间
 }
 
 // RemoteHeartbeat 处理来自远程服务器的心跳请求
@@ -180,9 +180,6 @@ func (h *XrayServerHandler) RemoteHeartbeat(w http.ResponseWriter, r *http.Reque
 	_ = cryptoErr
 
 	token := crypto.Token
-	if token == "" {
-		token = r.Header.Get("MM-Remote-Token")
-	}
 	if token == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
@@ -289,8 +286,8 @@ func (h *XrayServerHandler) RemoteHeartbeat(w http.ResponseWriter, r *http.Reque
 	}
 
 	// 记录重启事件
-	if result.MmwxRestarted {
-		log.Printf("[RemoteHeartbeat] Detected MMWX restart for token %s... (boot count: %d)", token[:8], result.BootCount)
+	if result.RelayDockRestarted {
+		log.Printf("[RemoteHeartbeat] Detected RelayDock Agent restart for token %s... (boot count: %d)", safePrefix(token, 8), result.BootCount)
 	}
 	if result.XrayRestarted {
 		log.Printf("[RemoteHeartbeat] Detected Xray restart for token %s... (xray boot count: %d)", token[:8], result.XrayBootCount)
@@ -338,12 +335,12 @@ func (h *XrayServerHandler) RemoteHeartbeat(w http.ResponseWriter, r *http.Reque
 	}
 
 	resp := RemoteHeartbeatResponse{
-		Success:          true,
-		Message:          "心跳成功",
-		MmwxRestarted:    result.MmwxRestarted,
-		XrayRestarted:    result.XrayRestarted,
-		TokenExpiresSoon: result.TokenExpiresSoon,
-		ServerTime:       time.Now().Unix(),
+		Success:            true,
+		Message:            "心跳成功",
+		RelayDockRestarted: result.RelayDockRestarted,
+		XrayRestarted:      result.XrayRestarted,
+		TokenExpiresSoon:   result.TokenExpiresSoon,
+		ServerTime:         time.Now().Unix(),
 	}
 
 	if result.TokenExpiresAt != nil {
@@ -379,14 +376,14 @@ func (h *XrayServerHandler) RefreshRemoteToken(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 从标头获取令牌
-	token := r.Header.Get("MM-Remote-Token")
-	if token == "" {
+	// 从标准 Bearer 标头获取令牌。
+	token, ok := remoteBearerToken(r.Header.Get("Authorization"))
+	if !ok {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(RefreshRemoteTokenResponse{
 			Success: false,
-			Message: "Missing MM-Remote-Token header",
+			Message: "Missing bearer token",
 		})
 		return
 	}
@@ -606,12 +603,12 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 		http.Error(w, "Expiry guard release asset is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	agentSHA256AMD64, err := agentAssetSHA256("mmw-agent-linux-amd64")
+	agentSHA256AMD64, err := agentAssetSHA256("relaydock-agent-linux-amd64")
 	if err != nil {
 		http.Error(w, "Agent release asset is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	agentSHA256ARM64, err := agentAssetSHA256("mmw-agent-linux-arm64")
+	agentSHA256ARM64, err := agentAssetSHA256("relaydock-agent-linux-arm64")
 	if err != nil {
 		http.Error(w, "Agent release asset is unavailable", http.StatusServiceUnavailable)
 		return
@@ -696,8 +693,8 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 
 	// 返回安装脚本内容
 	script := `#!/bin/bash
-# MMWX Remote Server Installation Script
-# This script installs panel-provided MMWX assets and configures a remote server
+# RelayDock Remote Server Installation Script
+# This script installs panel-provided RelayDock assets and configures a remote server
 
 set -e
 umask 077
@@ -744,7 +741,7 @@ DOWNLOAD_DIR=$(mktemp -d "${DOWNLOAD_ROOT%/}/arcway-install.XXXXXX")
 chmod 0700 "$DOWNLOAD_DIR"
 trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
 trap 'exit 130' HUP INT TERM
-AGENT_DOWNLOAD="$DOWNLOAD_DIR/mmw-agent"
+AGENT_DOWNLOAD="$DOWNLOAD_DIR/relaydock-agent"
 GUARD_DOWNLOAD="$DOWNLOAD_DIR/arcway-expiry-guard"
 CURL_AUTH_HEADER_FILE="$DOWNLOAD_DIR/curl-auth.header"
 CURL_INSTALL_NONCE_HEADER_FILE="$DOWNLOAD_DIR/curl-install-nonce.header"
@@ -799,7 +796,7 @@ fi
 MASTER_URL="${PROTOCOL}://${SERVER}"
 
 echo "=========================================="
-echo "  MMWX Remote Server Installation"
+echo "  RelayDock Remote Server Installation"
 echo "=========================================="
 echo ""
 echo "Master Server: $MASTER_URL"
@@ -898,9 +895,9 @@ download_verified_asset() {
     mv -f "$candidate" "$destination"
 }
 
-AGENT_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/mmw-agent-linux-${ARCH_NAME}"
-AGENT_MASTER_URL="${MASTER_URL}/api/remote/mmw-agent?arch=${ARCH_NAME}"
-download_verified_asset "mmw-agent" "$AGENT_DOWNLOAD" "$AGENT_SHA256" "$AGENT_GITHUB_URL" "$AGENT_MASTER_URL" || exit 1
+AGENT_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/relaydock-agent-linux-${ARCH_NAME}"
+AGENT_MASTER_URL="${MASTER_URL}/api/remote/relaydock-agent?arch=${ARCH_NAME}"
+download_verified_asset "relaydock-agent" "$AGENT_DOWNLOAD" "$AGENT_SHA256" "$AGENT_GITHUB_URL" "$AGENT_MASTER_URL" || exit 1
 
 GUARD_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/arcway-expiry-guard-linux-${ARCH_NAME}"
 GUARD_MASTER_URL="${MASTER_URL}/api/remote/expiry-guard?arch=${ARCH_NAME}"
@@ -915,7 +912,7 @@ if ! validate_elf "$AGENT_DOWNLOAD" || ! validate_elf "$GUARD_DOWNLOAD"; then
     exit 1
 fi
 if [ "$(sha256sum "$AGENT_DOWNLOAD" | awk '{ print $1 }')" != "$AGENT_SHA256" ]; then
-    echo "ERROR: mmw-agent SHA-256 verification failed; installation aborted" >&2
+    echo "ERROR: relaydock-agent SHA-256 verification failed; installation aborted" >&2
     exit 1
 fi
 if [ "$(sha256sum "$GUARD_DOWNLOAD" | awk '{ print $1 }')" != "$GUARD_SHA256" ]; then
@@ -1322,13 +1319,13 @@ OLD_GUARD_UNIT_PRESENT=0
 OLD_AGENT_ENABLE_STATE=""
 OLD_GUARD_ENABLE_STATE=""
 if [ "$HAS_SYSTEMD" = "1" ]; then
-    systemctl is-active --quiet mmw-agent && OLD_AGENT_ACTIVE=1 || true
+    systemctl is-active --quiet relaydock-agent && OLD_AGENT_ACTIVE=1 || true
     systemctl is-active --quiet arcway-expiry-guard && OLD_GUARD_ACTIVE=1 || true
-    if systemctl cat mmw-agent >/dev/null 2>&1; then
+    if systemctl cat relaydock-agent >/dev/null 2>&1; then
         OLD_AGENT_UNIT_PRESENT=1
-        OLD_AGENT_ENABLE_STATE=$(systemctl is-enabled mmw-agent 2>/dev/null || true)
+        OLD_AGENT_ENABLE_STATE=$(systemctl is-enabled relaydock-agent 2>/dev/null || true)
         reversible_systemd_enable_state "$OLD_AGENT_ENABLE_STATE" || {
-            echo "ERROR: mmw-agent.service has unsupported enable state '$OLD_AGENT_ENABLE_STATE'" >&2
+            echo "ERROR: relaydock-agent.service has unsupported enable state '$OLD_AGENT_ENABLE_STATE'" >&2
             exit 1
         }
         case "$OLD_AGENT_ENABLE_STATE" in enabled|enabled-runtime) OLD_AGENT_ENABLED=1 ;; esac
@@ -1343,16 +1340,16 @@ if [ "$HAS_SYSTEMD" = "1" ]; then
         case "$OLD_GUARD_ENABLE_STATE" in enabled|enabled-runtime) OLD_GUARD_ENABLED=1 ;; esac
     fi
 elif [ "$HAS_OPENRC" = "1" ]; then
-    rc-service mmw-agent status >/dev/null 2>&1 && OLD_AGENT_ACTIVE=1 || true
+    rc-service relaydock-agent status >/dev/null 2>&1 && OLD_AGENT_ACTIVE=1 || true
     rc-service arcway-expiry-guard status >/dev/null 2>&1 && OLD_GUARD_ACTIVE=1 || true
-    rc-update show default 2>/dev/null | awk '$1 == "mmw-agent" { found=1 } END { exit !found }' && OLD_AGENT_ENABLED=1 || true
+    rc-update show default 2>/dev/null | awk '$1 == "relaydock-agent" { found=1 } END { exit !found }' && OLD_AGENT_ENABLED=1 || true
     rc-update show default 2>/dev/null | awk '$1 == "arcway-expiry-guard" { found=1 } END { exit !found }' && OLD_GUARD_ENABLED=1 || true
 else
-    pgrep -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1 && OLD_AGENT_ACTIVE=1 || true
+    pgrep -f '/usr/local/bin/relaydock-agent' >/dev/null 2>&1 && OLD_AGENT_ACTIVE=1 || true
     pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1 && OLD_GUARD_ACTIVE=1 || true
 fi
 
-EXISTING_LISTEN_PORT=$(awk -F: '/^[[:space:]]*listen_port[[:space:]]*:/ { value=$2; gsub(/["[:space:]]/, "", value); print value; exit }' /etc/mmw-agent/config.yaml 2>/dev/null || true)
+EXISTING_LISTEN_PORT=$(awk -F: '/^[[:space:]]*listen_port[[:space:]]*:/ { value=$2; gsub(/["[:space:]]/, "", value); print value; exit }' /etc/relaydock-agent/config.yaml 2>/dev/null || true)
 case "$EXISTING_LISTEN_PORT" in
     ''|*[!0-9]*) EXISTING_LISTEN_PORT="" ;;
     *)
@@ -1365,28 +1362,28 @@ esac
 BACKUP_DIR="$DOWNLOAD_DIR/backup"
 LEGACY_COMPAT_RULES_FILE="$BACKUP_DIR/legacy-compat.rules"
 TRACKED_PATHS=(
-    /usr/local/bin/mmw-agent
+    /usr/local/bin/relaydock-agent
     /usr/local/bin/arcway-expiry-guard
     /usr/local/bin/geoip.dat
     /usr/local/bin/geosite.dat
     /usr/local/bin/geoip.dat.tmp
     /usr/local/bin/geosite.dat.tmp
-    /etc/mmw-agent/config.yaml
+    /etc/relaydock-agent/config.yaml
     /etc/arcway-expiry-guard.env
-    /var/lib/mmw-agent
+    /var/lib/relaydock-agent
     /var/lib/arcway-expiry-guard
-    /var/log/mmw-agent
+    /var/log/relaydock-agent
     /usr/local/etc/xray
     /etc/xray
     /opt/xray
     /etc/arcway-port-firewall.env
     /usr/local/sbin/arcway-agent-firewall
     /usr/local/sbin/arcway-nginx-bridge
-    /etc/systemd/system/mmw-agent.service
+    /etc/systemd/system/relaydock-agent.service
     /etc/systemd/system/arcway-expiry-guard.service
-    /etc/init.d/mmw-agent
+    /etc/init.d/relaydock-agent
     /etc/init.d/arcway-expiry-guard
-    /usr/local/bin/mmw-agent-supervisor.sh
+    /usr/local/bin/relaydock-agent-supervisor.sh
     /usr/local/bin/arcway-expiry-guard-supervisor.sh
     /etc/ufw/user.rules
     /etc/ufw/user6.rules
@@ -1553,27 +1550,27 @@ openrc_default_enabled() {
 restart_quiesced_arcway_services() {
     if [ "$HAS_SYSTEMD" = "1" ]; then
         if [ "$OLD_AGENT_ACTIVE" = "1" ]; then
-            systemctl start mmw-agent >/dev/null 2>&1 && systemctl is-active --quiet mmw-agent || return 1
+            systemctl start relaydock-agent >/dev/null 2>&1 && systemctl is-active --quiet relaydock-agent || return 1
         fi
         if [ "$OLD_GUARD_ACTIVE" = "1" ]; then
             systemctl start arcway-expiry-guard >/dev/null 2>&1 && systemctl is-active --quiet arcway-expiry-guard || return 1
         fi
     elif [ "$HAS_OPENRC" = "1" ]; then
         if [ "$OLD_AGENT_ACTIVE" = "1" ]; then
-            rc-service mmw-agent start 9>&- >/dev/null 2>&1 && rc-service mmw-agent status >/dev/null 2>&1 || return 1
+            rc-service relaydock-agent start 9>&- >/dev/null 2>&1 && rc-service relaydock-agent status >/dev/null 2>&1 || return 1
         fi
         if [ "$OLD_GUARD_ACTIVE" = "1" ]; then
             rc-service arcway-expiry-guard start 9>&- >/dev/null 2>&1 && rc-service arcway-expiry-guard status >/dev/null 2>&1 || return 1
         fi
     else
-        if [ "$OLD_AGENT_ACTIVE" = "1" ] && [ -x /usr/local/bin/mmw-agent-supervisor.sh ]; then
-            nohup /usr/local/bin/mmw-agent-supervisor.sh 9>&- >/dev/null 2>&1 &
+        if [ "$OLD_AGENT_ACTIVE" = "1" ] && [ -x /usr/local/bin/relaydock-agent-supervisor.sh ]; then
+            nohup /usr/local/bin/relaydock-agent-supervisor.sh 9>&- >/dev/null 2>&1 &
         fi
         if [ "$OLD_GUARD_ACTIVE" = "1" ] && [ -x /usr/local/bin/arcway-expiry-guard-supervisor.sh ]; then
             nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh 9>&- >/dev/null 2>&1 &
         fi
         sleep 1
-        if [ "$OLD_AGENT_ACTIVE" = "1" ] && ! pgrep -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1; then return 1; fi
+        if [ "$OLD_AGENT_ACTIVE" = "1" ] && ! pgrep -f '/usr/local/bin/relaydock-agent' >/dev/null 2>&1; then return 1; fi
         if [ "$OLD_GUARD_ACTIVE" = "1" ] && ! pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1; then return 1; fi
     fi
 }
@@ -1611,8 +1608,8 @@ rollback_install() {
     set +e
     ROLLBACK_FAILED=0
 	if [ "$HAS_SYSTEMD" = "1" ]; then
-		systemctl stop arcway-expiry-guard mmw-agent >/dev/null 2>&1
-			if systemctl is-active --quiet arcway-expiry-guard || systemctl is-active --quiet mmw-agent; then
+		systemctl stop arcway-expiry-guard relaydock-agent >/dev/null 2>&1
+			if systemctl is-active --quiet arcway-expiry-guard || systemctl is-active --quiet relaydock-agent; then
 				ROLLBACK_FAILED=1
 			fi
 			if [ "$XRAY_UNIT_PRESENT" = "1" ]; then
@@ -1626,9 +1623,9 @@ rollback_install() {
 		# Disable services that were not enabled before this transaction while the
 		# newly written units still exist. This removes wants symlinks before a
 		# fresh-install rollback deletes the unit files.
-			if [ "$OLD_AGENT_ENABLED" != "1" ] && systemd_service_registered mmw-agent; then
-				systemctl disable mmw-agent >/dev/null 2>&1 || ROLLBACK_FAILED=1
-				systemctl is-enabled --quiet mmw-agent && ROLLBACK_FAILED=1
+			if [ "$OLD_AGENT_ENABLED" != "1" ] && systemd_service_registered relaydock-agent; then
+				systemctl disable relaydock-agent >/dev/null 2>&1 || ROLLBACK_FAILED=1
+				systemctl is-enabled --quiet relaydock-agent && ROLLBACK_FAILED=1
 			fi
 			if [ "$OLD_GUARD_ENABLED" != "1" ] && systemd_service_registered arcway-expiry-guard; then
 				systemctl disable arcway-expiry-guard >/dev/null 2>&1 || ROLLBACK_FAILED=1
@@ -1636,15 +1633,15 @@ rollback_install() {
 		fi
 	elif [ "$HAS_OPENRC" = "1" ]; then
 		rc-service arcway-expiry-guard stop >/dev/null 2>&1
-		rc-service mmw-agent stop >/dev/null 2>&1
-		if rc-service arcway-expiry-guard status >/dev/null 2>&1 || rc-service mmw-agent status >/dev/null 2>&1; then
+		rc-service relaydock-agent stop >/dev/null 2>&1
+		if rc-service arcway-expiry-guard status >/dev/null 2>&1 || rc-service relaydock-agent status >/dev/null 2>&1; then
 			ROLLBACK_FAILED=1
 		fi
 		# Remove runlevel links created by this transaction before missing init
 		# scripts are restored as absent.
 				if [ "$OLD_AGENT_ENABLED" != "1" ]; then
-					if openrc_default_enabled mmw-agent; then rc-update del mmw-agent default >/dev/null 2>&1 || ROLLBACK_FAILED=1; fi
-					openrc_default_enabled mmw-agent && ROLLBACK_FAILED=1
+					if openrc_default_enabled relaydock-agent; then rc-update del relaydock-agent default >/dev/null 2>&1 || ROLLBACK_FAILED=1; fi
+					openrc_default_enabled relaydock-agent && ROLLBACK_FAILED=1
 				fi
 				if [ "$OLD_GUARD_ENABLED" != "1" ]; then
 					if openrc_default_enabled arcway-expiry-guard; then rc-update del arcway-expiry-guard default >/dev/null 2>&1 || ROLLBACK_FAILED=1; fi
@@ -1652,13 +1649,13 @@ rollback_install() {
 				fi
 	else
 		pkill -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1
-        pkill -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1
+        pkill -f '/usr/local/bin/relaydock-agent' >/dev/null 2>&1
         sleep 1
-        if pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1 || pgrep -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1; then
+        if pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1 || pgrep -f '/usr/local/bin/relaydock-agent' >/dev/null 2>&1; then
             ROLLBACK_FAILED=1
 		fi
 	fi
-		rm -f /usr/local/bin/.mmw-agent.new /usr/local/bin/.arcway-expiry-guard.new || ROLLBACK_FAILED=1
+		rm -f /usr/local/bin/.relaydock-agent.new /usr/local/bin/.arcway-expiry-guard.new || ROLLBACK_FAILED=1
     for TRACKED_PATH in "${TRACKED_PATHS[@]}"; do
         if [ -e "$BACKUP_DIR$TRACKED_PATH.arcway-missing" ]; then
             rm -rf "$TRACKED_PATH" || ROLLBACK_FAILED=1
@@ -1754,14 +1751,14 @@ rollback_install() {
 			restore_systemd_service_state nginx "$OLD_NGINX_ENABLE_STATE" "$OLD_NGINX_ACTIVE" || ROLLBACK_FAILED=1
 		fi
         if [ "$OLD_AGENT_UNIT_PRESENT" = "1" ]; then
-            restore_systemd_service_state mmw-agent "$OLD_AGENT_ENABLE_STATE" 0 || ROLLBACK_FAILED=1
+            restore_systemd_service_state relaydock-agent "$OLD_AGENT_ENABLE_STATE" 0 || ROLLBACK_FAILED=1
         fi
         if [ "$OLD_GUARD_UNIT_PRESENT" = "1" ]; then
             restore_systemd_service_state arcway-expiry-guard "$OLD_GUARD_ENABLE_STATE" 0 || ROLLBACK_FAILED=1
         fi
         if [ "$FIREWALL_SAFE" = "1" ]; then
             if [ "$OLD_AGENT_ACTIVE" = "1" ]; then
-                systemctl start mmw-agent >/dev/null 2>&1 && systemctl is-active --quiet mmw-agent || ROLLBACK_FAILED=1
+                systemctl start relaydock-agent >/dev/null 2>&1 && systemctl is-active --quiet relaydock-agent || ROLLBACK_FAILED=1
             fi
             if [ "$OLD_GUARD_ACTIVE" = "1" ]; then
                 systemctl start arcway-expiry-guard >/dev/null 2>&1 && systemctl is-active --quiet arcway-expiry-guard || ROLLBACK_FAILED=1
@@ -1770,13 +1767,13 @@ rollback_install() {
             ROLLBACK_FAILED=1
         fi
 	elif [ "$HAS_OPENRC" = "1" ]; then
-		if [ -e /etc/init.d/mmw-agent ]; then
+		if [ -e /etc/init.d/relaydock-agent ]; then
 			if [ "$OLD_AGENT_ENABLED" = "1" ]; then
-				rc-update add mmw-agent default >/dev/null 2>&1 || ROLLBACK_FAILED=1
-				openrc_default_enabled mmw-agent || ROLLBACK_FAILED=1
-			elif openrc_default_enabled mmw-agent; then
-				rc-update del mmw-agent default >/dev/null 2>&1 || ROLLBACK_FAILED=1
-				openrc_default_enabled mmw-agent && ROLLBACK_FAILED=1
+				rc-update add relaydock-agent default >/dev/null 2>&1 || ROLLBACK_FAILED=1
+				openrc_default_enabled relaydock-agent || ROLLBACK_FAILED=1
+			elif openrc_default_enabled relaydock-agent; then
+				rc-update del relaydock-agent default >/dev/null 2>&1 || ROLLBACK_FAILED=1
+				openrc_default_enabled relaydock-agent && ROLLBACK_FAILED=1
 			fi
 		fi
 		if [ -e /etc/init.d/arcway-expiry-guard ]; then
@@ -1789,21 +1786,21 @@ rollback_install() {
 			fi
 		fi
         if [ "$FIREWALL_SAFE" = "1" ]; then
-            if [ "$OLD_AGENT_ACTIVE" = "1" ]; then rc-service mmw-agent start 9>&- >/dev/null 2>&1 && rc-service mmw-agent status >/dev/null 2>&1 || ROLLBACK_FAILED=1; fi
+            if [ "$OLD_AGENT_ACTIVE" = "1" ]; then rc-service relaydock-agent start 9>&- >/dev/null 2>&1 && rc-service relaydock-agent status >/dev/null 2>&1 || ROLLBACK_FAILED=1; fi
             if [ "$OLD_GUARD_ACTIVE" = "1" ]; then rc-service arcway-expiry-guard start 9>&- >/dev/null 2>&1 && rc-service arcway-expiry-guard status >/dev/null 2>&1 || ROLLBACK_FAILED=1; fi
         else
             ROLLBACK_FAILED=1
         fi
     else
         if [ "$FIREWALL_SAFE" = "1" ]; then
-            if [ "$OLD_AGENT_ACTIVE" = "1" ] && [ -x /usr/local/bin/mmw-agent-supervisor.sh ]; then
-                nohup /usr/local/bin/mmw-agent-supervisor.sh 9>&- >/dev/null 2>&1 &
+            if [ "$OLD_AGENT_ACTIVE" = "1" ] && [ -x /usr/local/bin/relaydock-agent-supervisor.sh ]; then
+                nohup /usr/local/bin/relaydock-agent-supervisor.sh 9>&- >/dev/null 2>&1 &
             fi
             if [ "$OLD_GUARD_ACTIVE" = "1" ] && [ -x /usr/local/bin/arcway-expiry-guard-supervisor.sh ]; then
                 nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh 9>&- >/dev/null 2>&1 &
             fi
             sleep 1
-            if [ "$OLD_AGENT_ACTIVE" = "1" ] && ! pgrep -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1; then ROLLBACK_FAILED=1; fi
+            if [ "$OLD_AGENT_ACTIVE" = "1" ] && ! pgrep -f '/usr/local/bin/relaydock-agent' >/dev/null 2>&1; then ROLLBACK_FAILED=1; fi
             if [ "$OLD_GUARD_ACTIVE" = "1" ] && ! pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1; then ROLLBACK_FAILED=1; fi
         else
             ROLLBACK_FAILED=1
@@ -1857,24 +1854,24 @@ MUTATION_STARTED=1
 echo "[2/7] Stopping existing service (if any)..."
 if [ "$HAS_SYSTEMD" = "1" ]; then
     systemctl stop arcway-expiry-guard 2>/dev/null || true
-    systemctl stop mmw-agent 2>/dev/null || true
-    if systemctl is-active --quiet arcway-expiry-guard || systemctl is-active --quiet mmw-agent; then
+    systemctl stop relaydock-agent 2>/dev/null || true
+    if systemctl is-active --quiet arcway-expiry-guard || systemctl is-active --quiet relaydock-agent; then
         echo "ERROR: existing Arcway services did not stop" >&2
         exit 1
     fi
 elif [ "$HAS_OPENRC" = "1" ]; then
     rc-service arcway-expiry-guard stop 2>/dev/null || true
-    rc-service mmw-agent stop 2>/dev/null || true
-    if rc-service arcway-expiry-guard status >/dev/null 2>&1 || rc-service mmw-agent status >/dev/null 2>&1; then
+    rc-service relaydock-agent stop 2>/dev/null || true
+    if rc-service arcway-expiry-guard status >/dev/null 2>&1 || rc-service relaydock-agent status >/dev/null 2>&1; then
         echo "ERROR: existing Arcway services did not stop" >&2
         exit 1
     fi
 else
     # nohup 兜底:杀掉现有 agent / guard 进程及 supervisor
     pkill -f /usr/local/bin/arcway-expiry-guard 2>/dev/null || true
-    pkill -f /usr/local/bin/mmw-agent 2>/dev/null || true
+    pkill -f /usr/local/bin/relaydock-agent 2>/dev/null || true
     sleep 1
-    if pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1 || pgrep -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1; then
+    if pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1 || pgrep -f '/usr/local/bin/relaydock-agent' >/dev/null 2>&1; then
         echo "ERROR: existing Arcway processes did not stop" >&2
         exit 1
     fi
@@ -1909,8 +1906,8 @@ fi
 # Step 3: Create config directory first
 echo ""
 echo "[3/7] Creating configuration..."
-mkdir -p /etc/mmw-agent
-mkdir -p /var/lib/mmw-agent
+mkdir -p /etc/relaydock-agent
+mkdir -p /var/lib/relaydock-agent
 mkdir -p /var/lib/arcway-expiry-guard
 chmod 0700 /var/lib/arcway-expiry-guard
 
@@ -1960,8 +1957,8 @@ if [ "$ACTUAL_PORT" != "$REQUESTED_PORT" ]; then
 fi
 LISTEN_PORT="$ACTUAL_PORT"
 
-cat > /etc/mmw-agent/config.yaml << EOF
-# MMWX Remote Server Configuration
+cat > /etc/relaydock-agent/config.yaml << EOF
+# RelayDock Remote Server Configuration
 # Generated by install script
 
 mode: remote
@@ -1976,7 +1973,7 @@ listen_port: "${LISTEN_PORT}"
 hide_port_on_ws: false
 EOF
 
-echo "Configuration saved to /etc/mmw-agent/config.yaml"
+echo "Configuration saved to /etc/relaydock-agent/config.yaml"
 
 cat > /etc/arcway-expiry-guard.env << EOF
 ARCWAY_GUARD_LISTEN=:${GUARD_PORT}
@@ -2033,15 +2030,15 @@ esac
 : "${ARCWAY_GUARD_PORT:?missing ARCWAY_GUARD_PORT}"
 : "${ARCWAY_PANEL_IPS:?missing ARCWAY_PANEL_IPS}"
 
-CONFIGURED_AGENT_PORT=$(awk -F: '/^[[:space:]]*listen_port[[:space:]]*:/ { value=$2; gsub(/["[:space:]]/, "", value); print value; exit }' /etc/mmw-agent/config.yaml 2>/dev/null || true)
+CONFIGURED_AGENT_PORT=$(awk -F: '/^[[:space:]]*listen_port[[:space:]]*:/ { value=$2; gsub(/["[:space:]]/, "", value); print value; exit }' /etc/relaydock-agent/config.yaml 2>/dev/null || true)
 case "$CONFIGURED_AGENT_PORT" in
     ''|*[!0-9]*)
-        echo "ERROR: mmw-agent config has no valid listen_port" >&2
+        echo "ERROR: relaydock-agent config has no valid listen_port" >&2
         exit 1
         ;;
 esac
 if [ "$CONFIGURED_AGENT_PORT" != "$ARCWAY_AGENT_PORT" ]; then
-    echo "ERROR: mmw-agent listen_port drifted from the protected Arcway port" >&2
+    echo "ERROR: relaydock-agent listen_port drifted from the protected Arcway port" >&2
     exit 1
 fi
 
@@ -2093,7 +2090,7 @@ if [ -z "$XRAY_CONFIG_PATH" ]; then
     done
 fi
 if [ -n "$XRAY_CONFIG_PATH" ]; then
-    ARCWAY_AGENT_BINARY=${ARCWAY_AGENT_BINARY:-/usr/local/bin/mmw-agent}
+    ARCWAY_AGENT_BINARY=${ARCWAY_AGENT_BINARY:-/usr/local/bin/relaydock-agent}
     if [ ! -x "$ARCWAY_AGENT_BINARY" ]; then
         echo "ERROR: Arcway Agent binary cannot derive Xray firewall rules" >&2
         exit 1
@@ -2506,7 +2503,7 @@ STREAM_LOADER="$BT_STREAM_DIR/zz_arcway_loader.conf"
 MANAGED_ROOT=/usr/local/nginx
 HTTP_INCLUDE='/www/server/panel/vhost/nginx/*.conf'
 STREAM_INCLUDE='/www/server/panel/vhost/nginx/tcp/*.conf'
-AGENT_CONFIG=${ARCWAY_AGENT_CONFIG:-/etc/mmw-agent/config.yaml}
+AGENT_CONFIG=${ARCWAY_AGENT_CONFIG:-/etc/relaydock-agent/config.yaml}
 
 # The helper remains in service pre-start hooks for installation compatibility,
 # but reuse_existing must never create loaders or reload the externally-owned
@@ -2689,9 +2686,9 @@ echo ""
 echo "[4/7] Creating service..."
 
 if [ "$HAS_SYSTEMD" = "1" ]; then
-    cat > /etc/systemd/system/mmw-agent.service << EOF
+    cat > /etc/systemd/system/relaydock-agent.service << EOF
 [Unit]
-Description=MMW Agent Remote Server
+Description=RelayDock Agent Remote Server
 After=network-online.target ufw.service firewalld.service
 Wants=network-online.target
 
@@ -2700,10 +2697,10 @@ Type=simple
 EnvironmentFile=/etc/arcway-port-firewall.env
 ExecStartPre=/usr/local/sbin/arcway-agent-firewall
 ExecStartPre=/usr/local/sbin/arcway-nginx-bridge
-ExecStart=/usr/local/bin/mmw-agent -c /etc/mmw-agent/config.yaml
+ExecStart=/usr/local/bin/relaydock-agent -c /etc/relaydock-agent/config.yaml
 Restart=always
 RestartSec=5
-WorkingDirectory=/var/lib/mmw-agent
+WorkingDirectory=/var/lib/relaydock-agent
 
 [Install]
 WantedBy=multi-user.target
@@ -2711,9 +2708,9 @@ EOF
     cat > /etc/systemd/system/arcway-expiry-guard.service << EOF
 [Unit]
 Description=Arcway Managed Client Expiry Guard
-After=network-online.target mmw-agent.service
+After=network-online.target relaydock-agent.service
 Wants=network-online.target
-Requires=mmw-agent.service
+Requires=relaydock-agent.service
 
 [Service]
 Type=simple
@@ -2732,19 +2729,19 @@ ReadWritePaths=/var/lib/arcway-expiry-guard
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 0644 /etc/systemd/system/mmw-agent.service /etc/systemd/system/arcway-expiry-guard.service
+    chmod 0644 /etc/systemd/system/relaydock-agent.service /etc/systemd/system/arcway-expiry-guard.service
     systemctl daemon-reload
 elif [ "$HAS_OPENRC" = "1" ]; then
-    cat > /etc/init.d/mmw-agent << 'EOF'
+    cat > /etc/init.d/relaydock-agent << 'EOF'
 #!/sbin/openrc-run
-name="mmw-agent"
-description="MMW Agent Remote Server"
-command="/usr/local/bin/mmw-agent"
-command_args="-c /etc/mmw-agent/config.yaml"
+name="relaydock-agent"
+description="RelayDock Agent Remote Server"
+command="/usr/local/bin/relaydock-agent"
+command_args="-c /etc/relaydock-agent/config.yaml"
 supervisor="supervise-daemon"
 respawn_delay=5
 respawn_max=0
-# 日志由 agent 自身写文件并轮转(/var/log/mmw-agent/mmw-agent.log),不再用 output_log 重复落地(避免无轮转爆盘)
+# 日志由 agent 自身写文件并轮转(/var/log/relaydock-agent/relaydock-agent.log),不再用 output_log 重复落地(避免无轮转爆盘)
 start_pre() {
     set -a
     . /etc/arcway-port-firewall.env
@@ -2754,7 +2751,7 @@ start_pre() {
 }
 depend() { need net; }
 EOF
-    chmod +x /etc/init.d/mmw-agent
+    chmod +x /etc/init.d/relaydock-agent
     cat > /etc/init.d/arcway-expiry-guard << 'EOF'
 #!/sbin/openrc-run
 name="arcway-expiry-guard"
@@ -2772,25 +2769,25 @@ start_pre() {
     . /etc/arcway-expiry-guard.env || return 1
     set +a
 }
-depend() { need net mmw-agent; }
+depend() { need net relaydock-agent; }
 EOF
     chmod +x /etc/init.d/arcway-expiry-guard
 else
     # 无 init 系统(典型 LXC 容器):写一个 supervisor 脚本,失败自动重启,放后台跑;同时塞进 rc.local 以便重启
-    cat > /usr/local/bin/mmw-agent-supervisor.sh << 'EOF'
+    cat > /usr/local/bin/relaydock-agent-supervisor.sh << 'EOF'
 #!/bin/sh
 if ! /usr/local/sbin/arcway-nginx-bridge; then
     echo "[supervisor] Arcway Nginx bridge validation failed" >&2
     exit 1
 fi
 while true; do
-    # 日志由 agent 自身写文件并轮转(/var/log/mmw-agent/mmw-agent.log);这里输出走 stdout(由 rc.local 的 nohup 接管)
-    /usr/local/bin/mmw-agent -c /etc/mmw-agent/config.yaml
-    echo "[supervisor] mmw-agent exited, restarting in 5s..."
+    # 日志由 agent 自身写文件并轮转(/var/log/relaydock-agent/relaydock-agent.log);这里输出走 stdout(由 rc.local 的 nohup 接管)
+    /usr/local/bin/relaydock-agent -c /etc/relaydock-agent/config.yaml
+    echo "[supervisor] relaydock-agent exited, restarting in 5s..."
     sleep 5
 done
 EOF
-    chmod +x /usr/local/bin/mmw-agent-supervisor.sh
+    chmod +x /usr/local/bin/relaydock-agent-supervisor.sh
 
     cat > /usr/local/bin/arcway-expiry-guard-supervisor.sh << 'EOF'
 #!/bin/sh
@@ -2815,11 +2812,11 @@ EOF
     # installation where the firewall line had been appended after supervisors.
     RC_LOCAL_NEW="$DOWNLOAD_DIR/rc.local"
     awk '
-        /arcway-agent-firewall|arcway-nginx-bridge|mmw-agent-supervisor[.]sh|arcway-expiry-guard-supervisor[.]sh/ { next }
+        /arcway-agent-firewall|arcway-nginx-bridge|relaydock-agent-supervisor[.]sh|arcway-expiry-guard-supervisor[.]sh/ { next }
         /^exit 0[[:space:]]*$/ && !inserted {
             print "set -a; . /etc/arcway-port-firewall.env; set +a; /usr/local/sbin/arcway-agent-firewall || exit 1"
             print "/usr/local/sbin/arcway-nginx-bridge || exit 1"
-            print "nohup /usr/local/bin/mmw-agent-supervisor.sh >/dev/null 2>&1 &"
+            print "nohup /usr/local/bin/relaydock-agent-supervisor.sh >/dev/null 2>&1 &"
             print "nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh >/dev/null 2>&1 &"
             inserted=1
         }
@@ -2828,7 +2825,7 @@ EOF
             if (!inserted) {
                 print "set -a; . /etc/arcway-port-firewall.env; set +a; /usr/local/sbin/arcway-agent-firewall || exit 1"
                 print "/usr/local/sbin/arcway-nginx-bridge || exit 1"
-                print "nohup /usr/local/bin/mmw-agent-supervisor.sh >/dev/null 2>&1 &"
+                print "nohup /usr/local/bin/relaydock-agent-supervisor.sh >/dev/null 2>&1 &"
                 print "nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh >/dev/null 2>&1 &"
             }
         }
@@ -2839,28 +2836,28 @@ fi
 # Step 5: atomically install the already verified binaries.
 echo ""
 echo "[5/7] Installing verified binaries..."
-install -m 0755 "$AGENT_DOWNLOAD" /usr/local/bin/.mmw-agent.new
-mv -f /usr/local/bin/.mmw-agent.new /usr/local/bin/mmw-agent
+install -m 0755 "$AGENT_DOWNLOAD" /usr/local/bin/.relaydock-agent.new
+mv -f /usr/local/bin/.relaydock-agent.new /usr/local/bin/relaydock-agent
 install -m 0755 "$GUARD_DOWNLOAD" /usr/local/bin/.arcway-expiry-guard.new
 mv -f /usr/local/bin/.arcway-expiry-guard.new /usr/local/bin/arcway-expiry-guard
 
-echo "Binaries installed to /usr/local/bin/mmw-agent and /usr/local/bin/arcway-expiry-guard"
+echo "Binaries installed to /usr/local/bin/relaydock-agent and /usr/local/bin/arcway-expiry-guard"
 
 # Step 6: 启用并启动 service
 echo ""
 echo "[6/7] Starting service..."
 if [ "$HAS_SYSTEMD" = "1" ]; then
-    systemctl enable mmw-agent
-    systemctl start mmw-agent
+    systemctl enable relaydock-agent
+    systemctl start relaydock-agent
     systemctl enable arcway-expiry-guard
     systemctl start arcway-expiry-guard
 elif [ "$HAS_OPENRC" = "1" ]; then
-	rc-update add mmw-agent default
-	rc-update show default 2>/dev/null | awk '$1 == "mmw-agent" { found=1 } END { exit !found }' || {
-		echo "ERROR: mmw-agent was not registered in the OpenRC default runlevel" >&2
+	rc-update add relaydock-agent default
+	rc-update show default 2>/dev/null | awk '$1 == "relaydock-agent" { found=1 } END { exit !found }' || {
+		echo "ERROR: relaydock-agent was not registered in the OpenRC default runlevel" >&2
 		exit 1
 	}
-	rc-service mmw-agent start 9>&-
+	rc-service relaydock-agent start 9>&-
 	rc-update add arcway-expiry-guard default
 	rc-update show default 2>/dev/null | awk '$1 == "arcway-expiry-guard" { found=1 } END { exit !found }' || {
 		echo "ERROR: arcway-expiry-guard was not registered in the OpenRC default runlevel" >&2
@@ -2868,7 +2865,7 @@ elif [ "$HAS_OPENRC" = "1" ]; then
 	}
 	rc-service arcway-expiry-guard start 9>&-
 else
-    nohup /usr/local/bin/mmw-agent-supervisor.sh 9>&- >/dev/null 2>&1 &
+    nohup /usr/local/bin/relaydock-agent-supervisor.sh 9>&- >/dev/null 2>&1 &
     nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh 9>&- >/dev/null 2>&1 &
     echo "Started via nohup (PID=$!); 安装重启后通过 /etc/rc.local 自启动"
 fi
@@ -2882,13 +2879,13 @@ echo "[7/7] Verifying installation..."
 
 echo "Service status:"
 if [ "$HAS_SYSTEMD" = "1" ]; then
-    systemctl status mmw-agent --no-pager -l 2>/dev/null | head -15 || echo "Service started"
+    systemctl status relaydock-agent --no-pager -l 2>/dev/null | head -15 || echo "Service started"
     systemctl status arcway-expiry-guard --no-pager -l 2>/dev/null | head -15 || echo "Guard service started"
 elif [ "$HAS_OPENRC" = "1" ]; then
-    rc-service mmw-agent status 2>/dev/null || echo "Service started"
+    rc-service relaydock-agent status 2>/dev/null || echo "Service started"
     rc-service arcway-expiry-guard status 2>/dev/null || echo "Guard service started"
 else
-    pgrep -af /usr/local/bin/mmw-agent | head -5 || echo "Process not found in pgrep, check /var/log/mmw-agent.log"
+    pgrep -af /usr/local/bin/relaydock-agent | head -5 || echo "Process not found in pgrep, check /var/log/relaydock-agent.log"
     pgrep -af /usr/local/bin/arcway-expiry-guard | head -5 || echo "Guard process not found"
 fi
 guard_healthy=0
@@ -3062,17 +3059,17 @@ stop_install_renewal
 echo ""
 echo "To check status:"
 if [ "$HAS_SYSTEMD" = "1" ]; then
-    echo "  systemctl status mmw-agent"
+    echo "  systemctl status relaydock-agent"
     echo "  systemctl status arcway-expiry-guard"
 elif [ "$HAS_OPENRC" = "1" ]; then
-    echo "  rc-service mmw-agent status"
+    echo "  rc-service relaydock-agent status"
     echo "  rc-service arcway-expiry-guard status"
 else
-    echo "  tail -f /var/log/mmw-agent.log  # 或: pgrep -af mmw-agent"
+    echo "  tail -f /var/log/relaydock-agent.log  # 或: pgrep -af relaydock-agent"
 fi
 echo ""
 echo "To view logs:"
-echo "  journalctl -u mmw-agent -f"
+echo "  journalctl -u relaydock-agent -f"
 echo ""
 
 echo ""

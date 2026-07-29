@@ -26,7 +26,7 @@ type forwardingGuardReadiness struct {
 }
 
 // ForwardingGuardDeployer sends tunnel mutations only through the signed,
-// durable expiry-guard API installed beside each mmw-agent.
+// durable expiry-guard API installed beside each relaydock-agent.
 type ForwardingGuardDeployer struct {
 	managed *ManagedNodesHandler
 

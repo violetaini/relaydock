@@ -15,6 +15,7 @@ DATA_DIR="${ARCWAY_DATA_DIR:-/etc/arcway}"
 CONFIG_DIR="${ARCWAY_CONFIG_DIR:-$DATA_DIR}"
 GUARD_ASSET_DIR="${ARCWAY_GUARD_ASSET_DIR:-/usr/local/lib/arcway/guard-assets}"
 AGENT_ASSET_DIR="${ARCWAY_AGENT_ASSET_DIR:-/usr/local/lib/arcway/agent-assets}"
+SPEEDTESTER_ASSET_DIR="${ARCWAY_SPEEDTESTER_ASSET_DIR:-/usr/local/lib/arcway/speedtester-assets}"
 SYSTEMD_UNIT_DIR="${ARCWAY_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 SERVICE_FILE="$SYSTEMD_UNIT_DIR/${SERVICE_NAME}.service"
 INSTALL_LOCK_FILE="${ARCWAY_INSTALL_LOCK_FILE:-/run/arcway-install.lock}"
@@ -35,6 +36,8 @@ GUARD_PARENT_DIR=""
 OLD_GUARD_PARENT_PRESENT=false
 AGENT_PARENT_DIR=""
 OLD_AGENT_PARENT_PRESENT=false
+SPEEDTESTER_PARENT_DIR=""
+OLD_SPEEDTESTER_PARENT_PRESENT=false
 PRESERVE_TMP_DIR=false
 
 # 颜色输出
@@ -59,11 +62,14 @@ echo_error() {
 detect_existing_installation_paths() {
     [ -f "$SERVICE_FILE" ] || return 0
 
+    local requested_action=${1:-}
     local existing_exec=""
     local existing_working_dir=""
     local existing_database=""
     local existing_guard_dir=""
     local existing_agent_dir=""
+    local existing_speedtester_dir=""
+    local env_file_speedtester_dir=""
     local existing_env_file=""
 
     existing_exec=$(sed -n 's/^ExecStart=\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
@@ -71,6 +77,7 @@ detect_existing_installation_paths() {
     existing_database=$(sed -n 's/^Environment="DATABASE_PATH=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
     existing_guard_dir=$(sed -n 's/^Environment="ARCWAY_GUARD_ASSET_DIR=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
     existing_agent_dir=$(sed -n 's/^Environment="ARCWAY_AGENT_ASSET_DIR=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
+    existing_speedtester_dir=$(sed -n 's/^Environment="ARCWAY_SPEEDTESTER_ASSET_DIR=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
     existing_env_file=$(sed -n 's/^EnvironmentFile=-\{0,1\}\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
 
     if [ -n "$existing_env_file" ] && [ -f "$existing_env_file" ]; then
@@ -83,6 +90,13 @@ detect_existing_installation_paths() {
         if [ -z "$existing_agent_dir" ]; then
             existing_agent_dir=$(sed -n 's/^ARCWAY_AGENT_ASSET_DIR=\(.*\)$/\1/p' "$existing_env_file" | head -n 1)
         fi
+        env_file_speedtester_dir=$(sed -n 's/^ARCWAY_SPEEDTESTER_ASSET_DIR=\(.*\)$/\1/p' "$existing_env_file" | tail -n 1)
+        if [ -n "$env_file_speedtester_dir" ]; then
+            env_file_speedtester_dir=${env_file_speedtester_dir#\"}
+            env_file_speedtester_dir=${env_file_speedtester_dir%\"}
+            # systemd EnvironmentFile values override Environment= assignments.
+            existing_speedtester_dir="$env_file_speedtester_dir"
+        fi
     fi
 
     existing_database=${existing_database#\"}
@@ -91,6 +105,15 @@ detect_existing_installation_paths() {
     existing_guard_dir=${existing_guard_dir%\"}
     existing_agent_dir=${existing_agent_dir#\"}
     existing_agent_dir=${existing_agent_dir%\"}
+    existing_speedtester_dir=${existing_speedtester_dir#\"}
+    existing_speedtester_dir=${existing_speedtester_dir%\"}
+
+    if [ "$requested_action" = update ] && [ "${ARCWAY_SPEEDTESTER_ASSET_DIR+x}" = "x" ] \
+        && [ -n "$env_file_speedtester_dir" ] && [ "$env_file_speedtester_dir" != "$SPEEDTESTER_ASSET_DIR" ]; then
+        echo_error "EnvironmentFile 中的 ARCWAY_SPEEDTESTER_ASSET_DIR 会覆盖目标目录"
+        echo_error "请先将 $existing_env_file 中的值改为 $SPEEDTESTER_ASSET_DIR"
+        return 1
+    fi
 
     if [ "${ARCWAY_INSTALL_DIR+x}" != "x" ] && [ -n "$existing_exec" ] && [ "$(basename "$existing_exec")" = "$SERVICE_NAME" ]; then
         INSTALL_DIR=$(dirname "$existing_exec")
@@ -116,6 +139,14 @@ detect_existing_installation_paths() {
         elif [ -n "$existing_exec" ] && [ -d "$(dirname "$existing_exec")/agent-assets" ]; then
             # Pre-variable installations kept assets beside the panel binary.
             AGENT_ASSET_DIR="$(dirname "$existing_exec")/agent-assets"
+        fi
+    fi
+    if [ "${ARCWAY_SPEEDTESTER_ASSET_DIR+x}" != "x" ]; then
+        if [ -n "$existing_speedtester_dir" ]; then
+            SPEEDTESTER_ASSET_DIR="$existing_speedtester_dir"
+        elif [ -n "$existing_exec" ] && [ -d "$(dirname "$existing_exec")/speedtester-assets" ]; then
+            # Pre-variable installations may keep assets beside the panel binary.
+            SPEEDTESTER_ASSET_DIR="$(dirname "$existing_exec")/speedtester-assets"
         fi
     fi
 
@@ -289,9 +320,20 @@ download_binary() {
         fi
     done
 
-    for agent in mmw-agent-linux-amd64 mmw-agent-linux-arm64; do
+    for agent in relaydock-agent-linux-amd64 relaydock-agent-linux-arm64; do
         if ! wget -q "https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${agent}" -O "$TMP_DIR/$agent"; then
             echo_error "下载 Agent 失败: $agent"
+            exit 1
+        fi
+    done
+
+    for speedtester in \
+        relaydock-speedtester-linux-amd64 \
+        relaydock-speedtester-linux-arm64 \
+        relaydock-speedtester-windows-amd64.exe \
+        relaydock-speedtester-windows-arm64.exe; do
+        if ! wget -q "https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${speedtester}" -O "$TMP_DIR/$speedtester"; then
+            echo_error "下载 RelayDock speedtester 失败: $speedtester"
             exit 1
         fi
     done
@@ -304,8 +346,12 @@ download_binary() {
         "$BINARY_NAME" \
         arcway-expiry-guard-linux-amd64 \
         arcway-expiry-guard-linux-arm64 \
-        mmw-agent-linux-amd64 \
-        mmw-agent-linux-arm64; do
+        relaydock-agent-linux-amd64 \
+        relaydock-agent-linux-arm64 \
+        relaydock-speedtester-linux-amd64 \
+        relaydock-speedtester-linux-arm64 \
+        relaydock-speedtester-windows-amd64.exe \
+        relaydock-speedtester-windows-arm64.exe; do
         expected=$(awk -v name="$asset" '$2 == name { print $1; exit }' "$TMP_DIR/checksums.txt")
         actual=$(sha256sum "$TMP_DIR/$asset" | awk '{ print $1 }')
         if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
@@ -340,13 +386,30 @@ install_binary() {
     done
     install -d -m 0755 "$AGENT_ASSET_DIR"
     agent_index=0
-    for agent in mmw-agent-linux-amd64 mmw-agent-linux-arm64; do
+    for agent in relaydock-agent-linux-amd64 relaydock-agent-linux-arm64; do
         if ! atomic_install_file "$TMP_DIR/$agent" "$AGENT_ASSET_DIR/$agent" 0755; then
             return 1
         fi
         agent_index=$((agent_index + 1))
         if [ "$agent_index" -eq 1 ]; then
             if ! arcway_test_failpoint after_first_agent_swap; then
+                return 1
+            fi
+        fi
+    done
+    install -d -m 0755 "$SPEEDTESTER_ASSET_DIR"
+    speedtester_index=0
+    for speedtester in \
+        relaydock-speedtester-linux-amd64 \
+        relaydock-speedtester-linux-arm64 \
+        relaydock-speedtester-windows-amd64.exe \
+        relaydock-speedtester-windows-arm64.exe; do
+        if ! atomic_install_file "$TMP_DIR/$speedtester" "$SPEEDTESTER_ASSET_DIR/$speedtester" 0755; then
+            return 1
+        fi
+        speedtester_index=$((speedtester_index + 1))
+        if [ "$speedtester_index" -eq 1 ]; then
+            if ! arcway_test_failpoint after_first_speedtester_swap; then
                 return 1
             fi
         fi
@@ -417,8 +480,12 @@ begin_update_transaction() {
         "$INSTALL_DIR/${SERVICE_NAME}.bak"
         "$GUARD_ASSET_DIR/arcway-expiry-guard-linux-amd64"
         "$GUARD_ASSET_DIR/arcway-expiry-guard-linux-arm64"
-        "$AGENT_ASSET_DIR/mmw-agent-linux-amd64"
-        "$AGENT_ASSET_DIR/mmw-agent-linux-arm64"
+        "$AGENT_ASSET_DIR/relaydock-agent-linux-amd64"
+        "$AGENT_ASSET_DIR/relaydock-agent-linux-arm64"
+        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-linux-amd64"
+        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-linux-arm64"
+        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-windows-amd64.exe"
+        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-windows-arm64.exe"
         "$SERVICE_FILE"
         "$DATA_DIR/.version"
     )
@@ -429,6 +496,7 @@ begin_update_transaction() {
     track_transaction_directory "$CONFIG_DIR"
     track_transaction_directory "$GUARD_ASSET_DIR"
     track_transaction_directory "$AGENT_ASSET_DIR"
+    track_transaction_directory "$SPEEDTESTER_ASSET_DIR"
     GUARD_PARENT_DIR=$(dirname "$GUARD_ASSET_DIR")
     OLD_GUARD_PARENT_PRESENT=false
     if [ -d "$GUARD_PARENT_DIR" ]; then
@@ -438,6 +506,11 @@ begin_update_transaction() {
     OLD_AGENT_PARENT_PRESENT=false
     if [ -d "$AGENT_PARENT_DIR" ]; then
         OLD_AGENT_PARENT_PRESENT=true
+    fi
+    SPEEDTESTER_PARENT_DIR=$(dirname "$SPEEDTESTER_ASSET_DIR")
+    OLD_SPEEDTESTER_PARENT_PRESENT=false
+    if [ -d "$SPEEDTESTER_PARENT_DIR" ]; then
+        OLD_SPEEDTESTER_PARENT_PRESENT=true
     fi
 
     for tracked_path in "${UPDATE_TRACKED_PATHS[@]}"; do
@@ -510,12 +583,11 @@ resolve_database_path() {
     service_database=${service_database#\"}
     service_database=${service_database%\"}
 
-    # The application historically opens data/mmwx.db relative to WorkingDirectory.
-    # Prefer a database that actually exists over legacy, unused DATABASE_PATH values.
+    # Prefer an existing Arcway database over an unused service override.
     for candidate in \
-        "${service_working_dir:+$service_working_dir/data/mmwx.db}" \
-        "$DATA_DIR/mmwx.db" \
-        "$DATA_DIR/data/mmwx.db" \
+        "${service_working_dir:+$service_working_dir/data/arcway.db}" \
+        "$DATA_DIR/arcway.db" \
+        "$DATA_DIR/data/arcway.db" \
         "$service_database"; do
         if [ -n "$candidate" ] && database_has_state "$candidate"; then
             DATABASE_PATH=$candidate
@@ -524,11 +596,11 @@ resolve_database_path() {
     done
 
     if [ -n "$service_working_dir" ]; then
-        DATABASE_PATH="$service_working_dir/data/mmwx.db"
+        DATABASE_PATH="$service_working_dir/data/arcway.db"
     elif [ -n "$service_database" ]; then
         DATABASE_PATH=$service_database
     else
-        DATABASE_PATH="$DATA_DIR/data/mmwx.db"
+        DATABASE_PATH="$DATA_DIR/data/arcway.db"
     fi
 }
 
@@ -614,6 +686,9 @@ rollback_update_transaction() {
     fi
     if [ "$OLD_AGENT_PARENT_PRESENT" = false ] && [ -n "$AGENT_PARENT_DIR" ]; then
         rmdir "$AGENT_PARENT_DIR" >/dev/null 2>&1 || true
+    fi
+    if [ "$OLD_SPEEDTESTER_PARENT_PRESENT" = false ] && [ -n "$SPEEDTESTER_PARENT_DIR" ]; then
+        rmdir "$SPEEDTESTER_PARENT_DIR" >/dev/null 2>&1 || true
     fi
 
     if ! systemctl daemon-reload >/dev/null 2>&1; then
@@ -743,10 +818,11 @@ SyslogIdentifier=$SERVICE_NAME
 
 # 环境变量
 Environment="PORT=$PORT_INPUT"
-Environment="DATABASE_PATH=$DATA_DIR/data/mmwx.db"
+Environment="DATABASE_PATH=$DATA_DIR/data/arcway.db"
 Environment="LOG_LEVEL=info"
 Environment="ARCWAY_GUARD_ASSET_DIR=$GUARD_ASSET_DIR"
 Environment="ARCWAY_AGENT_ASSET_DIR=$AGENT_ASSET_DIR"
+Environment="ARCWAY_SPEEDTESTER_ASSET_DIR=$SPEEDTESTER_ASSET_DIR"
 Environment="ARCWAY_PANEL_IPS=$PANEL_SOURCE_IPS"
 
 # 安全选项
@@ -807,6 +883,32 @@ update_systemd_service_settings() {
         else
             sed -i "/^\[Install\]/i Environment=\"ARCWAY_AGENT_ASSET_DIR=$escaped_agent_asset_dir\"" "$staged_unit"
         fi
+    fi
+
+    speedtester_env_file=$(sed -n 's/^EnvironmentFile=-\{0,1\}\([^[:space:]]*\).*$/\1/p' "$staged_unit" | head -n 1)
+    speedtester_env_file=${speedtester_env_file#\"}
+    speedtester_env_file=${speedtester_env_file%\"}
+    env_file_speedtester_dir=""
+    if [ -n "$speedtester_env_file" ] && [ -f "$speedtester_env_file" ]; then
+        env_file_speedtester_dir=$(sed -n 's/^ARCWAY_SPEEDTESTER_ASSET_DIR=\(.*\)$/\1/p' "$speedtester_env_file" | tail -n 1)
+        env_file_speedtester_dir=${env_file_speedtester_dir#\"}
+        env_file_speedtester_dir=${env_file_speedtester_dir%\"}
+    fi
+    if [ -n "$env_file_speedtester_dir" ] && [ "$env_file_speedtester_dir" != "$SPEEDTESTER_ASSET_DIR" ]; then
+        echo_error "EnvironmentFile 中的 ARCWAY_SPEEDTESTER_ASSET_DIR 会覆盖目标目录"
+        echo_error "请先将 $speedtester_env_file 中的值改为 $SPEEDTESTER_ASSET_DIR"
+        return 1
+    fi
+
+    escaped_speedtester_asset_dir=$(printf '%s' "$SPEEDTESTER_ASSET_DIR" | sed 's/[&|\\]/\\&/g')
+    if grep -q '^Environment="ARCWAY_SPEEDTESTER_ASSET_DIR=' "$staged_unit"; then
+        sed -i "s|^Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=.*\"$|Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=$escaped_speedtester_asset_dir\"|" "$staged_unit"
+    elif grep -q '^Environment="ARCWAY_AGENT_ASSET_DIR=' "$staged_unit"; then
+        sed -i "/^Environment=\"ARCWAY_AGENT_ASSET_DIR=/a Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=$escaped_speedtester_asset_dir\"" "$staged_unit"
+    elif grep -q '^Environment="ARCWAY_GUARD_ASSET_DIR=' "$staged_unit"; then
+        sed -i "/^Environment=\"ARCWAY_GUARD_ASSET_DIR=/a Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=$escaped_speedtester_asset_dir\"" "$staged_unit"
+    else
+        sed -i "/^\[Install\]/i Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=$escaped_speedtester_asset_dir\"" "$staged_unit"
     fi
 
     if ! verify_and_commit_systemd_unit "$staged_unit"; then
@@ -1005,8 +1107,14 @@ uninstall_service() {
     rm -f "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak"
     rm -f "$INSTALL_DIR"/.arcway.arcway-stage.*
     rm -rf "$GUARD_ASSET_DIR"
-    rm -f "$AGENT_ASSET_DIR/mmw-agent-linux-amd64" "$AGENT_ASSET_DIR/mmw-agent-linux-arm64"
+    rm -f "$AGENT_ASSET_DIR/relaydock-agent-linux-amd64" "$AGENT_ASSET_DIR/relaydock-agent-linux-arm64"
     rmdir "$AGENT_ASSET_DIR" >/dev/null 2>&1 || true
+    rm -f \
+        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-linux-amd64" \
+        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-linux-arm64" \
+        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-windows-amd64.exe" \
+        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-windows-arm64.exe"
+    rmdir "$SPEEDTESTER_ASSET_DIR" >/dev/null 2>&1 || true
     echo_info "✓ 程序文件已删除"
     echo ""
 
@@ -1076,7 +1184,7 @@ reinstall_service() {
 main() {
     check_root
     acquire_install_lock
-    detect_existing_installation_paths
+    detect_existing_installation_paths "${1:-}"
 
     # 检查命令行参数
     if [ "$1" = "update" ]; then

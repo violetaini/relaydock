@@ -45,10 +45,28 @@ RUN mkdir -p /app/guard-assets \
         -o /app/guard-assets/arcway-expiry-guard-linux-arm64 \
         ./cmd/arcway-expiry-guard
 
+RUN mkdir -p /app/speedtester-assets \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+        -trimpath -ldflags="-s -w" \
+        -o /app/speedtester-assets/relaydock-speedtester-linux-amd64 \
+        ./cmd/relaydock-speedtester \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build \
+        -trimpath -ldflags="-s -w" \
+        -o /app/speedtester-assets/relaydock-speedtester-linux-arm64 \
+        ./cmd/relaydock-speedtester \
+    && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build \
+        -trimpath -ldflags="-s -w" \
+        -o /app/speedtester-assets/relaydock-speedtester-windows-amd64.exe \
+        ./cmd/relaydock-speedtester \
+    && CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build \
+        -trimpath -ldflags="-s -w" \
+        -o /app/speedtester-assets/relaydock-speedtester-windows-arm64.exe \
+        ./cmd/relaydock-speedtester
+
 # Release CI downloads the two pinned Agent builds into the Docker context.
-RUN test -s /app/agent-assets/mmw-agent-linux-amd64 \
-    && test -s /app/agent-assets/mmw-agent-linux-arm64 \
-    && chmod 0755 /app/agent-assets/mmw-agent-linux-amd64 /app/agent-assets/mmw-agent-linux-arm64
+RUN test -s /app/agent-assets/relaydock-agent-linux-amd64 \
+    && test -s /app/agent-assets/relaydock-agent-linux-arm64 \
+    && chmod 0755 /app/agent-assets/relaydock-agent-linux-amd64 /app/agent-assets/relaydock-agent-linux-arm64
 
 # Final stage - 用 nginx 官方 Docker base(mainline-bookworm),跟 install-nginx.sh 同款"最新 nginx mainline"语义。
 # 该镜像默认编译 --with-http_v3_module 且静态链 QuicTLS,完整支持 listen ... quic;
@@ -88,6 +106,7 @@ RUN groupadd -g 1000 appuser && \
 COPY --from=backend-builder /app/server /app/server
 COPY --from=backend-builder /app/guard-assets /app/guard-assets
 COPY --from=backend-builder /app/agent-assets /app/agent-assets
+COPY --from=backend-builder /app/speedtester-assets /app/speedtester-assets
 
 # Copy rule templates directory
 COPY --from=backend-builder /app/rule_templates /app/rule_templates
@@ -97,7 +116,7 @@ COPY docker-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Set proper ownership for app files
-RUN chown -R appuser:appuser /app/server /app/guard-assets /app/agent-assets /app/rule_templates
+RUN chown -R appuser:appuser /app/server /app/guard-assets /app/agent-assets /app/speedtester-assets /app/rule_templates
 
 # Volume for persistent data
 VOLUME ["/app/data", "/app/subscribes"]
@@ -110,6 +129,7 @@ VOLUME ["/app/data", "/app/subscribes"]
 ENV BIND_HOST=0.0.0.0
 ENV ARCWAY_GUARD_ASSET_DIR=/app/guard-assets
 ENV ARCWAY_AGENT_ASSET_DIR=/app/agent-assets
+ENV ARCWAY_SPEEDTESTER_ASSET_DIR=/app/speedtester-assets
 
 # Expose port
 EXPOSE 12889

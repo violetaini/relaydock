@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/storage"
 
 	"gopkg.in/yaml.v3"

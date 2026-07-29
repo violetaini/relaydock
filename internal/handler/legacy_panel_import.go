@@ -1,7 +1,7 @@
 package handler
 
-// 旧版面板(mmw)到 RelayDock 迁移工具的后端实现。
-// 当前只实现"自动拉取备份"接口,其余 (import-mmw / claim-*) 后续在引导页评审通过后逐步补。
+// 旧版面板(legacyPanel)到 RelayDock 迁移工具的后端实现。
+// 当前只实现"自动拉取备份"接口,其余 (import-legacyPanel / claim-*) 后续在引导页评审通过后逐步补。
 
 import (
 	"archive/zip"
@@ -29,8 +29,8 @@ import (
 )
 
 const (
-	migrateWorkDir      = "/tmp/mmwx-migrate"
-	defaultFetchTimeout = 5 * time.Minute // mmw 备份可能几十 MB,跨网络下载留足时间
+	migrateWorkDir      = "/tmp/relaydock-migrate"
+	defaultFetchTimeout = 5 * time.Minute // legacyPanel 备份可能几十 MB,跨网络下载留足时间
 	maxBackupSizeBytes  = 500 << 20       // 500 MB,防止恶意 URL 让主控 OOM
 	maxExtractedBytes   = 1 << 30         // 1 GiB, ZIP 解压后所有有效条目的总上限
 	maxExtractedEntry   = 768 << 20       // 768 MiB, 单个 DB/订阅文件上限
@@ -50,12 +50,12 @@ type MigrateHandler struct {
 }
 
 func NewMigrateHandler(repo *storage.TrafficRepository, rm *RemoteManageHandler) *MigrateHandler {
-	return &MigrateHandler{repo: repo, rm: rm, subscribesDir: mmwxSubscribesDir}
+	return &MigrateHandler{repo: repo, rm: rm, subscribesDir: relaydockSubscribesDir}
 }
 
-// ------- POST /api/admin/migrate/fetch-mmw-backup -------
+// ------- POST /api/admin/migrate/fetch-legacyPanel-backup -------
 
-type fetchMmwBackupReq struct {
+type fetchLegacyPanelBackupReq struct {
 	URL                   string `json:"url"`
 	Username              string `json:"username"`
 	Password              string `json:"password"`
@@ -63,7 +63,7 @@ type fetchMmwBackupReq struct {
 	AllowInsecureLoopback bool   `json:"allow_insecure_loopback"`
 }
 
-type fetchMmwBackupResp struct {
+type fetchLegacyPanelBackupResp struct {
 	Success        bool   `json:"success"`
 	MigrationID    string `json:"migration_id"`
 	BackupPath     string `json:"backup_path,omitempty"`    // 旧前端兼容字段;新响应不再暴露服务端路径
@@ -74,12 +74,12 @@ type fetchMmwBackupResp struct {
 	DBSizeBytes    int64  `json:"db_size_bytes"`
 }
 
-func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) {
+func (h *MigrateHandler) FetchLegacyBackup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "only POST")
 		return
 	}
-	var req fetchMmwBackupReq
+	var req fetchLegacyPanelBackupReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -89,7 +89,7 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusBadRequest, "url, username, password 必填")
 		return
 	}
-	sourceURL, err := validateMmwSourceURL(req.URL, req.AllowInsecureLoopback)
+	sourceURL, err := validateLegacyPanelSourceURL(req.URL, req.AllowInsecureLoopback)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -106,10 +106,10 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 	}
 	cleanupExpiredMigrationSessions(time.Now())
 	// 不在 client 上设 Timeout — 完全靠 ctx 控制,避免和 ctx 重复
-	client := newMmwHTTPClient(sourceURL)
+	client := newLegacyPanelHTTPClient(sourceURL)
 
-	// 1. 登录 mmw 拿 token
-	token, err := mmwLogin(ctx, client, req.URL, req.Username, req.Password, req.TOTP)
+	// 1. 登录 legacyPanel 拿 token
+	token, err := legacyPanelLogin(ctx, client, req.URL, req.Username, req.Password, req.TOTP)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("登录旧版面板失败: %v", err))
 		return
@@ -129,9 +129,9 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 	}()
 	zipPath := filepath.Join(migrateWorkDir, id+".zip")
 
-	// 3. 调 mmw 备份下载接口
+	// 3. 调 legacyPanel 备份下载接口
 	dlReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, req.URL+"/api/admin/backup/download", nil)
-	dlReq.Header.Set("MM-Authorization", token)
+	dlReq.Header.Set("Authorization", "Bearer "+token)
 	dlResp, err := client.Do(dlReq)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("下载备份失败: %v", err))
@@ -167,16 +167,16 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 	// 4. 解压 zip 中的 *.db 文件 + subscribes/ 目录到独立路径(后续 import 直接用)
 	dbPath := filepath.Join(migrateWorkDir, id+".db")
 	subsDir := filepath.Join(migrateWorkDir, id+"-subs")
-	dbSize, subCount, err := extractMmwBackup(zipPath, dbPath, subsDir)
+	dbSize, subCount, err := extractLegacyPanelBackup(zipPath, dbPath, subsDir)
 	if err != nil {
 		_ = removeMigrationSession(id)
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("解压备份失败: %v", err))
 		return
 	}
 
-	log.Printf("[Migrate] fetched mmw backup from %s: zip=%d bytes db=%d bytes subs=%d files", req.URL, n, dbSize, subCount)
+	log.Printf("[Migrate] fetched legacyPanel backup from %s: zip=%d bytes db=%d bytes subs=%d files", req.URL, n, dbSize, subCount)
 
-	respondJSON(w, http.StatusOK, fetchMmwBackupResp{
+	respondJSON(w, http.StatusOK, fetchLegacyPanelBackupResp{
 		Success:        true,
 		MigrationID:    id,
 		SubscribeCount: subCount,
@@ -186,13 +186,13 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 	keepSession = true
 }
 
-// ------- POST /api/admin/migrate/upload-mmw-backup -------
+// ------- POST /api/admin/migrate/upload-legacyPanel-backup -------
 // 用户上传旧版面板后台备份 zip(同 fetch 接口拿到的格式)。
-type uploadMmwBackupResp = fetchMmwBackupResp
+type uploadLegacyPanelBackupResp = fetchLegacyPanelBackupResp
 
 const maxUploadBytes = 500 << 20
 
-func (h *MigrateHandler) UploadMmwBackup(w http.ResponseWriter, r *http.Request) {
+func (h *MigrateHandler) UploadLegacyBackup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "only POST")
 		return
@@ -241,16 +241,16 @@ func (h *MigrateHandler) UploadMmwBackup(w http.ResponseWriter, r *http.Request)
 
 	dbPath := filepath.Join(migrateWorkDir, id+".db")
 	subsDir := filepath.Join(migrateWorkDir, id+"-subs")
-	dbSize, subCount, err := extractMmwBackup(zipPath, dbPath, subsDir)
+	dbSize, subCount, err := extractLegacyPanelBackup(zipPath, dbPath, subsDir)
 	if err != nil {
 		_ = removeMigrationSession(id)
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("解压备份失败: %v", err))
 		return
 	}
 
-	log.Printf("[Migrate] uploaded mmw backup: zip=%d bytes db=%d bytes subs=%d files", n, dbSize, subCount)
+	log.Printf("[Migrate] uploaded legacyPanel backup: zip=%d bytes db=%d bytes subs=%d files", n, dbSize, subCount)
 
-	respondJSON(w, http.StatusOK, uploadMmwBackupResp{
+	respondJSON(w, http.StatusOK, uploadLegacyPanelBackupResp{
 		Success:        true,
 		MigrationID:    id,
 		SubscribeCount: subCount,
@@ -260,8 +260,8 @@ func (h *MigrateHandler) UploadMmwBackup(w http.ResponseWriter, r *http.Request)
 	keepSession = true
 }
 
-// mmwLogin 调 $baseURL/api/login,若需 2FA 再调 /api/login/2fa,最终返回 access token。
-func mmwLogin(ctx context.Context, client *http.Client, baseURL, username, password, totp string) (string, error) {
+// legacyPanelLogin 调 $baseURL/api/login,若需 2FA 再调 /api/login/2fa,最终返回 access token。
+func legacyPanelLogin(ctx context.Context, client *http.Client, baseURL, username, password, totp string) (string, error) {
 	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/login", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -282,7 +282,7 @@ func mmwLogin(ctx context.Context, client *http.Client, baseURL, username, passw
 	if needs, _ := first["requires_2fa"].(bool); needs {
 		tfToken, _ := first["two_factor_token"].(string)
 		if tfToken == "" {
-			return "", errors.New("mmw 要求 2FA 但未返回 two_factor_token")
+			return "", errors.New("legacyPanel 要求 2FA 但未返回 two_factor_token")
 		}
 		if strings.TrimSpace(totp) == "" {
 			return "", errors.New("管理员账号开启了 2FA,请填写两步验证码后重试")
@@ -319,14 +319,14 @@ func mmwLogin(ctx context.Context, client *http.Client, baseURL, username, passw
 	return tok, nil
 }
 
-// extractMmwBackup 从 zip 提取 mmw 备份的两部分:
+// extractLegacyPanelBackup 从 zip 提取 legacyPanel 备份的两部分:
 //   - data/*.db → outDBPath(取第一个找到的 db 文件)
 //   - subscribes/* → outSubsDir/ (每个文件展平,忽略原 zip 内子目录)
 //
 // 返回 (dbSize, subsFileCount, error)。
 //
 // 防御:跳过含 "..", 跳过目录条目,subscribe 文件总大小受 maxBackupSizeBytes 约束(zip 自身已被外层限速)。
-func extractMmwBackup(zipPath, outDBPath, outSubsDir string) (int64, int, error) {
+func extractLegacyPanelBackup(zipPath, outDBPath, outSubsDir string) (int64, int, error) {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return 0, 0, err
@@ -588,7 +588,7 @@ func resolveLegacyMigrationPaths(dbPath, subsDir string) (string, string, error)
 	return resolvedDB, resolvedSubs, nil
 }
 
-func resolveMigrationImportPaths(req importMmwReq) (string, string, error) {
+func resolveMigrationImportPaths(req importLegacyPanelReq) (string, string, error) {
 	if id := strings.TrimSpace(req.MigrationID); id != "" {
 		paths, err := migrationSession(id)
 		if err != nil {
@@ -615,9 +615,9 @@ func resolveMigrationImportPaths(req importMmwReq) (string, string, error) {
 	return resolveLegacyMigrationPaths(req.DBPath, req.SubscribesDir)
 }
 
-// CleanupMmwSession 删除一个迁移会话创建的 zip、db 和 subscribes 目录。
+// CleanupLegacySession 删除一个迁移会话创建的 zip、db 和 subscribes 目录。
 // 只接受不透明 migration_id，绝不接受任意文件路径。
-func (h *MigrateHandler) CleanupMmwSession(w http.ResponseWriter, r *http.Request) {
+func (h *MigrateHandler) CleanupLegacySession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "only DELETE or POST")
 		return
@@ -646,7 +646,7 @@ func (h *MigrateHandler) CleanupMmwSession(w http.ResponseWriter, r *http.Reques
 	respondJSON(w, http.StatusOK, map[string]any{"success": true, "migration_id": id, "removed": true})
 }
 
-func validateMmwSourceURL(raw string, allowInsecureLoopback bool) (*url.URL, error) {
+func validateLegacyPanelSourceURL(raw string, allowInsecureLoopback bool) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil {
 		return nil, errors.New("url 必须是不含账号密码的 http(s) 地址")
@@ -687,7 +687,7 @@ func sameURLOrigin(a, b *url.URL) bool {
 	return port(a) == port(b)
 }
 
-func newMmwHTTPClient(source *url.URL) *http.Client {
+func newLegacyPanelHTTPClient(source *url.URL) *http.Client {
 	return &http.Client{
 		CheckRedirect: func(next *http.Request, via []*http.Request) error {
 			if len(via) > 0 && !sameURLOrigin(source, next.URL) {
@@ -698,35 +698,35 @@ func newMmwHTTPClient(source *url.URL) *http.Client {
 	}
 }
 
-// ------- POST /api/admin/migrate/import-mmw -------
+// ------- POST /api/admin/migrate/import-legacyPanel -------
 
-type importMmwReq struct {
+type importLegacyPanelReq struct {
 	MigrationID   string `json:"migration_id"`
-	DBPath        string `json:"db_path"`        // mmw.db 路径
-	SubscribesDir string `json:"subscribes_dir"` // 可选:解压后的 subscribes/ 目录,内部文件会被拷到 mmwx subscribes/
+	DBPath        string `json:"db_path"`        // legacyPanel.db 路径
+	SubscribesDir string `json:"subscribes_dir"` // 可选:解压后的 subscribes/ 目录,内部文件会被拷到 relaydock subscribes/
 }
 
-type importMmwResp struct {
-	Success           bool                     `json:"success"`
-	Report            *storage.MmwImportReport `json:"report"`
-	OwnedByAdmin      string                   `json:"owned_by_admin"`     // 订阅 / 模板等被分配给哪个 admin 用户
-	SubscribesCopied  int                      `json:"subscribes_copied"`  // 拷到 mmwx subscribes/ 的文件数
-	SubscribesSkipped []string                 `json:"subscribes_skipped"` // 跳过的文件(同名已存在)
+type importLegacyPanelResp struct {
+	Success           bool                             `json:"success"`
+	Report            *storage.LegacyPanelImportReport `json:"report"`
+	OwnedByAdmin      string                           `json:"owned_by_admin"`     // 订阅 / 模板等被分配给哪个 admin 用户
+	SubscribesCopied  int                              `json:"subscribes_copied"`  // 拷到 relaydock subscribes/ 的文件数
+	SubscribesSkipped []string                         `json:"subscribes_skipped"` // 跳过的文件(同名已存在)
 }
 
-const mmwxSubscribesDir = "subscribes" // mmwx 默认订阅文件目录(相对工作目录)
+const relaydockSubscribesDir = "subscribes" // relaydock 默认订阅文件目录(相对工作目录)
 
-// ImportMmw 把 mmw 备份完整导入当前 mmwx 实例:
+// ImportLegacyPanel 把 legacyPanel 备份完整导入当前 relaydock 实例:
 //   - subscribes_dir(可选):先原子、幂等复制订阅文件，全部成功后才提交数据库
-//   - db_path:mmw.db,核心 9 张表合并到 mmwx db(INSERT OR IGNORE)
+//   - db_path:legacyPanel.db,核心 9 张表合并到 relaydock db(INSERT OR IGNORE)
 //   - 把 subscribe_files / templates 的 created_by 字段填成当前认证 admin 用户名
-//     (mmw 没有 created_by 概念，不能按源库时间或 rowid 选择管理员)
-func (h *MigrateHandler) ImportMmw(w http.ResponseWriter, r *http.Request) {
+//     (legacyPanel 没有 created_by 概念，不能按源库时间或 rowid 选择管理员)
+func (h *MigrateHandler) ImportLegacyBackup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "only POST")
 		return
 	}
-	var req importMmwReq
+	var req importLegacyPanelReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -742,7 +742,7 @@ func (h *MigrateHandler) ImportMmw(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	blocking, err := h.repo.MmwImportBlockingCounts(r.Context(), admin)
+	blocking, err := h.repo.LegacyPanelImportBlockingCounts(r.Context(), admin)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("迁移预检失败: %v", err))
 		return
@@ -775,7 +775,7 @@ func (h *MigrateHandler) ImportMmw(w http.ResponseWriter, r *http.Request) {
 		}
 		destination := h.subscribesDir
 		if strings.TrimSpace(destination) == "" {
-			destination = mmwxSubscribesDir
+			destination = relaydockSubscribesDir
 		}
 		copied, skipped, err = copySubscribesDir(r.Context(), h.repo, subsDir, destination)
 		if err != nil {
@@ -785,15 +785,15 @@ func (h *MigrateHandler) ImportMmw(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. 文件已完整就位后，再以单事务导入数据库。
-	report, err := h.repo.ImportFromMmw(r.Context(), dbPath, admin)
+	report, err := h.repo.ImportFromLegacyPanel(r.Context(), dbPath, admin)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("导入失败: %v", err))
 		return
 	}
 
-	log.Printf("[Migrate] imported mmw: db=%s users=%d user_tokens=%d nodes=%d sub_files=%d subs_copied=%d",
+	log.Printf("[Migrate] imported legacyPanel: db=%s users=%d user_tokens=%d nodes=%d sub_files=%d subs_copied=%d",
 		dbPath, report.Users, report.UserTokens, report.Nodes, report.SubscribeFiles, copied)
-	respondJSON(w, http.StatusOK, importMmwResp{
+	respondJSON(w, http.StatusOK, importLegacyPanelResp{
 		Success:           true,
 		Report:            report,
 		OwnedByAdmin:      admin,
@@ -803,7 +803,7 @@ func (h *MigrateHandler) ImportMmw(w http.ResponseWriter, r *http.Request) {
 }
 
 // copySubscribesDir 把 src 目录里所有非隐藏常规文件拷贝到 dst。
-// 同名文件已存在 → 跳过(保留 mmwx 现有的,不覆盖),并把文件名加入 skipped 列表。
+// 同名文件已存在 → 跳过(保留 relaydock 现有的,不覆盖),并把文件名加入 skipped 列表。
 // dst 目录不存在会自动建。
 func copySubscribesDir(ctx context.Context, repo *storage.TrafficRepository, src, dst string) (int, []string, error) {
 	if repo == nil {
@@ -916,7 +916,7 @@ type takeoverExternalXrayResp struct {
 //   - 让 agent 探测正在跑的外置 xray + 合并 -confdir 进单个 config.json + 重启 xray
 //
 // 用途:从旧版面板迁移过来,被旧版面板用 multi-conf 方式管理的 xray 服务器,
-// 装上 mmw-agent 后需要先把多片配置合并成单文件,mmwx 主控的 /api/child/inbounds
+// 装上 legacyPanel-agent 后需要先把多片配置合并成单文件,relaydock 主控的 /api/child/inbounds
 // 等接口才能正确读写(后续 PatchClientEmails 也才能找到 client)。
 func (h *MigrateHandler) TakeoverExternalXray(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1043,7 +1043,7 @@ type patchClientEmailsResp struct {
 //
 // 为什么需要:
 //   - 旧版面板的 xray inbound 一般只配一个 client,没设 email
-//   - mmwx 这边按 email 做流量统计 / routing 限定,缺 email 导致无法归属用户
+//   - relaydock 这边按 email 做流量统计 / routing 限定,缺 email 导致无法归属用户
 //
 // 处理逻辑(对每个 server):
 //  1. forwardToRemoteServer GET /api/child/inbounds → 拿所有 inbound 定义
@@ -1301,7 +1301,7 @@ type distinctServer struct {
 	NodeCount        int      `json:"node_count"`      // 指向该 server 的节点数
 	Ports            []int    `json:"ports"`           // 涉及到的端口集合
 	Protocols        []string `json:"protocols"`       // 涉及到的协议集合
-	ExistingServer   bool     `json:"existing_server"` // mmwx 已有同名 remote_server
+	ExistingServer   bool     `json:"existing_server"` // relaydock 已有同名 remote_server
 	ExistingServerID int64    `json:"existing_server_id,omitempty"`
 	SampleNodeName   string   `json:"sample_node_name"` // 任选一个节点名给用户做参考
 }
@@ -1312,11 +1312,11 @@ type distinctServersResp struct {
 	Note    string           `json:"note"`
 }
 
-// DistinctNodeServers 列出当前 mmwx 数据库里所有外部节点(没有 original_server / inbound_tag 关联的)
+// DistinctNodeServers 列出当前 relaydock 数据库里所有外部节点(没有 original_server / inbound_tag 关联的)
 // 的去重 server 地址,用于"待添加为远程服务器"清单。
 //
-// mmw 没有"远程服务器 / xray inbound"概念,节点只是 clash 配置;迁移到 mmwx 后这些节点是
-// "外部节点",必须先把每个去重 server 加为 mmwx 远程服务器并装 agent,扫描其 inbound 与节点
+// legacyPanel 没有"远程服务器 / xray inbound"概念,节点只是 clash 配置;迁移到 relaydock 后这些节点是
+// "外部节点",必须先把每个去重 server 加为 relaydock 远程服务器并装 agent,扫描其 inbound 与节点
 // 凭据匹配后才能升级为"受管节点"。
 func (h *MigrateHandler) DistinctNodeServers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -1343,6 +1343,6 @@ func (h *MigrateHandler) DistinctNodeServers(w http.ResponseWriter, r *http.Requ
 	respondJSON(w, http.StatusOK, distinctServersResp{
 		Success: true,
 		Servers: out,
-		Note:    "对每个未关联的 server 地址,需要在「服务管理」创建对应的远程服务器并安装 mmw-agent;agent 接入后会自动扫描 inbound,主控按凭据匹配把节点从'外部'升级为'受管'。",
+		Note:    "对每个未关联的 server 地址,需要在「服务管理」创建对应的远程服务器并安装 legacyPanel-agent;agent 接入后会自动扫描 inbound,主控按凭据匹配把节点从'外部'升级为'受管'。",
 	})
 }

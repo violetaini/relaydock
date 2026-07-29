@@ -28,7 +28,7 @@ import (
 //	POST   /api/admin/tgbot/invites                创建
 //	POST   /api/admin/tgbot/invites/revoke         撤销
 //
-// 独立 mmwX-tgbot 调用(用 admin token):
+// 独立 TG bot 调用(用 admin token):
 //
 //	POST   /api/admin/tgbot/bind                   一次性入口:kind=new 创建+绑+消费,kind=bind 绑已有+消费
 //	POST   /api/admin/tgbot/unbind                 反查 username 后解绑

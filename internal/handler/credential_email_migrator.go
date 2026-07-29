@@ -67,7 +67,7 @@ func (m *CredentialEmailMigrator) runOnce(ctx context.Context) {
 	}
 
 	// 兜底:只迁移**老 generateCredential 生成**的 email(== user.Email 或 user.Username)。
-	// 任何其他 email(wtt / hkbn25 / iluobei-XXX 这种 admin 手工添加的语义化 email)都保留不动 —
+	// 任何其他由管理员手工添加的语义化 email 都保留不动 —
 	// 它们往往跟 xray routing rule user[] 配套(改 email 会让 routed 出站规则全失效)。
 	// 先一次性拉所有用户的 (username, email),省去每行查表的开销。
 	userEmailByName := map[string]string{}
@@ -141,7 +141,7 @@ const (
 //	email := user.Email; if email == "" { email = user.Username }
 //
 // 所以**只有** email 等于该用户的注册邮箱或用户名时,才认为是 generateCredential 老逻辑产物。
-// 其他值 — 比如 `wtt` / `hkbn25` / `iluobei-XXX` 这种语义化 email —
+// 其他语义化 email —
 // 是 admin 手工添加的 routed 入口 client,跟 xray routing rule `user[]` 数组精确对应。
 // 改这种 email 会让 routed 出站规则全失效(实际事故:2026-06-01 jimlee 8 个 routed 入口被误迁)。
 func classifyCredentialEmail(c storage.UserInboundConfig, userEmailByName map[string]string) credEmailVerdict {

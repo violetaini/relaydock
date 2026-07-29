@@ -21,7 +21,7 @@ var embeddedFiles embed.FS
 
 // themePlaceholder is replaced when index.html is served so the first paint
 // uses the configured default theme before React starts.
-const themePlaceholder = "__MMW_DEFAULT_THEME__"
+const themePlaceholder = "__RELAYDOCK_DEFAULT_THEME__"
 
 type webSource struct {
 	files      fs.FS
