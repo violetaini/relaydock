@@ -112,7 +112,7 @@ func main() {
 	// 初始化logger
 	logger.Init()
 	initTimezone()
-	logger.Info("喵喵屋服务器启动中", "version", version.Version)
+	logger.Info("RelayDock 服务器启动中", "version", version.Version)
 
 	// 启动日志清理任务（每天凌晨3点清理7天前的日志）
 	go startLogCleanup()

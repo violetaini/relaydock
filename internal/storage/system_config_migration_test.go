@@ -11,7 +11,8 @@ import (
 
 func TestSystemConfigManagementFeaturesColumnMigrationPreservesValue(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "system-config-migration.db")
-	legacyColumn := strings.Join([]string{"enable", "miao", "miao", "wu", "features"}, "_")
+	legacyBrand := strings.Join([]string{"miao", "miao", "wu"}, "")
+	legacyColumn := strings.Join([]string{"enable", legacyBrand, "features"}, "_")
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -63,7 +64,8 @@ INSERT INTO system_config (id, proxy_groups_source_url, %s) VALUES (1, '', 0);
 
 func TestSystemConfigManagementFeaturesColumnMigrationDropsSupersededColumn(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "system-config-overlap.db")
-	legacyColumn := strings.Join([]string{"enable", "miao", "miao", "wu", "features"}, "_")
+	legacyBrand := strings.Join([]string{"miao", "miao", "wu"}, "")
+	legacyColumn := strings.Join([]string{"enable", legacyBrand, "features"}, "_")
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {

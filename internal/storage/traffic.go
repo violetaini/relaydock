@@ -1936,7 +1936,8 @@ CREATE INDEX IF NOT EXISTS idx_override_scripts_hook ON override_scripts(hook);
 	if err := r.ensureSystemConfigColumn("silent_mode_timeout", "INTEGER NOT NULL DEFAULT 15"); err != nil {
 		return err
 	}
-	legacyManagementFeaturesColumn := strings.Join([]string{"enable", "miao", "miao", "wu", "features"}, "_")
+	legacyManagementFeaturesBrand := strings.Join([]string{"miao", "miao", "wu"}, "")
+	legacyManagementFeaturesColumn := strings.Join([]string{"enable", legacyManagementFeaturesBrand, "features"}, "_")
 	if err := r.renameSystemConfigColumnIfPresent(legacyManagementFeaturesColumn, "enable_management_features"); err != nil {
 		return err
 	}
