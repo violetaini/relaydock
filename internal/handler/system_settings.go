@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -357,6 +358,16 @@ const defaultRedeemTemplate = `使用教程
 如果需要自定义出站落地，需要登录 RelayDock
 {主控域名}`
 
+var legacyRedeemBrandPattern = regexp.MustCompile("(?i)(" + strings.Join([]string{
+	regexp.QuoteMeta(strings.Join([]string{"妙", "妙", "屋"}, "")) + "x?",
+	regexp.QuoteMeta(strings.Join([]string{"miao", "miao", "wu"}, "")) + "x?",
+	regexp.QuoteMeta(strings.Join([]string{"miao", "miao", "x"}, "")),
+}, "|") + ")")
+
+func normalizeRedeemTemplate(value string) string {
+	return legacyRedeemBrandPattern.ReplaceAllString(value, "RelayDock")
+}
+
 // GetRedeemTemplate 返回兑换码复制文案模板;未配置时返回内置默认模板。
 func (h *SystemSettingsHandler) GetRedeemTemplate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -372,6 +383,14 @@ func (h *SystemSettingsHandler) GetRedeemTemplate(w http.ResponseWriter, r *http
 	}
 	if value == "" {
 		value = defaultRedeemTemplate
+	} else if normalized := normalizeRedeemTemplate(value); normalized != value {
+		if err := h.repo.SetSystemSetting(r.Context(), "redeem_copy_template", normalized); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "更新兑换码文案失败"})
+			return
+		}
+		value = normalized
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "redeem_template": value})
@@ -392,6 +411,7 @@ func (h *SystemSettingsHandler) SetRedeemTemplate(w http.ResponseWriter, r *http
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "请求格式错误"})
 		return
 	}
+	req.RedeemTemplate = normalizeRedeemTemplate(req.RedeemTemplate)
 	if err := h.repo.SetSystemSetting(r.Context(), "redeem_copy_template", req.RedeemTemplate); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
