@@ -97,6 +97,10 @@ type mihomoLatencyStartError struct {
 	configLikely bool
 }
 
+type mihomoLatencyProxySnapshot struct {
+	Proxies map[string]json.RawMessage `json:"proxies"`
+}
+
 func (e *mihomoLatencyStartError) Error() string { return e.err.Error() }
 func (e *mihomoLatencyStartError) Unwrap() error { return e.err }
 
@@ -470,9 +474,8 @@ func startMihomoLatencySession(ctx context.Context, mihomoBin string, targets []
 			// return it to API clients because those fields may contain credentials.
 			return nil, &mihomoLatencyStartError{err: errors.New("Mihomo 无法加载节点配置"), configLikely: configLikely}
 		case <-ticker.C:
-			connection, dialErr := (&net.Dialer{Timeout: 250 * time.Millisecond}).Dial("unix", socketPath)
-			if dialErr == nil {
-				_ = connection.Close()
+			ready, readyErr := mihomoLatencyTargetsReady(ctx, session.client, targets)
+			if readyErr == nil && ready {
 				return session, nil
 			}
 		case <-ctx.Done():
@@ -483,6 +486,41 @@ func startMihomoLatencySession(ctx context.Context, mihomoBin string, targets []
 			return nil, &mihomoLatencyStartError{err: errors.New("Mihomo 核心启动超时")}
 		}
 	}
+}
+
+func mihomoLatencyTargetsReady(ctx context.Context, client *http.Client, targets []preparedProtocolLatencyTarget) (bool, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://mihomo/proxies", nil)
+	if err != nil {
+		return false, err
+	}
+	request.Header.Set("Authorization", "Bearer "+protocolLatencyAPISecret)
+	response, err := client.Do(request)
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("Mihomo controller returned HTTP %d", response.StatusCode)
+	}
+	var snapshot mihomoLatencyProxySnapshot
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 4<<20))
+	if err := decoder.Decode(&snapshot); err != nil || snapshot.Proxies == nil {
+		return false, errors.New("Mihomo controller returned an invalid proxy snapshot")
+	}
+	for _, target := range targets {
+		for _, proxy := range target.proxies {
+			name, ok := proxy["name"].(string)
+			if !ok || strings.TrimSpace(name) == "" {
+				return false, errors.New("Mihomo probe proxy is missing its runtime name")
+			}
+			if _, exists := snapshot.Proxies[name]; !exists {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
 }
 
 func cleanupAbandonedMihomoLatencyWorkdirs(parent string) {

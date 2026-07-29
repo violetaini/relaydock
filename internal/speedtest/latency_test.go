@@ -371,10 +371,17 @@ func TestStartMihomoLatencySessionWritesIsolatedMinimalConfig(t *testing.T) {
 		},
 	}
 
+	startedAt := time.Now()
 	session, err := startMihomoLatencySession(context.Background(), helper, targets)
 	if err != nil {
 		diagnostics, _ := os.ReadFile(helperErrors)
 		t.Fatalf("startMihomoLatencySession() error = %v; helper diagnostics = %s", err, diagnostics)
+	}
+	if elapsed := time.Since(startedAt); elapsed < 100*time.Millisecond {
+		t.Fatalf("startMihomoLatencySession() returned after %v, before proxies were registered", elapsed)
+	}
+	if _, err := os.Stat(helperErrors + ".controller-requested"); err != nil {
+		t.Fatalf("startMihomoLatencySession() did not query controller readiness: %v", err)
 	}
 	stopped := false
 	defer func() {
@@ -439,6 +446,45 @@ func TestStartMihomoLatencySessionWritesIsolatedMinimalConfig(t *testing.T) {
 	}
 }
 
+func TestMihomoLatencyTargetsReadyRequiresDialerDependencies(t *testing.T) {
+	targets := []preparedProtocolLatencyTarget{
+		{
+			name: "arcway-probe-1",
+			proxies: []map[string]interface{}{
+				{"name": "arcway-probe-1"},
+				{"name": "arcway-probe-1-hop-1"},
+			},
+		},
+	}
+	snapshot := `{"proxies":{"arcway-probe-1":{}}}`
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/proxies" {
+			t.Fatalf("readiness request path = %q, want /proxies", request.URL.Path)
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer "+protocolLatencyAPISecret {
+			t.Fatalf("readiness Authorization = %q", got)
+		}
+		return latencyResponse(http.StatusOK, snapshot), nil
+	})}
+
+	ready, err := mihomoLatencyTargetsReady(context.Background(), client, targets)
+	if err != nil {
+		t.Fatalf("mihomoLatencyTargetsReady() error = %v", err)
+	}
+	if ready {
+		t.Fatal("mihomoLatencyTargetsReady() = true while dialer dependency is absent")
+	}
+
+	snapshot = `{"proxies":{"arcway-probe-1":{},"arcway-probe-1-hop-1":{}}}`
+	ready, err = mihomoLatencyTargetsReady(context.Background(), client, targets)
+	if err != nil {
+		t.Fatalf("mihomoLatencyTargetsReady() with all proxies error = %v", err)
+	}
+	if !ready {
+		t.Fatal("mihomoLatencyTargetsReady() = false with every configured proxy present")
+	}
+}
+
 func TestCleanupAbandonedMihomoLatencyWorkdirs(t *testing.T) {
 	parent := t.TempDir()
 	abandoned := filepath.Join(parent, "run-abandoned")
@@ -482,6 +528,9 @@ func TestMihomoLatencyHelperProcess(t *testing.T) {
 	}
 	var config struct {
 		Controller string `yaml:"external-controller-unix"`
+		Proxies    []struct {
+			Name string `yaml:"name"`
+		} `yaml:"proxies"`
 	}
 	if err := yaml.Unmarshal(configBytes, &config); err != nil {
 		failMihomoLatencyHelper("helper parse config: %v", err)
@@ -491,12 +540,31 @@ func TestMihomoLatencyHelperProcess(t *testing.T) {
 		failMihomoLatencyHelper("helper listen: %v", err)
 	}
 	defer listener.Close()
-	for {
-		connection, acceptErr := listener.Accept()
-		if acceptErr != nil {
+	readyAt := time.Now().Add(150 * time.Millisecond)
+	requestMarker := os.Getenv("ARCWAY_MIHOMO_LATENCY_HELPER_ERROR") + ".controller-requested"
+	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/proxies" {
+			http.NotFound(w, request)
 			return
 		}
-		_ = connection.Close()
+		if request.Header.Get("Authorization") != "Bearer "+protocolLatencyAPISecret {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if err := os.WriteFile(requestMarker, []byte("requested"), 0600); err != nil {
+			failMihomoLatencyHelper("helper write controller marker: %v", err)
+		}
+		proxies := make(map[string]interface{})
+		if !time.Now().Before(readyAt) {
+			for _, proxy := range config.Proxies {
+				proxies[proxy.Name] = map[string]interface{}{"name": proxy.Name}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"proxies": proxies})
+	})
+	if err := http.Serve(listener, handler); err != nil && !errors.Is(err, net.ErrClosed) {
+		failMihomoLatencyHelper("helper serve controller: %v", err)
 	}
 }
 
