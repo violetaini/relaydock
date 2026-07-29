@@ -21,4 +21,4 @@ ProtectSystem=full
 UMask=0077
 
 [Install]
-RequiredBy=arcway.service
+WantedBy=multi-user.target
