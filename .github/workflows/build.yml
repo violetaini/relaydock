@@ -179,12 +179,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: violetaini/relaydock-agent
-          ref: a280e0b8ceb71261ab5a97cf8613b90d3c6b6bc3
+          ref: 5bd42cdd7ea4c02ca448ea6699af349349021d3c
           path: agent-src
 
       - name: Verify pinned sources
         run: |
-          test "$(git -C agent-src rev-parse HEAD)" = "a280e0b8ceb71261ab5a97cf8613b90d3c6b6bc3"
+          test "$(git -C agent-src rev-parse HEAD)" = "5bd42cdd7ea4c02ca448ea6699af349349021d3c"
 
       - name: Setup Go
         uses: actions/setup-go@v5
