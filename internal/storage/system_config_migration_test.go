@@ -61,6 +61,57 @@ INSERT INTO system_config (id, proxy_groups_source_url, %s) VALUES (1, '', 0);
 	}
 }
 
+func TestSystemConfigManagementFeaturesColumnMigrationDropsSupersededColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "system-config-overlap.db")
+	legacyColumn := strings.Join([]string{"enable", "miao", "miao", "wu", "features"}, "_")
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open overlapping database: %v", err)
+	}
+	schema := fmt.Sprintf(`
+CREATE TABLE system_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    proxy_groups_source_url TEXT NOT NULL DEFAULT '',
+    %s INTEGER NOT NULL DEFAULT 1,
+    enable_management_features INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO system_config (id, proxy_groups_source_url, %s, enable_management_features)
+VALUES (1, '', 0, 1);
+`, legacyColumn, legacyColumn)
+	if _, err := db.Exec(schema); err != nil {
+		_ = db.Close()
+		t.Fatalf("create overlapping system_config: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close overlapping database: %v", err)
+	}
+
+	repo, err := NewTrafficRepository(path)
+	if err != nil {
+		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	cfg, err := repo.GetSystemConfig(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemConfig: %v", err)
+	}
+	if !cfg.EnableManagementFeatures {
+		t.Fatal("EnableManagementFeatures = false, want current column value preserved")
+	}
+
+	columns, err := systemConfigColumnNames(repo.db)
+	if err != nil {
+		t.Fatalf("read migrated columns: %v", err)
+	}
+	if _, ok := columns[legacyColumn]; ok {
+		t.Fatalf("superseded column %q still exists", legacyColumn)
+	}
+}
+
 func systemConfigColumnNames(db *sql.DB) (map[string]struct{}, error) {
 	rows, err := db.Query(`PRAGMA table_info(system_config)`)
 	if err != nil {

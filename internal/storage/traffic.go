@@ -3804,7 +3804,14 @@ func (r *TrafficRepository) renameSystemConfigColumnIfPresent(oldName, newName s
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("close system_config table info: %w", err)
 	}
-	if !oldExists || newExists {
+	if !oldExists {
+		return nil
+	}
+	if newExists {
+		statement := fmt.Sprintf("ALTER TABLE system_config DROP COLUMN %s", oldName)
+		if _, err := r.db.Exec(statement); err != nil {
+			return fmt.Errorf("drop superseded system_config column %s: %w", oldName, err)
+		}
 		return nil
 	}
 
