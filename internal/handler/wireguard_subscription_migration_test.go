@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func writeWireGuardMigrationFixtureFile(t *testing.T, directory, name, content string) string {

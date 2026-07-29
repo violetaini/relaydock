@@ -1,4 +1,4 @@
-module miaomiaowux
+module github.com/violetaini/relaydock
 
 go 1.26
 

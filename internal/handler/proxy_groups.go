@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/proxygroups"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/proxygroups"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // ProxyGroupsHandler 提供代理组配置的读取接口

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/securechan"
+	"github.com/violetaini/relaydock/internal/securechan"
 
 	"github.com/gorilla/websocket"
 )

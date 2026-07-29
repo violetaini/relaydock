@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"miaomiaowux/internal/dnscredentials"
+	"github.com/violetaini/relaydock/internal/dnscredentials"
 )
 
 func TestNewCloudflareProviderUsesGlobalHeadersWhenLegacyRecordContainsBothModes(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 type userSubscriptionsHandler struct {

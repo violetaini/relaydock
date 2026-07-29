@@ -1,4 +1,4 @@
-// Package mcp 在主控内提供嵌入式 MCP server(streamable-HTTP),供 OpenClaw 等 agent 运维妙妙屋X。
+// Package mcp 在主控内提供嵌入式 MCP server(streamable-HTTP),供 OpenClaw 等 agent 运维 RelayDock。
 // 设计:工具是薄封装,内部把调用转成对现有 REST mux 的 HTTP 请求(带调用方 API 令牌),
 // 复用现有 handler + 鉴权链(RequireToken/RequireAdmin),零业务逻辑复制,权限与 Web 端一致。
 package mcp

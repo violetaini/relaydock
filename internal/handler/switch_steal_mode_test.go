@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func newSwitchModeTestHandler(t *testing.T) (*RemoteManageHandler, *storage.TrafficRepository, *storage.RemoteServer, *atomic.Int64) {

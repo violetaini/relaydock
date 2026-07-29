@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/linespeed"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/linespeed"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 const (

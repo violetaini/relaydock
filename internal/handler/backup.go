@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // backupPassphraseFromRequest 从请求头或表单取备份口令。下载用 header(不进访问日志),
@@ -69,7 +69,7 @@ func NewBackupDownloadHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 
-		filename := fmt.Sprintf("miaomiaowux-backup-%s.zip.enc", time.Now().Format("20060102-150405"))
+		filename := fmt.Sprintf("relaydock-backup-%s.zip.enc", time.Now().Format("20060102-150405"))
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 

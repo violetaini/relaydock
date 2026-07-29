@@ -11,7 +11,7 @@ import (
 // NewHandler 构建嵌入式 MCP server,返回可挂到主控 mux(/mcp)的 http.Handler。
 // mux 为主控顶层路由(工具调用经它复用现有 REST handler + 鉴权)。
 func NewHandler(mux http.Handler) http.Handler {
-	s := server.NewMCPServer("miaomiaowux", "0.1.0")
+	s := server.NewMCPServer("relaydock", "0.1.0")
 	b := &bridge{mux: mux}
 
 	registerNodeTools(s, b)

@@ -16,28 +16,28 @@ import (
 	"time"
 	_ "time/tzdata" // 嵌入时区库,LoadLocation 不依赖系统 zoneinfo(纠正缺 /etc/localtime 的机器)
 
-	appconfigs "miaomiaowux/configs"
-	"miaomiaowux/internal/agentfirewall"
-	"miaomiaowux/internal/agentlog"
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/captcha"
-	"miaomiaowux/internal/child"
-	"miaomiaowux/internal/ddns"
-	"miaomiaowux/internal/event"
-	"miaomiaowux/internal/handler"
-	"miaomiaowux/internal/logger"
-	mcpserver "miaomiaowux/internal/mcp"
-	"miaomiaowux/internal/notify"
-	"miaomiaowux/internal/patches"
-	"miaomiaowux/internal/proxygroups"
-	"miaomiaowux/internal/securechan"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/traffic"
-	"miaomiaowux/internal/version"
-	"miaomiaowux/internal/web"
-	ruletemplates "miaomiaowux/rule_templates"
-	"miaomiaowux/subscribes"
+	appconfigs "github.com/violetaini/relaydock/configs"
+	"github.com/violetaini/relaydock/internal/agentfirewall"
+	"github.com/violetaini/relaydock/internal/agentlog"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/captcha"
+	"github.com/violetaini/relaydock/internal/child"
+	"github.com/violetaini/relaydock/internal/ddns"
+	"github.com/violetaini/relaydock/internal/event"
+	"github.com/violetaini/relaydock/internal/handler"
+	"github.com/violetaini/relaydock/internal/logger"
+	mcpserver "github.com/violetaini/relaydock/internal/mcp"
+	"github.com/violetaini/relaydock/internal/notify"
+	"github.com/violetaini/relaydock/internal/patches"
+	"github.com/violetaini/relaydock/internal/proxygroups"
+	"github.com/violetaini/relaydock/internal/securechan"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/traffic"
+	"github.com/violetaini/relaydock/internal/version"
+	"github.com/violetaini/relaydock/internal/web"
+	ruletemplates "github.com/violetaini/relaydock/rule_templates"
+	"github.com/violetaini/relaydock/subscribes"
 
 	"gopkg.in/yaml.v3"
 )
@@ -641,7 +641,7 @@ func main() {
 	// 用户私有路由出站(routed_owner='user'):普通用户为自己创建/删除/查询专属出站
 	mux.Handle("/api/user/routed-outbound", auth.RequireToken(tokenStore, userRepo, handler.NewUserRoutedOutboundHandler(repo, remoteManageHandler)))
 
-	// 从妙妙屋(mmw)迁移工具
+	// 从旧版面板(mmw)迁移工具
 	migrateHandler := handler.NewMigrateHandler(repo, remoteManageHandler)
 	mux.Handle("/api/admin/migrate/fetch-mmw-backup", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.FetchMmwBackup)))
 	mux.Handle("/api/admin/migrate/upload-mmw-backup", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.UploadMmwBackup)))
@@ -1020,12 +1020,12 @@ func main() {
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
 	})))
-	mux.Handle("/api/admin/system-settings/miaomiaowu-features", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/admin/system-settings/management-features", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			systemSettingsHandler.GetMiaomiaowuFeaturesEnabled(w, r)
+			systemSettingsHandler.GetManagementFeaturesEnabled(w, r)
 		case http.MethodPut:
-			systemSettingsHandler.SetMiaomiaowuFeaturesEnabled(w, r)
+			systemSettingsHandler.SetManagementFeaturesEnabled(w, r)
 		default:
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
@@ -1105,7 +1105,7 @@ func main() {
 	mux.Handle("/api/user/custom-short-code", auth.RequireToken(tokenStore, userRepo, handler.NewUserCustomShortCodeSelfHandler(repo)))
 
 	// 临时订阅端点
-	// 中间件:RequireToken(非 admin 也能进 handler),handler 内按"妙妙屋功能 → 节点管理"开关决定是否放行。
+	// 中间件:RequireToken(非 admin 也能进 handler),handler 内按"管理功能 → 节点管理"开关决定是否放行。
 	// 路径保留 /api/admin/ 前缀以避免破坏既有前端调用;实际权限语义由 handler 控制。
 	mux.Handle("/api/admin/temp-subscription", auth.RequireToken(tokenStore, userRepo, handler.NewTempSubscriptionHandler(repo)))
 	tempSubAccessHandler := handler.NewTempSubscriptionAccessHandler()
@@ -1174,7 +1174,7 @@ func main() {
 			}
 		}
 
-		// 兼容妙妙屋短链接:旧版 mmw 直接 GET /<code>(无 /x/ 前缀)。
+		// 兼容旧版面板短链接:旧版 mmw 直接 GET /<code>(无 /x/ 前缀)。
 		// 系统设置启用后,把单段 alphanumeric 路径(看起来像短码)按 /x/<code> 试一遍,
 		// 命中即返回订阅内容。不命中**必须 fall-through 到 SPA**,因为 /nodes / /users / /packages
 		// 这些前端路由也是单段 alphanumeric,如果直接 404 会把整个前端路由废掉。
@@ -1327,7 +1327,7 @@ func main() {
 	}
 
 	go func() {
-		logger.Info("妙妙屋 HTTP 服务器启动", "version", version.Version, "address", addr)
+		logger.Info("RelayDock HTTP 服务器启动", "version", version.Version, "address", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("HTTP服务器运行失败", "error", err)
 			os.Exit(1)

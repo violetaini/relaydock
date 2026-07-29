@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // CredentialEmailMigrator 后台一次性迁移老格式 user_inbound_configs 凭据 email。

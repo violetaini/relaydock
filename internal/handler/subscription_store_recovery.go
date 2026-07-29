@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 const subscriptionStoreAuthoritativeSetting = "_subscription_file_registry_authoritative_v1"

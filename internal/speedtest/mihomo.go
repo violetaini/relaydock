@@ -382,7 +382,7 @@ func fetchRelease(ctx context.Context, tag string) (*ghRelease, error) {
 		return nil, fmt.Errorf("创建 mihomo release 请求: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "miaomiaowux-speedtest")
+	req.Header.Set("User-Agent", "relaydock-speedtest")
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("查询 mihomo release %s: %w", tag, err)

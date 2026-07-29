@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func prepareSubscriptionRecoveryTest(t *testing.T) (*storage.TrafficRepository, string) {

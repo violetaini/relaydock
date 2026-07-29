@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 
 	"gopkg.in/yaml.v3"
 )

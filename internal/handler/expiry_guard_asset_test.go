@@ -19,9 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/expiryguard"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/expiryguard"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 func newExpiryGuardAssetHandler(t *testing.T) (*XrayServerHandler, string) {
@@ -178,7 +178,7 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"/api/remote/install-finalize",
 		"CURL_AUTH_HEADER_FILE=\"$DOWNLOAD_DIR/curl-auth.header\"",
 		"printf 'Authorization: Bearer %s\\n' \"$TOKEN\"",
-		"printf 'User-Agent: %s\\n' 'miaomiaowux/0.1' >> \"$CURL_AUTH_HEADER_FILE\"",
+		"printf 'User-Agent: %s\\n' '" + version.AgentUserAgent + "' >> \"$CURL_AUTH_HEADER_FILE\"",
 		"chmod 0600 \"$CURL_AUTH_HEADER_FILE\"",
 		"start_install_renewal",
 		"assert_install_lease",

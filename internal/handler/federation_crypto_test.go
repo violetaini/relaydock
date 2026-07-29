@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"miaomiaowux/internal/securechan"
+	"github.com/violetaini/relaydock/internal/securechan"
 )
 
 // 验证令牌揭示的 ECDH:双方各自临时密钥对 + 相同分享令牌,应派生出可互通的会话。

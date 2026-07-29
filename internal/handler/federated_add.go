@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 // 消费方:接入一台"分享服务器"。探测拥有方联邦接口校验令牌,然后建一条 remote_servers 行 + federated_servers 标记。

@@ -13,13 +13,13 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/agentlog"
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/ddns"
-	"miaomiaowux/internal/securechan"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/traffic"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/agentlog"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/ddns"
+	"github.com/violetaini/relaydock/internal/securechan"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/traffic"
+	"github.com/violetaini/relaydock/internal/version"
 
 	"github.com/gorilla/websocket"
 )
@@ -561,7 +561,7 @@ func (h *RemoteWSHandler) markTokenConflict(token, winnerIP string) {
 }
 
 func (h *RemoteWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("User-Agent") != version.AgentUserAgent {
+	if !version.IsAgentUserAgent(r.Header.Get("User-Agent")) {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		log.Printf("[Remote WS] Rejected connection from %s: invalid User-Agent", r.RemoteAddr)
 		return

@@ -14,10 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/acme"
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/dnscredentials"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/acme"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/dnscredentials"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // CertificateHandler 处理证书管理 API 端点。
@@ -1173,7 +1173,7 @@ func (h *CertificateHandler) deployRemoteCertificateHTTP(ctx context.Context, se
 	hdr := http.Header{}
 	hdr.Set("Content-Type", "application/json")
 	hdr.Set("Authorization", "Bearer "+server.Token)
-	hdr.Set("User-Agent", "miaomiaowux/0.1")
+	hdr.Set("User-Agent", "relaydock/0.1")
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := tryHTTPWithFallback(ctx, client, server, http.MethodPost, "/api/child/cert/deploy", body, hdr)

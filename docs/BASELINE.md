@@ -1,6 +1,6 @@
 # Source baseline
 
-- Upstream repository: `https://github.com/violetaini/miaomiaowuX`
+- Repository: `https://github.com/violetaini/relaydock`
 - Upstream branch: `main`
 - Locked commit: `25fdc3ee457cc555940881566813e9597ab05bdd`
 - Upstream version marker: `v0.3.4`

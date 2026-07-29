@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"miaomiaowux/internal/auth"
+	"github.com/violetaini/relaydock/internal/auth"
 )
 
 func managedTLSClientOptionRequest() map[string]interface{} {

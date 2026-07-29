@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func wssInboundRequest(protocol, network string) map[string]interface{} {

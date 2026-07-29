@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/guardwire"
+	"github.com/violetaini/relaydock/internal/guardwire"
 )
 
 type fakeTunnelAgent struct {

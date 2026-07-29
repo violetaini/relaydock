@@ -2,7 +2,7 @@ package auth
 
 import (
 	"context"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // RepositoryAdapter 适配 storage.TrafficRepository 来实现 UserRepository 接口。

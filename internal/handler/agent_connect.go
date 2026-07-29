@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/child"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/child"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 // ChildAPIHandler 处理来自主服务器的 API 请求（对于pull模式）
@@ -161,7 +161,7 @@ func (h *XrayServerHandler) RemoteHeartbeat(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if r.Header.Get("User-Agent") != version.AgentUserAgent {
+	if !version.IsAgentUserAgent(r.Header.Get("User-Agent")) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(RemoteHeartbeatResponse{
@@ -369,7 +369,7 @@ func (h *XrayServerHandler) RefreshRemoteToken(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if r.Header.Get("User-Agent") != version.AgentUserAgent {
+	if !version.IsAgentUserAgent(r.Header.Get("User-Agent")) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
 		json.NewEncoder(w).Encode(RefreshRemoteTokenResponse{
@@ -658,7 +658,7 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 	listenPortParam := strconv.Itoa(listenPort)
 	// 计算 install 脚本里写入的 SERVER:
 	// 优先用系统设置 master_url 里的 host(用户配置的对外可达域名),
-	// 这是 agent 真正访问主控的地址。仅在 master_url 未配置时回退到 r.Host(可能是 nginx upstream 名,如 miaomiaowu_web,不可对外访问)。
+	// 这是 agent 真正访问主控的地址。仅在 master_url 未配置时回退到 r.Host(可能是 nginx upstream 名,不可对外访问)。
 	// 若 master_url 已显式配置,EXPLICIT_MASTER=1 在脚本里禁用"同机部署"自动覆盖
 	// (避免在主控本机上安装 agent 时把 master_url 改写成 127.0.0.1)。
 	normalizedIngress, hasExplicitMaster, normalizeErr := h.effectiveRemoteInstallMasterURL(r.Context(), r)

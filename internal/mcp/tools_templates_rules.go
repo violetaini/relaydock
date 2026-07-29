@@ -13,7 +13,7 @@ import (
 // 注意:V3 的 /process 端点会读磁盘 rule_templates/{name},不暴露;只暴露 list/preview-with-tags/analyze。
 func registerTemplateRuleTools(s *server.MCPServer, b *bridge) {
 	// —— V3 模板 ——
-	s.AddTool(readTool("template_v3_list", "列出所有 V3 订阅模板(妙妙屋X 主推的模板系统,带 selected_tags 筛选)。"),
+	s.AddTool(readTool("template_v3_list", "列出所有 V3 订阅模板(RelayDock 模板系统,带 selected_tags 筛选)。"),
 		func(ctx context.Context, _ mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 			return b.get(ctx, "/api/admin/template-v3")
 		})

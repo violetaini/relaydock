@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"miaomiaowux/templates"
+	"github.com/violetaini/relaydock/templates"
 )
 
 const nginxBridgeHelperStart = "cat > /usr/local/sbin/arcway-nginx-bridge << 'EOF'\n"

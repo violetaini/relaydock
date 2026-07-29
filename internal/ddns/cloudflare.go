@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/dnscredentials"
+	"github.com/violetaini/relaydock/internal/dnscredentials"
 )
 
 // cloudflareProvider 直接调 CF v4 HTTP API,不依赖 lego internal 包(lego 的 cloudflare client 在

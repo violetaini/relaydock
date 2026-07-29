@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"testing"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func subscriptionListResponse(t *testing.T, handler http.Handler, username string) map[string]bool {

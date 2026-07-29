@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // ProbePublicHandler 提供"伪装成探针"的公开(无鉴权)只读服务器状态。

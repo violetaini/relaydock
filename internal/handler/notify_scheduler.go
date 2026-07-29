@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/notify"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/notify"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // 服务器上下线通知去抖动 — 同一 server 同一状态短时间内频繁触发(国际线路抖动 / 心跳延迟卡阈值 /

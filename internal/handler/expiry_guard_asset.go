@@ -17,9 +17,9 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/guardwire"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/guardwire"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 const expiryGuardAssetDirEnv = "ARCWAY_GUARD_ASSET_DIR"

@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/util"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/util"
 
 	"gopkg.in/yaml.v3"
 )
@@ -144,7 +144,7 @@ func (h *TempSubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		if !allowed {
-			writeError(w, http.StatusForbidden, errors.New("无权限:请联系管理员在妙妙屋功能中开启节点管理"))
+			writeError(w, http.StatusForbidden, errors.New("无权限:请联系管理员在管理功能中开启节点管理"))
 			return
 		}
 	}

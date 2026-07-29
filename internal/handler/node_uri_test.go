@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 
 	"github.com/MMWOrg/mmwX-plugins/proxyparser"
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"

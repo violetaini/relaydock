@@ -1,6 +1,6 @@
 package handler
 
-// 妙妙屋(mmw)→ 妙妙屋X 迁移工具的后端实现。
+// 旧版面板(mmw)到 RelayDock 迁移工具的后端实现。
 // 当前只实现"自动拉取备份"接口,其余 (import-mmw / claim-*) 后续在引导页评审通过后逐步补。
 
 import (
@@ -24,8 +24,8 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 const (
@@ -111,7 +111,7 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 	// 1. 登录 mmw 拿 token
 	token, err := mmwLogin(ctx, client, req.URL, req.Username, req.Password, req.TOTP)
 	if err != nil {
-		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("登录妙妙屋失败: %v", err))
+		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("登录旧版面板失败: %v", err))
 		return
 	}
 
@@ -187,7 +187,7 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 }
 
 // ------- POST /api/admin/migrate/upload-mmw-backup -------
-// 用户上传妙妙屋后台备份 zip(同 fetch 接口拿到的格式)。
+// 用户上传旧版面板后台备份 zip(同 fetch 接口拿到的格式)。
 type uploadMmwBackupResp = fetchMmwBackupResp
 
 const maxUploadBytes = 500 << 20
@@ -205,7 +205,7 @@ func (h *MigrateHandler) UploadMmwBackup(w http.ResponseWriter, r *http.Request)
 	}
 	defer file.Close()
 	if !strings.HasSuffix(strings.ToLower(header.Filename), ".zip") {
-		writeJSONError(w, http.StatusBadRequest, "请上传妙妙屋后台导出的 zip 备份")
+		writeJSONError(w, http.StatusBadRequest, "请上传旧版面板后台导出的 zip 备份")
 		return
 	}
 
@@ -314,7 +314,7 @@ func mmwLogin(ctx context.Context, client *http.Client, baseURL, username, passw
 	}
 	tok, _ := first["token"].(string)
 	if tok == "" {
-		return "", errors.New("登录响应中缺少 token (可能不是妙妙屋实例?)")
+		return "", errors.New("登录响应中缺少 token (可能不是兼容的旧版面板实例?)")
 	}
 	return tok, nil
 }
@@ -393,7 +393,7 @@ func extractMmwBackup(zipPath, outDBPath, outSubsDir string) (int64, int, error)
 	}
 
 	if !dbFound {
-		return 0, 0, errors.New("zip 中没有 data/*.db,该归档可能不是有效的妙妙屋备份")
+		return 0, 0, errors.New("zip 中没有 data/*.db,该归档可能不是有效的旧版面板备份")
 	}
 	return dbSize, subCount, nil
 }
@@ -915,7 +915,7 @@ type takeoverExternalXrayResp struct {
 // /api/child/external-xray/takeover 接口:
 //   - 让 agent 探测正在跑的外置 xray + 合并 -confdir 进单个 config.json + 重启 xray
 //
-// 用途:从妙妙屋迁移过来,被妙妙屋用 multi-conf 方式管理的 xray 服务器,
+// 用途:从旧版面板迁移过来,被旧版面板用 multi-conf 方式管理的 xray 服务器,
 // 装上 mmw-agent 后需要先把多片配置合并成单文件,mmwx 主控的 /api/child/inbounds
 // 等接口才能正确读写(后续 PatchClientEmails 也才能找到 client)。
 func (h *MigrateHandler) TakeoverExternalXray(w http.ResponseWriter, r *http.Request) {
@@ -1042,7 +1042,7 @@ type patchClientEmailsResp struct {
 // 补 email = 系统第一个 admin 的 username。
 //
 // 为什么需要:
-//   - 妙妙屋时代 xray inbound 一般只配一个 client,没设 email
+//   - 旧版面板的 xray inbound 一般只配一个 client,没设 email
 //   - mmwx 这边按 email 做流量统计 / routing 限定,缺 email 导致无法归属用户
 //
 // 处理逻辑(对每个 server):

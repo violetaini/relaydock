@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // routingMutateLocks 是 auto-detected routed 节点更新 routing rule 时的 per-server 锁。

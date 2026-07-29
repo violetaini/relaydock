@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 
-	"miaomiaowux/internal/securechan"
+	"github.com/violetaini/relaydock/internal/securechan"
 )
 
 // 联邦(分享服务器)端到端加密:消费方↔拥有方两个主控之间没有预置身份公钥,

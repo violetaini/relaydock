@@ -10,9 +10,9 @@ import (
 	"strconv"
 	"strings"
 
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/traffic"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/traffic"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 // TrafficHandler 处理与流量相关的 API 请求
@@ -824,7 +824,7 @@ func (h *RemoteTrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if r.Header.Get("User-Agent") != version.AgentUserAgent {
+	if !version.IsAgentUserAgent(r.Header.Get("User-Agent")) {
 		h.writeJSON(w, http.StatusForbidden, map[string]interface{}{
 			"success": false,
 			"error":   "Forbidden",

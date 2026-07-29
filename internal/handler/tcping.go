@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"miaomiaowux/internal/probe"
+	"github.com/violetaini/relaydock/internal/probe"
 )
 
 // TCPingRequest 表示 TCP ping 请求

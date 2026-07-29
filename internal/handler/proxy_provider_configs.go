@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // ProxyProviderConfigsHandler 提供普通用户 / 管理员管理自己的"代理集合"(Clash proxy-provider)配置。

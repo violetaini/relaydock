@@ -10,10 +10,10 @@ import (
 	"strconv"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/speedtest"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/speedtest"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // 节点测速(Phase 1:主控本机用 mihomo 内核测单节点)。

@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"strings"
 
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/templates"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/templates"
 )
 
 func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *storage.RemoteServer) error {

@@ -8,12 +8,12 @@ import (
 	"net/http"
 	"strconv"
 
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // 服务器分享:拥有方为某台 remote_server 生成/管理分享令牌,
-// 其他妙妙屋X主控凭令牌通过 /api/federation/* 间接管理该服务器。
+// 其他 RelayDock 主控凭令牌通过 /api/federation/* 间接管理该服务器。
 
 type ServerShareHandler struct {
 	repo              *storage.TrafficRepository

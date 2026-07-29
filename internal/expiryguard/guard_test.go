@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/guardwire"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/guardwire"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 func newTestGuard(t *testing.T, agent http.Handler) (*Guard, string, *httptest.Server) {

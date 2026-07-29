@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"strings"
 
-	"miaomiaowux/internal/notify"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/notify"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 type notifyConfigResponse struct {

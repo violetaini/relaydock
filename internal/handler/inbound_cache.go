@@ -6,7 +6,7 @@ import (
 	"log"
 	"sync"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // CachedInbound 是 inbound 在内存中的最小描述,只保留 generateCredential 真正需要的字段:

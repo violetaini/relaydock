@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func newUserTrafficLimitTestRepo(t *testing.T) (*storage.TrafficRepository, storage.User, *storage.Package) {

@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func newManagedSecurityTestRepo(t *testing.T) *storage.TrafficRepository {

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/logger"
+	"github.com/violetaini/relaydock/internal/logger"
 )
 
 var ErrRateLimited = errors.New("rate limit exceeded")

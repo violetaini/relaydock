@@ -7,13 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"miaomiaowux/internal/logger"
+	"github.com/violetaini/relaydock/internal/logger"
 	"net/http"
 	"strings"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/validator"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/validator"
 
 	"gopkg.in/yaml.v3"
 )

@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"strings"
 
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // NewUserNodeLimitsHandler 处理 PUT /api/admin/users/node-limits — 设置用户级 per-node 限速 / 客户端数覆盖。

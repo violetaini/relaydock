@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func defaultTemplateTestHandler(t *testing.T) *RuleTemplatesHandler {

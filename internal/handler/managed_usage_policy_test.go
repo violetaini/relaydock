@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func TestManagedUsageSyncStopsAfterSelectionDeactivation(t *testing.T) {

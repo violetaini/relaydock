@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/storage"
 
 	"github.com/google/uuid"
 )

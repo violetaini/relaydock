@@ -3,14 +3,14 @@ package handler
 import (
 	"encoding/json"
 	"errors"
-	"miaomiaowux/internal/logger"
+	"github.com/violetaini/relaydock/internal/logger"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 type externalSubscriptionRequest struct {

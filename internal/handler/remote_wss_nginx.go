@@ -14,8 +14,8 @@ import (
 	"sync"
 	texttemplate "text/template"
 
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/templates"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/templates"
 )
 
 // WSS 入站 nginx 联动:

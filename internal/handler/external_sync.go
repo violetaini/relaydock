@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/violetaini/relaydock/internal/logger"
 	"io"
-	"miaomiaowux/internal/logger"
 	"net/http"
 	"os"
 	"regexp"
@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 
 	"gopkg.in/yaml.v3"
 )

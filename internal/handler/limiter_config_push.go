@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 type LimiterConfigPusher struct {

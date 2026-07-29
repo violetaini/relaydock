@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 type wireGuardSubscriptionFileMigration struct {

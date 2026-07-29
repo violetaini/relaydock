@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"miaomiaowux/internal/expiryguard"
+	"github.com/violetaini/relaydock/internal/expiryguard"
 )
 
 func envOr(name, fallback string) string {

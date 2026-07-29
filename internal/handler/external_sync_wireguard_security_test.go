@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func TestSyncExternalNodeUpdateToLegacyYAMLSkipsHydratedWireGuard(t *testing.T) {

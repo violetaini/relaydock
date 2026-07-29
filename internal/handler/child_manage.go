@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/acme"
-	"miaomiaowux/internal/xrpc/client"
+	"github.com/violetaini/relaydock/internal/acme"
+	"github.com/violetaini/relaydock/internal/xrpc/client"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
 	"github.com/xtls/xray-core/infra/conf"

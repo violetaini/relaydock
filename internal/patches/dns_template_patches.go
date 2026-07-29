@@ -9,7 +9,7 @@
 //
 // 迁移性:
 //
-//	本文件设计为独立包,迁移到 sibling 项目 (miaomiaowu) 只需:
+//	本文件设计为独立包,迁移到同类项目只需:
 //	  1. 复制本 .go 文件到对应位置
 //	  2. 在 main.go 启动序列里 ruletemplates.Ensure(...) 之后调一行 patches.ApplyDNSPatches(dir)
 //	不依赖项目内任何其它符号,纯 yaml.v3 + 标准库。

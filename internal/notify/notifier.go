@@ -120,5 +120,5 @@ func (n *Notifier) SendTest(ctx context.Context) error {
 	if cfg.BotToken == "" || cfg.ChatID == "" {
 		return fmt.Errorf("bot token or chat ID is empty")
 	}
-	return sendTelegram(ctx, cfg.BotToken, cfg.ChatID, "*测试通知*\n妙妙屋X 通知配置成功 ✓")
+	return sendTelegram(ctx, cfg.BotToken, cfg.ChatID, "*测试通知*\nRelayDock 通知配置成功 ✓")
 }

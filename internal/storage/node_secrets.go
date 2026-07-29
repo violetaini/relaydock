@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"miaomiaowux/internal/secretbox"
+	"github.com/violetaini/relaydock/internal/secretbox"
 )
 
 const wireGuardPrivateKeySecretKind = "wireguard-private-key-v1"

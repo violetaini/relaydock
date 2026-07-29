@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/logger"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/logger"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func NewTwoFactorLoginHandler(tokens *auth.TokenStore, repo *storage.TrafficRepository, tfStore *auth.TwoFactorPendingStore) http.Handler {
@@ -144,7 +144,7 @@ func NewTwoFactorSetupHandler(manager *auth.Manager, repo *storage.TrafficReposi
 			return
 		}
 
-		key, err := auth.GenerateTOTPKey(username, "妙妙屋X")
+		key, err := auth.GenerateTOTPKey(username, "RelayDock")
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return

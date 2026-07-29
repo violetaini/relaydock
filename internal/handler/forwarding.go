@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // ForwardingHandler owns the durable, user-authorized forwarding control plane.

@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// shared_servers: 拥有方把某台 remote_server 分享给其他妙妙屋X主控的令牌记录。
+// shared_servers: 拥有方把某台 remote_server 分享给其他 RelayDock 主控的令牌记录。
 // 分享令牌明文只在创建时返回一次,库里只存 sha256 哈希。
 
 type SharedServer struct {

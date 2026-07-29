@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/scriptengine"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/scriptengine"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 type overrideScriptRequest struct {

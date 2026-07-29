@@ -32,7 +32,7 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/securechan"
+	"github.com/violetaini/relaydock/internal/securechan"
 )
 
 // 协议常量(必须与前端 src/lib/securechan.ts 保持一致)

@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"miaomiaowux/internal/auth"
+	"github.com/violetaini/relaydock/internal/auth"
 )
 
 type changePasswordRequest struct {

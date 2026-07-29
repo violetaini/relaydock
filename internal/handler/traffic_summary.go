@@ -12,9 +12,9 @@ import (
 	"sort"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/logger"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/logger"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 const bytesPerGigabyte = 1073741824.0

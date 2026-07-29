@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/violetaini/relaydock/internal/logger"
 	"io"
 	"log"
-	"miaomiaowux/internal/logger"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 
 	"github.com/MMWOrg/mmwX-plugins/proxyparser"
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"

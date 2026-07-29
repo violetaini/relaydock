@@ -17,8 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"miaomiaowux/internal/logger"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/logger"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 const (

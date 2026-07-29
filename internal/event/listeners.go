@@ -9,7 +9,7 @@ import (
 	"net"
 	"strings"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // InboundToClashFunc 入站转 Clash 配置的函数类型

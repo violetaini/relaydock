@@ -5,7 +5,7 @@ import (
 	"os"
 	"sync"
 
-	"miaomiaowux/internal/dnscredentials"
+	"github.com/violetaini/relaydock/internal/dnscredentials"
 
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/providers/dns/alidns"

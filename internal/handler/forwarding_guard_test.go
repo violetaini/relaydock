@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/tunnelidentity"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/tunnelidentity"
 )
 
 func TestForwardingGuardCapabilitiesRequireTCPUDP(t *testing.T) {

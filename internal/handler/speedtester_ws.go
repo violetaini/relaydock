@@ -12,9 +12,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/speedtest"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/speedtest"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // 家用测速端反向 WS:测速端(部署在用户家里)主动连入主控,凭配对 token 认证;

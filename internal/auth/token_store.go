@@ -23,7 +23,7 @@ type session struct {
 type contextKey string
 
 const (
-	userContextKey contextKey = "miaomiaowux/auth/username"
+	userContextKey contextKey = "github.com/violetaini/relaydock/auth/username"
 )
 
 const AuthHeader = "MM-Authorization"

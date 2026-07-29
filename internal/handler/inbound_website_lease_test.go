@@ -19,8 +19,8 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func attachRemoteCertificateHandler(t *testing.T, repo *storage.TrafficRepository, remote *RemoteManageHandler) {

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"miaomiaowux/internal/securechan"
+	"github.com/violetaini/relaydock/internal/securechan"
 )
 
 // CryptoConfig 统一加密配置，所有 handler 共享同一个实例

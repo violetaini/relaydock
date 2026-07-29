@@ -21,12 +21,12 @@ import (
 
 	"github.com/google/uuid"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/event"
-	"miaomiaowux/internal/securechan"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/version"
-	"miaomiaowux/templates"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/event"
+	"github.com/violetaini/relaydock/internal/securechan"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/version"
+	"github.com/violetaini/relaydock/templates"
 )
 
 // RemoteManageHandler 处理需要转发到子服务器的管理请求

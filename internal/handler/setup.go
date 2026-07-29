@@ -16,9 +16,9 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"miaomiaowux/internal/logger"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/templates"
+	"github.com/violetaini/relaydock/internal/logger"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/templates"
 )
 
 type setupStatusResponse struct {

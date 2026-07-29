@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // UserRoutedOutboundHandler 处理普通用户私有路由出站(routed_owner='user')的增删查。

@@ -17,10 +17,10 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/logger"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/validator"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/logger"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/validator"
 
 	"gopkg.in/yaml.v3"
 )

@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/templates"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/templates"
 )
 
 func localPanelBackend(masterURL string) string {

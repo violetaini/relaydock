@@ -239,6 +239,6 @@ systemctl restart arcway
 
 可通过 `ARCWAY_DEPLOY_HOST`、`ARCWAY_DEPLOY_PORT`、`ARCWAY_DEPLOY_USER`、`ARCWAY_FRONTEND_DIR` 和 `ARCWAY_WEB_DEPLOY_ROOT` 设置发布脚本的默认参数。主控进程的 `ARCWAY_WEB_ROOT` 则指向版本根目录下的 `current` 软链。
 
-## 许可与致谢
+## 许可
 
-RelayDock 基于 [iluobei/miaomiaowuX](https://github.com/iluobei/miaomiaowuX) 的公开代码继续开发，感谢原作者的开源工作。原项目的 MIT 许可与版权声明保留在 [LICENSE](LICENSE) 中。
+RelayDock 采用 MIT 许可，完整许可与版权声明保留在 [LICENSE](LICENSE) 中。

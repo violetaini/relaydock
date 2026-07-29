@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 var subscriptionStoreMutex sync.Mutex

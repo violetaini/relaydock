@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/ddns"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/ddns"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // DDNSAdminHandler 暴露 DDNS 状态查询 + 手动触发 API

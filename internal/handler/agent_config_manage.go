@@ -19,10 +19,10 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/ddns"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/traffic"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/ddns"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/traffic"
 )
 
 // randReader 是用于生成安全令牌的加密读取器

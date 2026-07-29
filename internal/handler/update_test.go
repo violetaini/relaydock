@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 func TestVerifyBinaryChecksum(t *testing.T) {

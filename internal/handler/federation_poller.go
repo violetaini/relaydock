@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 // 消费方:定时从拥有方主控拉取被分享服务器的状态/流量快照,写回本地 remote_servers 行,

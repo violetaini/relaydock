@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"miaomiaowux/internal/dnscredentials"
+	"github.com/violetaini/relaydock/internal/dnscredentials"
 )
 
 func TestSetDNSCredentialEnvSelectsGlobalModeAndRestoresEnvironment(t *testing.T) {

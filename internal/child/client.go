@@ -15,10 +15,10 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/agentlog"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/traffic"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/agentlog"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/traffic"
+	"github.com/violetaini/relaydock/internal/version"
 
 	"github.com/gorilla/websocket"
 )

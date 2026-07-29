@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func findLimiterUser(t *testing.T, configs []WSLimiterConfigPayload, tag, email string) WSUserLimitInfo {

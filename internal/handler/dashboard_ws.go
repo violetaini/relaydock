@@ -14,8 +14,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // DashboardWSHub 是面向浏览器的实时数据推送 hub:主控每隔「刷新间隔」算一次快照(服务器状态/网速/流量、

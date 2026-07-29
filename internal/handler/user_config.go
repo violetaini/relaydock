@@ -9,8 +9,8 @@ import (
 	"net/url"
 	"strings"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 type userConfigRequest struct {
@@ -281,7 +281,7 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 	}
 
 	// 只更新 system_config 的这两项。必须先读全量再改,否则 UpdateSystemConfig 会把其它系统设置
-	// (短链接 / 通知 / 各间隔 / 静默模式 / 妙妙屋功能 / 默认模板 …)全部清零 —— 这正是"系统设置概率性重置"的根因。
+	// (短链接 / 通知 / 各间隔 / 静默模式 / 管理功能 / 默认模板 …)全部清零 —— 这正是"系统设置概率性重置"的根因。
 	systemConfig, err := repo.GetSystemConfig(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("get system config: %w", err))

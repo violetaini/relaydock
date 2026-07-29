@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"miaomiaowux/internal/captcha"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/captcha"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // SecuritySettingsHandler 处理 /api/admin/security-settings 的 GET/PUT。

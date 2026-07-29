@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/secretbox"
+	"github.com/violetaini/relaydock/internal/secretbox"
 
 	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
@@ -597,9 +597,9 @@ type SystemConfig struct {
 	SubscriptionOutputFormat      string // 订阅序列化格式: "yaml"(default) or "json"。仅影响 Clash 客户端输出。
 	SilentMode                    bool   // 静默模式：所有请求返回404，仅订阅接口可用
 	SilentModeTimeout             int    // 获取订阅后恢复访问的分钟数，默认15
-	EnableMiaomiaowuFeatures      bool   // 启用妙妙屋功能（模板、订阅管理等菜单）
+	EnableManagementFeatures      bool   // 启用管理功能（模板、订阅管理等菜单）
 	DefaultTemplateFilename       string // 默认模板文件名（rule_templates/目录下）
-	// 兼容妙妙屋短链接:旧版 mmw 用 /<code> 形式,新版 mmwx 用 /x/<code>。
+	// 兼容旧版面板短链接:旧版 mmw 用 /<code> 形式,新版 mmwx 用 /x/<code>。
 	// 开启后,直接 GET /<code>(无 /x/ 前缀)会尝试匹配同 code 的 /x/ 短链;命中则放行,
 	// 未命中按安全规则计入暴力枚举失败计数。
 	EnableMmwShortLinkCompat bool
@@ -1391,7 +1391,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_enabled ON nodes(enabled);
 		return err
 	}
 
-	// 多标签支持 — 老项目 miaomiaowu 同款架构:tag 是单标签兼容入口,tags 是 JSON 数组多标签。
+	// 多标签支持 — 兼容旧版架构:tag 是单标签兼容入口,tags 是 JSON 数组多标签。
 	// 启动时一次性把已有 tag 同步进 tags(幂等):tags 为空 '[]' 且 tag 非空时,把 tag 包成单元素 JSON 数组。
 	// 注意 SQL 字符串拼接里反斜杠转义:REPLACE 把 tag 内部的 " 转成 \" ,防止 JSON 解析失败。
 	if err := r.ensureNodeColumn("tags", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
@@ -1936,7 +1936,11 @@ CREATE INDEX IF NOT EXISTS idx_override_scripts_hook ON override_scripts(hook);
 	if err := r.ensureSystemConfigColumn("silent_mode_timeout", "INTEGER NOT NULL DEFAULT 15"); err != nil {
 		return err
 	}
-	if err := r.ensureSystemConfigColumn("enable_miaomiaowu_features", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+	legacyManagementFeaturesColumn := strings.Join([]string{"enable", "miao", "miao", "wu", "features"}, "_")
+	if err := r.renameSystemConfigColumnIfPresent(legacyManagementFeaturesColumn, "enable_management_features"); err != nil {
+		return err
+	}
+	if err := r.ensureSystemConfigColumn("enable_management_features", "INTEGER NOT NULL DEFAULT 1"); err != nil {
 		return err
 	}
 	if err := r.ensureSystemConfigColumn("enable_mmw_short_link_compat", "INTEGER NOT NULL DEFAULT 0"); err != nil {
@@ -3769,6 +3773,45 @@ func (r *TrafficRepository) ensureSystemConfigColumn(name, definition string) er
 		return fmt.Errorf("add column %s: %w", name, err)
 	}
 
+	return nil
+}
+
+func (r *TrafficRepository) renameSystemConfigColumnIfPresent(oldName, newName string) error {
+	rows, err := r.db.Query(`PRAGMA table_info(system_config)`)
+	if err != nil {
+		return fmt.Errorf("system_config table info: %w", err)
+	}
+	var oldExists, newExists bool
+	for rows.Next() {
+		var (
+			cid        int
+			colName    string
+			colType    string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &colName, &colType, &notNull, &defaultVal, &pk); err != nil {
+			return fmt.Errorf("scan table info: %w", err)
+		}
+		oldExists = oldExists || strings.EqualFold(colName, oldName)
+		newExists = newExists || strings.EqualFold(colName, newName)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate system_config columns: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close system_config table info: %w", err)
+	}
+	if !oldExists || newExists {
+		return nil
+	}
+
+	statement := fmt.Sprintf("ALTER TABLE system_config RENAME COLUMN %s TO %s", oldName, newName)
+	if _, err := r.db.Exec(statement); err != nil {
+		return fmt.Errorf("rename system_config column %s: %w", oldName, err)
+	}
 	return nil
 }
 
@@ -6903,7 +6946,7 @@ func (r *TrafficRepository) ListProxyProviderConfigsBySubscription(ctx context.C
 	return configs, nil
 }
 
-// ListMMWProxyProviderConfigs 返回所有妙妙屋模式的代理集合配置
+// ListMMWProxyProviderConfigs 返回所有兼容模式的代理集合配置
 // 该方法用于定时同步器获取需要自动刷新的代理集合列表
 func (r *TrafficRepository) ListMMWProxyProviderConfigs(ctx context.Context) ([]ProxyProviderConfig, error) {
 	if r == nil || r.db == nil {
@@ -7034,7 +7077,7 @@ SELECT proxy_groups_source_url, client_compatibility_mode, COALESCE(enable_short
        COALESCE(enable_override_scripts, 0),
        COALESCE(subscription_output_format, 'yaml'),
        COALESCE(silent_mode, 0), COALESCE(silent_mode_timeout, 15),
-       COALESCE(enable_miaomiaowu_features, 1), COALESCE(default_template_filename, ''),
+       COALESCE(enable_management_features, 1), COALESCE(default_template_filename, ''),
        COALESCE(enable_mmw_short_link_compat, 0),
        COALESCE(node_name_multiplier_prefix_enabled, 0),
        COALESCE(node_name_multiplier_left, '「'),
@@ -7059,7 +7102,7 @@ WHERE id = 1
 	var notifyEnabled, notifyLogin, notifySubFetch, notifyDailyTraffic int
 	var notifyServerOffline, notifyServerOnline, notifyTrafficThreshold int
 	var enableOverrideScripts, silentMode, silentModeTimeout int
-	var enableMiaomiaowuFeatures, enableMmwShortLinkCompat int
+	var enableManagementFeatures, enableMmwShortLinkCompat int
 	var nodeNameMultPrefixEnabled int
 	var notifyTH80, notifyOverLimit, notifyPkgExpiring, notifyPkgExpired int
 	var notifyUserReg, notifyTGBound, notifyCert, notifyAgentLO, notifyDeviceLimit int
@@ -7075,7 +7118,7 @@ WHERE id = 1
 		&enableOverrideScripts,
 		&cfg.SubscriptionOutputFormat,
 		&silentMode, &silentModeTimeout,
-		&enableMiaomiaowuFeatures, &cfg.DefaultTemplateFilename,
+		&enableManagementFeatures, &cfg.DefaultTemplateFilename,
 		&enableMmwShortLinkCompat,
 		&nodeNameMultPrefixEnabled, &cfg.NodeNameMultiplierLeft, &cfg.NodeNameMultiplierRight,
 		&notifyTH80, &notifyOverLimit, &notifyPkgExpiring, &cfg.NotifyPackageExpiringDays,
@@ -7084,7 +7127,7 @@ WHERE id = 1
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return SystemConfig{EnableShortLink: true, SpeedCollectInterval: 3, TrafficCollectInterval: 60, TrafficCheckInterval: 120, HeartbeatInterval: 30, NotifyDailyTrafficTime: "08:00", NotifyTrafficThresholdPercent: 80, SubscriptionOutputFormat: "yaml", SilentModeTimeout: 15, EnableMiaomiaowuFeatures: true}, nil
+			return SystemConfig{EnableShortLink: true, SpeedCollectInterval: 3, TrafficCollectInterval: 60, TrafficCheckInterval: 120, HeartbeatInterval: 30, NotifyDailyTrafficTime: "08:00", NotifyTrafficThresholdPercent: 80, SubscriptionOutputFormat: "yaml", SilentModeTimeout: 15, EnableManagementFeatures: true}, nil
 		}
 		return SystemConfig{}, fmt.Errorf("query system config: %w", err)
 	}
@@ -7108,7 +7151,7 @@ WHERE id = 1
 	if cfg.SilentModeTimeout <= 0 {
 		cfg.SilentModeTimeout = 15
 	}
-	cfg.EnableMiaomiaowuFeatures = enableMiaomiaowuFeatures != 0
+	cfg.EnableManagementFeatures = enableManagementFeatures != 0
 	cfg.EnableMmwShortLinkCompat = enableMmwShortLinkCompat != 0
 	cfg.NodeNameMultiplierPrefixEnabled = nodeNameMultPrefixEnabled != 0
 	cfg.NotifyTrafficThreshold80 = notifyTH80 != 0
@@ -7157,7 +7200,7 @@ SET proxy_groups_source_url = ?,
     subscription_output_format = ?,
     silent_mode = ?,
     silent_mode_timeout = ?,
-    enable_miaomiaowu_features = ?,
+    enable_management_features = ?,
     default_template_filename = ?,
     enable_mmw_short_link_compat = ?,
     node_name_multiplier_prefix_enabled = ?,
@@ -7239,7 +7282,7 @@ WHERE id = 1
 		boolToInt(cfg.EnableOverrideScripts),
 		subOutFmt,
 		boolToInt(cfg.SilentMode), silentModeTimeout,
-		boolToInt(cfg.EnableMiaomiaowuFeatures), cfg.DefaultTemplateFilename,
+		boolToInt(cfg.EnableManagementFeatures), cfg.DefaultTemplateFilename,
 		boolToInt(cfg.EnableMmwShortLinkCompat),
 		boolToInt(cfg.NodeNameMultiplierPrefixEnabled), nnmLeft, nnmRight,
 		boolToInt(cfg.NotifyTrafficThreshold80), boolToInt(cfg.NotifyOverLimit),
@@ -7265,7 +7308,7 @@ INSERT INTO system_config (id, proxy_groups_source_url, client_compatibility_mod
     notify_daily_traffic, notify_server_offline, notify_server_online, notify_traffic_threshold,
     notify_daily_traffic_time, notify_traffic_threshold_percent, enable_override_scripts,
     subscription_output_format,
-    silent_mode, silent_mode_timeout, enable_miaomiaowu_features, default_template_filename, enable_mmw_short_link_compat,
+    silent_mode, silent_mode_timeout, enable_management_features, default_template_filename, enable_mmw_short_link_compat,
     node_name_multiplier_prefix_enabled, node_name_multiplier_left, node_name_multiplier_right,
     notify_traffic_threshold_80, notify_over_limit, notify_package_expiring, notify_package_expiring_days,
     notify_package_expired, notify_user_registered, notify_telegram_bound, notify_cert_result,
@@ -7281,7 +7324,7 @@ VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
 			boolToInt(cfg.EnableOverrideScripts),
 			subOutFmt,
 			boolToInt(cfg.SilentMode), silentModeTimeout,
-			boolToInt(cfg.EnableMiaomiaowuFeatures), cfg.DefaultTemplateFilename,
+			boolToInt(cfg.EnableManagementFeatures), cfg.DefaultTemplateFilename,
 			boolToInt(cfg.EnableMmwShortLinkCompat),
 			boolToInt(cfg.NodeNameMultiplierPrefixEnabled), nnmLeft, nnmRight,
 			boolToInt(cfg.NotifyTrafficThreshold80), boolToInt(cfg.NotifyOverLimit),

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/templates"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/templates"
 )
 
 type realityDomainLatencyProbeRequest struct {

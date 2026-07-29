@@ -13,7 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"miaomiaowux/internal/dnscredentials"
+	"github.com/violetaini/relaydock/internal/dnscredentials"
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"

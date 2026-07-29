@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 type RuleTemplatesHandler struct {

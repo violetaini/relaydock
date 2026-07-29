@@ -12,9 +12,9 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 type userEntry struct {

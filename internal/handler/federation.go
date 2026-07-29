@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/securechan"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/securechan"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
-// 联邦(服务器分享)入口:其他妙妙屋X主控凭分享令牌,通过本主控间接管理被分享的服务器。
+// 联邦(服务器分享)入口:其他 RelayDock 主控凭分享令牌,通过本主控间接管理被分享的服务器。
 // 鉴权用分享令牌(X-Share-Token),不走 JWT。本主控始终是 agent 的唯一控制者,
 // 所有转发都经 RemoteManageHandler 走 securechan 到 agent。
 //

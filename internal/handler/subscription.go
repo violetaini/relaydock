@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"miaomiaowux/internal/logger"
+	"github.com/violetaini/relaydock/internal/logger"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/scriptengine"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/scriptengine"
+	"github.com/violetaini/relaydock/internal/storage"
 
 	"gopkg.in/yaml.v3"
 )
@@ -1270,7 +1270,7 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 				}
 			}
 
-			// 妙妙屋模式：通过节点的 Tag（外部订阅名称）找到外部订阅URL
+			// 兼容模式：通过节点的 Tag（外部订阅名称）找到外部订阅URL
 			if len(usedTags) > 0 {
 				logger.Info("[Subscription] 发现使用外部订阅的节点", "tag_count", len(usedTags))
 
@@ -1296,10 +1296,10 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 	if proxyGroups, ok := yamlContent["proxy-groups"].([]any); ok {
 		logger.Info("[Subscription] 检查 proxy-groups", "group_count", len(proxyGroups))
 		providerNames := make(map[string]bool)
-		groupNames := make(map[string]bool) // 妙妙屋模式：收集 proxy-group 的名称
+		groupNames := make(map[string]bool) // 兼容模式：收集 proxy-group 的名称
 		for _, group := range proxyGroups {
 			if groupMap, ok := group.(map[string]any); ok {
-				// 收集 proxy-group 名称（妙妙屋模式会创建同名的 proxy-group）
+				// 收集 proxy-group 名称（兼容模式会创建同名的 proxy-group）
 				if groupName, ok := groupMap["name"].(string); ok && groupName != "" {
 					groupNames[groupName] = true
 				}
@@ -2575,7 +2575,7 @@ func injectChainProxy(ctx context.Context, repo *storage.TrafficRepository, user
 	return []byte(fixed)
 }
 
-// ─── 订阅 YAML → JSON 序列化(从妙妙屋 subscription.go L2506-2679 移植,无 mmw 特化) ───
+// ─── 订阅 YAML → JSON 序列化(兼容旧版逻辑,无 mmw 特化) ───
 //
 // 用 yaml.Node 解析后手工写出 JSON,这样可以:
 //   1. 保留 proxies / proxy-groups 顶层数组的多行格式(可读性)

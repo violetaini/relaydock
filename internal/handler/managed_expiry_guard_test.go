@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/guardwire"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/guardwire"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func startManagedGuardServer(t *testing.T, handler http.Handler) (*httptest.Server, int) {

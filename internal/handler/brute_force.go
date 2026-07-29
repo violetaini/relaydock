@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/logger"
-	"miaomiaowux/internal/notify"
+	"github.com/violetaini/relaydock/internal/logger"
+	"github.com/violetaini/relaydock/internal/notify"
 )
 
 var globalBruteForceProtector *BruteForceProtector

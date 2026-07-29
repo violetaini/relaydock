@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // 每用户 API 令牌管理(供 MCP / 程序化访问)。明文仅创建时返回一次。

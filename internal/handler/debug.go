@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/logger"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/logger"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 const debugAutoCloseSeconds = 5 * 60

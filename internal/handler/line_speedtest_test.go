@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/capabilities"
-	"miaomiaowux/internal/linespeed"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/linespeed"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 type stubLineSpeedService struct {

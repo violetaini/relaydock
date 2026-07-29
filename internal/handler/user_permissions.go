@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 // 用户权限 / 配额功能(全局统一配置,存 system_settings)。

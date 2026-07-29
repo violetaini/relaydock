@@ -14,9 +14,9 @@ import (
 	"time"
 	"unicode"
 
-	"miaomiaowux/internal/agentlog"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/traffic"
+	"github.com/violetaini/relaydock/internal/agentlog"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/traffic"
 )
 
 type SystemSettingsHandler struct {
@@ -354,7 +354,7 @@ const defaultRedeemTemplate = `使用教程
 点左下角我的面板，然后输入兑换码注册
 {兑换码}
 
-如果需要自定义出站落地，需要登录妙妙屋X
+如果需要自定义出站落地，需要登录 RelayDock
 {主控域名}`
 
 // GetRedeemTemplate 返回兑换码复制文案模板;未配置时返回内置默认模板。
@@ -926,7 +926,7 @@ func (h *SystemSettingsHandler) SetRequireEncryption(w http.ResponseWriter, r *h
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "加密设置已更新"})
 }
 
-func (h *SystemSettingsHandler) GetMiaomiaowuFeaturesEnabled(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsHandler) GetManagementFeaturesEnabled(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -935,12 +935,12 @@ func (h *SystemSettingsHandler) GetMiaomiaowuFeaturesEnabled(w http.ResponseWrit
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"success": true, "enable_miaomiaowu_features": cfg.EnableMiaomiaowuFeatures})
+	json.NewEncoder(w).Encode(map[string]any{"success": true, "enable_management_features": cfg.EnableManagementFeatures})
 }
 
-func (h *SystemSettingsHandler) SetMiaomiaowuFeaturesEnabled(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsHandler) SetManagementFeaturesEnabled(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		EnableMiaomiaowuFeatures bool `json:"enable_miaomiaowu_features"`
+		EnableManagementFeatures bool `json:"enable_management_features"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -955,7 +955,7 @@ func (h *SystemSettingsHandler) SetMiaomiaowuFeaturesEnabled(w http.ResponseWrit
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "获取设置失败"})
 		return
 	}
-	cfg.EnableMiaomiaowuFeatures = req.EnableMiaomiaowuFeatures
+	cfg.EnableManagementFeatures = req.EnableManagementFeatures
 	if err := h.repo.UpdateSystemConfig(r.Context(), cfg); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -963,10 +963,10 @@ func (h *SystemSettingsHandler) SetMiaomiaowuFeaturesEnabled(w http.ResponseWrit
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "妙妙屋功能设置已更新"})
+	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "管理功能设置已更新"})
 }
 
-// 兼容妙妙屋短链接(/<code> 自动尝试匹配 /x/<code>)— 默认 false。
+// 兼容旧版面板短链接(/<code> 自动尝试匹配 /x/<code>)— 默认 false。
 // 开启后,根路径下单段 alphanumeric 路径会先尝试当作短链;命中返回订阅,未命中计入暴力枚举失败。
 func (h *SystemSettingsHandler) GetMmwShortLinkCompat(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
@@ -1005,7 +1005,7 @@ func (h *SystemSettingsHandler) SetMmwShortLinkCompat(w http.ResponseWriter, r *
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "妙妙屋短链接兼容设置已更新"})
+	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "旧版短链接兼容设置已更新"})
 }
 
 func (h *SystemSettingsHandler) GetDefaultTemplate(w http.ResponseWriter, r *http.Request) {

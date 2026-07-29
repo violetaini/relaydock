@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/guardwire"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/guardwire"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 const (

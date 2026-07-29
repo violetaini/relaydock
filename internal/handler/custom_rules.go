@@ -5,15 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"miaomiaowux/internal/logger"
+	"github.com/violetaini/relaydock/internal/logger"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 
 	"gopkg.in/yaml.v3"
 )

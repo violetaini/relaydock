@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"miaomiaowux/internal/storage"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 func TestUserExtendPreservesDisabledMonthlyReset(t *testing.T) {

@@ -5,9 +5,9 @@ import (
 	"log"
 	"net/http"
 
-	"miaomiaowux/internal/agentlog"
-	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/version"
+	"github.com/violetaini/relaydock/internal/agentlog"
+	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/version"
 )
 
 // RemoteSpeedHandler 通过 HTTP 处理来自远程服务器的速度报告
@@ -37,7 +37,7 @@ func (h *RemoteSpeedHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Header.Get("User-Agent") != version.AgentUserAgent {
+	if !version.IsAgentUserAgent(r.Header.Get("User-Agent")) {
 		h.writeJSON(w, http.StatusForbidden, map[string]interface{}{
 			"success": false,
 			"error":   "Forbidden",

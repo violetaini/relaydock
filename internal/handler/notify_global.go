@@ -1,6 +1,6 @@
 package handler
 
-import "miaomiaowux/internal/notify"
+import "github.com/violetaini/relaydock/internal/notify"
 
 var globalNotifier *notify.Notifier
 
