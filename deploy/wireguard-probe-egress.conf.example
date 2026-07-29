@@ -1,0 +1,6 @@
+# REMOTE_IPV4 REMOTE_UDP_PORT LOCAL_IPV4 RELAY_UDP_PORT
+#
+# Each line permits only replies from one WireGuard endpoint to the fixed UDP
+# port used by the local Mihomo WireGuard relay. This file does not configure
+# address translation or expose any other source, destination, or protocol.
+203.0.113.10 51820 198.51.100.20 443

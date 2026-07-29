@@ -85,11 +85,12 @@ type preparedProtocolLatencyTarget struct {
 }
 
 type mihomoLatencySession struct {
-	client   *http.Client
-	cmd      *exec.Cmd
-	done     chan error
-	workdir  string
-	stopOnce sync.Once
+	client          *http.Client
+	cmd             *exec.Cmd
+	done            chan error
+	workdir         string
+	wireGuardRelays []io.Closer
+	stopOnce        sync.Once
 }
 
 type mihomoLatencyStartError struct {
@@ -388,18 +389,30 @@ func startMihomoLatencySession(ctx context.Context, mihomoBin string, targets []
 		return nil, &mihomoLatencyStartError{err: errors.New("无法解析 Mihomo 临时目录")}
 	}
 	_ = os.Chmod(workdir, 0700)
-	cleanup := func() { _ = os.RemoveAll(workdir) }
+	var wireGuardRelays []io.Closer
+	cleanup := func() {
+		closeMihomoWireGuardRelays(wireGuardRelays)
+		_ = os.RemoveAll(workdir)
+	}
 
 	socketPath := filepath.Join(workdir, "controller.sock")
 	proxies := make([]map[string]interface{}, 0, len(targets))
 	hosts := make(map[string]string)
 	for _, target := range targets {
-		proxies = append(proxies, target.proxies...)
+		for _, proxy := range target.proxies {
+			proxies = append(proxies, cloneProtocolLatencyProxy(proxy))
+		}
 		for host, address := range target.hosts {
 			if _, exists := hosts[host]; !exists {
 				hosts[host] = address
 			}
 		}
+	}
+	wireGuardRelays, err = prepareMihomoWireGuardRelays(ctx, proxies, hosts)
+	if err != nil {
+		cleanup()
+		var configErr *wireGuardRelayConfigError
+		return nil, &mihomoLatencyStartError{err: err, configLikely: errors.As(err, &configErr)}
 	}
 	config := map[string]interface{}{
 		"allow-lan":                false,
@@ -458,6 +471,7 @@ func startMihomoLatencySession(ctx context.Context, mihomoBin string, targets []
 	}
 	session := &mihomoLatencySession{
 		client: &http.Client{Transport: transport}, cmd: cmd, done: done, workdir: workdir,
+		wireGuardRelays: wireGuardRelays,
 	}
 
 	deadline := time.NewTimer(protocolLatencyStartWait)
@@ -583,6 +597,7 @@ func (s *mihomoLatencySession) stop() {
 				<-s.done
 			}
 		}
+		closeMihomoWireGuardRelays(s.wireGuardRelays)
 		_ = os.RemoveAll(s.workdir)
 	})
 }

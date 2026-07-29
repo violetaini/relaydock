@@ -37,6 +37,11 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Verify WireGuard relay firewall assets
+        run: |
+          bash -n deploy/arcway-wireguard-probe-egress.sh scripts/wireguard_probe_egress_test.sh
+          sudo bash scripts/wireguard_probe_egress_test.sh
+
       - name: Build server
         run: go build -trimpath -o /tmp/arcway ./cmd/server
 
