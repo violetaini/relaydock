@@ -96,11 +96,12 @@ func versionGTE(a, b string) bool {
 }
 
 // mihomoSupportsSnell 检查 mihomo 版本 >= minMihomoVersion(确保支持 snell v4/v5)。
-// 版本解析不到时保守返回 true,不误伤非标准但可用的二进制。
+// 版本无法解析时拒绝使用，避免把 MIHOMO_BIN、PATH 或缓存目录中的未知程序
+// 当作受信任的 Mihomo 核心执行。
 func mihomoSupportsSnell(bin string) bool {
 	v := mihomoVersion(bin)
 	if v == "" {
-		return true
+		return false
 	}
 	return versionGTE(v, minMihomoVersion)
 }

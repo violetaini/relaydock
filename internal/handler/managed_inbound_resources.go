@@ -243,10 +243,25 @@ func (h *RemoteManageHandler) createManagedWireGuardResource(w http.ResponseWrit
 		return
 	}
 	mutationID := "managed-wireguard:" + uuid.NewString()
+	probePeer, err := newWireGuardProbePeerForInbound(request.Inbound)
+	if err != nil {
+		remoteWriteError(w, http.StatusBadRequest, "WireGuard 专用探测 Peer 生成失败: "+err.Error())
+		return
+	}
+	if err := appendWireGuardProbePeer(request.Inbound, &probePeer); err != nil {
+		remoteWriteError(w, http.StatusBadRequest, "WireGuard 专用探测 Peer 生成失败: "+err.Error())
+		return
+	}
 	displayName := strings.TrimSpace(request.DisplayName)
 	resource, err := h.upsertWireGuardManagedResource(r.Context(), serverID, displayName, auth.UsernameFromContext(r.Context()), request.Inbound, mutationID)
 	if err != nil {
 		remoteWriteError(w, http.StatusBadRequest, "WireGuard 公开元数据预存失败: "+err.Error())
+		return
+	}
+	probePeer.ResourceID = resource.ID
+	if _, err := h.repo.CreateWireGuardProbePeer(r.Context(), probePeer); err != nil {
+		_ = h.repo.DeleteManagedInboundResource(r.Context(), resource.ID)
+		remoteWriteError(w, http.StatusBadGateway, "WireGuard 专用探测凭据加密预存失败: "+err.Error())
 		return
 	}
 	displayName = resource.DisplayName
@@ -313,6 +328,15 @@ func (h *RemoteManageHandler) createManagedWireGuardResource(w http.ResponseWrit
 			return
 		}
 		remoteWriteError(w, http.StatusBadGateway, message+"；预存节点与远程入站已回滚")
+		return
+	}
+	if _, err := h.repo.MarkWireGuardProbePeerActive(r.Context(), resource.ID); err != nil {
+		rollbackErr := h.rollbackStagedManagedWireGuard(r, serverID, tag, stagedNodeID, mutationID)
+		if rollbackErr != nil {
+			remoteWriteError(w, http.StatusBadGateway, "WireGuard 入站已创建但专用探测 Peer 状态保存失败；自动回滚失败，已保留禁用节点和加密凭据: "+rollbackErr.Error())
+			return
+		}
+		remoteWriteError(w, http.StatusBadGateway, "WireGuard 入站已创建但专用探测 Peer 状态保存失败；预存节点与远程入站已回滚")
 		return
 	}
 	resource, err = h.repo.GetManagedInboundResourceByServerTag(r.Context(), serverID, tag)
@@ -535,6 +559,20 @@ func (h *RemoteManageHandler) recoverStagedManagedWireGuard(ctx context.Context,
 	}
 	if err := managedWireGuardInventoryMatchesResource(inbound, resource); err != nil {
 		return storage.Node{}, false, fmt.Errorf("Agent 上同代 WireGuard 配置与预存记录不一致: %w", err)
+	}
+	probePeer, err := h.repo.GetWireGuardProbePeer(ctx, resource.ID)
+	if err != nil {
+		return storage.Node{}, false, errors.New("预存记录缺少 WireGuard 专用探测凭据")
+	}
+	present, err := wireGuardInboundHasProbePeer(inbound, probePeer)
+	if err != nil {
+		return storage.Node{}, false, err
+	}
+	if !present {
+		return storage.Node{}, false, errors.New("Agent 上同代 WireGuard 配置缺少专用探测 Peer")
+	}
+	if _, err := h.repo.MarkWireGuardProbePeerActive(ctx, resource.ID); err != nil {
+		return storage.Node{}, false, fmt.Errorf("恢复 WireGuard 专用探测 Peer 状态: %w", err)
 	}
 	attached, err := h.repo.AttachStagedWireGuardNodeIfMutation(ctx, staged.ID, resource.MutationID, server.Name, resource.InboundTag)
 	if err != nil {

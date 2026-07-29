@@ -32,12 +32,24 @@ func registerNodeTools(s *server.MCPServer, b *bridge) {
 			return b.get(ctx, "/api/admin/tunnels")
 		})
 
-	s.AddTool(readTool("node_tcping", "TCP 连通性探测(从主控发起对目标 host:port 的 TCP 握手)。常用于诊断节点失联。",
-		mcpgo.WithString("host", mcpgo.Required(), mcpgo.Description("目标主机/IP")),
-		mcpgo.WithNumber("port", mcpgo.Required(), mcpgo.Description("目标端口")),
+	s.AddTool(readTool("node_tcping", "使用主控本机 Mihomo 测试指定节点的真实协议链路，结果包含协议建链和 HTTPS 探测往返耗时。",
+		mcpgo.WithNumber("node_id", mcpgo.Required(), mcpgo.Min(1), mcpgo.Description("节点 ID")),
+		mcpgo.WithNumber("timeout", mcpgo.Min(500), mcpgo.Max(30000), mcpgo.Description("单节点超时毫秒数，默认 5000，有效范围 500-30000")),
 	),
 		func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-			return b.send(ctx, http.MethodPost, "/api/admin/tcping", argsBody(req))
+			nodeID, err := req.RequireInt("node_id")
+			if err != nil || nodeID <= 0 {
+				return mcpgo.NewToolResultError("node_id 必须是正整数"), nil
+			}
+			body := map[string]any{"node_id": nodeID}
+			if _, provided := req.GetArguments()["timeout"]; provided {
+				timeout, timeoutErr := req.RequireInt("timeout")
+				if timeoutErr != nil || timeout < 500 || timeout > 30000 {
+					return mcpgo.NewToolResultError("timeout 必须是 500-30000 之间的整数毫秒"), nil
+				}
+				body["timeout"] = timeout
+			}
+			return b.send(ctx, http.MethodPost, "/api/admin/tcping", body)
 		})
 
 	// 写

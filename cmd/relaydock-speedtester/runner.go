@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -147,7 +148,7 @@ func RunNodeTest(ctx context.Context, mihomoBin, clashConfigJSON string, opts Op
 	// LatencyOnly:只测真连接延迟(Cloudflare 204 多采样),不跑下载
 	if opts.LatencyOnly {
 		latency := measureLatencyCloudflare(ctx, cfLatencySamples)
-		return Result{LatencyMs: latency, EgressIP: egressIP}, nil
+		return latencyOnlyResult(latency, egressIP)
 	}
 
 	latency := measureLatency(ctx)
@@ -162,6 +163,14 @@ func RunNodeTest(ctx context.Context, mihomoBin, clashConfigJSON string, opts Op
 		mbps = float64(n) * 8 / dur.Seconds() / 1e6
 	}
 	return Result{DownMbps: mbps, LatencyMs: latency, Bytes: n, Duration: dur, EgressIP: egressIP}, nil
+}
+
+func latencyOnlyResult(latency int64, egressIP string) (Result, error) {
+	result := Result{LatencyMs: latency, EgressIP: egressIP}
+	if latency < 0 {
+		return result, errors.New("Mihomo 无法通过该节点完成延迟测试")
+	}
+	return result, nil
 }
 
 // measureEgressIP 经代理请求一个 IP 回显端点,拿到出口 IP;失败返回空。
@@ -192,11 +201,12 @@ func measureEgressIP(ctx context.Context) string {
 }
 
 func startMihomo(bin, workdir string, cfg []byte) (func(), error) {
-	if err := os.MkdirAll(workdir, 0755); err != nil {
+	if err := os.MkdirAll(workdir, 0700); err != nil {
 		return nil, err
 	}
+	_ = os.Chmod(workdir, 0700)
 	cfgPath := filepath.Join(workdir, "config.yaml")
-	if err := os.WriteFile(cfgPath, cfg, 0644); err != nil {
+	if err := os.WriteFile(cfgPath, cfg, 0600); err != nil {
 		return nil, err
 	}
 	cmd := exec.Command(bin, "-d", workdir, "-f", cfgPath)

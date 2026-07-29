@@ -1524,9 +1524,11 @@ func parseMieruURL(uri string) (map[string]any, error) {
 		"name":     name,
 		"type":     "mieru",
 		"server":   server,
-		"port":     port,
 		"username": username,
 		"password": password,
+	}
+	if port > 0 {
+		node["port"] = port
 	}
 
 	if v := queryParams["transport"]; v != "" {
@@ -1550,6 +1552,7 @@ func parseMieruURL(uri string) (map[string]any, error) {
 	}
 	if v := queryParams["port-range"]; v != "" {
 		node["port-range"] = v
+		delete(node, "port")
 	}
 	if v := queryParams["traffic-pattern"]; v != "" {
 		node["traffic-pattern"] = v

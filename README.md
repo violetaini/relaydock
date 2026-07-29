@@ -245,6 +245,8 @@ RelayDock 采用 MIT 许可，完整许可与版权声明保留在 [LICENSE](LIC
 
 ## 第三方致谢
 
+RelayDock 的真实协议链路测试使用官方 [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) `v1.19.28` 独立可执行组件。Mihomo 依 [GNU GPLv3](https://github.com/MetaCubeX/mihomo/blob/Meta/LICENSE) 发布，对应版本源码与发行文件见 [v1.19.28 Release](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.28)。
+
 RelayDock 后端最初基于 [iluobei/miaomiaowuX](https://github.com/iluobei/miaomiaowuX) 的公开代码继续开发。项目基线记录于 2026-07-18，对应公开版本 `v0.3.4` 和提交 `25fdc3ee457cc555940881566813e9597ab05bdd`；感谢原作者的开源工作，其版权声明和 MIT 许可保留在仓库根目录的 [LICENSE](LICENSE) 中。
 
 `internal/proxyparser` 包含从 `github.com/MMWOrg/mmwX-plugins/proxyparser` `v0.1.3` 本地化并继续维护的代码。依照其 MIT 许可，保留原版权声明与许可全文如下：

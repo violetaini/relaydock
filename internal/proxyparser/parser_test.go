@@ -118,6 +118,19 @@ func TestParse_Issue98(t *testing.T) {
 	})
 }
 
+func TestParseMieruPortRangeOmitsMutuallyExclusivePort(t *testing.T) {
+	got, err := Parse("mieru://user:pass@mieru.example.test/?port-range=5000-5010#range")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["port-range"] != "5000-5010" {
+		t.Fatalf("port-range = %#v", got["port-range"])
+	}
+	if _, exists := got["port"]; exists {
+		t.Fatalf("Mieru port-range config retained mutually exclusive port: %#v", got)
+	}
+}
+
 // TestParse_SkipCertAliases 验证 6 种 skip-cert-verify 别名都被识别且输出真 bool。
 func TestParse_SkipCertAliases(t *testing.T) {
 	aliases := []string{"insecure", "allowInsecure", "allow_insecure", "skip-cert-verify", "skip_cert_verify", "skipCertVerify"}

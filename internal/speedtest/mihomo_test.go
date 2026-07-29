@@ -59,6 +59,19 @@ func TestPinnedMihomoAssets(t *testing.T) {
 	}
 }
 
+func TestMihomoSupportsSnellRejectsUnparseableExecutable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell")
+	}
+	path := filepath.Join(t.TempDir(), "not-mihomo")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\necho unknown-program\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if mihomoSupportsSnell(path) {
+		t.Fatal("unparseable executable was accepted as a trusted Mihomo core")
+	}
+}
+
 func TestDownloadMihomoAssetVerifiesCompressedSHA256AndVersion(t *testing.T) {
 	requireLinux(t)
 	payload := fakeMihomo("1.19.28", 0)

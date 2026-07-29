@@ -2899,6 +2899,9 @@ CREATE TABLE IF NOT EXISTS traffic_threshold_notified (
 	if err := r.migrateManagedInboundResources(); err != nil {
 		return err
 	}
+	if err := r.migrateWireGuardProbePeers(); err != nil {
+		return err
+	}
 	if err := r.migrateRemoteInboundOwnership(); err != nil {
 		return err
 	}

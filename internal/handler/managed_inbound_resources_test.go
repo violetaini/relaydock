@@ -32,6 +32,7 @@ type managedWireGuardAgent struct {
 	failRemove         bool
 	rejectRemove       bool
 	beforeAdd          func()
+	lastAddPayload     map[string]interface{}
 }
 
 func (a *managedWireGuardAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -86,6 +87,7 @@ func (a *managedWireGuardAgent) ServeHTTP(w http.ResponseWriter, r *http.Request
 				return
 			}
 			inbound, _ := request["inbound"].(map[string]interface{})
+			a.lastAddPayload = cloneManagedWireGuardInbound(request)
 			a.inbound = cloneManagedWireGuardInbound(inbound)
 			a.ownerMutationID = mutationID
 			responseMode = a.addResponseMode
@@ -189,6 +191,18 @@ func (a *managedWireGuardAgent) hasInbound() bool {
 	return a.inbound != nil
 }
 
+func (a *managedWireGuardAgent) addPayloadSnapshot() map[string]interface{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return cloneManagedWireGuardInbound(a.lastAddPayload)
+}
+
+func (a *managedWireGuardAgent) inboundSnapshot() map[string]interface{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return cloneManagedWireGuardInbound(a.inbound)
+}
+
 func cloneManagedWireGuardInbound(inbound map[string]interface{}) map[string]interface{} {
 	if inbound == nil {
 		return nil
@@ -278,7 +292,9 @@ func TestManagedWireGuardResourceCreateListRenameDelete(t *testing.T) {
 	}
 	defer inspectionDB.Close()
 	createBody := managedWireGuardCreateBody(t, "Hong Kong WireGuard")
-	clientPrivateKey := createBody["client"].(map[string]interface{})["private_key"].(string)
+	client := createBody["client"].(map[string]interface{})
+	clientPrivateKey := client["private_key"].(string)
+	clientPublicKey := client["public_key"].(string)
 	stagedResult := make(chan error, 1)
 	agent.setBeforeAdd(func() {
 		var enabled int
@@ -341,6 +357,63 @@ WHERE lower(n.protocol) = 'wireguard' AND n.node_name = 'Hong Kong WireGuard'`).
 	if strings.TrimSpace(wireGuardStringValue(metadata["server_public_key"])) == "" {
 		t.Fatalf("derived server public key missing: %#v", metadata)
 	}
+	probePeer, err := repo.GetWireGuardProbePeer(context.Background(), created.Resource.ID)
+	if err != nil {
+		t.Fatalf("read active WireGuard probe peer: %v", err)
+	}
+	if probePeer.State != storage.WireGuardProbePeerStateActive || probePeer.PrivateKey == "" ||
+		probePeer.PublicKey == "" || probePeer.PublicKey == clientPublicKey || len(probePeer.Addresses) == 0 {
+		t.Fatalf("unexpected active WireGuard probe peer: %+v", probePeer)
+	}
+	var probeCiphertext, probeState string
+	if err := inspectionDB.QueryRow(`
+SELECT private_key_ciphertext, state
+FROM wireguard_probe_peers WHERE resource_id = ?`, created.Resource.ID).Scan(&probeCiphertext, &probeState); err != nil {
+		t.Fatalf("inspect stored WireGuard probe peer: %v", err)
+	}
+	if probeState != storage.WireGuardProbePeerStateActive || probeCiphertext == probePeer.PrivateKey ||
+		strings.Contains(probeCiphertext, probePeer.PrivateKey) || !strings.HasPrefix(probeCiphertext, "v1:") {
+		t.Fatalf("probe private key was not encrypted at rest: state=%q ciphertext=%q", probeState, probeCiphertext)
+	}
+
+	addPayload := agent.addPayloadSnapshot()
+	addPayloadJSON, err := json.Marshal(addPayload)
+	if err != nil {
+		t.Fatalf("encode captured Agent payload: %v", err)
+	}
+	if bytes.Contains(addPayloadJSON, []byte(probePeer.PrivateKey)) {
+		t.Fatalf("Agent payload exposed probe private key: %s", addPayloadJSON)
+	}
+	remoteInbound, _ := addPayload["inbound"].(map[string]interface{})
+	remoteSettings, _ := remoteInbound["settings"].(map[string]interface{})
+	remotePeers := wireGuardInterfaceSlice(remoteSettings["peers"])
+	if len(remotePeers) != 2 {
+		t.Fatalf("Agent payload peers=%#v, want client peer plus dedicated probe peer", remotePeers)
+	}
+	var foundClient, foundProbe bool
+	for _, rawPeer := range remotePeers {
+		peer, _ := rawPeer.(map[string]interface{})
+		publicKey := strings.TrimSpace(wireGuardStringValue(peer["publicKey"]))
+		switch publicKey {
+		case clientPublicKey:
+			foundClient = true
+		case probePeer.PublicKey:
+			foundProbe = true
+			if !sameWireGuardStringSet(normalizedWireGuardStrings(wireGuardStringValues(peer["allowedIPs"])), normalizedWireGuardStrings(probePeer.Addresses)) {
+				t.Fatalf("Agent probe peer addresses=%v, want %v", wireGuardStringValues(peer["allowedIPs"]), probePeer.Addresses)
+			}
+		}
+		if strings.TrimSpace(wireGuardStringValue(peer["privateKey"])) != "" {
+			t.Fatalf("Agent payload peer exposed a private key: %#v", peer)
+		}
+	}
+	if !foundClient || !foundProbe {
+		t.Fatalf("Agent payload did not contain independent client and probe peers: client=%v probe=%v peers=%#v", foundClient, foundProbe, remotePeers)
+	}
+	if bytes.Contains(created.Resource.PublicMetadata, []byte(probePeer.PrivateKey)) ||
+		bytes.Contains(resourceJSON, []byte(probePeer.PrivateKey)) {
+		t.Fatalf("public managed-resource metadata exposed probe private key: %s", resourceJSON)
+	}
 
 	nodes, err := repo.ListAllNodes(context.Background())
 	if err != nil || len(nodes) != 1 || nodes[0].ID != created.Node.ID || !strings.Contains(nodes[0].ClashConfig, `"private-key"`) {
@@ -383,9 +456,24 @@ func TestManagedWireGuardCreateRecoversMatchingStagedGenerationWithoutReadding(t
 	body := managedWireGuardCreateBody(t, "Recovered WireGuard")
 	inbound := body["inbound"].(map[string]interface{})
 	mutationID := "managed-wireguard:recover-generation"
+	probePeer, err := newWireGuardProbePeerForInbound(inbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := appendWireGuardProbePeer(inbound, &probePeer); err != nil {
+		t.Fatalf("appendWireGuardProbePeer: %v", err)
+	}
 	resource, err := handler.upsertWireGuardManagedResource(context.Background(), server.ID, "Recovered WireGuard", "admin", inbound, mutationID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	probePeer.ResourceID = resource.ID
+	storedProbePeer, err := repo.CreateWireGuardProbePeer(context.Background(), probePeer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedProbePeer.State != storage.WireGuardProbePeerStatePending || storedProbePeer.PrivateKey == "" {
+		t.Fatalf("unexpected staged probe peer: %+v", storedProbePeer)
 	}
 	var client managedWireGuardClient
 	clientJSON, _ := json.Marshal(body["client"])
@@ -429,6 +517,18 @@ func TestManagedWireGuardCreateRecoversMatchingStagedGenerationWithoutReadding(t
 	}
 	if actions := agent.actionSnapshot(); len(actions) != 0 {
 		t.Fatalf("recovery resent mutation to Agent: %v", actions)
+	}
+	recoveredProbePeer, err := repo.GetWireGuardProbePeer(context.Background(), resource.ID)
+	if err != nil {
+		t.Fatalf("read recovered probe peer: %v", err)
+	}
+	if recoveredProbePeer.State != storage.WireGuardProbePeerStateActive ||
+		recoveredProbePeer.PrivateKey != storedProbePeer.PrivateKey || recoveredProbePeer.PublicKey != storedProbePeer.PublicKey {
+		t.Fatalf("unexpected recovered probe peer: %+v", recoveredProbePeer)
+	}
+	present, err := wireGuardInboundHasProbePeer(agent.inboundSnapshot(), recoveredProbePeer)
+	if err != nil || !present {
+		t.Fatalf("recovered remote inbound missing dedicated probe peer: present=%v err=%v", present, err)
 	}
 	attached, err := repo.GetNodeByID(context.Background(), staged.ID)
 	if err != nil || !attached.Enabled || attached.OriginalServer != server.Name || attached.InboundTag != resource.InboundTag ||

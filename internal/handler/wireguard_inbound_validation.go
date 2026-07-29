@@ -3,8 +3,10 @@ package handler
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -138,6 +140,12 @@ func wireGuardNumericValue(value interface{}) (float64, bool) {
 		return float64(number), true
 	case int64:
 		return float64(number), true
+	case json.Number:
+		parsed, err := number.Float64()
+		return parsed, err == nil
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(number), 64)
+		return parsed, err == nil
 	default:
 		return 0, false
 	}
