@@ -3453,6 +3453,67 @@ func (h *RemoteManageHandler) HandleScan(w http.ResponseWriter, r *http.Request)
 	w.Write(result)
 }
 
+// preserveLegacyManagedWireGuardOwnership keeps consistent pre-fence evidence
+// long enough for the latency path to claim it with an Agent-side CAS.
+func (h *RemoteManageHandler) preserveLegacyManagedWireGuardOwnership(
+	ctx context.Context,
+	serverID int64,
+	inbound map[string]interface{},
+) (bool, error) {
+	if canonicalManagedProtocol(wireGuardStringValue(inbound["protocol"])) != "wireguard" {
+		return false, nil
+	}
+	tag := strings.TrimSpace(wireGuardStringValue(inbound["tag"]))
+	if tag == "" {
+		return false, nil
+	}
+	resource, err := h.repo.GetManagedInboundResourceByServerTag(ctx, serverID, tag)
+	if errors.Is(err, storage.ErrManagedInboundResourceNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	mutationID := strings.TrimSpace(resource.MutationID)
+	if !strings.HasPrefix(mutationID, "managed-wireguard:") || strings.TrimSpace(strings.TrimPrefix(mutationID, "managed-wireguard:")) == "" {
+		return false, nil
+	}
+	owner, err := h.repo.GetRemoteInboundOwnership(ctx, serverID, tag)
+	if err != nil {
+		return true, err
+	}
+	if strings.TrimSpace(owner) != mutationID {
+		return false, nil
+	}
+	if err := managedWireGuardInventoryMatchesResource(inbound, resource); err != nil {
+		return false, nil
+	}
+	nodes, err := h.repo.ListAllNodes(ctx)
+	if err != nil {
+		return true, err
+	}
+	matchingNode := false
+	for _, node := range nodes {
+		if strings.TrimSpace(node.OriginalServer) != strings.TrimSpace(resource.ServerName) ||
+			strings.TrimSpace(node.InboundTag) != tag ||
+			canonicalManagedProtocol(node.Protocol) != "wireguard" ||
+			(node.NodeType != "" && node.NodeType != "physical") {
+			continue
+		}
+		if strings.TrimSpace(node.InboundMutationID) != mutationID {
+			return false, nil
+		}
+		matchingNode = true
+	}
+	if !matchingNode {
+		return false, nil
+	}
+	if err := h.repo.MarkWireGuardProbePeerPending(ctx, resource.ID); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 // 将远程服务器的入站同步到节点表（内部使用）
 func (h *RemoteManageHandler) syncInboundsToNodesInternal(ctx context.Context, serverID int64) SyncInboundsToNodesResponse {
 	return h.syncInboundsToNodes(ctx, serverID, "", false)
@@ -3543,6 +3604,14 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 		inventoryMutationKnown[tag] = true
 		inventoryMutationByTag[tag] = mutationID
 		if mutationID == "" {
+			preserve, preserveErr := h.preserveLegacyManagedWireGuardOwnership(ctx, serverID, inbound)
+			if preserveErr != nil {
+				response.Success = false
+				response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: 保留旧 WireGuard 所有权失败: %v", tag, preserveErr))
+			}
+			if preserve {
+				continue
+			}
 			if err := h.repo.ClearRemoteInboundOwnership(ctx, serverID, tag); err != nil {
 				response.Success = false
 				response.Errors = append(response.Errors, fmt.Sprintf("tag=%s: 清理旧入站所有权失败: %v", tag, err))

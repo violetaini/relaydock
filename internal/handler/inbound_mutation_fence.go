@@ -162,6 +162,31 @@ func (h *ChildManageHandler) beginInboundAddMutationLocked(
 	if previous.Pending != nil {
 		return nil, fmt.Errorf("inbound mutation recovery is still pending for %s", tag)
 	}
+	expectedDigest := strings.TrimSpace(req.ExpectedInboundDigest)
+	if req.ExpectedMutationOwner == nil && expectedDigest != "" {
+		return nil, fmt.Errorf("expected inbound digest requires an expected mutation owner for %s", tag)
+	}
+	if req.ExpectedMutationOwner != nil {
+		if mutationID == "" {
+			return nil, fmt.Errorf("mutation_id is required for conditional replacement of %s", tag)
+		}
+		if previous.Owner != strings.TrimSpace(*req.ExpectedMutationOwner) {
+			return nil, fmt.Errorf("inbound mutation owner changed before conditional replacement of %s", tag)
+		}
+		if expectedDigest == "" {
+			return nil, fmt.Errorf("expected inbound digest is required for conditional replacement of %s", tag)
+		}
+		if previousInbound == nil {
+			return nil, fmt.Errorf("inbound %s disappeared before conditional replacement", tag)
+		}
+		actualDigest, err := canonicalInboundMutationDigest(previousInbound)
+		if err != nil {
+			return nil, fmt.Errorf("digest current inbound %s for conditional replacement: %w", tag, err)
+		}
+		if actualDigest != expectedDigest {
+			return nil, fmt.Errorf("inbound %s changed before conditional replacement", tag)
+		}
+	}
 	if mutationID == "" {
 		if previous.Owner != "" || len(previous.Canceled) > 0 {
 			return nil, fmt.Errorf("mutation_id is required to replace fenced inbound %s", tag)

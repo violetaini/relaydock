@@ -926,6 +926,62 @@ func TestManagedWireGuardInventorySyncBackfillsWithoutCreatingNode(t *testing.T)
 	}
 }
 
+func TestManagedWireGuardInventorySyncPreservesLegacyOwnershipAndRechecksPeer(t *testing.T) {
+	handler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	createResponse := httptest.NewRecorder()
+	handler.HandleManagedInboundResources(createResponse, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10),
+		managedWireGuardCreateBody(t, "Legacy WG")))
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", createResponse.Code, createResponse.Body.String())
+	}
+	var created struct {
+		Resource managedInboundResourceDTO `json:"resource"`
+		Node     nodeDTO                   `json:"node"`
+	}
+	if err := json.Unmarshal(createResponse.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.GetNodeByID(context.Background(), created.Node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.InboundMutationID == "" {
+		t.Fatal("created node has no mutation ownership")
+	}
+	owner, err := repo.GetRemoteInboundOwnership(context.Background(), server.ID, node.InboundTag)
+	if err != nil || owner != node.InboundMutationID {
+		t.Fatalf("initial ownership=%q node=%q err=%v", owner, node.InboundMutationID, err)
+	}
+	peer, err := repo.GetWireGuardProbePeer(context.Background(), created.Resource.ID)
+	if err != nil || peer.State != storage.WireGuardProbePeerStateActive {
+		t.Fatalf("initial probe peer=%+v err=%v", peer, err)
+	}
+
+	agent.mu.Lock()
+	agent.ownerMutationID = ""
+	agent.mu.Unlock()
+	result := handler.syncInboundsToNodesInternal(context.Background(), server.ID)
+	if !result.Success || len(result.Errors) != 0 {
+		t.Fatalf("sync result=%+v", result)
+	}
+	owner, err = repo.GetRemoteInboundOwnership(context.Background(), server.ID, node.InboundTag)
+	if err != nil || owner != node.InboundMutationID {
+		t.Fatalf("legacy sync cleared ownership=%q node=%q err=%v", owner, node.InboundMutationID, err)
+	}
+	nodeAfter, err := repo.GetNodeByID(context.Background(), node.ID)
+	if err != nil || nodeAfter.InboundMutationID != node.InboundMutationID {
+		t.Fatalf("legacy sync changed node ownership: node=%+v err=%v", nodeAfter, err)
+	}
+	peer, err = repo.GetWireGuardProbePeer(context.Background(), created.Resource.ID)
+	if err != nil || peer.State != storage.WireGuardProbePeerStatePending {
+		t.Fatalf("legacy sync did not require Agent recheck: peer=%+v err=%v", peer, err)
+	}
+	if actions := agent.actionSnapshot(); len(actions) != 1 || actions[0] != "add" {
+		t.Fatalf("inventory sync unexpectedly mutated Agent: %v", actions)
+	}
+}
+
 func TestManagedWireGuardOrdinaryNodeDeleteClosesRemoteLifecycle(t *testing.T) {
 	remoteHandler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
 	createResponse := httptest.NewRecorder()

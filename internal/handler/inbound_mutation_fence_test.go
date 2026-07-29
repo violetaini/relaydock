@@ -252,6 +252,70 @@ func TestChildInboundMutationFenceAllowsLegacyRemoveWithoutOwner(t *testing.T) {
 	}
 }
 
+func TestChildInboundMutationFenceConditionalReplacementCAS(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "config.json")
+	previousInbound := mutationFenceTestInbound("legacy-wireguard", 51820)
+	intendedInbound := mutationFenceTestInbound("legacy-wireguard", 51821)
+	writeInboundPersistenceFixture(t, configPath, []any{previousInbound})
+	previousDigest, err := canonicalInboundMutationDigest(previousInbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyOwner := ""
+
+	handler := &ChildManageHandler{
+		inboundMutationFencePath: filepath.Join(directory, "inbound-fences.json"),
+		inboundMutationFences:    make(map[string]inboundMutationFenceState),
+	}
+	handler.inboundsMu.Lock()
+	transaction, err := handler.beginInboundAddMutationLocked(&ChildInboundRequest{
+		MutationID:            "managed-wireguard:legacy-generation",
+		ExpectedMutationOwner: &emptyOwner,
+		ExpectedInboundDigest: previousDigest,
+		Inbound:               intendedInbound,
+	}, configPath, previousInbound)
+	if err == nil {
+		err = handler.rollbackInboundMutationLocked(transaction)
+	}
+	handler.inboundsMu.Unlock()
+	if err != nil {
+		t.Fatalf("matching conditional replacement failed: %v", err)
+	}
+
+	handler.inboundsMu.Lock()
+	if err := seedChildInboundMutationOwner(handler, "legacy-wireguard", "managed-wireguard:newer-generation"); err != nil {
+		handler.inboundsMu.Unlock()
+		t.Fatal(err)
+	}
+	_, ownerErr := handler.beginInboundAddMutationLocked(&ChildInboundRequest{
+		MutationID:            "managed-wireguard:legacy-generation",
+		ExpectedMutationOwner: &emptyOwner,
+		ExpectedInboundDigest: previousDigest,
+		Inbound:               intendedInbound,
+	}, configPath, previousInbound)
+	handler.inboundsMu.Unlock()
+	if ownerErr == nil || !strings.Contains(ownerErr.Error(), "owner changed") {
+		t.Fatalf("changed owner was not rejected: %v", ownerErr)
+	}
+
+	digestHandler := &ChildManageHandler{
+		inboundMutationFencePath: filepath.Join(directory, "digest-inbound-fences.json"),
+		inboundMutationFences:    make(map[string]inboundMutationFenceState),
+	}
+	digestHandler.inboundsMu.Lock()
+	_, digestErr := digestHandler.beginInboundAddMutationLocked(&ChildInboundRequest{
+		MutationID:            "managed-wireguard:legacy-generation",
+		ExpectedMutationOwner: &emptyOwner,
+		ExpectedInboundDigest: strings.Repeat("0", 64),
+		Inbound:               intendedInbound,
+	}, configPath, previousInbound)
+	digestHandler.inboundsMu.Unlock()
+	if digestErr == nil || !strings.Contains(digestErr.Error(), "changed before conditional replacement") {
+		t.Fatalf("changed inbound digest was not rejected: %v", digestErr)
+	}
+}
+
 func TestApplyInboundAddRestoresPreviousFenceOnEveryFailurePhase(t *testing.T) {
 	for _, phase := range []string{"grpc", "persist", "firewall"} {
 		t.Run(phase, func(t *testing.T) {

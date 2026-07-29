@@ -23,6 +23,8 @@ const maxTCPingBatch = 200
 const maxProbeDialerChainDepth = 8
 const maxTCPingBatchDuration = 75 * time.Second
 
+var errManagedWireGuardInboundUnowned = errors.New("managed WireGuard inbound has no mutation owner")
+
 // TCPingRequest keeps its historical JSON shape, but protocol latency requires
 // node_id. Host/port cannot describe the credentials needed for a real Mihomo
 // protocol test and are therefore no longer accepted as an alternate target.
@@ -576,7 +578,30 @@ func (h *tcpingHandler) ensureManagedWireGuardProbePeerUncached(ctx context.Cont
 	}
 	peer, peerErr := h.repo.GetWireGuardProbePeer(ctx, resource.ID)
 	if peerErr == nil && peer.State == storage.WireGuardProbePeerStateActive {
-		return peer, nil
+		if h.remote == nil {
+			return nil, errors.New("受管服务器探测通道不可用")
+		}
+		body, inventoryErr := h.remote.ForwardToServer(ctx, server.ID, http.MethodGet, "/api/child/inbounds", nil)
+		if inventoryErr != nil {
+			return nil, errors.New("无法读取受管 WireGuard 入站")
+		}
+		inbound, inventoryErr := managedWireGuardInboundForMutation(
+			body,
+			node.InboundTag,
+			managedWireGuardInboundPort(node),
+			resource.MutationID,
+		)
+		if inventoryErr == nil {
+			present, presentErr := wireGuardInboundHasProbePeer(inbound, peer)
+			if presentErr != nil {
+				return nil, presentErr
+			}
+			if present {
+				return peer, nil
+			}
+		} else if !errors.Is(inventoryErr, errManagedWireGuardInboundUnowned) {
+			return nil, inventoryErr
+		}
 	}
 	if peerErr != nil && !errors.Is(peerErr, storage.ErrWireGuardProbePeerNotFound) {
 		return nil, errors.New("无法读取 WireGuard 专用探测凭据")
@@ -599,9 +624,6 @@ func (h *tcpingHandler) ensureManagedWireGuardProbePeerUncached(ctx context.Cont
 		return nil, errors.New("该受管 WireGuard 入站缺少可信的变更所有权，无法安全添加探测 Peer")
 	}
 	peer, err = h.repo.GetWireGuardProbePeer(leasedCtx, resource.ID)
-	if err == nil && peer.State == storage.WireGuardProbePeerStateActive {
-		return peer, nil
-	}
 	if err != nil && !errors.Is(err, storage.ErrWireGuardProbePeerNotFound) {
 		return nil, errors.New("无法读取 WireGuard 专用探测凭据")
 	}
@@ -616,10 +638,23 @@ func (h *tcpingHandler) ensureManagedWireGuardProbePeerUncached(ctx context.Cont
 		managedWireGuardInboundPort(node),
 		resource.MutationID,
 	)
+	expectedMutationOwner := resource.MutationID
+	replacementDigest := ""
+	if errors.Is(err, errManagedWireGuardInboundUnowned) {
+		inbound, err = managedWireGuardInboundForMutation(
+			body,
+			node.InboundTag,
+			managedWireGuardInboundPort(node),
+			"",
+		)
+		if err == nil {
+			replacementDigest, err = h.prepareLegacyManagedWireGuardProbeAdoption(leasedCtx, node, resource, inbound)
+			expectedMutationOwner = ""
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-
 	if peerMissing {
 		peer, err = createWireGuardProbePeerForInbound(leasedCtx, h.repo, resource.ID, inbound)
 	}
@@ -630,14 +665,31 @@ func (h *tcpingHandler) ensureManagedWireGuardProbePeerUncached(ctx context.Cont
 	if err != nil {
 		return nil, err
 	}
-	if !present {
-		if err := appendWireGuardProbePeer(inbound, peer); err != nil {
-			return nil, err
+	if present && !peerMissing && peer.State == storage.WireGuardProbePeerStateActive && replacementDigest == "" {
+		return peer, nil
+	}
+	if !present || replacementDigest != "" {
+		if replacementDigest == "" {
+			stripManagedInboundRuntimeFields(inbound)
+			replacementDigest, err = canonicalInboundMutationDigest(inbound)
+			if err != nil || strings.TrimSpace(replacementDigest) == "" {
+				return nil, errors.New("无法生成 WireGuard 当前配置校验摘要")
+			}
+		}
+		if !present {
+			if err := appendWireGuardProbePeer(inbound, peer); err != nil {
+				return nil, err
+			}
 		}
 		stripManagedInboundRuntimeFields(inbound)
-		payload, marshalErr := json.Marshal(map[string]interface{}{
-			"action": "add", "inbound": inbound, "mutation_id": resource.MutationID,
-		})
+		mutationPayload := map[string]interface{}{
+			"action":                  "add",
+			"inbound":                 inbound,
+			"mutation_id":             resource.MutationID,
+			"expected_mutation_owner": expectedMutationOwner,
+			"expected_inbound_digest": replacementDigest,
+		}
+		payload, marshalErr := json.Marshal(mutationPayload)
 		if marshalErr != nil {
 			return nil, errors.New("无法生成 WireGuard 探测 Peer 变更")
 		}
@@ -670,6 +722,34 @@ func managedWireGuardInboundPort(node storage.Node) int {
 	return port
 }
 
+func (h *tcpingHandler) prepareLegacyManagedWireGuardProbeAdoption(
+	ctx context.Context,
+	node storage.Node,
+	resource *storage.ManagedInboundResource,
+	inbound map[string]interface{},
+) (string, error) {
+	mutationID := strings.TrimSpace(resource.MutationID)
+	if !strings.HasPrefix(mutationID, "managed-wireguard:") || strings.TrimSpace(strings.TrimPrefix(mutationID, "managed-wireguard:")) == "" {
+		return "", errors.New("历史 WireGuard 入站缺少可信的受管代次，拒绝接管")
+	}
+	if strings.TrimSpace(node.InboundMutationID) != mutationID {
+		return "", errors.New("WireGuard 节点与管理资源的变更代次不一致，拒绝接管")
+	}
+	owner, err := h.repo.GetRemoteInboundOwnership(ctx, resource.ServerID, resource.InboundTag)
+	if err != nil || strings.TrimSpace(owner) != mutationID {
+		return "", errors.New("WireGuard 本地所有权记录不一致，拒绝接管")
+	}
+	if err := managedWireGuardInventoryMatchesResource(inbound, resource); err != nil {
+		return "", errors.New("WireGuard 当前配置与历史管理记录不一致，拒绝接管")
+	}
+	stripManagedInboundRuntimeFields(inbound)
+	digest, err := canonicalInboundMutationDigest(inbound)
+	if err != nil || strings.TrimSpace(digest) == "" {
+		return "", errors.New("无法生成 WireGuard 历史配置校验摘要")
+	}
+	return digest, nil
+}
+
 func managedWireGuardInboundFromInventory(body []byte, expectedTag string, expectedPort int) (map[string]interface{}, error) {
 	return managedWireGuardInboundForMutation(body, expectedTag, expectedPort, "")
 }
@@ -693,7 +773,11 @@ func managedWireGuardInboundForMutation(body []byte, expectedTag string, expecte
 		if !inventory.MutationFenceKnown {
 			return nil, errors.New("Agent 未提供可信的 WireGuard 入站所有权清单")
 		}
-		if strings.TrimSpace(inventory.MutationOwners[expectedTag]) != expectedMutationID {
+		owner := strings.TrimSpace(inventory.MutationOwners[expectedTag])
+		if owner == "" {
+			return nil, errManagedWireGuardInboundUnowned
+		}
+		if owner != expectedMutationID {
 			return nil, errors.New("WireGuard 入站已由另一代配置持有，拒绝添加探测 Peer")
 		}
 	}

@@ -1560,12 +1560,14 @@ func (h *ChildManageHandler) saveNginxConfigFile(w http.ResponseWriter, r *http.
 
 // ChildInboundRequest 表示入站管理请求
 type ChildInboundRequest struct {
-	Action     string                 `json:"action"` // “添加”、“删除”、“列表”
-	Inbound    map[string]interface{} `json:"inbound,omitempty"`
-	Tag        string                 `json:"tag,omitempty"`
-	MutationID string                 `json:"mutation_id,omitempty"`
-	Client     map[string]interface{} `json:"client,omitempty"`
-	NotAfter   *time.Time             `json:"not_after,omitempty"`
+	Action                string                 `json:"action"` // “添加”、“删除”、“列表”
+	Inbound               map[string]interface{} `json:"inbound,omitempty"`
+	Tag                   string                 `json:"tag,omitempty"`
+	MutationID            string                 `json:"mutation_id,omitempty"`
+	ExpectedMutationOwner *string                `json:"expected_mutation_owner,omitempty"`
+	ExpectedInboundDigest string                 `json:"expected_inbound_digest,omitempty"`
+	Client                map[string]interface{} `json:"client,omitempty"`
+	NotAfter              *time.Time             `json:"not_after,omitempty"`
 }
 
 // HandleInbounds 处理子服务器的入站管理

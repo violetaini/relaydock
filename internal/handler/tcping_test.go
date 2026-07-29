@@ -144,7 +144,7 @@ func createTCPingWireGuardNode(t *testing.T, repo *storage.TrafficRepository) (s
 	}
 	resource, err := repo.CreateManagedInboundResource(ctx, storage.ManagedInboundResource{
 		ServerID: server.ID, DisplayName: "Managed WG", Protocol: "wireguard", InboundTag: "wireguard-test",
-		MutationID: "wireguard-generation-1", EndpointHost: "wg.example.test", EndpointPort: 51820,
+		MutationID: "managed-wireguard:generation-1", EndpointHost: "wg.example.test", EndpointPort: 51820,
 		PublicMetadataJSON: json.RawMessage(`{}`), CreatedBy: "test",
 	})
 	if err != nil {
@@ -283,6 +283,13 @@ func TestTCPingManagedWireGuardUsesDedicatedProbePeerForMihomo(t *testing.T) {
 	repo := newTCPingTestRepository(t)
 	createTCPingAdmin(t, repo)
 	server, node, resource, customerPrivateKey := createTCPingWireGuardNode(t, repo)
+	node.InboundMutationID = resource.MutationID
+	if _, err := repo.UpdateNode(context.Background(), node); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetRemoteInboundOwnership(context.Background(), server.ID, resource.InboundTag, resource.MutationID); err != nil {
+		t.Fatal(err)
+	}
 	serverPublicKey, serverPrivateKey := wireGuardTCPingTestKeyPair(t, 0x31)
 	customerPublicKey, _ := wireGuardTCPingTestKeyPair(t, 0x32)
 	inventory, err := json.Marshal(map[string]interface{}{
@@ -304,6 +311,7 @@ func TestTCPingManagedWireGuardUsesDedicatedProbePeerForMihomo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	currentInventory := inventory
 	remote := &fakeRemoteNodeProbeClient{}
 	remote.forward = func(serverID int64, method, path string, _ []byte) ([]byte, error) {
 		if serverID != server.ID || path != "/api/child/inbounds" {
@@ -311,9 +319,9 @@ func TestTCPingManagedWireGuardUsesDedicatedProbePeerForMihomo(t *testing.T) {
 		}
 		switch method {
 		case http.MethodGet:
-			return inventory, nil
+			return currentInventory, nil
 		case http.MethodPost:
-			return []byte(`{"success":true,"mutation_id":"wireguard-generation-1"}`), nil
+			return []byte(`{"success":true,"mutation_id":"managed-wireguard:generation-1"}`), nil
 		default:
 			return nil, errors.New("unexpected Agent method")
 		}
@@ -378,14 +386,25 @@ func TestTCPingManagedWireGuardUsesDedicatedProbePeerForMihomo(t *testing.T) {
 		t.Fatalf("unexpected inventory call: %+v", calls[0])
 	}
 	var mutation struct {
-		Action     string                 `json:"action"`
-		MutationID string                 `json:"mutation_id"`
-		Inbound    map[string]interface{} `json:"inbound"`
+		Action                string                 `json:"action"`
+		MutationID            string                 `json:"mutation_id"`
+		ExpectedMutationOwner *string                `json:"expected_mutation_owner"`
+		ExpectedInboundDigest string                 `json:"expected_inbound_digest"`
+		Inbound               map[string]interface{} `json:"inbound"`
 	}
 	if err := json.Unmarshal(calls[1].body, &mutation); err != nil {
 		t.Fatalf("decode Agent mutation: %v body=%s", err, calls[1].body)
 	}
-	if mutation.Action != "add" || mutation.MutationID != resource.MutationID {
+	initialInbound, err := managedWireGuardInboundForMutation(inventory, resource.InboundTag, resource.EndpointPort, resource.MutationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripManagedInboundRuntimeFields(initialInbound)
+	initialDigest, err := canonicalInboundMutationDigest(initialInbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutation.Action != "add" || mutation.MutationID != resource.MutationID || mutation.ExpectedMutationOwner == nil || *mutation.ExpectedMutationOwner != resource.MutationID || mutation.ExpectedInboundDigest != initialDigest {
 		t.Fatalf("unexpected Agent mutation: %+v", mutation)
 	}
 	settings, _ := mutation.Inbound["settings"].(map[string]interface{})
@@ -403,11 +422,20 @@ func TestTCPingManagedWireGuardUsesDedicatedProbePeerForMihomo(t *testing.T) {
 		t.Fatalf("Agent mutation omitted dedicated probe public key: %s", calls[1].body)
 	}
 
-	remote.mu.Lock()
-	remote.forward = func(_ int64, _, _ string, _ []byte) ([]byte, error) {
-		return nil, errors.New("active probe peer must not contact the Agent")
+	legacyInbound, err := cloneInboundConfig(mutation.Inbound)
+	if err != nil {
+		t.Fatal(err)
 	}
-	remote.mu.Unlock()
+	legacyInbound["_runtime_status"] = "running"
+	currentInventory, err = json.Marshal(map[string]interface{}{
+		"success":              true,
+		"mutation_fence_known": true,
+		"mutation_owners":      map[string]string{},
+		"inbounds":             []map[string]interface{}{legacyInbound},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	secondRequest := httptest.NewRequest(http.MethodPost, "/api/admin/tcping", bytes.NewReader(body))
 	secondRequest = secondRequest.WithContext(auth.ContextWithUsername(secondRequest.Context(), "admin"))
 	secondRecorder := httptest.NewRecorder()
@@ -415,10 +443,218 @@ func TestTCPingManagedWireGuardUsesDedicatedProbePeerForMihomo(t *testing.T) {
 	if secondRecorder.Code != http.StatusOK {
 		t.Fatalf("second status=%d body=%s", secondRecorder.Code, secondRecorder.Body.String())
 	}
+	var secondResponse TCPingResponse
+	if err := json.Unmarshal(secondRecorder.Body.Bytes(), &secondResponse); err != nil {
+		t.Fatal(err)
+	}
+	if !secondResponse.Success || secondResponse.Probe != "mihomo_url_test" {
+		t.Fatalf("unexpected second response: %+v", secondResponse)
+	}
 	remote.mu.Lock()
-	defer remote.mu.Unlock()
-	if len(remote.calls) != 2 {
-		t.Fatalf("active probe peer repeated Agent access: %+v", remote.calls)
+	calls = append([]fakeRemoteNodeProbeCall(nil), remote.calls...)
+	remote.mu.Unlock()
+	if len(calls) != 5 || calls[2].method != http.MethodGet || calls[3].method != http.MethodGet || calls[4].method != http.MethodPost {
+		t.Fatalf("active legacy peer did not use read-check plus leased CAS: %+v", calls)
+	}
+	var adoption struct {
+		MutationID            string  `json:"mutation_id"`
+		ExpectedMutationOwner *string `json:"expected_mutation_owner"`
+		ExpectedInboundDigest string  `json:"expected_inbound_digest"`
+	}
+	if err := json.Unmarshal(calls[4].body, &adoption); err != nil {
+		t.Fatal(err)
+	}
+	if adoption.MutationID != resource.MutationID || adoption.ExpectedMutationOwner == nil || *adoption.ExpectedMutationOwner != "" || adoption.ExpectedInboundDigest == "" {
+		t.Fatalf("active legacy peer omitted conditional ownership evidence: %+v", adoption)
+	}
+
+	ownedInbound, err := cloneInboundConfig(mutation.Inbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedInbound["_runtime_status"] = "running"
+	currentInventory, err = json.Marshal(map[string]interface{}{
+		"success":              true,
+		"mutation_fence_known": true,
+		"mutation_owners":      map[string]string{"wireguard-test": resource.MutationID},
+		"inbounds":             []map[string]interface{}{ownedInbound},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdRequest := httptest.NewRequest(http.MethodPost, "/api/admin/tcping", bytes.NewReader(body))
+	thirdRequest = thirdRequest.WithContext(auth.ContextWithUsername(thirdRequest.Context(), "admin"))
+	thirdRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(thirdRecorder, thirdRequest)
+	if thirdRecorder.Code != http.StatusOK {
+		t.Fatalf("third status=%d body=%s", thirdRecorder.Code, thirdRecorder.Body.String())
+	}
+	remote.mu.Lock()
+	calls = append([]fakeRemoteNodeProbeCall(nil), remote.calls...)
+	remote.mu.Unlock()
+	if len(calls) != 6 || calls[5].method != http.MethodGet {
+		t.Fatalf("verified active peer should use one read-only Agent check: %+v", calls)
+	}
+
+	currentInventory = inventory
+	fourthRequest := httptest.NewRequest(http.MethodPost, "/api/admin/tcping", bytes.NewReader(body))
+	fourthRequest = fourthRequest.WithContext(auth.ContextWithUsername(fourthRequest.Context(), "admin"))
+	fourthRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(fourthRecorder, fourthRequest)
+	if fourthRecorder.Code != http.StatusOK {
+		t.Fatalf("fourth status=%d body=%s", fourthRecorder.Code, fourthRecorder.Body.String())
+	}
+	remote.mu.Lock()
+	calls = append([]fakeRemoteNodeProbeCall(nil), remote.calls...)
+	remote.mu.Unlock()
+	if len(calls) != 9 || calls[6].method != http.MethodGet || calls[7].method != http.MethodGet || calls[8].method != http.MethodPost {
+		t.Fatalf("missing active probe peer was not repaired under lease: %+v", calls)
+	}
+	var repair struct {
+		MutationID            string                 `json:"mutation_id"`
+		ExpectedMutationOwner *string                `json:"expected_mutation_owner"`
+		ExpectedInboundDigest string                 `json:"expected_inbound_digest"`
+		Inbound               map[string]interface{} `json:"inbound"`
+	}
+	if err := json.Unmarshal(calls[8].body, &repair); err != nil {
+		t.Fatal(err)
+	}
+	present, err := wireGuardInboundHasProbePeer(repair.Inbound, storedPeer)
+	if err != nil || !present || repair.MutationID != resource.MutationID || repair.ExpectedMutationOwner == nil || *repair.ExpectedMutationOwner != resource.MutationID || repair.ExpectedInboundDigest != initialDigest {
+		t.Fatalf("repair mutation omitted active probe peer: mutation=%+v present=%v err=%v", repair, present, err)
+	}
+}
+
+func TestTCPingManagedWireGuardAdoptsMatchingLegacyUnownedInbound(t *testing.T) {
+	repo := newTCPingTestRepository(t)
+	createTCPingAdmin(t, repo)
+	server, node, resource, _ := createTCPingWireGuardNode(t, repo)
+	_, serverPrivateKey := wireGuardTCPingTestKeyPair(t, 0x31)
+	customerPublicKey, _ := wireGuardTCPingTestKeyPair(t, 0x32)
+	inbound := map[string]interface{}{
+		"tag": "wireguard-test", "protocol": "wireguard", "port": 51820, "_runtime_status": "running",
+		"settings": map[string]interface{}{
+			"secretKey": serverPrivateKey,
+			"address":   []string{"10.66.66.1/32"},
+			"mtu":       1420,
+			"peers": []map[string]interface{}{{
+				"publicKey": customerPublicKey, "allowedIPs": []string{"10.66.66.2/32"}, "keepAlive": 25,
+			}},
+		},
+	}
+	pendingPeer, err := newWireGuardProbePeerForInbound(inbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingPeer.ResourceID = resource.ID
+	storedPendingPeer, err := repo.CreateWireGuardProbePeer(context.Background(), pendingPeer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := appendWireGuardProbePeer(inbound, storedPendingPeer); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := managedWireGuardPublicMetadataFromInbound(inbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource.MutationID = "managed-wireguard:legacy-generation"
+	resource.PublicMetadataJSON, err = json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource, err = repo.UpsertManagedInboundResource(context.Background(), *resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.InboundMutationID = resource.MutationID
+	node, err = repo.UpdateNode(context.Background(), node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetRemoteInboundOwnership(context.Background(), server.ID, resource.InboundTag, resource.MutationID); err != nil {
+		t.Fatal(err)
+	}
+
+	inventory, err := json.Marshal(map[string]interface{}{
+		"success":              true,
+		"mutation_fence_known": true,
+		"mutation_owners":      map[string]string{},
+		"inbounds":             []map[string]interface{}{inbound},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedInbound, err := cloneInboundConfig(inbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripManagedInboundRuntimeFields(expectedInbound)
+	expectedDigest, err := canonicalInboundMutationDigest(expectedInbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remote := &fakeRemoteNodeProbeClient{}
+	remote.forward = func(serverID int64, method, path string, _ []byte) ([]byte, error) {
+		if serverID != server.ID || path != "/api/child/inbounds" {
+			return nil, errors.New("unexpected Agent target")
+		}
+		switch method {
+		case http.MethodGet:
+			return inventory, nil
+		case http.MethodPost:
+			return []byte(`{"success":true,"mutation_id":"managed-wireguard:legacy-generation"}`), nil
+		default:
+			return nil, errors.New("unexpected Agent method")
+		}
+	}
+	prober := &fakeProtocolLatencyProber{results: []speedtest.ProtocolLatencyResult{{Latency: 38.75}}}
+	handler := newTCPingHandler(repo, remote, false, prober)
+	body, err := json.Marshal(TCPingRequest{NodeID: node.ID, Timeout: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/tcping", bytes.NewReader(body))
+	request = request.WithContext(auth.ContextWithUsername(request.Context(), "admin"))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response TCPingResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Success || response.Latency != 38.75 || response.Probe != "mihomo_url_test" {
+		t.Fatalf("unexpected response: %+v", response)
+	}
+
+	remote.mu.Lock()
+	calls := append([]fakeRemoteNodeProbeCall(nil), remote.calls...)
+	remote.mu.Unlock()
+	if len(calls) != 2 || calls[0].method != http.MethodGet || calls[1].method != http.MethodPost {
+		t.Fatalf("unexpected Agent calls: %+v", calls)
+	}
+	var mutation struct {
+		MutationID            string                 `json:"mutation_id"`
+		ExpectedMutationOwner *string                `json:"expected_mutation_owner"`
+		ExpectedInboundDigest string                 `json:"expected_inbound_digest"`
+		Inbound               map[string]interface{} `json:"inbound"`
+	}
+	if err := json.Unmarshal(calls[1].body, &mutation); err != nil {
+		t.Fatal(err)
+	}
+	if mutation.MutationID != resource.MutationID || mutation.ExpectedMutationOwner == nil || *mutation.ExpectedMutationOwner != "" || mutation.ExpectedInboundDigest != expectedDigest {
+		t.Fatalf("legacy adoption omitted conditional ownership evidence: %+v", mutation)
+	}
+	storedPeer, err := repo.GetWireGuardProbePeer(context.Background(), resource.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	present, err := wireGuardInboundHasProbePeer(mutation.Inbound, storedPeer)
+	if err != nil || !present || storedPeer.State != storage.WireGuardProbePeerStateActive {
+		t.Fatalf("legacy adoption did not activate the dedicated peer: present=%v peer=%+v err=%v", present, storedPeer, err)
 	}
 }
 

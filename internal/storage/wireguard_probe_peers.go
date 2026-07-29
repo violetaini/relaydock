@@ -327,3 +327,22 @@ WHERE resource_id = ?`, time.Now().UTC(), resourceID)
 	}
 	return r.GetWireGuardProbePeer(ctx, resourceID)
 }
+
+// MarkWireGuardProbePeerPending forces the next probe to reconcile the Agent
+// before reusing a previously active identity. A missing peer is a no-op.
+func (r *TrafficRepository) MarkWireGuardProbePeerPending(ctx context.Context, resourceID int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if resourceID <= 0 {
+		return nil
+	}
+	_, err := r.db.ExecContext(ctx, `
+UPDATE wireguard_probe_peers
+SET state = 'pending', updated_at = ?
+WHERE resource_id = ? AND state = 'active'`, time.Now().UTC(), resourceID)
+	if err != nil {
+		return fmt.Errorf("mark WireGuard probe peer pending: %w", err)
+	}
+	return nil
+}
