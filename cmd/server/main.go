@@ -716,10 +716,10 @@ func main() {
 	mux.Handle("/api/admin/remote-servers/reset-agent-token", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleResetAgentToken)))
 	mux.Handle("/api/admin/remote-servers/reset-all-tokens", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleResetAllTokens)))
 
-	// TCPing 端点
-	// tcping 连通性测试无数据修改，开放给普通用户（节点管理页的延迟测试按钮）
-	mux.Handle("/api/admin/tcping", auth.RequireToken(tokenStore, userRepo, handler.NewTCPingHandler()))
-	mux.Handle("/api/admin/tcping/batch", auth.RequireToken(tokenStore, userRepo, handler.NewTCPingBatchHandler()))
+	// 节点连通性端点。普通用户只可按可见 node_id 探测；受管 WireGuard
+	// 通过 Agent 确认入站运行状态并测量管理链路 RTT。
+	mux.Handle("/api/admin/tcping", auth.RequireToken(tokenStore, userRepo, handler.NewTCPingHandler(repo, remoteManageHandler)))
+	mux.Handle("/api/admin/tcping/batch", auth.RequireToken(tokenStore, userRepo, handler.NewTCPingBatchHandler(repo, remoteManageHandler)))
 
 	// 子服务器模式配置
 	// 确定我们是否处于儿童/远程模式：
