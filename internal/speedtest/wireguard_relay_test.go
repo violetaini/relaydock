@@ -6,9 +6,12 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestConfiguredMihomoWireGuardEgressPort(t *testing.T) {
@@ -245,6 +248,58 @@ func TestStartMihomoLatencySessionRewritesOnlyItsWireGuardCopy(t *testing.T) {
 	}
 	if len(session.wireGuardRelays) != 1 {
 		t.Fatalf("session WireGuard relay count = %d, want 1", len(session.wireGuardRelays))
+	}
+}
+
+func TestStartMihomoLatencySessionBypassesRelayForSelectedWireGuardProxy(t *testing.T) {
+	resetProcessWireGuardRelayHubForTest(t)
+	root, err := os.MkdirTemp("/tmp", "arcway-wg-relay-bypass-test-")
+	if err != nil {
+		t.Fatalf("MkdirTemp(): %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	t.Chdir(root)
+	helper, helperErrors := writeMihomoLatencyHelper(t)
+	egressPort := unusedUDP4Port(t)
+	t.Setenv(mihomoWireGuardEgressPortEnv, strconv.Itoa(egressPort))
+
+	external := map[string]interface{}{
+		"name": "arcway-probe-1", "type": "wireguard", "server": "127.0.0.2", "port": 51820,
+	}
+	managed := map[string]interface{}{
+		"name": "arcway-probe-1-hop-1", "type": "wireguard", "server": "127.0.0.3", "port": 51821,
+	}
+	targets := []preparedProtocolLatencyTarget{{
+		name: "arcway-probe-1", proxies: []map[string]interface{}{external, managed},
+		wireGuardRelayBypass: []bool{true, false}, timeout: time.Second,
+	}}
+	session, err := startMihomoLatencySession(context.Background(), helper, targets)
+	if err != nil {
+		diagnostics, _ := os.ReadFile(helperErrors)
+		t.Fatalf("startMihomoLatencySession() error = %v; helper diagnostics = %s", err, diagnostics)
+	}
+	defer session.stop()
+	if len(session.wireGuardRelays) != 1 {
+		t.Fatalf("session WireGuard relay count = %d, want only the managed relay", len(session.wireGuardRelays))
+	}
+	configBytes, err := os.ReadFile(filepath.Join(session.workdir, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config struct {
+		Proxies []map[string]interface{} `yaml:"proxies"`
+	}
+	if err := yaml.Unmarshal(configBytes, &config); err != nil {
+		t.Fatalf("decode generated Mihomo config: %v", err)
+	}
+	if len(config.Proxies) != 2 {
+		t.Fatalf("generated proxies = %d, want 2", len(config.Proxies))
+	}
+	if config.Proxies[0]["server"] != "127.0.0.2" || config.Proxies[0]["port"] != 51820 {
+		t.Fatalf("external WireGuard was rewritten through the managed relay: %#v", config.Proxies[0])
+	}
+	if config.Proxies[1]["server"] != "127.0.0.1" || config.Proxies[1]["port"] == 51821 {
+		t.Fatalf("managed WireGuard did not use the fixed-port relay: %#v", config.Proxies[1])
 	}
 }
 

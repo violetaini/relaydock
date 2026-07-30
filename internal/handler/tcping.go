@@ -297,6 +297,7 @@ func (h *tcpingHandler) prepareMihomoLatencyTarget(ctx context.Context, resolved
 	nodes = append(nodes, resolved.node)
 	nodes = append(nodes, resolved.dialerChain...)
 	configs := make([]string, 0, len(nodes))
+	wireGuardRelayBypass := make([]bool, 0, len(nodes))
 	hosts := make(map[string]string)
 	for _, node := range nodes {
 		config, err := h.mihomoProbeConfigForNode(ctx, node, wireGuardCache, timeout)
@@ -322,10 +323,12 @@ func (h *tcpingHandler) prepareMihomoLatencyTarget(ctx context.Context, resolved
 			}
 		}
 		configs = append(configs, config)
+		wireGuardRelayBypass = append(wireGuardRelayBypass,
+			canonicalProbeProtocol(node.Protocol) == "wireguard" && strings.TrimSpace(node.InboundTag) == "")
 	}
 	return speedtest.ProtocolLatencyTarget{
 		ClashConfig: configs[0], DialerChain: configs[1:], Hosts: hosts,
-		Timeout: timeout,
+		WireGuardRelayBypass: wireGuardRelayBypass, Timeout: timeout,
 	}, nil
 }
 
@@ -347,8 +350,11 @@ func (h *tcpingHandler) mihomoProbeConfigForNode(ctx context.Context, node stora
 	if canonicalProbeProtocol(configProtocol) != "wireguard" {
 		return config, nil
 	}
-	if strings.TrimSpace(node.OriginalServer) == "" || strings.TrimSpace(node.InboundTag) == "" {
-		return "", errors.New("外部 WireGuard 需要专用探测 Peer，无法安全进行 Mihomo 实测")
+	if strings.TrimSpace(node.InboundTag) == "" {
+		return config, nil
+	}
+	if strings.TrimSpace(node.OriginalServer) == "" {
+		return "", errors.New("受管 WireGuard 入站缺少所属服务器，无法选择探测身份")
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

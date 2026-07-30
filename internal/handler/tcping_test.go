@@ -279,6 +279,98 @@ func TestTCPingBatchPreservesOrderAndKeepsPerItemErrors(t *testing.T) {
 	}
 }
 
+func TestTCPingExternalWireGuardUsesImportedPeerForMihomo(t *testing.T) {
+	repo := newTCPingTestRepository(t)
+	createTCPingAdmin(t, repo)
+	serverPublicKey, _ := wireGuardTCPingTestKeyPair(t, 0x41)
+	_, clientPrivateKey := wireGuardTCPingTestKeyPair(t, 0x42)
+	config, err := json.Marshal(map[string]interface{}{
+		"name": "External WG", "type": "wireguard", "server": "203.0.113.50", "port": 51820,
+		"private-key": clientPrivateKey, "public-key": serverPublicKey, "ip": "10.77.0.2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(context.Background(), storage.Node{
+		Username: "admin", NodeName: "External WG", Protocol: "wireguard",
+		ParsedConfig: string(config), ClashConfig: string(config), Enabled: true,
+		OriginalServer: "Matched External Host",
+	})
+	if err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+	if node.OriginalServer != "Matched External Host" || node.InboundTag != "" {
+		t.Fatalf("external node unexpectedly became managed: %+v", node)
+	}
+
+	remote := &fakeRemoteNodeProbeClient{err: errors.New("external WireGuard must not call Agent")}
+	prober := &fakeProtocolLatencyProber{results: []speedtest.ProtocolLatencyResult{{Latency: 18.25}}}
+	handler := newTCPingHandler(repo, remote, false, prober)
+	body, err := json.Marshal(TCPingRequest{NodeID: node.ID, Timeout: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/tcping", bytes.NewReader(body))
+	request = request.WithContext(auth.ContextWithUsername(request.Context(), "admin"))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response TCPingResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Success || response.Latency != 18.25 || response.Probe != "mihomo_url_test" || response.Error != "" {
+		t.Fatalf("unexpected response: %+v", response)
+	}
+
+	prober.mu.Lock()
+	if len(prober.targets) != 1 {
+		prober.mu.Unlock()
+		t.Fatalf("targets=%d want 1", len(prober.targets))
+	}
+	target := prober.targets[0]
+	prober.mu.Unlock()
+	if len(target.WireGuardRelayBypass) != 1 || !target.WireGuardRelayBypass[0] {
+		t.Fatalf("external WireGuard did not bypass the managed fixed-port relay: %+v", target.WireGuardRelayBypass)
+	}
+	var proxy map[string]interface{}
+	if err := json.Unmarshal([]byte(target.ClashConfig), &proxy); err != nil {
+		t.Fatalf("decode external WireGuard target: %v", err)
+	}
+	if target.ClashConfig != node.ClashConfig {
+		t.Fatalf("Mihomo did not receive the imported WireGuard config\ngot:  %s\nwant: %s", target.ClashConfig, node.ClashConfig)
+	}
+	if wireGuardStringValue(proxy["private-key"]) != clientPrivateKey || wireGuardStringValue(proxy["public-key"]) != serverPublicKey {
+		t.Fatalf("Mihomo did not receive the imported WireGuard identity: %s", target.ClashConfig)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if len(remote.calls) != 0 {
+		t.Fatalf("external WireGuard unexpectedly called Agent: %+v", remote.calls)
+	}
+}
+
+func TestTCPingWireGuardRejectsManagedInboundWithoutServer(t *testing.T) {
+	_, privateKey := wireGuardTCPingTestKeyPair(t, 0x43)
+	config, err := json.Marshal(map[string]interface{}{
+		"name": "Broken Managed WG", "type": "wireguard", "server": "203.0.113.51", "port": 51820,
+		"private-key": privateKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &tcpingHandler{}
+	_, err = handler.mihomoProbeConfigForNode(context.Background(), storage.Node{
+		ID: 9, Protocol: "wireguard", ClashConfig: string(config), InboundTag: "wg-in",
+	}, make(map[string]cachedWireGuardProbePeer), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "缺少所属服务器") {
+		t.Fatalf("mihomoProbeConfigForNode() error = %v, want inconsistent managed association error", err)
+	}
+}
+
 func TestTCPingManagedWireGuardUsesDedicatedProbePeerForMihomo(t *testing.T) {
 	repo := newTCPingTestRepository(t)
 	createTCPingAdmin(t, repo)
@@ -357,6 +449,9 @@ func TestTCPingManagedWireGuardUsesDedicatedProbePeerForMihomo(t *testing.T) {
 	}
 	target := prober.targets[0]
 	prober.mu.Unlock()
+	if len(target.WireGuardRelayBypass) != 1 || target.WireGuardRelayBypass[0] {
+		t.Fatalf("managed WireGuard bypassed the fixed-port relay: %+v", target.WireGuardRelayBypass)
+	}
 	var proxy map[string]interface{}
 	if err := json.Unmarshal([]byte(target.ClashConfig), &proxy); err != nil {
 		t.Fatalf("decode Mihomo WireGuard target: %v", err)

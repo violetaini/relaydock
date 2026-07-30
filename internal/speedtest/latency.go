@@ -62,6 +62,10 @@ type ProtocolLatencyTarget struct {
 	// DialerChain contains the immediate dialer's config first, followed by
 	// that dialer's own dependency. The runner rewrites all names/references.
 	DialerChain []string
+	// WireGuardRelayBypass is aligned with ClashConfig followed by DialerChain.
+	// A true entry leaves an imported WireGuard endpoint on Mihomo's native UDP
+	// socket instead of the optional fixed-port relay for managed probes.
+	WireGuardRelayBypass []bool
 	// Hosts pins already-authorized endpoint hostnames to public addresses.
 	// It prevents a second DNS lookup from turning a user-visible node into an
 	// internal-network probe while preserving the original hostname for SNI.
@@ -77,11 +81,12 @@ type ProtocolLatencyResult struct {
 }
 
 type preparedProtocolLatencyTarget struct {
-	index   int
-	name    string
-	proxies []map[string]interface{}
-	hosts   map[string]string
-	timeout time.Duration
+	index                int
+	name                 string
+	proxies              []map[string]interface{}
+	wireGuardRelayBypass []bool
+	hosts                map[string]string
+	timeout              time.Duration
 }
 
 type mihomoLatencySession struct {
@@ -141,6 +146,8 @@ func ProbeProtocolLatency(ctx context.Context, mihomoBin string, targets []Proto
 		if !valid {
 			continue
 		}
+		wireGuardRelayBypass := make([]bool, len(proxies))
+		copy(wireGuardRelayBypass, target.WireGuardRelayBypass)
 		if existing := strings.TrimSpace(fmt.Sprint(proxies[len(proxies)-1]["dialer-proxy"])); existing != "" && existing != "<nil>" {
 			results[index].Err = errors.New("节点引用了未包含的前置代理，无法按真实链路测试")
 			continue
@@ -156,7 +163,8 @@ func ProbeProtocolLatency(ctx context.Context, mihomoBin string, targets []Proto
 			}
 		}
 		prepared = append(prepared, preparedProtocolLatencyTarget{
-			index: index, name: name, proxies: proxies, hosts: cloneLatencyHosts(target.Hosts),
+			index: index, name: name, proxies: proxies, wireGuardRelayBypass: wireGuardRelayBypass,
+			hosts:   cloneLatencyHosts(target.Hosts),
 			timeout: normalizedProtocolLatencyTimeout(target.Timeout),
 		})
 	}
@@ -397,10 +405,15 @@ func startMihomoLatencySession(ctx context.Context, mihomoBin string, targets []
 
 	socketPath := filepath.Join(workdir, "controller.sock")
 	proxies := make([]map[string]interface{}, 0, len(targets))
+	relayProxies := make([]map[string]interface{}, 0, len(targets))
 	hosts := make(map[string]string)
 	for _, target := range targets {
-		for _, proxy := range target.proxies {
-			proxies = append(proxies, cloneProtocolLatencyProxy(proxy))
+		for index, proxy := range target.proxies {
+			cloned := cloneProtocolLatencyProxy(proxy)
+			proxies = append(proxies, cloned)
+			if index >= len(target.wireGuardRelayBypass) || !target.wireGuardRelayBypass[index] {
+				relayProxies = append(relayProxies, cloned)
+			}
 		}
 		for host, address := range target.hosts {
 			if _, exists := hosts[host]; !exists {
@@ -408,7 +421,7 @@ func startMihomoLatencySession(ctx context.Context, mihomoBin string, targets []
 			}
 		}
 	}
-	wireGuardRelays, err = prepareMihomoWireGuardRelays(ctx, proxies, hosts)
+	wireGuardRelays, err = prepareMihomoWireGuardRelays(ctx, relayProxies, hosts)
 	if err != nil {
 		cleanup()
 		var configErr *wireGuardRelayConfigError
