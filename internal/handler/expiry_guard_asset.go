@@ -376,6 +376,16 @@ func (h *XrayServerHandler) PrepareRemoteInstallation(w http.ResponseWriter, r *
 		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "remote deployment manager is unavailable"})
 		return
 	}
+	deferDesiredState := false
+	if server.StealSelf && server.XrayMode != "embedded" {
+		xrayStatus, statusErr := h.remoteManager.remoteXrayServiceStatus(r.Context(), server.ID)
+		if statusErr != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "unable to inspect external Xray state"})
+			return
+		}
+		deferDesiredState = !xrayStatus.Installed
+	}
 	bypassCtx := h.repo.RemoteServerMutationLeaseBypassContext(r.Context(), server.ID)
 	err = h.repo.WithRemoteServerMutationLease(bypassCtx, server.ID, func(exclusiveCtx context.Context) error {
 		ready, validateErr := h.repo.ValidateRemoteServerInstallationReady(exclusiveCtx, server.ID, nonce)
@@ -385,7 +395,7 @@ func (h *XrayServerHandler) PrepareRemoteInstallation(w http.ResponseWriter, r *
 		if !ready {
 			return storage.ErrRemoteInstallationNotReady
 		}
-		if server.StealSelf {
+		if server.StealSelf && !deferDesiredState {
 			deployer := h.remoteManager.DeployStealSelfConfig
 			if h.remoteManager.stealSelfDeployer != nil {
 				deployer = h.remoteManager.stealSelfDeployer
@@ -393,6 +403,15 @@ func (h *XrayServerHandler) PrepareRemoteInstallation(w http.ResponseWriter, r *
 			if err := deployer(exclusiveCtx, server.ID); err != nil {
 				return fmt.Errorf("deploy desired state: %w", err)
 			}
+			if err := h.repo.SetRemoteServerXrayBootstrapPending(exclusiveCtx, server.ID, false); err != nil {
+				return fmt.Errorf("clear deferred Xray configuration state: %w", err)
+			}
+		}
+		if deferDesiredState {
+			if err := h.repo.SetRemoteServerXrayBootstrapPending(exclusiveCtx, server.ID, true); err != nil {
+				return fmt.Errorf("record deferred Xray configuration state: %w", err)
+			}
+			log.Printf("[Remote Install] Deferring desired-state deployment for server %d until external Xray is installed", server.ID)
 		}
 		return h.repo.MarkRemoteServerInstallationPrepared(exclusiveCtx, server.ID, nonce)
 	})

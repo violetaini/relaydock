@@ -2274,6 +2274,12 @@ CREATE INDEX IF NOT EXISTS idx_remote_server_install_tickets_server
 	if err := r.ensureRemoteServerColumn("xray_mode", "TEXT NOT NULL DEFAULT 'external'"); err != nil {
 		return err
 	}
+	// External-mode Agent installation can intentionally finish before Xray is
+	// present. Keep the deferred first configuration durable so a failed panel
+	// deployment can be retried without treating it as an ordinary core update.
+	if err := r.ensureRemoteServerColumn("xray_bootstrap_pending", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
 	if err := r.ensureRemoteServerColumn("traffic_used_offset", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
@@ -11826,6 +11832,51 @@ func (r *TrafficRepository) UpdateRemoteServerXrayMode(ctx context.Context, id i
 		`UPDATE remote_servers SET xray_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, mode, id)
 	if err != nil {
 		return fmt.Errorf("update remote server xray_mode: %w", err)
+	}
+	return nil
+}
+
+func (r *TrafficRepository) RemoteServerXrayBootstrapPending(ctx context.Context, id int64) (bool, error) {
+	if r == nil || r.db == nil {
+		return false, errors.New("traffic repository not initialized")
+	}
+	if id <= 0 {
+		return false, errors.New("remote server id is required")
+	}
+	var pending int
+	if err := r.db.QueryRowContext(ctx,
+		`SELECT COALESCE(xray_bootstrap_pending, 0) FROM remote_servers WHERE id = ?`, id,
+	).Scan(&pending); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrRemoteServerNotFound
+		}
+		return false, fmt.Errorf("read remote server Xray bootstrap state: %w", err)
+	}
+	return pending != 0, nil
+}
+
+func (r *TrafficRepository) SetRemoteServerXrayBootstrapPending(ctx context.Context, id int64, pending bool) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if id <= 0 {
+		return errors.New("remote server id is required")
+	}
+	value := 0
+	if pending {
+		value = 1
+	}
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE remote_servers SET xray_bootstrap_pending = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, value, id)
+	if err != nil {
+		return fmt.Errorf("update remote server Xray bootstrap state: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read remote server Xray bootstrap update result: %w", err)
+	}
+	if affected != 1 {
+		return ErrRemoteServerNotFound
 	}
 	return nil
 }

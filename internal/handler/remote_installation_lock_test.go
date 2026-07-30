@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +21,10 @@ import (
 )
 
 func newRemoteInstallationHandlerRepo(t *testing.T, listenPort int) (*storage.TrafficRepository, *storage.RemoteServer) {
+	return newRemoteInstallationHandlerRepoWithSteal(t, listenPort, true)
+}
+
+func newRemoteInstallationHandlerRepoWithSteal(t *testing.T, listenPort int, stealSelf bool) (*storage.TrafficRepository, *storage.RemoteServer) {
 	t.Helper()
 	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "installation-handler.db"))
 	if err != nil {
@@ -32,7 +40,7 @@ func newRemoteInstallationHandlerRepo(t *testing.T, listenPort int) (*storage.Tr
 		ListenPort:     listenPort,
 		Domain:         "edge.example.test",
 		Use443:         true,
-		StealSelf:      true,
+		StealSelf:      stealSelf,
 		StealMode:      "tunnel",
 	}
 	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
@@ -164,6 +172,176 @@ func TestRemoteStreamContextDeadlineCoversHTTPFallback(t *testing.T) {
 	}
 	if got := response.Header().Get("Content-Type"); got != "text/event-stream" {
 		t.Fatalf("stream timeout content-type=%q, want text/event-stream", got)
+	}
+}
+
+func TestRemoteSSECompletionTrackerRequiresExplicitSuccessfulTerminal(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		chunks  []string
+		success bool
+	}{
+		{name: "complete", chunks: []string{`data: {"type":"complete","success":true}` + "\n\n"}, success: true},
+		{name: "fragmented complete", chunks: []string{`data: {"type":"comp`, `lete","success":true}` + "\n\n"}, success: true},
+		{name: "output only", chunks: []string{`data: {"type":"output","data":"done"}` + "\n\n"}},
+		{name: "error", chunks: []string{`data: {"type":"error","message":"failed"}` + "\n\n"}},
+		{name: "error before complete", chunks: []string{`data: {"type":"error"}` + "\n", `data: {"type":"complete","success":true}` + "\n"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var output bytes.Buffer
+			tracker := &remoteSSECompletionTracker{writer: &output}
+			for _, chunk := range tt.chunks {
+				if _, err := tracker.Write([]byte(chunk)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := tracker.succeeded(); got != tt.success {
+				t.Fatalf("succeeded=%v want=%v, stream=%q", got, tt.success, output.String())
+			}
+		})
+	}
+}
+
+func TestXrayInstallStreamOnlyDeploysDeferredConfigAfterFirstInstallSuccess(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		initialInstalled bool
+		stealSelf        bool
+		streamError      bool
+		wantDeploy       bool
+	}{
+		{name: "first install", stealSelf: true, wantDeploy: true},
+		{name: "stream error", stealSelf: true, streamError: true},
+		{name: "core update", initialInstalled: true, stealSelf: true},
+		{name: "non takeover first install", stealSelf: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var installed atomic.Bool
+			installed.Store(tt.initialInstalled)
+			agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/child/services/status":
+					ready := installed.Load()
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"success": true,
+						"xray":    map[string]any{"installed": ready, "running": ready},
+					})
+				case r.Method == http.MethodPost && r.URL.Path == "/api/child/xray/install-stream":
+					w.Header().Set("Content-Type", "text/event-stream")
+					if tt.streamError {
+						_, _ = io.WriteString(w, "data: {\"type\":\"error\",\"message\":\"install failed\"}\n\n")
+						return
+					}
+					installed.Store(true)
+					_, _ = io.WriteString(w, "data: {\"type\":\"complete\",\"success\":true}\n\n")
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer agent.Close()
+
+			repo, server := newRemoteInstallationHandlerRepoWithSteal(t, testServerPort(t, agent.URL), tt.stealSelf)
+			if err := repo.UpdateRemoteServerXrayMode(context.Background(), server.ID, "external"); err != nil {
+				t.Fatal(err)
+			}
+			var deployCalls atomic.Int32
+			handler := NewRemoteManageHandler(repo, nil)
+			handler.SetStealSelfDeployer(func(context.Context, int64) error {
+				deployCalls.Add(1)
+				return nil
+			})
+			request := httptest.NewRequest(http.MethodPost, "/api/admin/remote/xray/install-stream?server_id="+strconv.FormatInt(server.ID, 10), nil)
+			response := httptest.NewRecorder()
+			handler.HandleXrayInstallStream(response, request)
+
+			if got := deployCalls.Load(); got != map[bool]int32{true: 1, false: 0}[tt.wantDeploy] {
+				t.Fatalf("deploy calls=%d wantDeploy=%v, body=%s", got, tt.wantDeploy, response.Body.String())
+			}
+			if tt.streamError && !strings.Contains(response.Body.String(), `"type":"error"`) {
+				t.Fatalf("stream error was not preserved: %s", response.Body.String())
+			}
+			if !tt.streamError && strings.Contains(response.Body.String(), "post-install verification failed") {
+				t.Fatalf("successful stream reported post-install failure: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+func TestXrayInstallStreamRetriesPersistedDeferredConfigWithoutChangingOrdinaryUpdates(t *testing.T) {
+	var installed atomic.Bool
+	installed.Store(true)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/child/services/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"xray":    map[string]any{"installed": installed.Load(), "running": installed.Load()},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/child/xray/install-stream":
+			_, _ = io.WriteString(w, "data: {\"type\":\"complete\",\"success\":true}\n\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer agent.Close()
+
+	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
+	if err := repo.UpdateRemoteServerXrayMode(context.Background(), server.ID, "external"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetRemoteServerXrayBootstrapPending(context.Background(), server.ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	var deployCalls atomic.Int32
+	failDeploy := atomic.Bool{}
+	failDeploy.Store(true)
+	handler := NewRemoteManageHandler(repo, nil)
+	handler.SetStealSelfDeployer(func(context.Context, int64) error {
+		deployCalls.Add(1)
+		if failDeploy.Load() {
+			return errors.New("temporary deployment failure")
+		}
+		return nil
+	})
+
+	run := func() string {
+		request := httptest.NewRequest(http.MethodPost, "/api/admin/remote/xray/install-stream?server_id="+strconv.FormatInt(server.ID, 10), nil)
+		response := httptest.NewRecorder()
+		handler.HandleXrayInstallStream(response, request)
+		return response.Body.String()
+	}
+	if body := run(); !strings.Contains(body, "post-install verification failed") {
+		t.Fatalf("failed deferred deployment was not reported: %s", body)
+	}
+	pending, err := repo.RemoteServerXrayBootstrapPending(context.Background(), server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pending {
+		t.Fatal("failed deferred deployment cleared its retry marker")
+	}
+
+	failDeploy.Store(false)
+	if body := run(); strings.Contains(body, `"type":"error"`) {
+		t.Fatalf("deferred deployment retry failed: %s", body)
+	}
+	pending, err = repo.RemoteServerXrayBootstrapPending(context.Background(), server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending {
+		t.Fatal("successful deferred deployment retained its retry marker")
+	}
+	if got := deployCalls.Load(); got != 2 {
+		t.Fatalf("deploy calls=%d want=2", got)
+	}
+
+	if body := run(); strings.Contains(body, `"type":"error"`) {
+		t.Fatalf("ordinary Xray update failed: %s", body)
+	}
+	if got := deployCalls.Load(); got != 2 {
+		t.Fatalf("ordinary update redeployed existing config: deploy calls=%d", got)
 	}
 }
 
@@ -424,6 +602,70 @@ func TestFinalizeRemoteInstallationRefreshesXrayStatusAfterLeaseRelease(t *testi
 			t.Fatalf("finalized server status was not refreshed: running=%v version=%q", stored.XrayRunning, stored.XrayVersion)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestPrepareRemoteInstallationDefersStealSelfUntilExternalXrayExists(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		installed      bool
+		wantDeployCall bool
+	}{
+		{name: "missing", installed: false, wantDeployCall: false},
+		{name: "installed", installed: true, wantDeployCall: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/child/services/status" || r.Method != http.MethodGet {
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"success": true,
+					"xray":    map[string]any{"installed": tt.installed, "running": tt.installed},
+				})
+			}))
+			defer agent.Close()
+
+			repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
+			if err := repo.UpdateRemoteServerXrayMode(context.Background(), server.ID, "external"); err != nil {
+				t.Fatal(err)
+			}
+			const nonce = "prepare-external-xray-state"
+			if err := repo.BeginRemoteServerInstallation(context.Background(), server.ID, nonce, time.Now().Add(time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+			if err := repo.MarkRemoteServerInstallationReady(context.Background(), server.ID, nonce); err != nil {
+				t.Fatal(err)
+			}
+
+			deployed := false
+			remote := NewRemoteManageHandler(repo, nil)
+			remote.SetStealSelfDeployer(func(context.Context, int64) error {
+				deployed = true
+				return nil
+			})
+			handler := NewXrayServerHandler(repo, nil, nil)
+			handler.SetRemoteManager(remote)
+			request := httptest.NewRequest(http.MethodPost, "/api/remote/install-prepare", nil)
+			request.Header.Set("Authorization", "Bearer "+server.Token)
+			request.Header.Set(remoteInstallationNonceHeader, nonce)
+			response := httptest.NewRecorder()
+			handler.PrepareRemoteInstallation(response, request)
+			if response.Code != http.StatusOK {
+				t.Fatalf("prepare status=%d body=%s", response.Code, response.Body.String())
+			}
+			if deployed != tt.wantDeployCall {
+				t.Fatalf("deployed=%v want=%v", deployed, tt.wantDeployCall)
+			}
+			pending, err := repo.RemoteServerXrayBootstrapPending(context.Background(), server.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pending != !tt.installed {
+				t.Fatalf("bootstrap pending=%v want=%v", pending, !tt.installed)
+			}
+		})
 	}
 }
 

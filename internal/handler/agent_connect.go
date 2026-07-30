@@ -1127,14 +1127,21 @@ SERVER_LOCK_STARTED=1
 start_install_renewal
 
 XRAY_BIN=""
+XRAY_REQUIRED_AFTER_INSTALL=1
 if [ "$XRAY_MODE" != "embedded" ]; then
+    XRAY_REQUIRED_AFTER_INSTALL=0
     for CANDIDATE in "$(command -v xray 2>/dev/null || true)" /usr/local/bin/xray /usr/bin/xray /opt/xray/xray; do
+        if [ -n "$CANDIDATE" ] && [ -e "$CANDIDATE" ] && [ ! -x "$CANDIDATE" ]; then
+            echo "ERROR: existing external Xray binary is not executable: $CANDIDATE" >&2
+            exit 1
+        fi
         if [ -n "$CANDIDATE" ] && [ -x "$CANDIDATE" ]; then XRAY_BIN="$CANDIDATE"; break; fi
     done
-    if [ -z "$XRAY_BIN" ] || ! "$XRAY_BIN" version >/dev/null 2>&1; then
-        echo "ERROR: external Xray mode requires a working Xray installation; install Xray before retrying" >&2
+    if [ -n "$XRAY_BIN" ] && ! "$XRAY_BIN" version >/dev/null 2>&1; then
+        echo "ERROR: existing external Xray binary failed its version check: $XRAY_BIN" >&2
         exit 1
     fi
+    if [ -n "$XRAY_BIN" ]; then XRAY_REQUIRED_AFTER_INSTALL=1; fi
 fi
 
 NGINX_BIN=""
@@ -1182,8 +1189,12 @@ if [ "$NGINX_MODE" = "managed" ] && [ "$NGINX_UNIT_PRESENT" = "1" ] && ! reversi
     echo "ERROR: nginx.service has unsupported enable state '$OLD_NGINX_ENABLE_STATE'; normalize it before installing" >&2
     exit 1
 fi
-if [ "$XRAY_MODE" != "embedded" ] && { [ "$XRAY_UNIT_PRESENT" != "1" ] || [ "$OLD_XRAY_ACTIVE" != "1" ]; }; then
+if [ "$XRAY_MODE" != "embedded" ] && [ "$XRAY_REQUIRED_AFTER_INSTALL" = "1" ] && { [ "$XRAY_UNIT_PRESENT" != "1" ] || [ "$OLD_XRAY_ACTIVE" != "1" ]; }; then
     echo "ERROR: external Xray mode requires an active systemd xray service so installation can be rolled back safely" >&2
+    exit 1
+fi
+if [ "$XRAY_MODE" != "embedded" ] && [ "$XRAY_REQUIRED_AFTER_INSTALL" != "1" ] && [ "$XRAY_UNIT_PRESENT" = "1" ]; then
+    echo "ERROR: xray.service exists but no working external Xray binary was found; repair or remove the partial installation first" >&2
     exit 1
 fi
 if [ "$AUTO_STEAL_SELF" = "1" ] && [ "$NGINX_MODE" = "managed" ] && { [ "$NGINX_UNIT_PRESENT" != "1" ] || [ "$OLD_NGINX_ACTIVE" != "1" ]; }; then
@@ -2909,7 +2920,7 @@ verify_local_services() {
         echo "ERROR: local Agent service-status check failed" >&2
         return 1
     }
-    if ! printf '%s\n' "$services_status" | grep -Eq '"xray"[[:space:]]*:[[:space:]]*\{[^}]*"running"[[:space:]]*:[[:space:]]*true'; then
+    if [ "$XRAY_REQUIRED_AFTER_INSTALL" = "1" ] && ! printf '%s\n' "$services_status" | grep -Eq '"xray"[[:space:]]*:[[:space:]]*\{[^}]*"running"[[:space:]]*:[[:space:]]*true'; then
         echo "ERROR: Agent reports that Xray is not running" >&2
         return 1
     fi
@@ -2933,7 +2944,7 @@ fi
 
 # Management readiness covers the control plane. Validate selected data-plane
 # prerequisites separately so a healthy Agent cannot mask a stopped Xray/Nginx.
-if [ "$XRAY_MODE" != "embedded" ]; then
+if [ "$XRAY_MODE" != "embedded" ] && [ "$XRAY_REQUIRED_AFTER_INSTALL" = "1" ]; then
     if ! "$XRAY_BIN" version >/dev/null 2>&1; then
         echo "ERROR: external Xray became unavailable during installation" >&2
         exit 1
@@ -3073,6 +3084,10 @@ echo "  journalctl -u relaydock-agent -f"
 echo ""
 
 echo ""
+if [ "$XRAY_MODE" != "embedded" ] && [ "$XRAY_REQUIRED_AFTER_INSTALL" != "1" ]; then
+    echo "External Xray is not installed; install it from this server's Service Control panel."
+    echo ""
+fi
 echo "=========================================="
 echo "  Installation Complete!"
 echo "=========================================="

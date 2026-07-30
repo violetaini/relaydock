@@ -206,7 +206,11 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"existing Arcway services did not stop",
 		"rollback backup retained at $BACKUP_DIR",
 		"automatic rollback was incomplete",
-		"external Xray mode requires a working Xray installation",
+		"XRAY_REQUIRED_AFTER_INSTALL=0",
+		`if [ "$XRAY_MODE" != "embedded" ] && [ "$XRAY_REQUIRED_AFTER_INSTALL" = "1" ]`,
+		`if [ "$XRAY_REQUIRED_AFTER_INSTALL" = "1" ] && ! printf`,
+		"xray.service exists but no working external Xray binary was found",
+		"External Xray is not installed; install it from this server's Service Control panel.",
 		"takeover mode requires a working Nginx installation",
 		"/var/lib/relaydock-agent",
 		"/var/lib/arcway-expiry-guard",
@@ -284,6 +288,9 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	}
 	if strings.Contains(script, "AGENT_VERSION=") {
 		t.Fatal("install script depends on an independently moving upstream Agent release")
+	}
+	if strings.Contains(script, "external Xray mode requires a working Xray installation") {
+		t.Fatal("install script still requires Xray before installing an external-mode Agent")
 	}
 	githubDownloadStart := strings.Index(script, `echo "Downloading $label from GitHub Release..."`)
 	masterFallbackStart := strings.Index(script, `echo "Downloading $label from master fallback..."`)
