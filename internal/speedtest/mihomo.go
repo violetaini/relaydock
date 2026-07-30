@@ -8,9 +8,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,13 +27,13 @@ import (
 const mihomoCacheDir = "data/bin"
 
 // minMihomoVersion:snell v4/v5 支持自 mihomo v1.19.26 起(v1.19.25 及更早会报 "snell version error: 4")。
-// 定位到的 mihomo 若低于此版本则跳过、重新下载固定版本,确保能对 snell 节点测速。
+// 定位到的 mihomo 若低于此版本则跳过、重新下载上游最新版,确保能对 snell 节点测速。
 const minMihomoVersion = "1.19.26"
 
 const (
-	pinnedMihomoTag      = "v1.19.28"
-	maxMihomoArchiveSize = int64(64 << 20)
-	maxMihomoBinarySize  = int64(256 << 20)
+	mihomoLatestReleaseURL = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+	maxMihomoArchiveSize   = int64(64 << 20)
+	maxMihomoBinarySize    = int64(256 << 20)
 )
 
 type mihomoAssetSpec struct {
@@ -41,29 +43,29 @@ type mihomoAssetSpec struct {
 	Digest  string
 }
 
-// pinnedMihomoAsset 是自动下载的信任根。未列出的平台必须显式提供 MIHOMO_BIN。
-func pinnedMihomoAsset(goos, goarch string) (mihomoAssetSpec, bool) {
+func managedMihomoAssetNames(goos, goarch, version string) ([]string, bool) {
 	switch goos + "/" + goarch {
 	case "linux/amd64":
-		return mihomoAssetSpec{
-			Tag:     pinnedMihomoTag,
-			Version: "1.19.28",
-			Name:    "mihomo-linux-amd64-compatible-v1.19.28.gz",
-			Digest:  "sha256:70d01cfb8cb7bf7a92fd1af16cb4b9553d90bb4eecde3b5c4849103e27c80ddb",
+		return []string{
+			"mihomo-linux-amd64-v1-v" + version + ".gz",
+			"mihomo-linux-amd64-compatible-v" + version + ".gz",
 		}, true
 	case "linux/arm64":
-		return mihomoAssetSpec{
-			Tag:     pinnedMihomoTag,
-			Version: "1.19.28",
-			Name:    "mihomo-linux-arm64-v1.19.28.gz",
-			Digest:  "sha256:2474450cd1c41dfa53036a54a4e85579f493d3af524d86c3d4b8e2b240b56cd2",
-		}, true
+		return []string{"mihomo-linux-arm64-v" + version + ".gz"}, true
 	default:
-		return mihomoAssetSpec{}, false
+		return nil, false
 	}
 }
 
-var mihomoVerRe = regexp.MustCompile(`v?(\d+)\.(\d+)\.(\d+)`)
+func managedMihomoPlatform(goos, goarch string) bool {
+	_, supported := managedMihomoAssetNames(goos, goarch, "0.0.0")
+	return supported
+}
+
+var (
+	mihomoVerRe        = regexp.MustCompile(`v?(\d+)\.(\d+)\.(\d+)`)
+	mihomoReleaseTagRe = regexp.MustCompile(`^v(\d+\.\d+\.\d+)$`)
+)
 
 // mihomoVersion 运行 `<bin> -v` 解析出 "X.Y.Z";解析不到返回 ""。
 func mihomoVersion(bin string) string {
@@ -115,9 +117,106 @@ func mihomoBinName() string {
 }
 
 var (
-	mihomoMu   sync.Mutex // 串行化定位/下载,避免并发重复下载
-	cachedPath string
+	mihomoMu sync.Mutex // 串行化定位/下载,避免并发重复下载
 )
+
+// ErrMihomoExternallyManaged 表示当前生效核心来自 MIHOMO_BIN 或 PATH，
+// Arcway 只展示状态，不会覆盖用户自行维护的可执行文件。
+var ErrMihomoExternallyManaged = errors.New("当前 Mihomo 由外部管理，请在 MIHOMO_BIN 或系统 PATH 中更新")
+
+// MihomoCoreStatus 是主控本机 Mihomo 的可管理状态。
+type MihomoCoreStatus struct {
+	Ready           bool   `json:"ready"`
+	Path            string `json:"path"`
+	Source          string `json:"source"`
+	CurrentVersion  string `json:"current_version"`
+	TargetVersion   string `json:"target_version"`
+	LatestVersion   string `json:"latest_version"`
+	LatestError     string `json:"latest_error,omitempty"`
+	Manageable      bool   `json:"manageable"`
+	UpdateAvailable bool   `json:"update_available"`
+}
+
+func mihomoStatusFor(path, source, version, target string, manageable bool) MihomoCoreStatus {
+	ready := version != "" && versionGTE(version, minMihomoVersion)
+	return MihomoCoreStatus{
+		Ready:           ready,
+		Path:            path,
+		Source:          source,
+		CurrentVersion:  version,
+		TargetVersion:   target,
+		LatestVersion:   target,
+		Manageable:      manageable,
+		UpdateAvailable: manageable && target != "" && (version == "" || !versionGTE(version, target)),
+	}
+}
+
+func applyMihomoLatest(status MihomoCoreStatus, version string) MihomoCoreStatus {
+	status.TargetVersion = version
+	status.LatestVersion = version
+	status.LatestError = ""
+	status.UpdateAvailable = status.Manageable && version != "" &&
+		(status.CurrentVersion == "" || !versionGTE(status.CurrentVersion, version))
+	return status
+}
+
+// inspectMihomoLocked 按 EnsureMihomo 的优先级检查候选核心。调用方必须持有 mihomoMu。
+func inspectMihomoLocked() MihomoCoreStatus {
+	supported := managedMihomoPlatform(runtime.GOOS, runtime.GOARCH)
+
+	if p := os.Getenv("MIHOMO_BIN"); p != "" && fileExists(p) {
+		if version := mihomoVersion(p); version != "" && versionGTE(version, minMihomoVersion) {
+			return mihomoStatusFor(p, "env", version, "", false)
+		}
+	}
+	if !supported {
+		return mihomoStatusFor("", "none", "", "", false)
+	}
+
+	local := filepath.Join(mihomoCacheDir, mihomoBinName())
+	localVersion := ""
+	if fileExists(local) {
+		localVersion = mihomoVersion(local)
+		if localVersion != "" && versionGTE(localVersion, minMihomoVersion) {
+			return mihomoStatusFor(local, "managed", localVersion, "", true)
+		}
+	}
+	if p, err := exec.LookPath("mihomo"); err == nil {
+		if version := mihomoVersion(p); version != "" && versionGTE(version, minMihomoVersion) {
+			return mihomoStatusFor(p, "path", version, "", false)
+		}
+	}
+	if fileExists(local) {
+		return mihomoStatusFor(local, "managed", localVersion, "", true)
+	}
+	return mihomoStatusFor("", "none", "", "", true)
+}
+
+type mihomoLatestResolver func(context.Context) (mihomoAssetSpec, ghAsset, error)
+type mihomoAssetInstaller func(context.Context, ghAsset, mihomoAssetSpec, string) error
+
+// getMihomoCoreStatus 返回本地核心状态，并尝试查询上游 latest。
+// latest 查询失败不会让已安装核心变为不可用。
+func getMihomoCoreStatus(ctx context.Context, resolve mihomoLatestResolver) MihomoCoreStatus {
+	mihomoMu.Lock()
+	status := inspectMihomoLocked()
+	mihomoMu.Unlock()
+
+	if !managedMihomoPlatform(runtime.GOOS, runtime.GOARCH) {
+		return status
+	}
+	spec, _, err := resolve(ctx)
+	if err != nil {
+		status.LatestError = err.Error()
+		return status
+	}
+	return applyMihomoLatest(status, spec.Version)
+}
+
+// GetMihomoCoreStatus 返回主控本机当前生效的 Mihomo、可管理性和上游最新版本。
+func GetMihomoCoreStatus(ctx context.Context) MihomoCoreStatus {
+	return getMihomoCoreStatus(ctx, latestMihomoAsset)
+}
 
 // EnsureMihomo 返回可用的 mihomo 二进制路径;按序尝试:env MIHOMO_BIN → data/bin/mihomo →
 // $PATH → 从 GitHub releases 自动下载到 data/bin/mihomo。
@@ -125,61 +224,67 @@ func EnsureMihomo(ctx context.Context) (string, error) {
 	mihomoMu.Lock()
 	defer mihomoMu.Unlock()
 
-	if _, supported := pinnedMihomoAsset(runtime.GOOS, runtime.GOARCH); !supported {
-		if p := os.Getenv("MIHOMO_BIN"); p != "" && fileExists(p) && mihomoSupportsSnell(p) {
-			cachedPath = p
-			return p, nil
-		}
+	status := inspectMihomoLocked()
+	if status.Ready {
+		return status.Path, nil
+	}
+	if !managedMihomoPlatform(runtime.GOOS, runtime.GOARCH) {
 		return "", fmt.Errorf("mihomo 不支持在 %s/%s 自动下载，请通过 MIHOMO_BIN 提供可信二进制", runtime.GOOS, runtime.GOARCH)
 	}
-	if cachedPath != "" && fileExists(cachedPath) {
-		return cachedPath, nil
-	}
-	// 每个候选都要求版本支持 snell(>= minMihomoVersion),否则跳过、最终重新下载固定版本。
-	if p := os.Getenv("MIHOMO_BIN"); p != "" && fileExists(p) && mihomoSupportsSnell(p) {
-		cachedPath = p
-		return p, nil
-	}
 	local := filepath.Join(mihomoCacheDir, mihomoBinName())
-	if fileExists(local) && mihomoSupportsSnell(local) {
-		cachedPath = local
-		return local, nil
-	}
-	if p, err := exec.LookPath("mihomo"); err == nil && mihomoSupportsSnell(p) {
-		cachedPath = p
-		return p, nil
-	}
-	// 自动下载固定版本(支持 snell)。若 data/bin 里是旧版会被覆盖。
+	// 自动下载上游最新版(支持 snell)。若 data/bin 里是过旧版本会被更新。
 	if err := downloadMihomo(ctx, local); err != nil {
 		return "", fmt.Errorf("mihomo 不可用且自动下载失败: %w", err)
 	}
-	cachedPath = local
 	return local, nil
+}
+
+// InstallManagedMihomo 安装或更新 Arcway 管理的核心到 MetaCubeX/mihomo 上游最新版。
+// 外部 MIHOMO_BIN/PATH 核心永远不会被覆盖；高于上游 latest 的受管核心也不会降级。
+func InstallManagedMihomo(ctx context.Context) (MihomoCoreStatus, error) {
+	return installManagedMihomo(ctx, latestMihomoAsset, func(ctx context.Context, asset ghAsset, spec mihomoAssetSpec, dst string) error {
+		return downloadMihomoAsset(ctx, &http.Client{Timeout: 5 * time.Minute}, asset, spec, dst)
+	})
+}
+
+func installManagedMihomo(ctx context.Context, resolve mihomoLatestResolver, install mihomoAssetInstaller) (MihomoCoreStatus, error) {
+	mihomoMu.Lock()
+	defer mihomoMu.Unlock()
+
+	status := inspectMihomoLocked()
+	if status.Source == "env" || status.Source == "path" {
+		return status, ErrMihomoExternallyManaged
+	}
+	if !status.Manageable {
+		return status, fmt.Errorf("mihomo 不支持在 %s/%s 自动安装，请通过 MIHOMO_BIN 提供可信二进制", runtime.GOOS, runtime.GOARCH)
+	}
+	spec, asset, err := resolve(ctx)
+	if err != nil {
+		status.LatestError = err.Error()
+		return status, fmt.Errorf("查询 Mihomo 上游最新版失败: %w", err)
+	}
+	status = applyMihomoLatest(status, spec.Version)
+	if status.Ready && versionGTE(status.CurrentVersion, spec.Version) {
+		return status, nil
+	}
+
+	local := filepath.Join(mihomoCacheDir, mihomoBinName())
+	if err := install(ctx, asset, spec, local); err != nil {
+		return status, fmt.Errorf("安装 Mihomo 失败: %w", err)
+	}
+	installed := applyMihomoLatest(inspectMihomoLocked(), spec.Version)
+	if !installed.Ready || installed.Source != "managed" {
+		return installed, errors.New("Mihomo 已下载但未能通过版本校验")
+	}
+	return installed, nil
 }
 
 // MihomoStatus 报告 mihomo 是否就绪及来源(供 UI 展示)。
 func MihomoStatus() (ready bool, path string) {
-	if _, supported := pinnedMihomoAsset(runtime.GOOS, runtime.GOARCH); !supported {
-		if p := os.Getenv("MIHOMO_BIN"); p != "" && fileExists(p) && mihomoSupportsSnell(p) {
-			return true, p
-		}
-		return false, ""
-	}
-	if cachedPath != "" && fileExists(cachedPath) {
-		return true, cachedPath
-	}
-	// 仅当版本支持 snell 时才算就绪,否则报未就绪以触发下载固定版本。
-	if p := os.Getenv("MIHOMO_BIN"); p != "" && fileExists(p) && mihomoSupportsSnell(p) {
-		return true, p
-	}
-	local := filepath.Join(mihomoCacheDir, mihomoBinName())
-	if fileExists(local) && mihomoSupportsSnell(local) {
-		return true, local
-	}
-	if p, err := exec.LookPath("mihomo"); err == nil && mihomoSupportsSnell(p) {
-		return true, p
-	}
-	return false, ""
+	mihomoMu.Lock()
+	status := inspectMihomoLocked()
+	mihomoMu.Unlock()
+	return status.Ready, status.Path
 }
 
 func fileExists(p string) bool {
@@ -187,30 +292,86 @@ func fileExists(p string) bool {
 	return err == nil && !st.IsDir()
 }
 
-// downloadMihomo 从固定的 MetaCubeX/mihomo release 下载清单内资源并安装到 dst。
+// downloadMihomo 从 MetaCubeX/mihomo 官方 latest release 下载当前平台资源。
 func downloadMihomo(ctx context.Context, dst string) error {
-	spec, supported := pinnedMihomoAsset(runtime.GOOS, runtime.GOARCH)
-	if !supported {
-		return fmt.Errorf("mihomo 不支持在 %s/%s 自动下载，请通过 MIHOMO_BIN 提供可信二进制", runtime.GOOS, runtime.GOARCH)
-	}
-	rel, err := fetchRelease(ctx, spec.Tag)
+	spec, asset, err := latestMihomoAsset(ctx)
 	if err != nil {
 		return err
 	}
-	if rel.TagName != spec.Tag {
-		return fmt.Errorf("mihomo release 标签不匹配: expected %s, got %s", spec.Tag, rel.TagName)
+	return downloadMihomoAsset(ctx, &http.Client{Timeout: 5 * time.Minute}, asset, spec, dst)
+}
+
+func latestMihomoAsset(ctx context.Context) (mihomoAssetSpec, ghAsset, error) {
+	if !managedMihomoPlatform(runtime.GOOS, runtime.GOARCH) {
+		return mihomoAssetSpec{}, ghAsset{}, fmt.Errorf(
+			"mihomo 不支持在 %s/%s 自动下载，请通过 MIHOMO_BIN 提供可信二进制",
+			runtime.GOOS, runtime.GOARCH,
+		)
 	}
-	var asset *ghAsset
-	for i := range rel.Assets {
-		if rel.Assets[i].Name == spec.Name {
-			asset = &rel.Assets[i]
-			break
+	rel, err := fetchLatestRelease(ctx)
+	if err != nil {
+		return mihomoAssetSpec{}, ghAsset{}, err
+	}
+	return resolveMihomoReleaseAsset(rel, runtime.GOOS, runtime.GOARCH)
+}
+
+func resolveMihomoReleaseAsset(rel *ghRelease, goos, goarch string) (mihomoAssetSpec, ghAsset, error) {
+	if rel == nil {
+		return mihomoAssetSpec{}, ghAsset{}, errors.New("mihomo latest release 为空")
+	}
+	if rel.Draft || rel.Prerelease {
+		return mihomoAssetSpec{}, ghAsset{}, fmt.Errorf("mihomo latest release %q 不是稳定发布", rel.TagName)
+	}
+	match := mihomoReleaseTagRe.FindStringSubmatch(rel.TagName)
+	if match == nil {
+		return mihomoAssetSpec{}, ghAsset{}, fmt.Errorf("mihomo latest release 标签无效: %q", rel.TagName)
+	}
+	version := match[1]
+	names, supported := managedMihomoAssetNames(goos, goarch, version)
+	if !supported {
+		return mihomoAssetSpec{}, ghAsset{}, fmt.Errorf("mihomo 不支持在 %s/%s 自动下载", goos, goarch)
+	}
+	for _, name := range names {
+		for _, asset := range rel.Assets {
+			if asset.Name != name {
+				continue
+			}
+			if err := validateMihomoReleaseAsset(rel.TagName, asset); err != nil {
+				return mihomoAssetSpec{}, ghAsset{}, err
+			}
+			return mihomoAssetSpec{
+				Tag:     rel.TagName,
+				Version: version,
+				Name:    name,
+				Digest:  asset.Digest,
+			}, asset, nil
 		}
 	}
-	if asset == nil {
-		return fmt.Errorf("release %s 未找到固定资源 %s", spec.Tag, spec.Name)
+	return mihomoAssetSpec{}, ghAsset{}, fmt.Errorf("mihomo release %s 未找到 %s 资源", rel.TagName, strings.Join(names, " 或 "))
+}
+
+func validateMihomoReleaseAsset(tag string, asset ghAsset) error {
+	if asset.State != "uploaded" {
+		return fmt.Errorf("GitHub 资源 %s 状态不是 uploaded", asset.Name)
 	}
-	return downloadMihomoAsset(ctx, &http.Client{Timeout: 5 * time.Minute}, *asset, spec, dst)
+	if asset.Size <= 0 || asset.Size > maxMihomoArchiveSize {
+		return fmt.Errorf("GitHub 资源 %s 大小 %d 不在允许范围内", asset.Name, asset.Size)
+	}
+	if asset.ContentType != "application/gzip" && asset.ContentType != "application/x-gzip" {
+		return fmt.Errorf("GitHub 资源 %s 类型不是 gzip: %q", asset.Name, asset.ContentType)
+	}
+	if _, err := parseSHA256Digest(asset.Digest); err != nil {
+		return fmt.Errorf("GitHub 资源 %s 的 digest 无效: %w", asset.Name, err)
+	}
+	downloadURL, err := url.Parse(asset.BrowserDownloadURL)
+	if err != nil {
+		return fmt.Errorf("GitHub 资源 %s 下载地址无效: %w", asset.Name, err)
+	}
+	wantPath := "/MetaCubeX/mihomo/releases/download/" + tag + "/" + asset.Name
+	if downloadURL.Scheme != "https" || !strings.EqualFold(downloadURL.Hostname(), "github.com") || downloadURL.Path != wantPath {
+		return fmt.Errorf("GitHub 资源 %s 下载地址不在官方 release: %q", asset.Name, asset.BrowserDownloadURL)
+	}
+	return nil
 }
 
 func parseSHA256Digest(digest string) ([]byte, error) {
@@ -229,7 +390,7 @@ func parseSHA256Digest(digest string) ([]byte, error) {
 	return expected, nil
 }
 
-// downloadMihomoAsset 校验固定摘要和 GitHub 元数据，再受限解压并原子替换 dst。
+// downloadMihomoAsset 校验 latest release 元数据中的 SHA-256，再受限解压并原子替换 dst。
 func downloadMihomoAsset(ctx context.Context, client *http.Client, asset ghAsset, spec mihomoAssetSpec, dst string) error {
 	return downloadMihomoAssetWithLimits(ctx, client, asset, spec, dst, maxMihomoArchiveSize, maxMihomoBinarySize)
 }
@@ -246,19 +407,28 @@ func downloadMihomoAssetWithLimits(
 	if asset.Name != spec.Name {
 		return fmt.Errorf("release 资源名称不匹配: expected %s, got %s", spec.Name, asset.Name)
 	}
-	trustedDigest, err := parseSHA256Digest(spec.Digest)
+	expectedDigest, err := parseSHA256Digest(spec.Digest)
 	if err != nil {
-		return fmt.Errorf("固定资源 %s 的 digest 无效: %w", spec.Name, err)
+		return fmt.Errorf("上游资源 %s 的 digest 无效: %w", spec.Name, err)
 	}
 	releaseDigest, err := parseSHA256Digest(asset.Digest)
 	if err != nil {
 		return fmt.Errorf("GitHub 资源 %s 的 digest 无效: %w", asset.Name, err)
 	}
-	if !bytes.Equal(releaseDigest, trustedDigest) {
-		return fmt.Errorf("GitHub 资源 %s 的 digest 与固定清单不一致", asset.Name)
+	if !bytes.Equal(releaseDigest, expectedDigest) {
+		return fmt.Errorf("GitHub 资源 %s 的 digest 与 latest release 解析结果不一致", asset.Name)
 	}
 	if archiveLimit <= 0 || binaryLimit <= 0 {
 		return fmt.Errorf("mihomo 下载大小上限必须大于零")
+	}
+	if asset.State != "uploaded" {
+		return fmt.Errorf("GitHub 资源 %s 状态不是 uploaded", asset.Name)
+	}
+	if asset.ContentType != "application/gzip" && asset.ContentType != "application/x-gzip" {
+		return fmt.Errorf("GitHub 资源 %s 类型不是 gzip: %q", asset.Name, asset.ContentType)
+	}
+	if asset.Size <= 0 || asset.Size > archiveLimit {
+		return fmt.Errorf("GitHub 资源 %s 声明的压缩大小 %d 不在允许范围内", asset.Name, asset.Size)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
@@ -298,9 +468,12 @@ func downloadMihomoAssetWithLimits(
 	if err != nil {
 		return fmt.Errorf("读取 %s: %w", asset.Name, err)
 	}
+	if written != asset.Size {
+		return fmt.Errorf("资源 %s 实际压缩大小 %d 与 release 元数据 %d 不一致", asset.Name, written, asset.Size)
+	}
 	actualDigest := hash.Sum(nil)
-	if !bytes.Equal(actualDigest, trustedDigest) {
-		return fmt.Errorf("资源 %s SHA-256 校验失败: expected %x, got %x", asset.Name, trustedDigest, actualDigest)
+	if !bytes.Equal(actualDigest, expectedDigest) {
+		return fmt.Errorf("资源 %s SHA-256 校验失败: expected %x, got %x", asset.Name, expectedDigest, actualDigest)
 	}
 	if _, err := download.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("重置 %s 读取位置: %w", asset.Name, err)
@@ -369,32 +542,41 @@ type ghAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Digest             string `json:"digest"`
+	State              string `json:"state"`
+	ContentType        string `json:"content_type"`
+	Size               int64  `json:"size"`
 }
 
 type ghRelease struct {
-	TagName string    `json:"tag_name"`
-	Assets  []ghAsset `json:"assets"`
+	TagName    string    `json:"tag_name"`
+	Draft      bool      `json:"draft"`
+	Prerelease bool      `json:"prerelease"`
+	Assets     []ghAsset `json:"assets"`
 }
 
-func fetchRelease(ctx context.Context, tag string) (*ghRelease, error) {
-	endpoint := "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/" + tag
+func fetchLatestRelease(ctx context.Context) (*ghRelease, error) {
+	return fetchMihomoRelease(ctx, &http.Client{Timeout: 30 * time.Second}, mihomoLatestReleaseURL)
+}
+
+func fetchMihomoRelease(ctx context.Context, client *http.Client, endpoint string) (*ghRelease, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("创建 mihomo release 请求: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	req.Header.Set("User-Agent", "relaydock-speedtest")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("查询 mihomo release %s: %w", tag, err)
+		return nil, fmt.Errorf("查询 mihomo latest release: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("查询 mihomo release %s HTTP %d", tag, resp.StatusCode)
+		return nil, fmt.Errorf("查询 mihomo latest release HTTP %d", resp.StatusCode)
 	}
 	var rel ghRelease
 	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("解析 mihomo latest release: %w", err)
 	}
 	return &rel, nil
 }

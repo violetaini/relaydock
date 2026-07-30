@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -17,45 +18,64 @@ import (
 	"testing"
 )
 
-func TestPinnedMihomoAssets(t *testing.T) {
-	tests := []struct {
-		goarch string
-		name   string
-		digest string
-	}{
-		{
-			goarch: "amd64",
-			name:   "mihomo-linux-amd64-compatible-v1.19.28.gz",
-			digest: "sha256:70d01cfb8cb7bf7a92fd1af16cb4b9553d90bb4eecde3b5c4849103e27c80ddb",
-		},
-		{
-			goarch: "arm64",
-			name:   "mihomo-linux-arm64-v1.19.28.gz",
-			digest: "sha256:2474450cd1c41dfa53036a54a4e85579f493d3af524d86c3d4b8e2b240b56cd2",
-		},
+func TestResolveMihomoReleaseAssetUsesStableLatestPlatformAssets(t *testing.T) {
+	const tag = "v1.19.29"
+	amd64V1 := releaseAsset(tag, "mihomo-linux-amd64-v1-v1.19.29.gz")
+	amd64Compatible := releaseAsset(tag, "mihomo-linux-amd64-compatible-v1.19.29.gz")
+	arm64 := releaseAsset(tag, "mihomo-linux-arm64-v1.19.29.gz")
+	release := &ghRelease{
+		TagName: tag,
+		Assets:  []ghAsset{amd64Compatible, arm64, amd64V1},
 	}
-	for _, tt := range tests {
-		t.Run(tt.goarch, func(t *testing.T) {
-			spec, ok := pinnedMihomoAsset("linux", tt.goarch)
-			if !ok {
-				t.Fatal("pinnedMihomoAsset() supported = false, want true")
-			}
-			if spec.Tag != pinnedMihomoTag || spec.Version != "1.19.28" {
-				t.Fatalf("pinned release = %s/%s, want %s/1.19.28", spec.Tag, spec.Version, pinnedMihomoTag)
-			}
-			if spec.Name != tt.name || spec.Digest != tt.digest {
-				t.Fatalf("pinned asset = %q %q, want %q %q", spec.Name, spec.Digest, tt.name, tt.digest)
-			}
-			if _, err := parseSHA256Digest(spec.Digest); err != nil {
-				t.Fatalf("parseSHA256Digest(%q): %v", spec.Digest, err)
-			}
-		})
+
+	spec, asset, err := resolveMihomoReleaseAsset(release, "linux", "amd64")
+	if err != nil {
+		t.Fatalf("resolve amd64: %v", err)
+	}
+	if spec.Tag != tag || spec.Version != "1.19.29" || spec.Name != amd64V1.Name || asset.Name != amd64V1.Name {
+		t.Fatalf("amd64 selection = %#v / %#v", spec, asset)
+	}
+
+	spec, asset, err = resolveMihomoReleaseAsset(release, "linux", "arm64")
+	if err != nil || spec.Name != arm64.Name || asset.Name != arm64.Name {
+		t.Fatalf("arm64 selection = %#v / %#v, err = %v", spec, asset, err)
+	}
+
+	// The upstream project is removing the compatible alias. Keep it only as a
+	// fallback for older releases where the baseline v1 asset is absent.
+	spec, _, err = resolveMihomoReleaseAsset(&ghRelease{TagName: tag, Assets: []ghAsset{amd64Compatible}}, "linux", "amd64")
+	if err != nil || spec.Name != amd64Compatible.Name {
+		t.Fatalf("amd64 compatible fallback = %#v, err = %v", spec, err)
 	}
 
 	for _, platform := range [][2]string{{"darwin", "amd64"}, {"windows", "amd64"}, {"linux", "386"}} {
-		if _, ok := pinnedMihomoAsset(platform[0], platform[1]); ok {
-			t.Fatalf("pinnedMihomoAsset(%q, %q) supported = true, want false", platform[0], platform[1])
+		if _, _, err := resolveMihomoReleaseAsset(release, platform[0], platform[1]); err == nil {
+			t.Fatalf("resolveMihomoReleaseAsset(%q, %q) error = nil", platform[0], platform[1])
 		}
+	}
+}
+
+func TestResolveMihomoReleaseAssetRejectsUntrustedMetadata(t *testing.T) {
+	const tag = "v1.19.29"
+	valid := releaseAsset(tag, "mihomo-linux-amd64-v1-v1.19.29.gz")
+	tests := []struct {
+		name    string
+		release *ghRelease
+	}{
+		{name: "invalid tag", release: &ghRelease{TagName: "latest", Assets: []ghAsset{valid}}},
+		{name: "prerelease", release: &ghRelease{TagName: tag, Prerelease: true, Assets: []ghAsset{valid}}},
+		{name: "missing digest", release: &ghRelease{TagName: tag, Assets: []ghAsset{func() ghAsset { a := valid; a.Digest = ""; return a }()}}},
+		{name: "wrong host", release: &ghRelease{TagName: tag, Assets: []ghAsset{func() ghAsset { a := valid; a.BrowserDownloadURL = "https://example.com/" + a.Name; return a }()}}},
+		{name: "not uploaded", release: &ghRelease{TagName: tag, Assets: []ghAsset{func() ghAsset { a := valid; a.State = "new"; return a }()}}},
+		{name: "wrong content type", release: &ghRelease{TagName: tag, Assets: []ghAsset{func() ghAsset { a := valid; a.ContentType = "application/octet-stream"; return a }()}}},
+		{name: "invalid size", release: &ghRelease{TagName: tag, Assets: []ghAsset{func() ghAsset { a := valid; a.Size = 0; return a }()}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := resolveMihomoReleaseAsset(tt.release, "linux", "amd64"); err == nil {
+				t.Fatal("resolveMihomoReleaseAsset() error = nil")
+			}
+		})
 	}
 }
 
@@ -72,6 +92,136 @@ func TestMihomoSupportsSnellRejectsUnparseableExecutable(t *testing.T) {
 	}
 }
 
+func TestMihomoCoreStatusAndManagedUpdate(t *testing.T) {
+	requireLinux(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("MIHOMO_BIN", "")
+	t.Setenv("PATH", "")
+
+	local := filepath.Join(mihomoCacheDir, mihomoBinName())
+	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(local, fakeMihomo("1.19.26", 0), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	status := getMihomoCoreStatus(context.Background(), testLatestResolver("1.19.29"))
+	if !status.Ready || status.Source != "managed" || !status.Manageable || !status.UpdateAvailable {
+		t.Fatalf("old managed status = %#v", status)
+	}
+	if status.CurrentVersion != "1.19.26" || status.TargetVersion != "1.19.29" || status.LatestVersion != "1.19.29" {
+		t.Fatalf("old managed versions = %#v", status)
+	}
+
+	downloadCalls := 0
+	updated, err := installManagedMihomo(context.Background(), testLatestResolver("1.19.29"), func(_ context.Context, _ ghAsset, _ mihomoAssetSpec, dst string) error {
+		downloadCalls++
+		return os.WriteFile(dst, fakeMihomo("1.19.29", 0), 0o755)
+	})
+	if err != nil {
+		t.Fatalf("installManagedMihomo() error = %v", err)
+	}
+	if downloadCalls != 1 || !updated.Ready || updated.Source != "managed" || updated.CurrentVersion != "1.19.29" || updated.UpdateAvailable {
+		t.Fatalf("updated status = %#v, download calls = %d", updated, downloadCalls)
+	}
+}
+
+func TestInstallManagedMihomoOnNewMachineUsesLatest(t *testing.T) {
+	requireLinux(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("MIHOMO_BIN", "")
+	t.Setenv("PATH", "")
+
+	installCalls := 0
+	installed, err := installManagedMihomo(context.Background(), testLatestResolver("1.19.29"), func(_ context.Context, _ ghAsset, spec mihomoAssetSpec, dst string) error {
+		installCalls++
+		if spec.Version != "1.19.29" {
+			t.Fatalf("install version = %q", spec.Version)
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(dst, fakeMihomo("1.19.29", 0), 0o755)
+	})
+	if err != nil {
+		t.Fatalf("installManagedMihomo() error = %v", err)
+	}
+	if installCalls != 1 || !installed.Ready || installed.Source != "managed" || installed.CurrentVersion != "1.19.29" || installed.TargetVersion != "1.19.29" {
+		t.Fatalf("installed status = %#v, install calls = %d", installed, installCalls)
+	}
+}
+
+func TestMihomoCoreStatusPreservesLocalReadinessWhenLatestCheckFails(t *testing.T) {
+	requireLinux(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("MIHOMO_BIN", "")
+	t.Setenv("PATH", "")
+	local := filepath.Join(mihomoCacheDir, mihomoBinName())
+	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(local, fakeMihomo("1.19.29", 0), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	status := getMihomoCoreStatus(context.Background(), func(context.Context) (mihomoAssetSpec, ghAsset, error) {
+		return mihomoAssetSpec{}, ghAsset{}, errors.New("github unavailable")
+	})
+	if !status.Ready || status.CurrentVersion != "1.19.29" || !strings.Contains(status.LatestError, "github unavailable") {
+		t.Fatalf("status = %#v", status)
+	}
+}
+
+func TestInstallManagedMihomoDoesNotDowngradeOrOverwriteExternalCore(t *testing.T) {
+	requireLinux(t)
+
+	t.Run("newer managed core", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		t.Setenv("MIHOMO_BIN", "")
+		t.Setenv("PATH", "")
+		local := filepath.Join(mihomoCacheDir, mihomoBinName())
+		if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(local, fakeMihomo("1.20.0", 0), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		resolveCalls, installCalls := 0, 0
+		status, err := installManagedMihomo(context.Background(), func(context.Context) (mihomoAssetSpec, ghAsset, error) {
+			resolveCalls++
+			return testLatestResolver("1.19.29")(context.Background())
+		}, func(context.Context, ghAsset, mihomoAssetSpec, string) error {
+			installCalls++
+			return nil
+		})
+		if err != nil || resolveCalls != 1 || installCalls != 0 || status.UpdateAvailable || status.CurrentVersion != "1.20.0" {
+			t.Fatalf("newer managed status = %#v, resolve calls = %d, install calls = %d, err = %v", status, resolveCalls, installCalls, err)
+		}
+	})
+
+	t.Run("MIHOMO_BIN", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		external := filepath.Join(t.TempDir(), "mihomo-external")
+		if err := os.WriteFile(external, fakeMihomo("1.19.28", 0), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("MIHOMO_BIN", external)
+		t.Setenv("PATH", "")
+		resolveCalls, installCalls := 0, 0
+		status, err := installManagedMihomo(context.Background(), func(context.Context) (mihomoAssetSpec, ghAsset, error) {
+			resolveCalls++
+			return testLatestResolver("1.19.29")(context.Background())
+		}, func(context.Context, ghAsset, mihomoAssetSpec, string) error {
+			installCalls++
+			return nil
+		})
+		if !errors.Is(err, ErrMihomoExternallyManaged) || resolveCalls != 0 || installCalls != 0 || status.Source != "env" || status.Manageable {
+			t.Fatalf("external status = %#v, resolve calls = %d, install calls = %d, err = %v", status, resolveCalls, installCalls, err)
+		}
+	})
+}
+
 func TestDownloadMihomoAssetVerifiesCompressedSHA256AndVersion(t *testing.T) {
 	requireLinux(t)
 	payload := fakeMihomo("1.19.28", 0)
@@ -81,7 +231,7 @@ func TestDownloadMihomoAssetVerifiesCompressedSHA256AndVersion(t *testing.T) {
 
 	spec := testAssetSpec(compressed)
 	dst := filepath.Join(t.TempDir(), "mihomo")
-	err := downloadMihomoAsset(context.Background(), server.Client(), testGHAsset(server.URL, spec), spec, dst)
+	err := downloadMihomoAsset(context.Background(), server.Client(), testGHAsset(server.URL, spec, int64(len(compressed))), spec, dst)
 	if err != nil {
 		t.Fatalf("downloadMihomoAsset() error = %v", err)
 	}
@@ -122,7 +272,7 @@ func TestDownloadMihomoAssetRejectsMissingOrInvalidReleaseDigestBeforeRequest(t 
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			asset := testGHAsset(server.URL, spec)
+			asset := testGHAsset(server.URL, spec, int64(len(compressed)))
 			asset.Digest = tt.digest
 			err := downloadMihomoAsset(context.Background(), server.Client(), asset, spec, filepath.Join(t.TempDir(), "mihomo"))
 			if err == nil {
@@ -149,7 +299,7 @@ func TestDownloadMihomoAssetDigestMismatchPreservesExistingBinary(t *testing.T) 
 	// The trusted and API digests intentionally cover the decompressed payload.
 	// Downloading must still hash the compressed release asset and reject it.
 	spec := testAssetSpec(payload)
-	err := downloadMihomoAsset(context.Background(), server.Client(), testGHAsset(server.URL, spec), spec, dst)
+	err := downloadMihomoAsset(context.Background(), server.Client(), testGHAsset(server.URL, spec, int64(len(compressed))), spec, dst)
 	if err == nil || !strings.Contains(err.Error(), "SHA-256 校验失败") {
 		t.Fatalf("downloadMihomoAsset() error = %v, want digest mismatch", err)
 	}
@@ -165,7 +315,7 @@ func TestDownloadMihomoAssetRejectsUnexpectedVersionBeforeRename(t *testing.T) {
 
 	dir, dst, original := existingBinary(t)
 	spec := testAssetSpec(compressed)
-	err := downloadMihomoAsset(context.Background(), server.Client(), testGHAsset(server.URL, spec), spec, dst)
+	err := downloadMihomoAsset(context.Background(), server.Client(), testGHAsset(server.URL, spec, int64(len(compressed))), spec, dst)
 	if err == nil || !strings.Contains(err.Error(), "版本不匹配") {
 		t.Fatalf("downloadMihomoAsset() error = %v, want version mismatch", err)
 	}
@@ -183,7 +333,7 @@ func TestDownloadMihomoAssetEnforcesSizeLimits(t *testing.T) {
 		dir, dst, original := existingBinary(t)
 		spec := testAssetSpec(compressed)
 		err := downloadMihomoAssetWithLimits(
-			context.Background(), server.Client(), testGHAsset(server.URL, spec), spec, dst,
+			context.Background(), server.Client(), testGHAsset(server.URL, spec, int64(len(compressed))), spec, dst,
 			int64(len(compressed)-1), int64(len(payload)+1),
 		)
 		if err == nil || !strings.Contains(err.Error(), "压缩大小") {
@@ -198,7 +348,7 @@ func TestDownloadMihomoAssetEnforcesSizeLimits(t *testing.T) {
 		dir, dst, original := existingBinary(t)
 		spec := testAssetSpec(compressed)
 		err := downloadMihomoAssetWithLimits(
-			context.Background(), server.Client(), testGHAsset(server.URL, spec), spec, dst,
+			context.Background(), server.Client(), testGHAsset(server.URL, spec, int64(len(compressed))), spec, dst,
 			int64(len(compressed)+1), int64(len(payload)-1),
 		)
 		if err == nil || !strings.Contains(err.Error(), "解压大小") {
@@ -208,17 +358,59 @@ func TestDownloadMihomoAssetEnforcesSizeLimits(t *testing.T) {
 	})
 }
 
+func TestFetchMihomoReleaseUsesGitHubAPIHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept") != "application/vnd.github+json" || r.Header.Get("X-GitHub-Api-Version") != "2022-11-28" {
+			t.Errorf("GitHub API headers = %#v", r.Header)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"tag_name":"v1.19.29","draft":false,"prerelease":false,"assets":[]}`)
+	}))
+	defer server.Close()
+
+	release, err := fetchMihomoRelease(context.Background(), server.Client(), server.URL)
+	if err != nil || release.TagName != "v1.19.29" {
+		t.Fatalf("fetchMihomoRelease() = %#v, %v", release, err)
+	}
+}
+
 func testAssetSpec(compressed []byte) mihomoAssetSpec {
 	return mihomoAssetSpec{
-		Tag:     pinnedMihomoTag,
+		Tag:     "v1.19.28",
 		Version: "1.19.28",
-		Name:    "mihomo-linux-amd64-compatible-v1.19.28.gz",
+		Name:    "mihomo-linux-amd64-v1-v1.19.28.gz",
 		Digest:  sha256Digest(compressed),
 	}
 }
 
-func testGHAsset(url string, spec mihomoAssetSpec) ghAsset {
-	return ghAsset{Name: spec.Name, BrowserDownloadURL: url, Digest: spec.Digest}
+func testGHAsset(url string, spec mihomoAssetSpec, size int64) ghAsset {
+	return ghAsset{
+		Name: spec.Name, BrowserDownloadURL: url, Digest: spec.Digest,
+		State: "uploaded", ContentType: "application/gzip", Size: size,
+	}
+}
+
+func testLatestResolver(version string) mihomoLatestResolver {
+	return func(context.Context) (mihomoAssetSpec, ghAsset, error) {
+		name, _ := managedMihomoAssetNames("linux", runtime.GOARCH, version)
+		assetName := "mihomo-linux-amd64-v1-v" + version + ".gz"
+		if len(name) > 0 {
+			assetName = name[0]
+		}
+		spec := mihomoAssetSpec{Tag: "v" + version, Version: version, Name: assetName, Digest: "sha256:" + strings.Repeat("0", 64)}
+		return spec, ghAsset{Name: spec.Name, Digest: spec.Digest}, nil
+	}
+}
+
+func releaseAsset(tag, name string) ghAsset {
+	return ghAsset{
+		Name:               name,
+		BrowserDownloadURL: "https://github.com/MetaCubeX/mihomo/releases/download/" + tag + "/" + name,
+		Digest:             "sha256:" + strings.Repeat("a", 64),
+		State:              "uploaded",
+		ContentType:        "application/gzip",
+		Size:               1024,
+	}
 }
 
 func fakeMihomo(version string, padding int) []byte {

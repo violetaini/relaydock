@@ -22,10 +22,17 @@ type SpeedTestHandler struct {
 	repo              *storage.TrafficRepository
 	capabilityManager *capabilities.Manager
 	testerWS          *SpeedTesterWSHandler // 家用测速端(Phase 2);nil 时只支持本机测速
+	mihomoStatus      func(context.Context) speedtest.MihomoCoreStatus
+	mihomoInstall     func(context.Context) (speedtest.MihomoCoreStatus, error)
 }
 
 func NewSpeedTestHandler(repo *storage.TrafficRepository, manager *capabilities.Manager) *SpeedTestHandler {
-	return &SpeedTestHandler{repo: repo, capabilityManager: manager}
+	return &SpeedTestHandler{
+		repo:              repo,
+		capabilityManager: manager,
+		mihomoStatus:      speedtest.GetMihomoCoreStatus,
+		mihomoInstall:     speedtest.InstallManagedMihomo,
+	}
 }
 
 // SetTesterWS 注入家用测速端 WS handler,启用"经家用测速端测速"。
@@ -49,8 +56,15 @@ func (h *SpeedTestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/admin/speedtest/results" && r.Method == http.MethodGet:
 		h.handleResults(w, r)
 	case r.URL.Path == "/api/admin/speedtest/mihomo-status" && r.Method == http.MethodGet:
-		ready, path := speedtest.MihomoStatus()
-		respondJSON(w, http.StatusOK, map[string]any{"success": true, "ready": ready, "path": path})
+		status := h.mihomoStatus(r.Context())
+		respondJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"ready":   status.Ready,
+			"path":    status.Path,
+			"status":  status,
+		})
+	case r.URL.Path == "/api/admin/speedtest/mihomo/install" && r.Method == http.MethodPost:
+		h.handleMihomoInstall(w, r)
 	case r.URL.Path == "/api/admin/speedtest/testers" && r.Method == http.MethodGet:
 		h.handleTestersList(w, r)
 	case r.URL.Path == "/api/admin/speedtest/testers/create" && r.Method == http.MethodPost:
@@ -62,6 +76,21 @@ func (h *SpeedTestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, errors.New("not found"))
 	}
+}
+
+func (h *SpeedTestHandler) handleMihomoInstall(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	status, err := h.mihomoInstall(ctx)
+	if err != nil {
+		code := http.StatusInternalServerError
+		if errors.Is(err, speedtest.ErrMihomoExternallyManaged) {
+			code = http.StatusConflict
+		}
+		writeError(w, code, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"success": true, "status": status})
 }
 
 func (h *SpeedTestHandler) handleRun(w http.ResponseWriter, r *http.Request) {
