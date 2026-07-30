@@ -521,6 +521,9 @@ func (h *RemoteManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.R
 		remoteWriteError(w, http.StatusBadRequest, "invalid server_id")
 		return
 	}
+	if !h.requireExternalManagedXray(r.Context(), w, id) {
+		return
+	}
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, "POST", "/api/child/xray/install", nil)
 	if err != nil {
@@ -578,6 +581,9 @@ func (h *RemoteManageHandler) HandleXrayRemove(w http.ResponseWriter, r *http.Re
 	id, err := strconv.ParseInt(serverID, 10, 64)
 	if err != nil {
 		remoteWriteError(w, http.StatusBadRequest, "invalid server_id")
+		return
+	}
+	if !h.requireExternalManagedXray(r.Context(), w, id) {
 		return
 	}
 
@@ -870,6 +876,30 @@ func (h *RemoteManageHandler) forwardStreamToRemoteLeased(w http.ResponseWriter,
 	}
 }
 
+func (h *RemoteManageHandler) requireExternalManagedXray(ctx context.Context, w http.ResponseWriter, serverID int64) bool {
+	server, err := h.repo.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		remoteWriteError(w, http.StatusNotFound, "server not found: "+err.Error())
+		return false
+	}
+	if server.XrayMode == "embedded" {
+		remoteWriteError(w, http.StatusConflict, "内嵌 Xray 随 Agent 更新，不能调用外置 Xray 安装或卸载程序")
+		return false
+	}
+	servers, err := h.repo.ListRemoteServers(ctx)
+	if err != nil {
+		remoteWriteError(w, http.StatusInternalServerError, "unable to verify server ownership: "+err.Error())
+		return false
+	}
+	for _, candidate := range servers {
+		if candidate.ID == serverID && candidate.IsFederated {
+			remoteWriteError(w, http.StatusConflict, "共享服务器的 Xray 核心由拥有方控制端管理")
+			return false
+		}
+	}
+	return true
+}
+
 func (h *RemoteManageHandler) HandleXrayInstallStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		remoteWriteError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -878,6 +908,9 @@ func (h *RemoteManageHandler) HandleXrayInstallStream(w http.ResponseWriter, r *
 	id, err := strconv.ParseInt(r.URL.Query().Get("server_id"), 10, 64)
 	if err != nil {
 		remoteSSEError(w, "invalid server_id")
+		return
+	}
+	if !h.requireExternalManagedXray(r.Context(), w, id) {
 		return
 	}
 	h.forwardStreamToRemote(w, r, id, "/api/child/xray/install-stream")
@@ -894,6 +927,9 @@ func (h *RemoteManageHandler) HandleXrayRemoveStream(w http.ResponseWriter, r *h
 	id, err := strconv.ParseInt(r.URL.Query().Get("server_id"), 10, 64)
 	if err != nil {
 		remoteSSEError(w, "invalid server_id")
+		return
+	}
+	if !h.requireExternalManagedXray(r.Context(), w, id) {
 		return
 	}
 	h.forwardStreamToRemote(w, r, id, "/api/child/xray/remove-stream")
