@@ -17,7 +17,7 @@ import (
 
 // AgentVersionHandler 给前端用:
 //   - 取目标服务器 agent 上报的当前版本
-//   - 取 GitHub 最新 release tag(全局缓存 1 小时)
+//   - 取 GitHub 最新 release tag(全局缓存 5 分钟)
 //   - 比对后返回 upgrade_available
 //
 // 一个端点搞定两件事,前端单次调用即可在每个服务器卡片旁渲染"版本 + 红点"。
@@ -29,10 +29,12 @@ type AgentVersionHandler struct {
 	latestVersion string    // 形如 "0.1.1"(去掉 GitHub tag 前缀 'v')
 	latestFetched time.Time // 最近一次成功拉取时间
 	latestErr     string    // 最近一次失败原因(显示用,不阻塞)
+	latestFetch   chan struct{}
+	httpClient    *http.Client
 }
 
 func NewAgentVersionHandler(rm *RemoteManageHandler, repo *storage.TrafficRepository) *AgentVersionHandler {
-	return &AgentVersionHandler{rm: rm, repo: repo}
+	return &AgentVersionHandler{rm: rm, repo: repo, httpClient: http.DefaultClient}
 }
 
 const githubLatestReleaseURL = "https://api.github.com/repos/violetaini/relaydock-agent/releases/latest"
@@ -113,57 +115,81 @@ func (h *AgentVersionHandler) fetchAgentCurrent(ctx context.Context, serverID in
 	return strings.TrimSpace(info.AgentVersion), ""
 }
 
-// fetchLatest 取 GitHub 最新 release 的版本号,带 1 小时缓存。
+// fetchLatest 取 GitHub 最新 release 的版本号,带 5 分钟缓存。
 // 取不到时返回上次缓存值(可能为空)+ 错误信息,不阻塞调用。
 func (h *AgentVersionHandler) fetchLatest(ctx context.Context) (string, string) {
 	h.latestMu.Lock()
 	cached := h.latestVersion
-	cachedErr := h.latestErr
 	stale := time.Since(h.latestFetched) > latestCacheTTL
-	h.latestMu.Unlock()
 	if !stale && cached != "" {
+		h.latestMu.Unlock()
 		return cached, ""
 	}
+	if h.latestFetch != nil {
+		done := h.latestFetch
+		h.latestMu.Unlock()
+		select {
+		case <-done:
+			h.latestMu.Lock()
+			latest, latestErr := h.latestVersion, h.latestErr
+			h.latestMu.Unlock()
+			return latest, latestErr
+		case <-ctx.Done():
+			return cached, ctx.Err().Error()
+		}
+	}
+	h.latestFetch = make(chan struct{})
+	done := h.latestFetch
+	h.latestMu.Unlock()
 
+	v, fetchErr := h.fetchLatestRelease(ctx)
+
+	h.latestMu.Lock()
+	if fetchErr == "" {
+		h.latestVersion = v
+		h.latestFetched = time.Now()
+		h.latestErr = ""
+	} else {
+		h.latestErr = fetchErr
+	}
+	latest, latestErr := h.latestVersion, h.latestErr
+	h.latestFetch = nil
+	close(done)
+	h.latestMu.Unlock()
+	return latest, latestErr
+}
+
+func (h *AgentVersionHandler) fetchLatestRelease(ctx context.Context) (string, string) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, githubLatestReleaseURL, nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := http.DefaultClient.Do(req)
+	client := h.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		h.latestMu.Lock()
-		h.latestErr = err.Error()
-		h.latestMu.Unlock()
-		return cached, err.Error()
+		return "", err.Error()
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		msg := "github status " + strconv.Itoa(resp.StatusCode)
-		h.latestMu.Lock()
-		h.latestErr = msg
-		h.latestMu.Unlock()
-		return cached, msg
+		return "", "github status " + strconv.Itoa(resp.StatusCode)
 	}
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return cached, err.Error()
+		return "", err.Error()
 	}
 	var rel struct {
 		TagName string `json:"tag_name"`
 	}
 	if err := json.Unmarshal(raw, &rel); err != nil {
-		return cached, "parse: " + err.Error()
+		return "", "parse: " + err.Error()
 	}
 	v := strings.TrimPrefix(strings.TrimSpace(rel.TagName), "v")
 	if v == "" {
-		return cached, "empty tag_name"
+		return "", "empty tag_name"
 	}
-	h.latestMu.Lock()
-	h.latestVersion = v
-	h.latestFetched = time.Now()
-	h.latestErr = ""
-	h.latestMu.Unlock()
-	_ = cachedErr
 	return v, ""
 }
 
