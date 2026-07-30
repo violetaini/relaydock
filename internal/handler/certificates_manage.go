@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/violetaini/relaydock/internal/acme"
@@ -44,6 +45,8 @@ type CertificateHandler struct {
 	onMasterURLChanged func(ctx context.Context, newURL string)
 	remoteManage       *RemoteManageHandler // 联邦(分享)服务器证书下发时,复用其 ForwardToAgent 走拥有方主控
 	localDeployer      func(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error
+	xrayCertSyncMu     sync.Mutex
+	xrayCertSynced     sync.Map // "serverID:certID" -> certificate material fingerprint
 }
 
 func (h *CertificateHandler) SetOnMasterURLChanged(fn func(ctx context.Context, newURL string)) {
@@ -578,6 +581,7 @@ func (h *CertificateHandler) requestLocalCertificate(cert *storage.Certificate) 
 	log.Printf("[Certificate] Successfully issued certificate for %s, expires %s", cert.Domain, result.ExpiryDate.Format("2006-01-02"))
 	SendCertResultNotification(ctx, cert.Domain, true, fmt.Sprintf("有效期至 %s", result.ExpiryDate.Format("2006-01-02")))
 
+	h.syncManagedXrayAfterMaterialUpdate(cert, result.CertPEM, result.KeyPEM)
 	// 如果配置则本地部署
 	h.deployAfterIssue(cert, result)
 	h.checkMasterCertReady(cert)
@@ -730,6 +734,7 @@ func (h *CertificateHandler) renewLocalCertificate(cert *storage.Certificate) {
 
 	log.Printf("[Certificate] Successfully renewed certificate for %s, expires %s", cert.Domain, result.ExpiryDate.Format("2006-01-02"))
 
+	h.syncManagedXrayAfterMaterialUpdate(cert, result.CertPEM, result.KeyPEM)
 	// 如果配置则本地部署
 	h.deployAfterIssue(cert, result)
 	h.checkMasterCertReady(cert)
@@ -1127,6 +1132,7 @@ func (h *CertificateHandler) deployCertToServerSyncLeased(ctx context.Context, s
 		if err := validateCertificateDeployACK(ack); err != nil {
 			return "", "", err
 		}
+		h.rememberXrayCertSync(server.ID, cert)
 		log.Printf("[Certificate] Sync cert_deploy to %s for %s", server.Name, payload.Domain)
 		return certPath, keyPath, nil
 	}
@@ -1136,6 +1142,7 @@ func (h *CertificateHandler) deployCertToServerSyncLeased(ctx context.Context, s
 	if err := h.deployRemoteCertificateHTTP(ctx, server, payload); err != nil {
 		return "", "", err
 	}
+	h.rememberXrayCertSync(server.ID, cert)
 	log.Printf("[Certificate] Sync cert_deploy via HTTP to %s for %s", server.Name, payload.Domain)
 	return certPath, keyPath, nil
 }
@@ -1677,6 +1684,7 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 			existing.DeployKeyPath = deployKeyPath
 			_ = h.repo.UpdateCertificate(ctx, existing)
 		}
+		h.syncManagedXrayAfterMaterialUpdate(existing, result.CertPEM, result.KeyPEM)
 		h.checkMasterCertReady(existing)
 		respondJSON(w, http.StatusOK, map[string]any{"success": true, "message": "证书已更新", "certificate_id": existing.ID})
 		return
@@ -1703,6 +1711,7 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 		log.Printf("[Certificate] UpdateCertificateIssued after upload failed: %v", err)
 	}
 
+	h.syncManagedXrayAfterMaterialUpdate(cert, result.CertPEM, result.KeyPEM)
 	h.checkMasterCertReady(cert)
 
 	respondJSON(w, http.StatusOK, map[string]any{"success": true, "message": "证书上传成功", "certificate_id": cert.ID})
