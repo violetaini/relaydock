@@ -480,6 +480,7 @@ func main() {
 	// by authenticated Agent reports and vanish on a control-plane restart
 	// instead of becoming stale persistent monitoring data.
 	probeMetricsStore := handler.NewProbeMetricsStore()
+	xrayServerHandler.SetProbeMetricsStore(probeMetricsStore)
 	remoteTrafficHandler := handler.NewRemoteTrafficHandler(repo, trafficCollector, cryptoConfig)
 	remoteTrafficHandler.SetProbeMetricsStore(probeMetricsStore)
 	mux.Handle("/api/admin/traffic", auth.RequireAdmin(tokenStore, userRepo, trafficApiHandler))

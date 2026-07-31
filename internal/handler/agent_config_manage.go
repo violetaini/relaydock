@@ -48,6 +48,7 @@ type XrayServerHandler struct {
 	limiterPusher            *LimiterConfigPusher
 	remoteManager            *RemoteManageHandler
 	wsHandler                *RemoteWSHandler
+	probeStore               *ProbeMetricsStore
 	crypto                   *CryptoConfig
 	capabilityManager        *capabilities.Manager
 	ddnsManager              *ddns.Manager
@@ -61,6 +62,13 @@ type XrayServerHandler struct {
 
 func (h *XrayServerHandler) SetWSHandler(ws *RemoteWSHandler) {
 	h.wsHandler = ws
+}
+
+// SetProbeMetricsStore injects the volatile live host-health cache shared by
+// authenticated Agent reports. It is optional for compatibility with focused
+// handler tests and older startup wiring.
+func (h *XrayServerHandler) SetProbeMetricsStore(store *ProbeMetricsStore) {
+	h.probeStore = store
 }
 
 func (h *XrayServerHandler) SetDDNSManager(m *ddns.Manager) {
@@ -146,6 +154,13 @@ type RemoteServerInboundInfo struct {
 type RemoteServerExtended struct {
 	storage.RemoteServer
 	TrafficUsed      int64                     `json:"traffic_used"`
+	CountryCode      string                    `json:"country_code,omitempty"`
+	CPUPct           *float64                  `json:"cpu_pct,omitempty"`
+	LoadAvg          string                    `json:"loadavg,omitempty"`
+	MemUsed          *int64                    `json:"mem_used,omitempty"`
+	MemTotal         *int64                    `json:"mem_total,omitempty"`
+	DiskUsed         *int64                    `json:"disk_used,omitempty"`
+	DiskTotal        *int64                    `json:"disk_total,omitempty"`
 	Inbounds         []RemoteServerInboundInfo `json:"inbounds"`
 	Encrypted        bool                      `json:"encrypted"`
 	WsConnected      bool                      `json:"ws_connected"`
@@ -264,6 +279,15 @@ func (h *XrayServerHandler) BuildRemoteServersList(ctx context.Context) RemoteSe
 				extended.AgentUninstallV2 = &capable
 			}
 		}
+		extended.CountryCode = cachedOrQueueGeoIPCountryCode(server.IPAddress)
+		if extended.CountryCode == "" && server.IPv6Enabled {
+			extended.CountryCode = cachedOrQueueGeoIPCountryCode(server.IPAddressV6)
+		}
+		if ((h.wsHandler != nil && h.wsHandler.IsConnected(server.Token)) || server.Status == storage.RemoteServerStatusConnected) && h.probeStore != nil {
+			if snapshot, ok := h.probeStore.Snapshot(server.ID); ok {
+				fillRemoteServerSystemMetrics(&extended, snapshot)
+			}
+		}
 
 		trafficUsed, _ := h.repo.GetServerTrafficUsed(ctx, server.ID)
 		extended.TrafficUsed = trafficUsed + server.TrafficUsedOffset
@@ -292,6 +316,25 @@ func (h *XrayServerHandler) BuildRemoteServersList(ctx context.Context) RemoteSe
 	return RemoteServersListResponse{
 		Success: true,
 		Servers: extendedServers,
+	}
+}
+
+func fillRemoteServerSystemMetrics(dst *RemoteServerExtended, snapshot ProbeSysSnapshot) {
+	if dst == nil {
+		return
+	}
+	if snapshot.HasCPU {
+		value := snapshot.CPUPct
+		dst.CPUPct = &value
+		dst.LoadAvg = snapshot.LoadAvg
+	}
+	if snapshot.HasMem {
+		used, total := snapshot.MemUsed, snapshot.MemTotal
+		dst.MemUsed, dst.MemTotal = &used, &total
+	}
+	if snapshot.HasDisk {
+		used, total := snapshot.DiskUsed, snapshot.DiskTotal
+		dst.DiskUsed, dst.DiskTotal = &used, &total
 	}
 }
 

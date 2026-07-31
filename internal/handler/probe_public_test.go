@@ -80,6 +80,8 @@ func decodeProbePayload(t *testing.T, response *httptest.ResponseRecorder) map[s
 func TestProbePublicPayloadUsesAllowlistAndLiveMetrics(t *testing.T) {
 	repo, server := newProbePublicRepository(t)
 	enableProbeForServer(t, repo, server.ID)
+	geoIPCache.Store(server.IPAddress, "US")
+	t.Cleanup(func() { geoIPCache.Delete(server.IPAddress) })
 
 	metrics := NewProbeMetricsStore()
 	if ok := metrics.IngestSys(server.ID, ProbeSysWire{
@@ -117,7 +119,7 @@ func TestProbePublicPayloadUsesAllowlistAndLiveMetrics(t *testing.T) {
 		t.Fatalf("server payload=%T, want object", servers[0])
 	}
 	wantKeys := map[string]bool{
-		"name": true, "online": true, "upload_speed": true, "download_speed": true,
+		"name": true, "country_code": true, "online": true, "upload_speed": true, "download_speed": true,
 		"traffic_used": true, "traffic_limit": true,
 		"cpu_pct": true, "loadavg": true,
 		"mem_used": true, "mem_total": true, "disk_used": true, "disk_total": true,
@@ -135,6 +137,9 @@ func TestProbePublicPayloadUsesAllowlistAndLiveMetrics(t *testing.T) {
 	if probe["cpu_pct"] != 17.5 || probe["loadavg"] != "0.12 0.08 0.03" {
 		t.Fatalf("cpu payload=%#v", probe)
 	}
+	if probe["country_code"] != "US" {
+		t.Fatalf("country_code=%#v, want US", probe["country_code"])
+	}
 	if probe["online"] != true || probe["upload_speed"] != float64(1234) || probe["download_speed"] != float64(5678) {
 		t.Fatalf("live status payload=%#v", probe)
 	}
@@ -147,6 +152,95 @@ func TestProbePublicPayloadUsesAllowlistAndLiveMetrics(t *testing.T) {
 		if strings.Contains(body, sensitive) {
 			t.Fatalf("public payload leaked sensitive server value %q: %s", sensitive, body)
 		}
+	}
+}
+
+func TestProbeDisguiseDefaultsToAllServersUntilAnEmptySelectionIsSaved(t *testing.T) {
+	repo, first := newProbePublicRepository(t)
+	second := &storage.RemoteServer{
+		Name:      "second-public-edge",
+		Token:     "second-probe-private-token",
+		Status:    storage.RemoteServerStatusConnected,
+		IPAddress: "203.0.113.94",
+	}
+	if err := repo.CreateRemoteServer(context.Background(), second); err != nil {
+		t.Fatalf("CreateRemoteServer(second): %v", err)
+	}
+	setProbePublicSetting(t, repo, probeDisguiseEnabledKey, "1")
+	setProbePublicSetting(t, repo, probeDisguiseShowNameKey, "1")
+
+	public := NewProbePublicHandler(repo, nil, NewProbeMetricsStore())
+	response := httptest.NewRecorder()
+	public.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/public/probe-servers", nil))
+	payload := decodeProbePayload(t, response)
+	servers, ok := payload["servers"].([]any)
+	if !ok || len(servers) != 2 {
+		t.Fatalf("default selection servers=%#v, want both remote servers", payload["servers"])
+	}
+
+	settings := NewSystemSettingsHandler(repo, nil)
+	settingsResponse := httptest.NewRecorder()
+	settings.GetProbeDisguise(settingsResponse, httptest.NewRequest(http.MethodGet, "/api/admin/system-settings/probe-disguise", nil))
+	var config map[string]any
+	if err := json.Unmarshal(settingsResponse.Body.Bytes(), &config); err != nil {
+		t.Fatalf("decode settings response: %v", err)
+	}
+	if config["server_ids_default"] != true {
+		t.Fatalf("server_ids_default=%#v, want true", config["server_ids_default"])
+	}
+	ids, ok := config["server_ids"].([]any)
+	if !ok || len(ids) != 2 || ids[0] != float64(first.ID) || ids[1] != float64(second.ID) {
+		t.Fatalf("default server_ids=%#v, want [%d %d]", config["server_ids"], first.ID, second.ID)
+	}
+
+	setProbePublicSetting(t, repo, probeDisguiseServerIDsKey, "[]")
+	public = NewProbePublicHandler(repo, nil, NewProbeMetricsStore())
+	response = httptest.NewRecorder()
+	public.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/public/probe-servers", nil))
+	payload = decodeProbePayload(t, response)
+	if servers, ok := payload["servers"].([]any); !ok || len(servers) != 0 {
+		t.Fatalf("explicit empty selection servers=%#v, want none", payload["servers"])
+	}
+
+	settingsResponse = httptest.NewRecorder()
+	settings.GetProbeDisguise(settingsResponse, httptest.NewRequest(http.MethodGet, "/api/admin/system-settings/probe-disguise", nil))
+	config = map[string]any{}
+	if err := json.Unmarshal(settingsResponse.Body.Bytes(), &config); err != nil {
+		t.Fatalf("decode explicit-empty settings response: %v", err)
+	}
+	if config["server_ids_default"] != false {
+		t.Fatalf("server_ids_default=%#v, want false", config["server_ids_default"])
+	}
+	if ids, ok := config["server_ids"].([]any); !ok || len(ids) != 0 {
+		t.Fatalf("explicit empty server_ids=%#v, want []", config["server_ids"])
+	}
+
+	// The editor can explicitly restore the dynamic all-server default.  This
+	// must clear the saved empty array rather than serializing today's IDs.
+	resetRequest := httptest.NewRequest(http.MethodPut, "/api/admin/system-settings/probe-disguise", strings.NewReader(`{
+		"enabled": true,
+		"title": "",
+		"show_name": true,
+		"server_ids_default": true
+	}`))
+	resetResponse := httptest.NewRecorder()
+	settings.SetProbeDisguise(resetResponse, resetRequest)
+	if resetResponse.Code != http.StatusOK {
+		t.Fatalf("reset default status=%d body=%s", resetResponse.Code, resetResponse.Body.String())
+	}
+	if raw, err := repo.GetSystemSetting(context.Background(), probeDisguiseServerIDsKey); err != nil || raw != "" {
+		t.Fatalf("default reset server_ids=%q err=%v, want empty setting", raw, err)
+	}
+	third := &storage.RemoteServer{Name: "third-public-edge", Token: "third-probe-private-token", Status: storage.RemoteServerStatusConnected, IPAddress: "203.0.113.95"}
+	if err := repo.CreateRemoteServer(context.Background(), third); err != nil {
+		t.Fatalf("CreateRemoteServer(third): %v", err)
+	}
+	public = NewProbePublicHandler(repo, nil, NewProbeMetricsStore())
+	response = httptest.NewRecorder()
+	public.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/public/probe-servers", nil))
+	payload = decodeProbePayload(t, response)
+	if servers, ok := payload["servers"].([]any); !ok || len(servers) != 3 {
+		t.Fatalf("restored default selection servers=%#v, want all three", payload["servers"])
 	}
 }
 
@@ -220,39 +314,63 @@ func TestProbeMetricsStorePrunesExpiredSnapshots(t *testing.T) {
 	}
 }
 
-func TestProbeConfigUpdatesReflectSelectionAndMetricSwitches(t *testing.T) {
+func TestProbeConfigUpdatesAlwaysCollectManagementTelemetry(t *testing.T) {
 	repo, server := newProbePublicRepository(t)
 
-	zeroes := map[string]string{
-		"probe_collect_cpu": "0", "probe_collect_mem": "0", "probe_collect_disk": "0",
-	}
-	if got := ProbeConfigUpdates(context.Background(), repo, server.ID); !mapsEqual(got, zeroes) {
-		t.Fatalf("disabled config=%#v want=%#v", got, zeroes)
-	}
-
-	enableProbeForServer(t, repo, server.ID)
-	setProbePublicSetting(t, repo, probeDisguiseMetricCPUKey, "")
-	setProbePublicSetting(t, repo, probeDisguiseMetricMemKey, "")
-	setProbePublicSetting(t, repo, probeDisguiseMetricDiskKey, "")
 	want := map[string]string{
 		"probe_collect_cpu": "1", "probe_collect_mem": "1", "probe_collect_disk": "1",
 	}
 	if got := ProbeConfigUpdates(context.Background(), repo, server.ID); !mapsEqual(got, want) {
-		t.Fatalf("default collection config=%#v want=%#v", got, want)
+		t.Fatalf("disabled public probe config=%#v want=%#v", got, want)
 	}
 
+	enableProbeForServer(t, repo, server.ID)
+	setProbePublicSetting(t, repo, probeDisguiseServerIDsKey, "[]")
 	setProbePublicSetting(t, repo, probeDisguiseMetricMemKey, "0")
-	want = map[string]string{
-		"probe_collect_cpu": "1", "probe_collect_mem": "0", "probe_collect_disk": "1",
-	}
 	if got := ProbeConfigUpdates(context.Background(), repo, server.ID); !mapsEqual(got, want) {
-		t.Fatalf("selected config=%#v want=%#v", got, want)
+		t.Fatalf("hidden public metric config=%#v want=%#v", got, want)
 	}
-	if got := ProbeConfigUpdates(context.Background(), repo, server.ID+999); !mapsEqual(got, zeroes) {
-		t.Fatalf("unselected config=%#v want=%#v", got, zeroes)
+	zeroes := map[string]string{
+		"probe_collect_cpu": "0", "probe_collect_mem": "0", "probe_collect_disk": "0",
 	}
 	if got := ProbeConfigUpdates(context.Background(), nil, server.ID); !mapsEqual(got, zeroes) {
 		t.Fatalf("nil repo config=%#v want=%#v", got, zeroes)
+	}
+}
+
+func TestRemoteServerListIncludesLiveMetricsAndCountryCode(t *testing.T) {
+	repo, server := newProbePublicRepository(t)
+	metrics := NewProbeMetricsStore()
+	if ok := metrics.IngestSys(server.ID, ProbeSysWire{
+		CPUPct:  23.5,
+		LoadAvg: "0.31 0.22 0.14",
+		HasCPU:  true,
+		MemUsed: 4 << 30, MemTotal: 8 << 30, HasMem: true,
+		DiskUsed: 50 << 30, DiskTotal: 100 << 30, HasDisk: true,
+	}); !ok {
+		t.Fatal("IngestSys returned false for a valid report")
+	}
+	geoIPCache.Store(server.IPAddress, "US")
+	t.Cleanup(func() { geoIPCache.Delete(server.IPAddress) })
+
+	handler := NewXrayServerHandler(repo, nil, nil)
+	handler.SetProbeMetricsStore(metrics)
+	response := handler.BuildRemoteServersList(context.Background())
+	if !response.Success || len(response.Servers) != 1 {
+		t.Fatalf("server response=%+v", response)
+	}
+	extended := response.Servers[0]
+	if extended.CountryCode != "US" {
+		t.Fatalf("country_code=%q, want US", extended.CountryCode)
+	}
+	if extended.CPUPct == nil || *extended.CPUPct != 23.5 || extended.LoadAvg != "0.31 0.22 0.14" {
+		t.Fatalf("cpu fields=%+v", extended)
+	}
+	if extended.MemUsed == nil || extended.MemTotal == nil || *extended.MemUsed != 4<<30 || *extended.MemTotal != 8<<30 {
+		t.Fatalf("memory fields=%+v", extended)
+	}
+	if extended.DiskUsed == nil || extended.DiskTotal == nil || *extended.DiskUsed != 50<<30 || *extended.DiskTotal != 100<<30 {
+		t.Fatalf("disk fields=%+v", extended)
 	}
 }
 

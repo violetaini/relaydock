@@ -1133,9 +1133,9 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 			}(wsConn, val)
 		}
 	}
-	// The public-probe collection policy is per server, so it cannot use the
-	// global BroadcastConfigUpdate helper.  Push it on every authenticated
-	// connection; HTTP-mode Agents receive the same values in traffic replies.
+	// Host-health collection is per server, so it cannot use the global
+	// BroadcastConfigUpdate helper. Push it on every authenticated connection;
+	// HTTP-mode Agents receive the same values in traffic replies.
 	go h.PushProbeConfigToAgent(context.Background(), server.ID)
 
 	// embedded 模式：认证成功后推送限速配置。
@@ -1487,9 +1487,9 @@ func (h *RemoteWSHandler) PushProbeConfigToAgent(ctx context.Context, serverID i
 	}
 }
 
-// PushProbeConfigToAll recalculates the policy for every connected server.
-// The selected-server list is intentionally evaluated per connection, so a
-// server removed from the disguise receives explicit zeroes immediately.
+// PushProbeConfigToAll refreshes host-health collection for every connected
+// server. Public-probe selection only controls serialization, while the same
+// readings remain available to authenticated service management.
 func (h *RemoteWSHandler) PushProbeConfigToAll(ctx context.Context) {
 	if h == nil || h.repo == nil {
 		return

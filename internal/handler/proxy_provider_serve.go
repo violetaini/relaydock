@@ -26,7 +26,8 @@ type geoIPResponse struct {
 	CountryCode string `json:"country_code"`
 }
 
-var geoIPCache = sync.Map{} // 地图[字符串]字符串（ip -> 国家/地区代码）
+var geoIPCache = sync.Map{}         // 地图[字符串]字符串（ip -> 国家/地区代码）
+var geoIPLookupPending = sync.Map{} // map[string]struct{}; prevents duplicate asynchronous lookups
 
 // 订阅内容缓存（5分钟过期）
 const subscriptionCacheTTL = 5 * time.Minute
@@ -92,6 +93,64 @@ func getGeoIPCountryCode(ipOrHost string) string {
 	geoIPCache.Store(ip, countryCode)
 	logger.Info("[GeoIP] IP地理位置查询成功", "ip", ip, "country", countryCode)
 	return countryCode
+}
+
+// cachedOrQueueGeoIPCountryCode returns a cached country code immediately and
+// queues a bounded background lookup for a public literal address on a cache
+// miss. Server-management and public-probe list handlers must not wait on a
+// third-party GeoIP request. Cache hits are local-only; cache misses reject
+// private, link-local, carrier-grade NAT and documentation ranges so opening
+// a list cannot disclose an internal/test address to the GeoIP provider.
+func cachedOrQueueGeoIPCountryCode(ipAddress string) string {
+	ip := net.ParseIP(strings.TrimSpace(ipAddress))
+	if ip == nil {
+		return ""
+	}
+	key := ip.String()
+	if cached, ok := geoIPCache.Load(key); ok {
+		if countryCode, ok := cached.(string); ok {
+			return publicCountryCode(countryCode)
+		}
+		return ""
+	}
+	if !isGeoIPLookupPublicIP(ip) {
+		return ""
+	}
+	if _, loaded := geoIPLookupPending.LoadOrStore(key, struct{}{}); !loaded {
+		go func() {
+			defer geoIPLookupPending.Delete(key)
+			_ = getGeoIPCountryCode(key)
+		}()
+	}
+	return ""
+}
+
+func publicCountryCode(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	if len(value) != 2 {
+		return ""
+	}
+	for _, r := range value {
+		if r < 'A' || r > 'Z' {
+			return ""
+		}
+	}
+	return value
+}
+
+func isGeoIPLookupPublicIP(ip net.IP) bool {
+	if !isPublicProbeIP(ip) {
+		return false
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		// RFC 5737 documentation ranges must never result in an external call.
+		if (ipv4[0] == 192 && ipv4[1] == 0 && ipv4[2] == 2) ||
+			(ipv4[0] == 198 && ipv4[1] == 51 && ipv4[2] == 100) ||
+			(ipv4[0] == 203 && ipv4[1] == 0 && ipv4[2] == 113) {
+			return false
+		}
+	}
+	return true
 }
 
 // 通过缓存获取订阅内容（5 分钟 TTL）

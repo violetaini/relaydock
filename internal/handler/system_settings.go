@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -261,7 +262,7 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "主服务器地址已更新"})
 }
 
-// 伪装探针配置。公开页只消费白名单 DTO；这些键只控制采集和展示，
+// 伪装探针配置。公开页只消费白名单 DTO；这些键只控制公开展示，
 // 不会使任何服务器地址、令牌或入站配置变成公开数据。
 const (
 	probeDisguiseEnabledKey       = "probe_disguise_enabled" // "1"/"" 开关
@@ -291,7 +292,6 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	logo, _ := h.repo.GetSystemSetting(ctx, probeDisguiseLogoKey)
 	blockLogin, _ := h.repo.GetSystemSetting(ctx, probeDisguiseBlockLoginKey)
 	showName, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowNameKey)
-	idsRaw, _ := h.repo.GetSystemSetting(ctx, probeDisguiseServerIDsKey)
 	metricCPU, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricCPUKey)
 	metricMem, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricMemKey)
 	metricDisk, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricDiskKey)
@@ -299,22 +299,37 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	metricSpeed, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricSpeedKey)
 
 	ids := []int64{}
-	if idsRaw != "" {
-		_ = json.Unmarshal([]byte(idsRaw), &ids)
+	selected, selectionConfigured := probeDisguiseServerSelection(ctx, h.repo)
+	if !selectionConfigured {
+		// A fresh installation deliberately starts with every managed server
+		// selected.  Saving [] remains an explicit request to show none.
+		if servers, err := h.repo.ListRemoteServers(ctx); err == nil {
+			ids = make([]int64, 0, len(servers))
+			for _, server := range servers {
+				ids = append(ids, server.ID)
+			}
+		}
+	} else {
+		ids = make([]int64, 0, len(selected))
+		for id := range selected {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"success":     true,
-		"enabled":     enabled == "1",
-		"title":       title,
-		"logo":        logo,
-		"block_login": blockLogin == "1",
-		"server_ids":  ids,
-		"show_name":   showName == "1",
-		"metric_cpu":  metricCPU != "0",
-		"metric_mem":  metricMem != "0",
-		"metric_disk": metricDisk != "0",
+		"success":            true,
+		"enabled":            enabled == "1",
+		"title":              title,
+		"logo":               logo,
+		"block_login":        blockLogin == "1",
+		"server_ids":         ids,
+		"server_ids_default": !selectionConfigured,
+		"show_name":          showName == "1",
+		"metric_cpu":         metricCPU != "0",
+		"metric_mem":         metricMem != "0",
+		"metric_disk":        metricDisk != "0",
 		// Preserve the old probe page's default: traffic and speeds are shown
 		// unless an administrator explicitly disables them with "0".
 		"metric_traffic": metricTraffic != "0",
@@ -336,10 +351,14 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		return
 	}
 	var req struct {
-		Enabled   bool    `json:"enabled"`
-		Title     string  `json:"title"`
-		ServerIDs []int64 `json:"server_ids"`
-		ShowName  bool    `json:"show_name"`
+		Enabled   bool     `json:"enabled"`
+		Title     string   `json:"title"`
+		ServerIDs *[]int64 `json:"server_ids"`
+		// A nil ServerIDs means this request did not edit the selection.  The
+		// explicit default flag clears the persisted list, so future servers are
+		// included automatically instead of freezing today's all-server list.
+		ServerIDsDefault *bool `json:"server_ids_default"`
+		ShowName         bool  `json:"show_name"`
 		// New fields intentionally use pointer semantics. Older frontends PUT
 		// the original four fields, and must not accidentally clear a newer
 		// metric selection.
@@ -377,17 +396,19 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		}
 		return ""
 	}
-	if req.ServerIDs == nil {
-		req.ServerIDs = []int64{}
-	}
-	idsJSON, _ := json.Marshal(req.ServerIDs)
-
-	for _, kv := range []struct{ k, v string }{
+	settings := []struct{ k, v string }{
 		{probeDisguiseEnabledKey, boolStr(req.Enabled)},
 		{probeDisguiseTitleKey, req.Title},
 		{probeDisguiseShowNameKey, boolStr(req.ShowName)},
-		{probeDisguiseServerIDsKey, string(idsJSON)},
-	} {
+	}
+	if req.ServerIDsDefault != nil && *req.ServerIDsDefault {
+		settings = append(settings, struct{ k, v string }{probeDisguiseServerIDsKey, ""})
+	} else if req.ServerIDs != nil {
+		idsJSON, _ := json.Marshal(*req.ServerIDs)
+		settings = append(settings, struct{ k, v string }{probeDisguiseServerIDsKey, string(idsJSON)})
+	}
+
+	for _, kv := range settings {
 		if err := h.repo.SetSystemSetting(ctx, kv.k, kv.v); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
@@ -437,7 +458,7 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "伪装探针配置已更新"})
+	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "伪装配置已更新"})
 }
 
 // defaultRedeemTemplate 兑换码复制文案的默认模板。占位符:

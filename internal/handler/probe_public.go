@@ -46,6 +46,7 @@ func NewProbePublicHandler(repo *storage.TrafficRepository, ws *RemoteWSHandler,
 // when the Agent has not reported a fresh value.
 type probeServer struct {
 	Name          string `json:"name,omitempty"`
+	CountryCode   string `json:"country_code,omitempty"`
 	UploadSpeed   *int64 `json:"upload_speed,omitempty"`
 	DownloadSpeed *int64 `json:"download_speed,omitempty"`
 	TrafficUsed   *int64 `json:"traffic_used,omitempty"`
@@ -126,21 +127,15 @@ func (h *ProbePublicHandler) buildPayloadUncached(ctx context.Context) (map[stri
 	showTraffic := trafficRaw != "0"
 	showSpeed := speedRaw != "0"
 
-	selected := make(map[int64]struct{})
-	if raw, _ := h.repo.GetSystemSetting(ctx, probeDisguiseServerIDsKey); raw != "" {
-		var ids []int64
-		if json.Unmarshal([]byte(raw), &ids) == nil {
-			for _, id := range ids {
-				if id > 0 {
-					selected[id] = struct{}{}
-				}
-			}
-		}
-	}
-
 	servers, err := h.repo.ListRemoteServers(ctx)
 	if err != nil {
 		return nil, err
+	}
+	selected, selectionConfigured := probeDisguiseServerSelection(ctx, h.repo)
+	if !selectionConfigured {
+		for _, server := range servers {
+			selected[server.ID] = struct{}{}
+		}
 	}
 	out := make([]probeServer, 0, len(selected))
 	for i := range servers {
@@ -151,6 +146,12 @@ func (h *ProbePublicHandler) buildPayloadUncached(ctx context.Context) (map[stri
 
 		probe := probeServer{
 			Online: (h.wsHandler != nil && h.wsHandler.IsConnected(server.Token)) || server.Status == storage.RemoteServerStatusConnected,
+		}
+		// Country code is safe to expose while addresses are not. The resolver
+		// only returns a cached two-letter value and queues any slow lookup.
+		probe.CountryCode = cachedOrQueueGeoIPCountryCode(server.IPAddress)
+		if probe.CountryCode == "" && server.IPv6Enabled {
+			probe.CountryCode = cachedOrQueueGeoIPCountryCode(server.IPAddressV6)
 		}
 		if showName {
 			probe.Name = server.Name
