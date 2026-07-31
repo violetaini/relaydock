@@ -666,6 +666,7 @@ func main() {
 	mux.Handle("/api/admin/remote/services/status", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleServicesStatus)))
 	mux.Handle("/api/admin/remote/services/control", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleServiceControl)))
 	mux.Handle("/api/admin/remote/xray/install", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleXrayInstall)))
+	mux.Handle("/api/admin/remote/xray/versions", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleXrayVersions)))
 	mux.Handle("/api/admin/remote/xray/remove", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleXrayRemove)))
 	mux.Handle("/api/admin/remote/xray/config", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleXrayConfig)))
 	mux.Handle("/api/admin/remote/xray/test-config", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleXrayTestConfig)))

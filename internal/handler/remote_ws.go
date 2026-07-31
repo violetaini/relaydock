@@ -104,6 +104,8 @@ type AgentCapabilities struct {
 	// AgentUninstallV2 表示 Agent 支持两阶段安全自卸载。主控在接单回执后
 	// 继续等待一次性 callback 确认清理完成，随后才删除服务器记录。
 	AgentUninstallV2 bool `json:"agent_uninstall_v2,omitempty"`
+	// XrayVersionSelectV1 表示外置 Xray 安装接口接受经过主控白名单校验的目标版本。
+	XrayVersionSelectV1 bool `json:"xray_version_select_v1,omitempty"`
 }
 
 // MissingManagedNodeCapabilities returns the safety contracts an Agent must

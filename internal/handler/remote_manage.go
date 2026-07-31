@@ -40,6 +40,11 @@ type RemoteManageHandler struct {
 	fedSessions       sync.Map // serverID (int64) → *securechan.Session (联邦:消费方↔拥有方)
 	stealSelfDeployer func(ctx context.Context, serverID int64) error
 	inboundCache      *InboundCache // 从 xray config snapshot 派生,套餐绑/换绑 cred 计算用,setter 注入
+	xrayVersionsMu    sync.Mutex
+	xrayVersions      []XrayCoreVersion
+	xrayVersionsAt    time.Time
+	xrayVersionsErr   string
+	xrayVersionsFetch chan struct{}
 }
 
 const (
@@ -524,11 +529,24 @@ func (h *RemoteManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.R
 	if !h.requireExternalManagedXray(r.Context(), w, id) {
 		return
 	}
+	installBody, targetVersion, errorStatus, err := h.prepareXrayInstallPayload(r.Context(), id, r)
+	if err != nil {
+		remoteWriteError(w, errorStatus, err.Error())
+		return
+	}
 
-	result, err := h.forwardToRemoteServer(r.Context(), id, "POST", "/api/child/xray/install", nil)
+	result, err := h.forwardToRemoteServer(r.Context(), id, "POST", "/api/child/xray/install", installBody)
 	if err != nil {
 		remoteWriteForwardError(w, err)
 		return
+	}
+	if targetVersion != "" {
+		verifyCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 20*time.Second)
+		defer cancel()
+		if err := h.waitForXrayInstall(verifyCtx, id, targetVersion); err != nil {
+			remoteWriteError(w, http.StatusConflict, "Xray installed, but version verification failed: "+err.Error())
+			return
+		}
 	}
 
 	// install 完成后异步自动触发"下发配置"动作 — 等价于用户手动点 UI 上的下发配置按钮。
@@ -817,16 +835,24 @@ func (t *remoteSSECompletionTracker) succeeded() bool {
 }
 
 func (h *RemoteManageHandler) forwardStreamToRemote(w http.ResponseWriter, r *http.Request, serverID int64, agentPath string) bool {
-	return h.forwardStreamToRemoteWithin(w, r, serverID, agentPath, 5*time.Minute)
+	return h.forwardStreamToRemoteBody(w, r, serverID, agentPath, nil)
+}
+
+func (h *RemoteManageHandler) forwardStreamToRemoteBody(w http.ResponseWriter, r *http.Request, serverID int64, agentPath string, body []byte) bool {
+	return h.forwardStreamToRemoteWithinBody(w, r, serverID, agentPath, body, 5*time.Minute)
 }
 
 func (h *RemoteManageHandler) forwardStreamToRemoteWithin(w http.ResponseWriter, r *http.Request, serverID int64, agentPath string, timeout time.Duration) bool {
+	return h.forwardStreamToRemoteWithinBody(w, r, serverID, agentPath, nil, timeout)
+}
+
+func (h *RemoteManageHandler) forwardStreamToRemoteWithinBody(w http.ResponseWriter, r *http.Request, serverID int64, agentPath string, body []byte, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
 	forwarded := false
 	err := h.repo.WithRemoteServerMutationLease(ctx, serverID, func(leasedCtx context.Context) error {
-		forwarded = h.forwardStreamToRemoteLeased(w, r.WithContext(leasedCtx), serverID, agentPath)
+		forwarded = h.forwardStreamToRemoteLeasedBody(w, r.WithContext(leasedCtx), serverID, agentPath, body)
 		return nil
 	})
 	if errors.Is(err, storage.ErrRemoteInstallationActive) {
@@ -840,6 +866,10 @@ func (h *RemoteManageHandler) forwardStreamToRemoteWithin(w http.ResponseWriter,
 }
 
 func (h *RemoteManageHandler) forwardStreamToRemoteLeased(w http.ResponseWriter, r *http.Request, serverID int64, agentPath string) bool {
+	return h.forwardStreamToRemoteLeasedBody(w, r, serverID, agentPath, nil)
+}
+
+func (h *RemoteManageHandler) forwardStreamToRemoteLeasedBody(w http.ResponseWriter, r *http.Request, serverID int64, agentPath string, body []byte) bool {
 	server, err := h.repo.GetRemoteServer(r.Context(), serverID)
 	if err != nil {
 		remoteSSEError(w, "server not found: "+err.Error())
@@ -860,7 +890,7 @@ func (h *RemoteManageHandler) forwardStreamToRemoteLeased(w http.ResponseWriter,
 	tracker := &remoteSSECompletionTracker{writer: w}
 	// forwardStreamToRemote 给整个操作设置了 5 分钟上限，包括租约等待、
 	// WS 尝试、HTTP 回退和响应读取；这里继续把同一 context 传给传输层。
-	if ok, err := h.tryWSRPCStream(r.Context(), serverID, http.MethodPost, agentPath, nil, tracker, flusher, 5*time.Minute); ok {
+	if ok, err := h.tryWSRPCStream(r.Context(), serverID, http.MethodPost, agentPath, body, tracker, flusher, 5*time.Minute); ok {
 		if err != nil {
 			log.Printf("[Remote Manage] WS stream %s for server %s ended with error (no fallback): %v", agentPath, server.Name, err)
 		}
@@ -879,7 +909,11 @@ func (h *RemoteManageHandler) forwardStreamToRemoteLeased(w http.ResponseWriter,
 	for i, childURL := range candidates {
 		log.Printf("[Remote Manage] Forwarding stream %s to server %s (%s)", agentPath, server.Name, childURL)
 
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, childURL, nil)
+		var requestBody io.Reader
+		if body != nil {
+			requestBody = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, childURL, requestBody)
 		if err != nil {
 			if i+1 < len(candidates) {
 				log.Printf("[Remote Manage] stream candidate %s req-build failed (%v), trying next", childURL, err)
@@ -890,6 +924,9 @@ func (h *RemoteManageHandler) forwardStreamToRemoteLeased(w http.ResponseWriter,
 		}
 		req.Header.Set("Authorization", "Bearer "+server.Token)
 		req.Header.Set("User-Agent", version.AgentUserAgent)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
 
 		client := &http.Client{} // SSE 生命周期由请求 context 的硬上限控制。
 		r2, err := client.Do(req)
@@ -986,30 +1023,44 @@ func (h *RemoteManageHandler) remoteXrayServiceStatus(ctx context.Context, serve
 	return status.Xray, nil
 }
 
+func (h *RemoteManageHandler) waitForXrayInstall(ctx context.Context, serverID int64, targetVersion string) error {
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		status, statusErr := h.remoteXrayServiceStatus(ctx, serverID)
+		ready := statusErr == nil && status.Installed && status.Running
+		if ready && (targetVersion == "" || reportedXrayVersionMatches(status.Version, targetVersion)) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if statusErr != nil {
+				return fmt.Errorf("verify installed Xray: %w", statusErr)
+			}
+			if !status.Installed || !status.Running {
+				return fmt.Errorf("Agent reports Xray installed=%v running=%v", status.Installed, status.Running)
+			}
+			return fmt.Errorf("Agent reports Xray version %q, expected %s", status.Version, targetVersion)
+		}
+		select {
+		case <-time.After(250 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 func (h *RemoteManageHandler) completeXrayStreamInstall(ctx context.Context, serverID int64, deployDeferredConfig bool) error {
+	return h.completeXrayStreamInstallVersion(ctx, serverID, deployDeferredConfig, "")
+}
+
+func (h *RemoteManageHandler) completeXrayStreamInstallVersion(ctx context.Context, serverID int64, deployDeferredConfig bool, targetVersion string) error {
 	leasedCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(ctx, serverID)
 	if err != nil {
 		return err
 	}
 	defer release()
 
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		status, statusErr := h.remoteXrayServiceStatus(leasedCtx, serverID)
-		if statusErr == nil && status.Installed && status.Running {
-			break
-		}
-		if time.Now().After(deadline) {
-			if statusErr != nil {
-				return fmt.Errorf("verify installed Xray: %w", statusErr)
-			}
-			return fmt.Errorf("Agent reports Xray installed=%v running=%v", status.Installed, status.Running)
-		}
-		select {
-		case <-time.After(250 * time.Millisecond):
-		case <-leasedCtx.Done():
-			return leasedCtx.Err()
-		}
+	if err := h.waitForXrayInstall(leasedCtx, serverID, targetVersion); err != nil {
+		return err
 	}
 
 	server, err := h.repo.GetRemoteServer(leasedCtx, serverID)
@@ -1048,6 +1099,11 @@ func (h *RemoteManageHandler) HandleXrayInstallStream(w http.ResponseWriter, r *
 	if !h.requireExternalManagedXray(r.Context(), w, id) {
 		return
 	}
+	installBody, targetVersion, errorStatus, err := h.prepareXrayInstallPayload(r.Context(), id, r)
+	if err != nil {
+		remoteWriteError(w, errorStatus, err.Error())
+		return
+	}
 	operationCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, storage.ErrRemoteInstallationActive) {
@@ -1071,7 +1127,7 @@ func (h *RemoteManageHandler) HandleXrayInstallStream(w http.ResponseWriter, r *
 		return
 	}
 	bootstrapCompletion := firstInstall || bootstrapPending
-	streamSucceeded := h.forwardStreamToRemote(w, r, id, "/api/child/xray/install-stream")
+	streamSucceeded := h.forwardStreamToRemoteBody(w, r, id, "/api/child/xray/install-stream", installBody)
 
 	// 安装完成后自动扫描更新 xray 状态
 	go h.refreshXrayStatus(id)
@@ -1080,7 +1136,7 @@ func (h *RemoteManageHandler) HandleXrayInstallStream(w http.ResponseWriter, r *
 	}
 	postCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 90*time.Second)
 	defer cancel()
-	if err := h.completeXrayStreamInstall(postCtx, id, bootstrapCompletion); err != nil {
+	if err := h.completeXrayStreamInstallVersion(postCtx, id, bootstrapCompletion, targetVersion); err != nil {
 		remoteSSEError(w, "Xray installed, but post-install verification failed: "+err.Error())
 		return
 	}
