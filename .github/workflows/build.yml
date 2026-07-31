@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  AGENT_SOURCE_SHA: f4c386bcd69890f6299983fe1d254c1ab82709f6
+  AGENT_SOURCE_SHA: 52d5601484149c4cb80fb80aff248c96bd8e63f8
 
 jobs:
   verify:
@@ -203,9 +203,11 @@ jobs:
           cache: true
           cache-dependency-path: agent-src/go.sum
 
-      - name: Verify Agent modules
+      - name: Verify Agent modules and record official Xray version
         working-directory: agent-src
-        run: go mod verify
+        run: |
+          go mod verify
+          go list -m -f 'Official Xray module: {{.Path}} {{.Version}}' github.com/xtls/xray-core
 
       - name: Build Agent
         working-directory: agent-src

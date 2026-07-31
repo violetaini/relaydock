@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/violetaini/relaydock/internal/safefetch"
 )
 
 const (
@@ -19,9 +21,7 @@ var (
 	ErrDownloadFailed = errors.New("proxy groups config download failed")
 )
 
-var httpClient = &http.Client{
-	Timeout: 30 * time.Second,
-}
+var httpClient = safefetch.NewClient(30*time.Second, 5<<20)
 
 // ResolveSourceURL 解析配置源地址
 // 优先级: 传入参数 > 环境变量 > 默认地址

@@ -377,6 +377,7 @@ func (r *TrafficRepository) CreateNode(ctx context.Context, node Node) (Node, er
 		return Node{}, fmt.Errorf("commit create node: %w", err)
 	}
 
+	r.invalidateTrafficBillingCache()
 	return r.GetNode(ctx, id, node.Username)
 }
 
@@ -486,6 +487,7 @@ func (r *TrafficRepository) UpdateNode(ctx context.Context, node Node) (Node, er
 		return Node{}, fmt.Errorf("commit update node: %w", err)
 	}
 
+	r.invalidateTrafficBillingCache()
 	return r.GetNode(ctx, node.ID, node.Username)
 }
 
@@ -558,6 +560,7 @@ func (r *TrafficRepository) DeleteNode(ctx context.Context, id int64, username s
 		}
 	}
 
+	r.invalidateTrafficBillingCache()
 	return nil
 }
 

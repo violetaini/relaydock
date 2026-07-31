@@ -461,6 +461,15 @@ func GenerateV3TemplateFromAnalysis(analysis *SubscriptionAnalysisResult) string
 		}
 	}
 
+	// RULE-SET entries are unusable without their top-level provider
+	// definitions. Preserve the complete provider maps captured during
+	// analysis, including client-specific fields we do not interpret here.
+	if len(analysis.RuleProviders) > 0 {
+		if providerYAML, err := yaml.Marshal(map[string]any{"rule-providers": analysis.RuleProviders}); err == nil {
+			lines = append(lines, "", strings.TrimSpace(string(providerYAML)))
+		}
+	}
+
 	return strings.Join(lines, "\n")
 }
 

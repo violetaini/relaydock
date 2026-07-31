@@ -39,9 +39,9 @@ func TestValidateLegacyPanelSourceURLAndRedirectOrigin(t *testing.T) {
 		})
 	}
 
-	source, _ := validateLegacyPanelSourceURL("https://panel.example.com", false)
+	source, _ := validateLegacyPanelSourceURL("https://8.8.8.8", false)
 	client := newLegacyPanelHTTPClient(source)
-	same, _ := http.NewRequest(http.MethodGet, "https://panel.example.com/api/login", nil)
+	same, _ := http.NewRequest(http.MethodGet, "https://8.8.8.8/api/login", nil)
 	if err := client.CheckRedirect(same, []*http.Request{{URL: source}}); err != nil {
 		t.Fatalf("same-origin redirect rejected: %v", err)
 	}

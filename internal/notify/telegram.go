@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -26,15 +27,15 @@ func sendTelegram(ctx context.Context, botToken, chatID, text string) error {
 		"parse_mode": {"Markdown"},
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(params.Encode()))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("create telegram request: %w", redactTelegramError(err, botToken, chatID))
 	}
-	req.URL.RawQuery = params.Encode()
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send telegram: %w", err)
+		return fmt.Errorf("send telegram: %w", redactTelegramError(err, botToken, chatID))
 	}
 	defer resp.Body.Close()
 
@@ -44,10 +45,27 @@ func sendTelegram(ctx context.Context, botToken, chatID, text string) error {
 			Description string `json:"description"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&result)
-		return fmt.Errorf("telegram API error (status %d): %s", resp.StatusCode, result.Description)
+		return fmt.Errorf("telegram API error (status %d): %s", resp.StatusCode,
+			redactTelegramText(result.Description, botToken, chatID))
 	}
 
 	return nil
+}
+
+func redactTelegramError(err error, secrets ...string) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(redactTelegramText(err.Error(), secrets...))
+}
+
+func redactTelegramText(value string, secrets ...string) string {
+	for _, secret := range secrets {
+		if secret != "" {
+			value = strings.ReplaceAll(value, secret, "[redacted]")
+		}
+	}
+	return value
 }
 
 // markdownEscaper 转义 Telegram legacy Markdown 的特殊字符。

@@ -518,6 +518,51 @@ func TestInboundToClashProxyPreservesVMessCipher(t *testing.T) {
 	}
 }
 
+func TestInboundToClashProxyUsesCompatibleTypeAndUDPDefaults(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		settings map[string]interface{}
+		wantType string
+	}{
+		{
+			name: "SOCKS5", protocol: "socks", wantType: "socks5",
+			settings: map[string]interface{}{"accounts": []interface{}{map[string]interface{}{"user": "alice", "pass": "secret"}}},
+		},
+		{
+			name: "HTTP", protocol: "http", wantType: "http",
+			settings: map[string]interface{}{"accounts": []interface{}{map[string]interface{}{"user": "alice", "pass": "secret"}}},
+		},
+		{
+			name: "Shadowsocks", protocol: "shadowsocks", wantType: "ss",
+			settings: map[string]interface{}{"method": "aes-128-gcm", "password": "secret"},
+		},
+		{
+			name: "Hysteria2", protocol: "hysteria", wantType: "hysteria2",
+			settings: map[string]interface{}{"clients": []interface{}{map[string]interface{}{"auth": "secret"}}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inbound := map[string]interface{}{
+				"tag": tt.protocol + "-in", "protocol": tt.protocol, "port": float64(443),
+				"settings": tt.settings,
+			}
+			proxy, err := (&RemoteManageHandler{}).inboundToClashProxy(inbound, "203.0.113.10", "edge", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if proxy["type"] != tt.wantType {
+				t.Fatalf("type = %#v, want %q", proxy["type"], tt.wantType)
+			}
+			if proxy["udp"] != true {
+				t.Fatalf("udp = %#v, want true", proxy["udp"])
+			}
+		})
+	}
+}
+
 func TestInboundToClashProxyDerivesRealityPublicKey(t *testing.T) {
 	privateBytes := make([]byte, 32)
 	for i := range privateBytes {
@@ -564,6 +609,9 @@ func TestInboundToClashProxyDerivesRealityPublicKey(t *testing.T) {
 	}
 	if got := proxy["client-fingerprint"]; got != "chrome" {
 		t.Fatalf("client-fingerprint = %v", got)
+	}
+	if got := proxy["skip-cert-verify"]; got != false {
+		t.Fatalf("skip-cert-verify = %v, want false", got)
 	}
 }
 

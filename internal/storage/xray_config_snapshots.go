@@ -35,6 +35,42 @@ type ServerXrayConfigSnapshot struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// beginImmediateTransaction reserves SQLite's single writer before a read/write
+// sequence. A deferred transaction can let two writers read the same state and
+// then race while upgrading their read locks.
+func (r *TrafficRepository) beginImmediateTransaction(ctx context.Context) (*sql.Conn, error) {
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire immediate transaction connection: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("begin immediate transaction: %w", err)
+	}
+	return conn, nil
+}
+
+func finishImmediateTransaction(ctx context.Context, conn *sql.Conn, commit bool) error {
+	if conn == nil {
+		return nil
+	}
+	statement := `ROLLBACK`
+	if commit {
+		statement = `COMMIT`
+	}
+	_, err := conn.ExecContext(ctx, statement)
+	if err != nil && commit {
+		// A canceled request can make COMMIT fail after the writes have run. Roll
+		// back before returning this manually managed connection to database/sql;
+		// otherwise the next borrower could inherit an open transaction and its
+		// writer lock.
+		_, rollbackErr := conn.ExecContext(context.Background(), `ROLLBACK`)
+		err = errors.Join(err, rollbackErr)
+	}
+	closeErr := conn.Close()
+	return errors.Join(err, closeErr)
+}
+
 // HashXrayConfig 对 config 文本做 sha256,大小写敏感、不规范化。
 // 调用方如果想跨格式差异(如 indent / trailing newline)对比,自己规范化后再 hash。
 func HashXrayConfig(config string) string {
@@ -96,16 +132,21 @@ func (r *TrafficRepository) GetXraySnapshotByID(ctx context.Context, id int64) (
 func (r *TrafficRepository) UpsertCurrentXraySnapshot(ctx context.Context, serverID int64, configJSON, source string) (*ServerXrayConfigSnapshot, error) {
 	hash := HashXrayConfig(configJSON)
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	conn, err := r.beginImmediateTransaction(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
+		return nil, err
 	}
-	defer tx.Rollback()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = finishImmediateTransaction(context.Background(), conn, false)
+		}
+	}()
 
 	// 查现行 current
 	var curID int64
 	var curHash string
-	err = tx.QueryRowContext(ctx,
+	err = conn.QueryRowContext(ctx,
 		`SELECT id, config_hash FROM server_xray_config_snapshots
 		 WHERE server_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1`,
 		serverID, XraySnapshotStatusCurrent,
@@ -117,15 +158,16 @@ func (r *TrafficRepository) UpsertCurrentXraySnapshot(ctx context.Context, serve
 
 	if hasCur && curHash == hash {
 		// 无需变更,直接返回现行 current
-		if err := tx.Commit(); err != nil {
+		if err := finishImmediateTransaction(ctx, conn, true); err != nil {
 			return nil, fmt.Errorf("commit: %w", err)
 		}
+		committed = true
 		return r.GetCurrentXraySnapshot(ctx, serverID)
 	}
 
 	// 旧 current 置 old
 	if hasCur {
-		if _, err := tx.ExecContext(ctx,
+		if _, err := conn.ExecContext(ctx,
 			`UPDATE server_xray_config_snapshots SET status = ? WHERE id = ?`,
 			XraySnapshotStatusOld, curID,
 		); err != nil {
@@ -134,7 +176,7 @@ func (r *TrafficRepository) UpsertCurrentXraySnapshot(ctx context.Context, serve
 	}
 
 	// 新 current
-	res, err := tx.ExecContext(ctx,
+	res, err := conn.ExecContext(ctx,
 		`INSERT INTO server_xray_config_snapshots (server_id, config_json, config_hash, source, status)
 		 VALUES (?, ?, ?, ?, ?)`,
 		serverID, configJSON, hash, source, XraySnapshotStatusCurrent,
@@ -144,9 +186,10 @@ func (r *TrafficRepository) UpsertCurrentXraySnapshot(ctx context.Context, serve
 	}
 	id, _ := res.LastInsertId()
 
-	if err := tx.Commit(); err != nil {
+	if err := finishImmediateTransaction(ctx, conn, true); err != nil {
 		return nil, fmt.Errorf("commit: %w", err)
 	}
+	committed = true
 	return &ServerXrayConfigSnapshot{
 		ID: id, ServerID: serverID, ConfigJSON: configJSON, ConfigHash: hash,
 		Source: source, Status: XraySnapshotStatusCurrent,
@@ -159,15 +202,20 @@ func (r *TrafficRepository) UpsertCurrentXraySnapshot(ctx context.Context, serve
 func (r *TrafficRepository) WritePendingXrayRecovery(ctx context.Context, serverID int64, configJSON, source string) (bool, error) {
 	hash := HashXrayConfig(configJSON)
 
-	tx, err := r.db.BeginTx(ctx, nil)
+	conn, err := r.beginImmediateTransaction(ctx)
 	if err != nil {
-		return false, fmt.Errorf("begin tx: %w", err)
+		return false, err
 	}
-	defer tx.Rollback()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = finishImmediateTransaction(context.Background(), conn, false)
+		}
+	}()
 
 	// 若与 current hash 一致 — 上报配置就是主控记的那一份,无需 pending(也无需告警)
 	var curHash string
-	err = tx.QueryRowContext(ctx,
+	err = conn.QueryRowContext(ctx,
 		`SELECT config_hash FROM server_xray_config_snapshots
 		 WHERE server_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1`,
 		serverID, XraySnapshotStatusCurrent,
@@ -176,14 +224,15 @@ func (r *TrafficRepository) WritePendingXrayRecovery(ctx context.Context, server
 		return false, fmt.Errorf("query current: %w", err)
 	}
 	if curHash == hash && curHash != "" {
-		if err := tx.Commit(); err != nil {
+		if err := finishImmediateTransaction(ctx, conn, true); err != nil {
 			return false, fmt.Errorf("commit: %w", err)
 		}
+		committed = true
 		return false, nil
 	}
 
 	// 删除旧 pending
-	if _, err := tx.ExecContext(ctx,
+	if _, err := conn.ExecContext(ctx,
 		`DELETE FROM server_xray_config_snapshots WHERE server_id = ? AND status = ?`,
 		serverID, XraySnapshotStatusPendingRecovery,
 	); err != nil {
@@ -191,7 +240,7 @@ func (r *TrafficRepository) WritePendingXrayRecovery(ctx context.Context, server
 	}
 
 	// 插新 pending
-	if _, err := tx.ExecContext(ctx,
+	if _, err := conn.ExecContext(ctx,
 		`INSERT INTO server_xray_config_snapshots (server_id, config_json, config_hash, source, status)
 		 VALUES (?, ?, ?, ?, ?)`,
 		serverID, configJSON, hash, source, XraySnapshotStatusPendingRecovery,
@@ -199,9 +248,10 @@ func (r *TrafficRepository) WritePendingXrayRecovery(ctx context.Context, server
 		return false, fmt.Errorf("insert pending: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := finishImmediateTransaction(ctx, conn, true); err != nil {
 		return false, fmt.Errorf("commit: %w", err)
 	}
+	committed = true
 	return true, nil
 }
 
@@ -220,14 +270,19 @@ func (r *TrafficRepository) DiscardPendingXrayRecovery(ctx context.Context, serv
 // AcceptPendingXrayRecovery 用户选了"接受 agent 当前配置": 旧 current 置 old,pending → current。
 // 同一事务里完成,失败回滚,pending 与 current 都不动。
 func (r *TrafficRepository) AcceptPendingXrayRecovery(ctx context.Context, serverID int64) error {
-	tx, err := r.db.BeginTx(ctx, nil)
+	conn, err := r.beginImmediateTransaction(ctx)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return err
 	}
-	defer tx.Rollback()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = finishImmediateTransaction(context.Background(), conn, false)
+		}
+	}()
 
 	var pendingID int64
-	err = tx.QueryRowContext(ctx,
+	err = conn.QueryRowContext(ctx,
 		`SELECT id FROM server_xray_config_snapshots
 		 WHERE server_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1`,
 		serverID, XraySnapshotStatusPendingRecovery,
@@ -240,7 +295,7 @@ func (r *TrafficRepository) AcceptPendingXrayRecovery(ctx context.Context, serve
 	}
 
 	// 旧 current → old
-	if _, err := tx.ExecContext(ctx,
+	if _, err := conn.ExecContext(ctx,
 		`UPDATE server_xray_config_snapshots SET status = ?
 		 WHERE server_id = ? AND status = ?`,
 		XraySnapshotStatusOld, serverID, XraySnapshotStatusCurrent,
@@ -249,16 +304,17 @@ func (r *TrafficRepository) AcceptPendingXrayRecovery(ctx context.Context, serve
 	}
 
 	// pending → current,同时把 source 标记为 manual_accept
-	if _, err := tx.ExecContext(ctx,
+	if _, err := conn.ExecContext(ctx,
 		`UPDATE server_xray_config_snapshots SET status = ?, source = ? WHERE id = ?`,
 		XraySnapshotStatusCurrent, XraySnapshotSourceManualAccept, pendingID,
 	); err != nil {
 		return fmt.Errorf("promote pending: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := finishImmediateTransaction(ctx, conn, true); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
+	committed = true
 	return nil
 }
 

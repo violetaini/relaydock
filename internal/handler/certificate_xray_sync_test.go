@@ -3,8 +3,10 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -171,5 +173,63 @@ func TestManagedXrayCertificateMaterialUpdateDeploysAndRestartsReferencedAgent(t
 	}
 	if h.needsXrayCertSync(server.ID, &storage.Certificate{ID: cert.ID, CertPEM: "renewed-certificate", KeyPEM: "renewed-key"}) {
 		t.Fatal("successful renewed deployment must be remembered by its certificate fingerprint")
+	}
+}
+
+func TestManagedXrayCertificateRestartFailureRestoresPreviousMaterial(t *testing.T) {
+	var deployments []WSCertDeployPayload
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/child/cert/deploy" {
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
+		var payload WSCertDeployPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		deployments = append(deployments, payload)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer agent.Close()
+
+	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
+	previous := &storage.Certificate{
+		ID: 31, Domain: "hy.example.test", CertPEM: "old-certificate", KeyPEM: "old-key",
+		Status: storage.CertStatusValid, RemoteServerID: 0,
+	}
+	renewed := *previous
+	renewed.CertPEM = "renewed-certificate"
+	renewed.KeyPEM = "renewed-key"
+
+	h := NewCertificateHandler(repo, nil)
+	h.SetRemoteManage(NewRemoteManageHandler(repo, nil))
+	restarts := 0
+	h.managedXrayRestart = func(context.Context, int64, string) error {
+		restarts++
+		if restarts == 1 {
+			return errors.New("renewed certificate rejected by Xray")
+		}
+		return nil
+	}
+	err := h.deployManagedXrayCert(context.Background(), server, &renewed, previous)
+	if err == nil || !strings.Contains(err.Error(), "renewed certificate rejected") {
+		t.Fatalf("expected renewed certificate restart failure, got %v", err)
+	}
+	if restarts != 2 {
+		t.Fatalf("restart calls=%d want renewed attempt plus rollback recovery", restarts)
+	}
+	if len(deployments) != 2 {
+		t.Fatalf("deployments=%d want renewed and rollback payloads: %#v", len(deployments), deployments)
+	}
+	if deployments[0].CertPEM != renewed.CertPEM || deployments[1].CertPEM != previous.CertPEM {
+		t.Fatalf("unexpected deployment order: %#v", deployments)
+	}
+	if !h.needsXrayCertSync(server.ID, &renewed) {
+		t.Fatal("renewed material must remain pending after rollback")
+	}
+	if h.needsXrayCertSync(server.ID, previous) {
+		t.Fatal("successfully restored old material must be remembered")
 	}
 }

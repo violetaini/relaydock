@@ -289,6 +289,7 @@ func TestSubscribeImportAndUploadRejectInvalidWireGuardPrivateKeyBeforeWrite(t *
 		_, _ = w.Write([]byte(foreignContent))
 	}))
 	defer upstream.Close()
+	handler.(*subscribeFilesHandler).fetchClient = upstream.Client()
 
 	importPayload, _ := json.Marshal(map[string]string{
 		"name": "foreign-import", "url": upstream.URL, "filename": "foreign-import.yaml",

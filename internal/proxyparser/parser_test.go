@@ -76,7 +76,7 @@ func TestParse_Issue98(t *testing.T) {
 		}
 		subset(t, "vless-reality", got, map[string]any{
 			"type": "vless", "tls": true, "servername": "x.com",
-			"client-fingerprint": "chrome", "skip-cert-verify": true,
+			"client-fingerprint": "chrome", "skip-cert-verify": false,
 			"reality-opts": map[string]any{"public-key": "PBKEY", "short-id": "", "spider-x": "/path"},
 		})
 	})
@@ -149,6 +149,39 @@ func TestParse_SkipCertAliases(t *testing.T) {
 		if !v {
 			t.Errorf("[%s] skip-cert-verify 应为 true", a)
 		}
+	}
+}
+
+func TestParseCertificateFingerprintAliases(t *testing.T) {
+	tests := []struct {
+		name string
+		uri  string
+		want string
+	}{
+		{name: "vless pcs", uri: "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&pcs=ABCDEF#vless", want: "ABCDEF"},
+		{name: "trojan xray pin", uri: "trojan://password@example.com:443?pinnedPeerCertSha256=123456#trojan", want: "123456"},
+		{name: "hysteria pin", uri: "hysteria2://password@example.com:443?pinSHA256=FEDCBA#hy2", want: "FEDCBA"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := Parse(tt.uri)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got["tls-fingerprint"] != tt.want {
+				t.Fatalf("tls-fingerprint = %#v, want %q", got["tls-fingerprint"], tt.want)
+			}
+		})
+	}
+}
+
+func TestParseRealityHonorsExplicitSkipCertVerify(t *testing.T) {
+	got, err := Parse("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=reality&pbk=key&insecure=1#reality")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["skip-cert-verify"] != true {
+		t.Fatalf("explicit insecure flag was lost: %#v", got["skip-cert-verify"])
 	}
 }
 

@@ -25,7 +25,7 @@ func SetFederationCapabilities(manager *capabilities.Manager) {
 }
 
 func StartFederationPoller(ctx context.Context, repo *storage.TrafficRepository) {
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := newFederationHTTPClient()
 	ticker := time.NewTicker(federationPollInterval)
 	defer ticker.Stop()
 	for {

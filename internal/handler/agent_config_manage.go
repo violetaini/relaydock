@@ -1799,6 +1799,7 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "Nginx 模式必须为 managed 或 reuse_existing"})
 		return
 	}
+	oldEffectiveNodeHost, newEffectiveNodeHost := normalizeRemoteServerAddressUpdate(oldServer, &req)
 
 	if req.XrayMode == "embedded" && oldServer.XrayMode != "embedded" && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureEmbeddedXray) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1947,25 +1948,17 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		}
 	}
 
-	// 域名变更同步刷新该服务器下所有节点 clash_config.server。
-	// Domain 优先于 IP(动态 IP 场景下域名稳定),空 Domain 时回退到 IPAddress。
-	newDomain := strings.TrimSpace(req.Domain)
-	oldDomain := strings.TrimSpace(oldServer.Domain)
-	if newDomain != oldDomain {
-		addr := newDomain
-		if addr == "" {
-			addr = oldServer.IPAddress
+	// Compare the effective endpoint, not just Domain. PullAddress changes and
+	// IPv4-to-IPv6 fallback changes must refresh existing subscription nodes too.
+	if newEffectiveNodeHost != "" && newEffectiveNodeHost != oldEffectiveNodeHost {
+		finalName := strings.TrimSpace(req.Name)
+		if finalName == "" {
+			finalName = oldServer.Name
 		}
-		if addr != "" {
-			finalName := req.Name
-			if finalName == "" {
-				finalName = oldServer.Name
-			}
-			if n, err := h.repo.RefreshNodesServerAddress(ctx, finalName, addr); err != nil {
-				log.Printf("[Remote Server] Refresh nodes server address failed for %s: %v", finalName, err)
-			} else if n > 0 {
-				log.Printf("[Remote Server] Refreshed %d node(s) server address → %s after domain change on %s", n, addr, finalName)
-			}
+		if n, err := h.repo.RefreshNodesServerAddress(ctx, finalName, newEffectiveNodeHost); err != nil {
+			log.Printf("[Remote Server] Refresh nodes server address failed for %s: %v", finalName, err)
+		} else if n > 0 {
+			log.Printf("[Remote Server] Refreshed %d node(s) server address %s → %s on %s", n, oldEffectiveNodeHost, newEffectiveNodeHost, finalName)
 		}
 	}
 
@@ -2034,6 +2027,34 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		Success: true,
 		Message: respMsg,
 	})
+}
+
+// normalizeRemoteServerAddressUpdate applies the linked-domain rule and returns
+// the old/new client endpoints. A Domain follows PullAddress only when it was
+// previously equal to PullAddress and the request did not explicitly replace it
+// with a different value.
+func normalizeRemoteServerAddressUpdate(oldServer *storage.RemoteServer, req *RemoteServerUpdateRequest) (string, string) {
+	if oldServer == nil || req == nil {
+		return "", ""
+	}
+	oldHost := chooseClashServerHost(oldServer)
+	oldPull := strings.TrimSpace(oldServer.PullAddress)
+	newPull := oldPull
+	pullConfigProvided := strings.TrimSpace(req.PullAddress) != "" || req.PullPort > 0 || strings.TrimSpace(req.PullToken) != ""
+	if pullConfigProvided {
+		newPull = strings.TrimSpace(req.PullAddress)
+	}
+	oldDomain := strings.TrimSpace(oldServer.Domain)
+	newDomain := strings.TrimSpace(req.Domain)
+	if newPull != oldPull && oldDomain != "" && oldDomain == oldPull && (newDomain == "" || newDomain == oldDomain) {
+		newDomain = newPull
+		req.Domain = newDomain
+	}
+
+	next := *oldServer
+	next.Domain = newDomain
+	next.PullAddress = newPull
+	return oldHost, chooseClashServerHost(&next)
 }
 
 // switchRemoteXrayMode 通知远程 Agent 切换 xray_mode 并重启。

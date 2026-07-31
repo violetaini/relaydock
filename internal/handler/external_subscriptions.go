@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/safefetch"
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
@@ -168,7 +169,7 @@ func handleCreateExternalSubscription(w http.ResponseWriter, r *http.Request, re
 		userAgent = "clash-meta/2.4.0"
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := safefetch.NewClient(30*time.Second, maxSubscriptionBytes)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
 	if err != nil {
 		logger.Info("[外部订阅] 创建请求失败", "name", name, "error", err)

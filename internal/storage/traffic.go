@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -94,6 +95,8 @@ type TrafficRepository struct {
 	remoteInstallationLeases sync.Map // serverID (int64) -> *sync.RWMutex
 	nodeSecretMu             sync.RWMutex
 	nodeSecretBox            *secretbox.Box
+	billingCacheMu           sync.Mutex
+	billingCache             map[int64]trafficBillingCacheEntry
 }
 
 // SubscriptionLink 表示向客户端公开的可配置订阅条目。
@@ -2471,6 +2474,10 @@ CREATE TABLE IF NOT EXISTS user_email_traffic (
     last_downlink INTEGER NOT NULL DEFAULT 0,
     cycle_base_uplink INTEGER NOT NULL DEFAULT 0,
     cycle_base_downlink INTEGER NOT NULL DEFAULT 0,
+    billable_bytes INTEGER NOT NULL DEFAULT 0,
+    billable_fraction REAL NOT NULL DEFAULT 0,
+    billable_initialized INTEGER NOT NULL DEFAULT 0,
+    billable_username TEXT NOT NULL DEFAULT '',
     cycle_start TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(server_id, email),
@@ -2487,6 +2494,12 @@ CREATE INDEX IF NOT EXISTS idx_user_email_traffic_email ON user_email_traffic(em
 	// 存量行 base=0 → 增量 == 当前累计值,与升级前行为完全一致。
 	_, _ = r.db.Exec("ALTER TABLE user_email_traffic ADD COLUMN cycle_base_uplink INTEGER NOT NULL DEFAULT 0")
 	_, _ = r.db.Exec("ALTER TABLE user_email_traffic ADD COLUMN cycle_base_downlink INTEGER NOT NULL DEFAULT 0")
+	// 计费用量在采集时按当时的套餐模式和节点倍率固化。存量行 initialized=0，
+	// 首次采集/读取时按迁移时规则建立一次基线，之后套餐变更只影响新增流量。
+	_, _ = r.db.Exec("ALTER TABLE user_email_traffic ADD COLUMN billable_bytes INTEGER NOT NULL DEFAULT 0")
+	_, _ = r.db.Exec("ALTER TABLE user_email_traffic ADD COLUMN billable_fraction REAL NOT NULL DEFAULT 0")
+	_, _ = r.db.Exec("ALTER TABLE user_email_traffic ADD COLUMN billable_initialized INTEGER NOT NULL DEFAULT 0")
+	_, _ = r.db.Exec("ALTER TABLE user_email_traffic ADD COLUMN billable_username TEXT NOT NULL DEFAULT ''")
 
 	// 流量快照表 - 存储每日流量快照以了解历史趋势
 	const trafficSnapshotsSchema = `
@@ -2866,6 +2879,34 @@ CREATE INDEX IF NOT EXISTS idx_xray_snap_server_created ON server_xray_config_sn
 	if _, err := r.db.Exec(xrayConfigSnapshotsSchema); err != nil {
 		return fmt.Errorf("migrate server_xray_config_snapshots: %w", err)
 	}
+	// Repair any historical split-brain rows before enforcing the invariant.
+	// The newest current snapshot wins; pending recovery also keeps only the
+	// newest candidate. Old snapshots remain available for manual rollback.
+	if _, err := r.db.Exec(`UPDATE server_xray_config_snapshots
+		SET status = 'old'
+		WHERE status = 'current'
+		  AND id NOT IN (
+			SELECT MAX(id) FROM server_xray_config_snapshots
+			WHERE status = 'current' GROUP BY server_id
+		  )`); err != nil {
+		return fmt.Errorf("repair duplicate current xray snapshots: %w", err)
+	}
+	if _, err := r.db.Exec(`DELETE FROM server_xray_config_snapshots
+		WHERE status = 'pending_recovery'
+		  AND id NOT IN (
+			SELECT MAX(id) FROM server_xray_config_snapshots
+			WHERE status = 'pending_recovery' GROUP BY server_id
+		  )`); err != nil {
+		return fmt.Errorf("repair duplicate pending xray snapshots: %w", err)
+	}
+	if _, err := r.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_xray_snap_one_current
+		ON server_xray_config_snapshots(server_id) WHERE status = 'current'`); err != nil {
+		return fmt.Errorf("enforce one current xray snapshot: %w", err)
+	}
+	if _, err := r.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_xray_snap_one_pending
+		ON server_xray_config_snapshots(server_id) WHERE status = 'pending_recovery'`); err != nil {
+		return fmt.Errorf("enforce one pending xray snapshot: %w", err)
+	}
 
 	// 用户路由出站操作日志:记录每条创建/删除,用于每日次数限制。
 	// 单条 routing 变更都会触发 agent 重启 xray,所以必须按"操作次数"限速而不仅按"当前持有数量"。
@@ -2890,6 +2931,18 @@ CREATE TABLE IF NOT EXISTS traffic_threshold_notified (
 `
 	if _, err := r.db.Exec(trafficThresholdNotifiedSchema); err != nil {
 		return fmt.Errorf("migrate traffic_threshold_notified: %w", err)
+	}
+
+	const userTrafficThresholdNotifiedSchema = `
+CREATE TABLE IF NOT EXISTS user_traffic_threshold_notified (
+    username TEXT PRIMARY KEY,
+    limit_bytes INTEGER NOT NULL,
+    notified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+);
+`
+	if _, err := r.db.Exec(userTrafficThresholdNotifiedSchema); err != nil {
+		return fmt.Errorf("migrate user_traffic_threshold_notified: %w", err)
 	}
 
 	// 服务器分享(联邦)相关表:必须在迁移阶段建好,因为 ListRemoteServers 会 EXISTS 查询 federated_servers。
@@ -2924,6 +2977,9 @@ CREATE TABLE IF NOT EXISTS traffic_threshold_notified (
 	// 的 cumulative 算 delta,基线必须包含两个旧客户端的累计)。
 	if err := r.mergeOrphanEmailTrafficRows(context.Background()); err != nil {
 		return fmt.Errorf("migrate user_traffic email merge: %w", err)
+	}
+	if err := r.initializeLegacyBillableTraffic(context.Background()); err != nil {
+		return fmt.Errorf("migrate collection-time billable traffic: %w", err)
 	}
 
 	// 一次性清理:扫 xray snapshot 表把已废弃 marktag(如 fix_openai)的 routing.rules 移除 + 重算 hash,
@@ -5538,6 +5594,49 @@ func (r *TrafficRepository) DeleteUserSessions(ctx context.Context, username str
 	return nil
 }
 
+// DisableUserAndDeleteSessions atomically marks an account inactive and removes
+// all of its persisted login sessions. Keeping both writes in one transaction
+// prevents a process restart between them from restoring a session that should
+// have been revoked.
+func (r *TrafficRepository) DisableUserAndDeleteSessions(ctx context.Context, username string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("username is required")
+	}
+
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("disable user begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx,
+		`UPDATE users SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, username)
+	if err != nil {
+		return fmt.Errorf("disable user: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("disable user rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrUserNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE username = ?`, username); err != nil {
+		return fmt.Errorf("delete disabled user sessions: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("disable user commit: %w", err)
+	}
+	return nil
+}
+
 // 从数据库中检索所有未过期的会话。
 func (r *TrafficRepository) LoadSessions(ctx context.Context) ([]Session, error) {
 	if r == nil || r.db == nil {
@@ -7355,9 +7454,13 @@ func (r *TrafficRepository) ListXrayServers(ctx context.Context) ([]XrayServer, 
 //   - download = 入方向 = node_traffic.downlink 或 system_rx_cycle
 //
 // 用户流量按套餐 traffic_mode 走,不在此处处理。
-func (r *TrafficRepository) GetServerTrafficUsed(ctx context.Context, serverID int64) (int64, error) {
-	if r == nil || r.db == nil {
-		return 0, errors.New("traffic repository not initialized")
+type trafficQueryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func getServerTrafficUsed(ctx context.Context, q trafficQueryRower, serverID int64) (int64, error) {
+	if serverID <= 0 {
+		return 0, errors.New("server id is required")
 	}
 
 	var (
@@ -7366,10 +7469,15 @@ func (r *TrafficRepository) GetServerTrafficUsed(ctx context.Context, serverID i
 		sysRx  int64
 		sysTx  int64
 	)
-	_ = r.db.QueryRowContext(ctx, `
+	if err := q.QueryRowContext(ctx, `
 		SELECT COALESCE(traffic_stats_mode, 'both'), COALESCE(traffic_source, 'xray'),
 		       COALESCE(system_rx_cycle, 0), COALESCE(system_tx_cycle, 0)
-		FROM remote_servers WHERE id = ?`, serverID).Scan(&mode, &source, &sysRx, &sysTx)
+		FROM remote_servers WHERE id = ?`, serverID).Scan(&mode, &source, &sysRx, &sysTx); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrRemoteServerNotFound
+		}
+		return 0, fmt.Errorf("get server traffic settings: %w", err)
+	}
 
 	if source == "system" {
 		switch mode {
@@ -7377,7 +7485,7 @@ func (r *TrafficRepository) GetServerTrafficUsed(ctx context.Context, serverID i
 			return sysTx, nil
 		case "download":
 			return sysRx, nil
-		case "max": // 上下行取最大
+		case "max":
 			if sysRx > sysTx {
 				return sysRx, nil
 			}
@@ -7387,7 +7495,6 @@ func (r *TrafficRepository) GetServerTrafficUsed(ctx context.Context, serverID i
 		}
 	}
 
-	// source = "xray" — 保持原行为(走 node_traffic 聚合)
 	var query string
 	switch mode {
 	case "upload":
@@ -7395,7 +7502,6 @@ func (r *TrafficRepository) GetServerTrafficUsed(ctx context.Context, serverID i
 	case "download":
 		query = `SELECT COALESCE(SUM(downlink), 0) FROM node_traffic WHERE server_id = ?`
 	case "max":
-		// 上下行各自求和后取最大值
 		query = `SELECT CASE WHEN COALESCE(SUM(uplink),0) > COALESCE(SUM(downlink),0)
 		                     THEN COALESCE(SUM(uplink),0) ELSE COALESCE(SUM(downlink),0) END
 		         FROM node_traffic WHERE server_id = ?`
@@ -7404,11 +7510,17 @@ func (r *TrafficRepository) GetServerTrafficUsed(ctx context.Context, serverID i
 	}
 
 	var total int64
-	err := r.db.QueryRowContext(ctx, query, serverID).Scan(&total)
-	if err != nil {
+	if err := q.QueryRowContext(ctx, query, serverID).Scan(&total); err != nil {
 		return 0, fmt.Errorf("get server traffic used: %w", err)
 	}
 	return total, nil
+}
+
+func (r *TrafficRepository) GetServerTrafficUsed(ctx context.Context, serverID int64) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("traffic repository not initialized")
+	}
+	return getServerTrafficUsed(ctx, r.db, serverID)
 }
 
 // UpsertRemoteServerSystemTraffic 处理 agent 每次 traffic 上报里带的系统级累计 RX/TX:
@@ -8163,6 +8275,7 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 		return 0, fmt.Errorf("get last insert id: %w", err)
 	}
 
+	r.invalidateTrafficBillingCache()
 	return id, nil
 }
 
@@ -8236,6 +8349,7 @@ func (r *TrafficRepository) UpdatePackage(ctx context.Context, pkg Package) erro
 		return ErrPackageNotFound
 	}
 
+	r.invalidateTrafficBillingCache()
 	return nil
 }
 
@@ -8265,6 +8379,7 @@ func (r *TrafficRepository) DeletePackage(ctx context.Context, id int64) error {
 		return ErrPackageNotFound
 	}
 
+	r.invalidateTrafficBillingCache()
 	return nil
 }
 
@@ -8324,6 +8439,7 @@ func (r *TrafficRepository) AssignPackageToUser(ctx context.Context, username st
 		return ErrUserNotFound
 	}
 
+	r.invalidateTrafficBillingCache()
 	return nil
 }
 
@@ -8359,6 +8475,7 @@ func (r *TrafficRepository) RemovePackageFromUser(ctx context.Context, username 
 		return ErrUserNotFound
 	}
 
+	r.invalidateTrafficBillingCache()
 	return nil
 }
 
@@ -8834,20 +8951,27 @@ func (r *TrafficRepository) UpsertUserSubaccount(ctx context.Context, sa UserSub
 		return 0, err
 	}
 	if sa.ID > 0 {
+		r.invalidateTrafficBillingCache()
 		return sa.ID, nil
 	}
 	id, _ := res.LastInsertId()
+	r.invalidateTrafficBillingCache()
 	return id, nil
 }
 
 // ReserveUserSubaccount durably records cleanup material before a routed
 // client becomes usable. Existing active bindings are left unchanged.
 func (r *TrafficRepository) ReserveUserSubaccount(ctx context.Context, sa UserSubaccount) error {
-	_, err := r.db.ExecContext(ctx, `
+	res, err := r.db.ExecContext(ctx, `
 		INSERT INTO user_subaccounts (username, routed_node_id, email, credential_json, is_active, created_at, updated_at)
 		VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		ON CONFLICT(routed_node_id, username) DO NOTHING
 	`, sa.Username, sa.RoutedNodeID, sa.Email, sa.CredentialJSON)
+	if err == nil {
+		if affected, _ := res.RowsAffected(); affected > 0 {
+			r.invalidateTrafficBillingCache()
+		}
+	}
 	return err
 }
 
@@ -9084,7 +9208,12 @@ func (r *TrafficRepository) SetSubaccountActive(ctx context.Context, id int64, a
 }
 
 func (r *TrafficRepository) DeleteUserSubaccount(ctx context.Context, id int64) error {
-	_, err := r.db.ExecContext(ctx, `DELETE FROM user_subaccounts WHERE id = ?`, id)
+	res, err := r.db.ExecContext(ctx, `DELETE FROM user_subaccounts WHERE id = ?`, id)
+	if err == nil {
+		if affected, _ := res.RowsAffected(); affected > 0 {
+			r.invalidateTrafficBillingCache()
+		}
+	}
 	return err
 }
 
@@ -9173,6 +9302,365 @@ func (r *TrafficRepository) ResolveUsernameByEmail(ctx context.Context, email st
 		return email[:i]
 	}
 	return email
+}
+
+const trafficBillingCacheTTL = 5 * time.Second
+
+// UserTrafficBilling is the collection-time attribution for one Xray client
+// counter. Multiplier already includes both the package traffic mode and the
+// selected node multiplier, so callers must not multiply it again later.
+type UserTrafficBilling struct {
+	Username   string
+	Multiplier float64
+}
+
+type trafficBillingUser struct {
+	packageID int64
+}
+
+type trafficBillingNode struct {
+	username string
+	nodeID   int64
+}
+
+type trafficBillingPackage struct {
+	trafficMode     string
+	nodeMultipliers map[int64]float64
+}
+
+type trafficBillingSnapshot struct {
+	serverName    string
+	subaccounts   map[string]trafficBillingNode
+	adminClients  map[string]trafficBillingNode
+	users         map[string]trafficBillingUser
+	usersByEmail  map[string]string
+	usernames     []string
+	packages      map[int64]trafficBillingPackage
+	physicalByTag map[string]int64
+}
+
+type trafficBillingCacheEntry struct {
+	expiresAt time.Time
+	snapshot  *trafficBillingSnapshot
+}
+
+func (r *TrafficRepository) invalidateTrafficBillingCache() {
+	if r == nil {
+		return
+	}
+	r.billingCacheMu.Lock()
+	r.billingCache = nil
+	r.billingCacheMu.Unlock()
+}
+
+func normalizeTrafficBillingMultiplier(multiplier float64) float64 {
+	if multiplier <= 0 || math.IsNaN(multiplier) || math.IsInf(multiplier, 0) {
+		return 1
+	}
+	return multiplier
+}
+
+func billTrafficBytes(rawBytes int64, multiplier float64) int64 {
+	billed, _ := accrueBillableTraffic(rawBytes, multiplier, 0)
+	return billed
+}
+
+// accrueBillableTraffic keeps the fractional part between collector ticks.
+// Rounding every small delta independently can materially overcharge packages
+// with multipliers below 1 (for example, 100 one-byte deltas at 0.5x used to
+// become 100 bytes instead of 50).
+func accrueBillableTraffic(rawBytes int64, multiplier, carry float64) (int64, float64) {
+	if math.IsNaN(carry) || math.IsInf(carry, 0) || carry < 0 || carry >= 1 {
+		carry = 0
+	}
+	if rawBytes <= 0 {
+		return 0, carry
+	}
+	weighted := float64(rawBytes)*normalizeTrafficBillingMultiplier(multiplier) + carry
+	if math.IsInf(weighted, 1) || weighted >= float64(math.MaxInt64) {
+		return math.MaxInt64, 0
+	}
+	whole := math.Floor(weighted)
+	return int64(whole), weighted - whole
+}
+
+func saturatingTrafficAdd(left, right int64) int64 {
+	left = max(left, 0)
+	right = max(right, 0)
+	if math.MaxInt64-left < right {
+		return math.MaxInt64
+	}
+	return left + right
+}
+
+func (s *trafficBillingSnapshot) resolve(email string) UserTrafficBilling {
+	if email == "" {
+		return UserTrafficBilling{}
+	}
+
+	var (
+		username string
+		nodeID   int64
+	)
+	if match, ok := s.subaccounts[email]; ok {
+		username, nodeID = match.username, match.nodeID
+	} else if match, ok := s.adminClients[email]; ok {
+		username, nodeID = match.username, match.nodeID
+	} else if strings.HasPrefix(email, "_admin__") {
+		return UserTrafficBilling{}
+	} else if matched, ok := s.usersByEmail[email]; ok {
+		username = matched
+	} else {
+		for _, candidate := range s.usernames {
+			if strings.HasPrefix(email, candidate+"__") {
+				username = candidate
+				if tag := strings.TrimPrefix(email, candidate+"__"); tag != "" {
+					nodeID = s.physicalByTag[tag]
+				}
+				break
+			}
+		}
+		if username == "" {
+			if _, ok := s.users[email]; ok {
+				username = email
+			} else if i := strings.Index(email, "__"); i > 0 {
+				username = email[:i]
+			}
+		}
+	}
+	if username == "" {
+		return UserTrafficBilling{}
+	}
+
+	multiplier := 1.0
+	if user, ok := s.users[username]; ok && user.packageID > 0 {
+		if pkg, ok := s.packages[user.packageID]; ok {
+			if pkg.trafficMode == "twoway" {
+				multiplier *= 2
+			}
+			if configured, ok := pkg.nodeMultipliers[nodeID]; nodeID > 0 && ok && configured > 0 {
+				multiplier *= configured
+			}
+		}
+	}
+	return UserTrafficBilling{Username: username, Multiplier: normalizeTrafficBillingMultiplier(multiplier)}
+}
+
+func (r *TrafficRepository) buildTrafficBillingSnapshot(ctx context.Context, serverID int64) (*trafficBillingSnapshot, error) {
+	snapshot := &trafficBillingSnapshot{
+		subaccounts:   make(map[string]trafficBillingNode),
+		adminClients:  make(map[string]trafficBillingNode),
+		users:         make(map[string]trafficBillingUser),
+		usersByEmail:  make(map[string]string),
+		packages:      make(map[int64]trafficBillingPackage),
+		physicalByTag: make(map[string]int64),
+	}
+
+	if err := r.db.QueryRowContext(ctx, `SELECT name FROM remote_servers WHERE id = ?`, serverID).Scan(&snapshot.serverName); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("resolve billing server: %w", err)
+		}
+		// Local Xray collection uses xray_servers IDs. Keep that path working.
+		if err := r.db.QueryRowContext(ctx, `SELECT name FROM xray_servers WHERE id = ?`, serverID).Scan(&snapshot.serverName); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("resolve local billing server: %w", err)
+		}
+	}
+
+	rows, err := r.db.QueryContext(ctx, `SELECT username, COALESCE(email, ''), COALESCE(package_id, 0) FROM users`)
+	if err != nil {
+		return nil, fmt.Errorf("list billing users: %w", err)
+	}
+	for rows.Next() {
+		var username, email string
+		var packageID int64
+		if err := rows.Scan(&username, &email, &packageID); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan billing user: %w", err)
+		}
+		snapshot.users[username] = trafficBillingUser{packageID: packageID}
+		snapshot.usernames = append(snapshot.usernames, username)
+		if email != "" {
+			snapshot.usersByEmail[email] = username
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate billing users: %w", err)
+	}
+	rows.Close()
+	sort.Slice(snapshot.usernames, func(i, j int) bool { return len(snapshot.usernames[i]) > len(snapshot.usernames[j]) })
+
+	rows, err = r.db.QueryContext(ctx, `SELECT id, COALESCE(traffic_mode, 'oneway'), COALESCE(node_multipliers, '{}') FROM packages`)
+	if err != nil {
+		return nil, fmt.Errorf("list billing packages: %w", err)
+	}
+	for rows.Next() {
+		var id int64
+		var mode, multipliersJSON string
+		if err := rows.Scan(&id, &mode, &multipliersJSON); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan billing package: %w", err)
+		}
+		pkg := trafficBillingPackage{trafficMode: mode, nodeMultipliers: map[int64]float64{}}
+		_ = json.Unmarshal([]byte(multipliersJSON), &pkg.nodeMultipliers)
+		snapshot.packages[id] = pkg
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate billing packages: %w", err)
+	}
+	rows.Close()
+
+	rows, err = r.db.QueryContext(ctx, `SELECT email, username, routed_node_id FROM user_subaccounts`)
+	if err != nil {
+		return nil, fmt.Errorf("list billing subaccounts: %w", err)
+	}
+	for rows.Next() {
+		var email, username string
+		var nodeID int64
+		if err := rows.Scan(&email, &username, &nodeID); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan billing subaccount: %w", err)
+		}
+		snapshot.subaccounts[email] = trafficBillingNode{username: username, nodeID: nodeID}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate billing subaccounts: %w", err)
+	}
+	rows.Close()
+
+	rows, err = r.db.QueryContext(ctx, `
+		SELECT id, username, COALESCE(node_type, 'physical'), COALESCE(parent_node_id, 0),
+		       COALESCE(original_server, ''), COALESCE(inbound_tag, ''), COALESCE(routed_admin_email, '')
+		FROM nodes`)
+	if err != nil {
+		return nil, fmt.Errorf("list billing nodes: %w", err)
+	}
+	for rows.Next() {
+		var id, parentID int64
+		var username, nodeType, serverName, inboundTag, adminEmail string
+		if err := rows.Scan(&id, &username, &nodeType, &parentID, &serverName, &inboundTag, &adminEmail); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan billing node: %w", err)
+		}
+		if adminEmail != "" {
+			if _, claimed := snapshot.subaccounts[adminEmail]; !claimed {
+				snapshot.adminClients[adminEmail] = trafficBillingNode{username: username, nodeID: id}
+			}
+		}
+		if nodeType != "routed" && parentID == 0 && serverName == snapshot.serverName && inboundTag != "" {
+			snapshot.physicalByTag[inboundTag] = id
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate billing nodes: %w", err)
+	}
+	rows.Close()
+	return snapshot, nil
+}
+
+// ResolveUserTrafficBilling resolves a whole collector batch from one cached
+// snapshot, eliminating the previous per-email SQL queries. Cache entries are
+// deliberately short lived so package/node changes affect new traffic quickly.
+func (r *TrafficRepository) ResolveUserTrafficBilling(ctx context.Context, serverID int64, emails []string) (map[string]UserTrafficBilling, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 {
+		return nil, errors.New("server id is required")
+	}
+
+	now := time.Now()
+	r.billingCacheMu.Lock()
+	if r.billingCache == nil {
+		r.billingCache = make(map[int64]trafficBillingCacheEntry)
+	}
+	entry, ok := r.billingCache[serverID]
+	if !ok || entry.snapshot == nil || !now.Before(entry.expiresAt) {
+		snapshot, err := r.buildTrafficBillingSnapshot(ctx, serverID)
+		if err != nil {
+			r.billingCacheMu.Unlock()
+			return nil, err
+		}
+		entry = trafficBillingCacheEntry{snapshot: snapshot, expiresAt: now.Add(trafficBillingCacheTTL)}
+		r.billingCache[serverID] = entry
+	}
+	r.billingCacheMu.Unlock()
+
+	resolved := make(map[string]UserTrafficBilling, len(emails))
+	for _, email := range emails {
+		resolved[email] = entry.snapshot.resolve(email)
+	}
+	return resolved, nil
+}
+
+// initializeLegacyBillableTraffic freezes pre-migration cycle usage once using
+// the rules active during the upgrade. It is idempotent per row and does not
+// alter raw counters, snapshots, or cycle baselines.
+func (r *TrafficRepository) initializeLegacyBillableTraffic(ctx context.Context) error {
+	type legacyRow struct {
+		id       int64
+		serverID int64
+		email    string
+		rawBytes int64
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, server_id, email,
+		       MAX(uplink - cycle_base_uplink, 0) + MAX(downlink - cycle_base_downlink, 0)
+		FROM user_email_traffic WHERE billable_initialized = 0`)
+	if err != nil {
+		return fmt.Errorf("list legacy billable traffic: %w", err)
+	}
+	var legacy []legacyRow
+	byServer := make(map[int64][]string)
+	for rows.Next() {
+		var row legacyRow
+		if err := rows.Scan(&row.id, &row.serverID, &row.email, &row.rawBytes); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan legacy billable traffic: %w", err)
+		}
+		legacy = append(legacy, row)
+		byServer[row.serverID] = append(byServer[row.serverID], row.email)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate legacy billable traffic: %w", err)
+	}
+	rows.Close()
+	if len(legacy) == 0 {
+		return nil
+	}
+
+	resolvedByServer := make(map[int64]map[string]UserTrafficBilling, len(byServer))
+	for serverID, emails := range byServer {
+		resolved, err := r.ResolveUserTrafficBilling(ctx, serverID, emails)
+		if err != nil {
+			return err
+		}
+		resolvedByServer[serverID] = resolved
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin legacy billable migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, row := range legacy {
+		billing := resolvedByServer[row.serverID][row.email]
+		billedBytes, billedFraction := accrueBillableTraffic(row.rawBytes, billing.Multiplier, 0)
+		if _, err := tx.ExecContext(ctx, `UPDATE user_email_traffic
+			SET billable_bytes = ?, billable_fraction = ?, billable_initialized = 1,
+			    billable_username = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE id = ? AND billable_initialized = 0`,
+			billedBytes, billedFraction, billing.Username, row.id); err != nil {
+			return fmt.Errorf("initialize legacy billable row %d: %w", row.id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit legacy billable migration: %w", err)
+	}
+	return nil
 }
 
 // ResolveNodeNameByEmail 按 xray client email 反查节点名(连接数超限通知"哪个节点"用)。
@@ -9407,6 +9895,114 @@ func (r *TrafficRepository) GetUserWeightedTraffic(ctx context.Context, username
 		return 0, fmt.Errorf("scan user_email_traffic: %w", err)
 	}
 	return int64(weighted), nil
+}
+
+// ListUserBillableTraffic returns the current-cycle counters already weighted
+// at collection time. It resolves all rows per server in batches and only uses
+// the legacy user_traffic table when no email-level rows exist for a user.
+func (r *TrafficRepository) ListUserBillableTraffic(ctx context.Context) (map[string]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	type billedRow struct {
+		serverID int64
+		email    string
+		username string
+		bytes    int64
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT server_id, email, billable_username, billable_bytes
+		FROM user_email_traffic WHERE billable_initialized = 1`)
+	if err != nil {
+		return nil, fmt.Errorf("list billable traffic: %w", err)
+	}
+	var billedRows []billedRow
+	byServer := make(map[int64][]string)
+	for rows.Next() {
+		var row billedRow
+		if err := rows.Scan(&row.serverID, &row.email, &row.username, &row.bytes); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan billable traffic: %w", err)
+		}
+		billedRows = append(billedRows, row)
+		if row.username == "" {
+			byServer[row.serverID] = append(byServer[row.serverID], row.email)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate billable traffic: %w", err)
+	}
+	rows.Close()
+
+	resolvedByServer := make(map[int64]map[string]UserTrafficBilling, len(byServer))
+	for serverID, emails := range byServer {
+		resolved, err := r.ResolveUserTrafficBilling(ctx, serverID, emails)
+		if err != nil {
+			return nil, err
+		}
+		resolvedByServer[serverID] = resolved
+	}
+	totals := make(map[string]int64)
+	for _, row := range billedRows {
+		username := row.username
+		if username == "" {
+			username = resolvedByServer[row.serverID][row.email].Username
+		}
+		if username == "" {
+			continue
+		}
+		if row.bytes > 0 && math.MaxInt64-totals[username] < row.bytes {
+			totals[username] = math.MaxInt64
+		} else {
+			totals[username] += max(row.bytes, 0)
+		}
+	}
+
+	// Very old installations may have user_traffic rows but no corresponding
+	// email rows. Preserve their previous traffic-mode semantics as a fallback.
+	rows, err = r.db.QueryContext(ctx, `
+		SELECT ut.username, COALESCE(SUM(ut.uplink + ut.downlink), 0), COALESCE(p.traffic_mode, 'oneway')
+		FROM user_traffic ut
+		LEFT JOIN users u ON u.username = ut.username
+		LEFT JOIN packages p ON p.id = u.package_id
+		GROUP BY ut.username, p.traffic_mode`)
+	if err != nil {
+		return nil, fmt.Errorf("list legacy user traffic fallback: %w", err)
+	}
+	for rows.Next() {
+		var username, mode string
+		var raw int64
+		if err := rows.Scan(&username, &raw, &mode); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan legacy user traffic fallback: %w", err)
+		}
+		if _, hasEmailCounters := totals[username]; hasEmailCounters {
+			continue
+		}
+		multiplier := 1.0
+		if mode == "twoway" {
+			multiplier = 2
+		}
+		totals[username] = billTrafficBytes(raw, multiplier)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate legacy user traffic fallback: %w", err)
+	}
+	rows.Close()
+	return totals, nil
+}
+
+func (r *TrafficRepository) GetUserBillableTraffic(ctx context.Context, username string) (int64, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return 0, errors.New("username is required")
+	}
+	totals, err := r.ListUserBillableTraffic(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return totals[username], nil
 }
 
 func (r *TrafficRepository) UpdateUserLimitOverrides(ctx context.Context, username string, speedOverride *float64, deviceOverride *int) error {
@@ -12573,6 +13169,11 @@ func (r *TrafficRepository) GetAllNodeTraffic(ctx context.Context) ([]NodeTraffi
 
 // ==================== 用户流量CRUD ====================
 
+type trafficReadWriter interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 // 通过重新启动检测来更新或插入用户流量。
 func (r *TrafficRepository) UpsertUserTraffic(ctx context.Context, serverID int64, username string, uplink, downlink int64, isXrayRestarted bool) error {
 	if r == nil || r.db == nil {
@@ -12585,11 +13186,14 @@ func (r *TrafficRepository) UpsertUserTraffic(ctx context.Context, serverID int6
 	if username == "" {
 		return errors.New("username is required")
 	}
+	return upsertUserTraffic(ctx, r.db, serverID, username, uplink, downlink, isXrayRestarted)
+}
 
+func upsertUserTraffic(ctx context.Context, q trafficReadWriter, serverID int64, username string, uplink, downlink int64, isXrayRestarted bool) error {
 	// 首先，尝试获取现有记录
 	var existing UserTraffic
 	var exists bool
-	row := r.db.QueryRowContext(ctx, `SELECT id, uplink, downlink, total_uplink, total_downlink, last_uplink, last_downlink FROM user_traffic WHERE server_id = ? AND username = ?`, serverID, username)
+	row := q.QueryRowContext(ctx, `SELECT id, uplink, downlink, total_uplink, total_downlink, last_uplink, last_downlink FROM user_traffic WHERE server_id = ? AND username = ?`, serverID, username)
 	err := row.Scan(&existing.ID, &existing.Uplink, &existing.Downlink, &existing.TotalUplink, &existing.TotalDownlink, &existing.LastUplink, &existing.LastDownlink)
 	if err == nil {
 		exists = true
@@ -12602,7 +13206,7 @@ func (r *TrafficRepository) UpsertUserTraffic(ctx context.Context, serverID int6
 		// 累计字段(uplink/downlink/total_*)从 0 起步,raw 仅作 last baseline,
 		// 否则套餐已用流量在首次见到一个用户时会被 xray 已有累计灌满。
 		const insertStmt = `INSERT INTO user_traffic (server_id, username, uplink, downlink, total_uplink, total_downlink, last_uplink, last_downlink, cycle_start, updated_at) VALUES (?, ?, 0, 0, 0, 0, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-		_, err := r.db.ExecContext(ctx, insertStmt, serverID, username, uplink, downlink)
+		_, err := q.ExecContext(ctx, insertStmt, serverID, username, uplink, downlink)
 		if err != nil {
 			return fmt.Errorf("insert user traffic: %w", err)
 		}
@@ -12637,7 +13241,7 @@ func (r *TrafficRepository) UpsertUserTraffic(ctx context.Context, serverID int6
 
 	// 更新记录
 	const updateStmt = `UPDATE user_traffic SET uplink = uplink + ?, downlink = downlink + ?, total_uplink = ?, total_downlink = ?, last_uplink = ?, last_downlink = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-	_, err = r.db.ExecContext(ctx, updateStmt, deltaUplink, deltaDownlink, newTotalUplink, newTotalDownlink, uplink, downlink, existing.ID)
+	_, err = q.ExecContext(ctx, updateStmt, deltaUplink, deltaDownlink, newTotalUplink, newTotalDownlink, uplink, downlink, existing.ID)
 	if err != nil {
 		return fmt.Errorf("update user traffic: %w", err)
 	}
@@ -12647,23 +13251,32 @@ func (r *TrafficRepository) UpsertUserTraffic(ctx context.Context, serverID int6
 
 // UserEmailTraffic 跟 UserTraffic 字段对齐,只是 key 换 email。
 type UserEmailTraffic struct {
-	ID            int64
-	ServerID      int64
-	Email         string
-	Uplink        int64
-	Downlink      int64
-	TotalUplink   int64
-	TotalDownlink int64
-	LastUplink    int64
-	LastDownlink  int64
-	CycleStart    time.Time
-	UpdatedAt     time.Time
+	ID               int64
+	ServerID         int64
+	Email            string
+	Uplink           int64
+	Downlink         int64
+	TotalUplink      int64
+	TotalDownlink    int64
+	LastUplink       int64
+	LastDownlink     int64
+	BillableBytes    int64
+	BillableFraction float64
+	BillableUsername string
+	CycleStart       time.Time
+	UpdatedAt        time.Time
 }
 
 // UpsertUserEmailTraffic 跟 UpsertUserTraffic 完全一样的 delta/restart 检测逻辑,key 换成 email。
 // collector 同一次循环里跟 UpsertUserTraffic 并行调用,**双写两张表**:user_traffic 按 username
 // 聚合(老路径不变),user_email_traffic 保留 email 细分(新功能用)。
 func (r *TrafficRepository) UpsertUserEmailTraffic(ctx context.Context, serverID int64, email string, uplink, downlink int64, isXrayRestarted bool) error {
+	return r.UpsertUserEmailTrafficWithBilling(ctx, serverID, email, uplink, downlink, isXrayRestarted, 1)
+}
+
+// UpsertUserEmailTrafficWithBilling stores the collection-time billable delta.
+// Existing raw counters remain intact for drilldown and historical snapshots.
+func (r *TrafficRepository) UpsertUserEmailTrafficWithBilling(ctx context.Context, serverID int64, email string, uplink, downlink int64, isXrayRestarted bool, billingMultiplier float64) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
@@ -12673,11 +13286,20 @@ func (r *TrafficRepository) UpsertUserEmailTraffic(ctx context.Context, serverID
 	if email == "" {
 		return errors.New("email is required")
 	}
+	return upsertUserEmailTraffic(ctx, r.db, serverID, email, "", uplink, downlink, isXrayRestarted, billingMultiplier)
+}
 
+func upsertUserEmailTraffic(ctx context.Context, q trafficReadWriter, serverID int64, email, billingUsername string, uplink, downlink int64, isXrayRestarted bool, billingMultiplier float64) error {
 	var existing UserEmailTraffic
+	var cycleBaseUplink, cycleBaseDownlink int64
+	var billableInitialized int
 	var exists bool
-	row := r.db.QueryRowContext(ctx, `SELECT id, uplink, downlink, total_uplink, total_downlink, last_uplink, last_downlink FROM user_email_traffic WHERE server_id = ? AND email = ?`, serverID, email)
-	err := row.Scan(&existing.ID, &existing.Uplink, &existing.Downlink, &existing.TotalUplink, &existing.TotalDownlink, &existing.LastUplink, &existing.LastDownlink)
+	row := q.QueryRowContext(ctx, `SELECT id, uplink, downlink, total_uplink, total_downlink, last_uplink, last_downlink,
+		cycle_base_uplink, cycle_base_downlink, billable_bytes, billable_fraction, billable_initialized, billable_username
+		FROM user_email_traffic WHERE server_id = ? AND email = ?`, serverID, email)
+	err := row.Scan(&existing.ID, &existing.Uplink, &existing.Downlink, &existing.TotalUplink, &existing.TotalDownlink,
+		&existing.LastUplink, &existing.LastDownlink, &cycleBaseUplink, &cycleBaseDownlink,
+		&existing.BillableBytes, &existing.BillableFraction, &billableInitialized, &existing.BillableUsername)
 	if err == nil {
 		exists = true
 	} else if err != sql.ErrNoRows {
@@ -12687,8 +13309,8 @@ func (r *TrafficRepository) UpsertUserEmailTraffic(ctx context.Context, serverID
 	if !exists {
 		// 首次见到 (server, email):见 UpsertNodeTraffic 同款注释 —— raw 仅作 baseline,
 		// 累计字段从 0 起步,避免历史累计灌入当期。
-		const insertStmt = `INSERT INTO user_email_traffic (server_id, email, uplink, downlink, total_uplink, total_downlink, last_uplink, last_downlink, cycle_start, updated_at) VALUES (?, ?, 0, 0, 0, 0, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-		if _, err := r.db.ExecContext(ctx, insertStmt, serverID, email, uplink, downlink); err != nil {
+		const insertStmt = `INSERT INTO user_email_traffic (server_id, email, uplink, downlink, total_uplink, total_downlink, last_uplink, last_downlink, billable_bytes, billable_fraction, billable_initialized, billable_username, cycle_start, updated_at) VALUES (?, ?, 0, 0, 0, 0, ?, ?, 0, 0, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+		if _, err := q.ExecContext(ctx, insertStmt, serverID, email, uplink, downlink, billingUsername); err != nil {
 			return fmt.Errorf("insert user email traffic: %w", err)
 		}
 		return nil
@@ -12717,10 +13339,91 @@ func (r *TrafficRepository) UpsertUserEmailTraffic(ctx context.Context, serverID
 		newTotalDownlink = existing.TotalDownlink
 	}
 
-	const updateStmt = `UPDATE user_email_traffic SET uplink = uplink + ?, downlink = downlink + ?, total_uplink = ?, total_downlink = ?, last_uplink = ?, last_downlink = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-	if _, err := r.db.ExecContext(ctx, updateStmt, deltaUplink, deltaDownlink, newTotalUplink, newTotalDownlink, uplink, downlink, existing.ID); err != nil {
+	// Old rows are initialized once from their current cycle usage. From this
+	// point onward only each new delta is multiplied, preserving history across
+	// future package or node multiplier changes.
+	newBillable := existing.BillableBytes
+	newBillableFraction := existing.BillableFraction
+	if billableInitialized == 0 {
+		currentRaw := saturatingTrafficAdd(existing.Uplink-cycleBaseUplink, existing.Downlink-cycleBaseDownlink)
+		newBillable, newBillableFraction = accrueBillableTraffic(currentRaw, billingMultiplier, 0)
+	}
+	billedDelta, newBillableFraction := accrueBillableTraffic(
+		saturatingTrafficAdd(deltaUplink, deltaDownlink), billingMultiplier, newBillableFraction)
+	if math.MaxInt64-newBillable < billedDelta {
+		newBillable = math.MaxInt64
+		newBillableFraction = 0
+	} else {
+		newBillable += billedDelta
+	}
+
+	if billingUsername == "" {
+		billingUsername = existing.BillableUsername
+	}
+	const updateStmt = `UPDATE user_email_traffic SET uplink = uplink + ?, downlink = downlink + ?, total_uplink = ?, total_downlink = ?, last_uplink = ?, last_downlink = ?, billable_bytes = ?, billable_fraction = ?, billable_initialized = 1, billable_username = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	if _, err := q.ExecContext(ctx, updateStmt, deltaUplink, deltaDownlink, newTotalUplink, newTotalDownlink, uplink, downlink, newBillable, newBillableFraction, billingUsername, existing.ID); err != nil {
 		return fmt.Errorf("update user email traffic: %w", err)
 	}
+	return nil
+}
+
+// UserTrafficSample is one email counter and its in-batch attribution.
+type UserTrafficSample struct {
+	Email             string
+	Username          string
+	Uplink            int64
+	Downlink          int64
+	BillingMultiplier float64
+}
+
+// UpsertUserTrafficBatch writes every per-email counter and its per-user
+// aggregate in one transaction. A partial collector tick is never exposed.
+func (r *TrafficRepository) UpsertUserTrafficBatch(ctx context.Context, serverID int64, samples []UserTrafficSample, isXrayRestarted bool) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 {
+		return errors.New("server id is required")
+	}
+	conn, err := r.beginImmediateTransaction(ctx)
+	if err != nil {
+		return fmt.Errorf("begin user traffic batch: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = finishImmediateTransaction(context.Background(), conn, false)
+		}
+	}()
+
+	type aggregate struct{ uplink, downlink int64 }
+	byUsername := make(map[string]*aggregate)
+	for _, sample := range samples {
+		if sample.Email == "" {
+			continue
+		}
+		if err := upsertUserEmailTraffic(ctx, conn, serverID, sample.Email, sample.Username, sample.Uplink, sample.Downlink, isXrayRestarted, sample.BillingMultiplier); err != nil {
+			return fmt.Errorf("upsert email %q: %w", sample.Email, err)
+		}
+		if sample.Username == "" {
+			continue
+		}
+		if total := byUsername[sample.Username]; total != nil {
+			total.uplink = saturatingTrafficAdd(total.uplink, sample.Uplink)
+			total.downlink = saturatingTrafficAdd(total.downlink, sample.Downlink)
+		} else {
+			byUsername[sample.Username] = &aggregate{uplink: max(sample.Uplink, 0), downlink: max(sample.Downlink, 0)}
+		}
+	}
+	for username, total := range byUsername {
+		if err := upsertUserTraffic(ctx, conn, serverID, username, total.uplink, total.downlink, isXrayRestarted); err != nil {
+			return fmt.Errorf("upsert user %q: %w", username, err)
+		}
+	}
+	if err := finishImmediateTransaction(ctx, conn, true); err != nil {
+		return fmt.Errorf("commit user traffic batch: %w", err)
+	}
+	committed = true
 	return nil
 }
 
@@ -12871,7 +13574,7 @@ func (r *TrafficRepository) GetUserTrafficByUsername(ctx context.Context, userna
 //
 // user_email_traffic 走基线而非清零:把 uplink/downlink 的当前值抬进 cycle_base_*,判定只看差值。
 // 这样 total_* 的历史累计得以保留,collector 的 `uplink = uplink + delta` 累加逻辑也无需改动。
-func (r *TrafficRepository) ResetUserTrafficCycle(ctx context.Context, username string) error {
+func (r *TrafficRepository) resetUserTrafficCycle(ctx context.Context, username string, automaticResetAt *time.Time) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
@@ -12896,19 +13599,48 @@ func (r *TrafficRepository) ResetUserTrafficCycle(ctx context.Context, username 
 	esc := escapeLikePattern(username)
 	const emailStmt = `UPDATE user_email_traffic
 		SET cycle_base_uplink = uplink, cycle_base_downlink = downlink,
+		    billable_bytes = 0, billable_fraction = 0, billable_initialized = 1,
 		    cycle_start = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
 		WHERE email = ?
 		   OR email LIKE ? ESCAPE '\'
 		   OR email LIKE ? ESCAPE '\'
-		   OR email IN (SELECT email FROM user_subaccounts WHERE username = ?)`
-	if _, err := tx.ExecContext(ctx, emailStmt, username, esc+`\_\_%`, esc+`-%`, username); err != nil {
+		   OR email IN (SELECT email FROM user_subaccounts WHERE username = ?)
+		   OR billable_username = ?`
+	if _, err := tx.ExecContext(ctx, emailStmt, username, esc+`\_\_%`, esc+`-%`, username, username); err != nil {
 		return fmt.Errorf("reset user email traffic cycle: %w", err)
+	}
+
+	if automaticResetAt != nil {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE users SET last_reset_at = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`,
+			*automaticResetAt, username); err != nil {
+			return fmt.Errorf("update user last_reset_at: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_traffic_threshold_notified WHERE username = ?`, username); err != nil {
+		return fmt.Errorf("clear user traffic threshold notification: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit reset user traffic cycle: %w", err)
 	}
 	return nil
+}
+
+// ResetUserTrafficCycle clears a cycle manually. It also clears the 80% marker,
+// but deliberately leaves last_reset_at unchanged so a manual reset cannot
+// suppress the next configured calendar reset.
+func (r *TrafficRepository) ResetUserTrafficCycle(ctx context.Context, username string) error {
+	return r.resetUserTrafficCycle(ctx, username, nil)
+}
+
+// ResetUserTrafficCycleAt performs the automatic cycle reset and records its
+// timestamp in the same transaction as both traffic tables and the warning marker.
+func (r *TrafficRepository) ResetUserTrafficCycleAt(ctx context.Context, username string, resetAt time.Time) error {
+	if resetAt.IsZero() {
+		return errors.New("reset time is required")
+	}
+	return r.resetUserTrafficCycle(ctx, username, &resetAt)
 }
 
 // UpdateUserLastResetAt 记录用户最近一次按 reset_day 触发的流量周期重置时间。
@@ -12969,14 +13701,55 @@ func (r *TrafficRepository) UpdateRemoteServerLastTrafficResetAt(ctx context.Con
 // offset = 0 - 当前聚合用量。对 system / xray 两种 source 统一(GetServerTrafficUsed 内部按 source 分流),
 // 只改 traffic_used_offset,不清 system_cycle / node_traffic(物理累计保留,后续增量继续从 0 涨)。
 func (r *TrafficRepository) ResetRemoteServerTrafficCycle(ctx context.Context, serverID int64) error {
+	return r.resetRemoteServerTrafficCycle(ctx, serverID, nil)
+}
+
+// ResetRemoteServerTrafficCycleAt updates the logical traffic offset, the
+// calendar reset timestamp and the server warning marker atomically.
+func (r *TrafficRepository) ResetRemoteServerTrafficCycleAt(ctx context.Context, serverID int64, resetAt time.Time) error {
+	if resetAt.IsZero() {
+		return errors.New("reset time is required")
+	}
+	return r.resetRemoteServerTrafficCycle(ctx, serverID, &resetAt)
+}
+
+func (r *TrafficRepository) resetRemoteServerTrafficCycle(ctx context.Context, serverID int64, resetAt *time.Time) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
-	aggregated, err := r.GetServerTrafficUsed(ctx, serverID)
+	if serverID <= 0 {
+		return errors.New("server id is required")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin reset remote server traffic cycle: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	aggregated, err := getServerTrafficUsed(ctx, tx, serverID)
 	if err != nil {
 		return fmt.Errorf("get server traffic used: %w", err)
 	}
-	return r.UpdateRemoteServerTrafficOffset(ctx, serverID, -aggregated)
+	if resetAt == nil {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE remote_servers SET traffic_used_offset = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			-aggregated, serverID); err != nil {
+			return fmt.Errorf("reset remote server traffic offset: %w", err)
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE remote_servers SET traffic_used_offset = ?, last_traffic_reset_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			-aggregated, *resetAt, serverID); err != nil {
+			return fmt.Errorf("reset remote server traffic offset and timestamp: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM traffic_threshold_notified WHERE server_id = ?`, serverID); err != nil {
+		return fmt.Errorf("clear remote server traffic threshold notification: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit reset remote server traffic cycle: %w", err)
+	}
+	return nil
 }
 
 // ==================== 流量快照 CRUD ====================
@@ -14185,6 +14958,42 @@ func (r *TrafficRepository) MarkTrafficThresholdNotified(ctx context.Context, se
 
 func (r *TrafficRepository) ClearTrafficThresholdNotified(ctx context.Context, serverID int64) error {
 	_, err := r.db.ExecContext(ctx, `DELETE FROM traffic_threshold_notified WHERE server_id = ?`, serverID)
+	return err
+}
+
+// ClaimUserTrafficThresholdNotification atomically claims the 80% notification
+// for one user's current limit. Repeated checks for the same limit return false;
+// changing the limit creates a fresh claim without waiting for a cycle reset.
+func (r *TrafficRepository) ClaimUserTrafficThresholdNotification(ctx context.Context, username string, limitBytes int64) (bool, error) {
+	if r == nil || r.db == nil {
+		return false, errors.New("traffic repository not initialized")
+	}
+	username = strings.TrimSpace(username)
+	if username == "" || limitBytes <= 0 {
+		return false, errors.New("username and positive limit are required")
+	}
+	result, err := r.db.ExecContext(ctx, `
+INSERT INTO user_traffic_threshold_notified (username, limit_bytes, notified_at)
+VALUES (?, ?, CURRENT_TIMESTAMP)
+ON CONFLICT(username) DO UPDATE SET
+    limit_bytes = excluded.limit_bytes,
+    notified_at = CURRENT_TIMESTAMP
+WHERE user_traffic_threshold_notified.limit_bytes != excluded.limit_bytes`, username, limitBytes)
+	if err != nil {
+		return false, fmt.Errorf("claim user traffic threshold notification: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim user traffic threshold rows affected: %w", err)
+	}
+	return rows > 0, nil
+}
+
+func (r *TrafficRepository) ClearUserTrafficThresholdNotification(ctx context.Context, username string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	_, err := r.db.ExecContext(ctx, `DELETE FROM user_traffic_threshold_notified WHERE username = ?`, strings.TrimSpace(username))
 	return err
 }
 

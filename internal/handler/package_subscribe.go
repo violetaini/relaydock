@@ -380,12 +380,10 @@ func (h *PackageSubscribeHandler) writeTrafficHeader(ctx context.Context, w http
 	if limitBytes <= 0 {
 		return
 	}
-	// 已用流量 = 裸流量(SUM(uplink+downlink)) × 套餐倍率(oneway×1 / twoway×2),
-	// 与限额判定口径一致(traffic_limit_enforcer.go:已用×TrafficMultiplier 比限额),
-	// 这样客户端显示的已用/剩余与实际被断流的时机吻合。
+	// 已用流量在采集时按当时的套餐模式和节点倍率固化，确保客户端
+	// 显示与限额判定一致，且套餐变更不会重算历史流量。
 	// 之前这里硬编码 download=0,导致客户端永远显示已用 0。
-	raw, _ := h.repo.GetUserTotalTraffic(ctx, user.Username)
-	used := raw * pkg.TrafficMultiplier()
+	used, _ := h.repo.GetUserBillableTraffic(ctx, user.Username)
 	info := fmt.Sprintf("upload=0; download=%d; total=%d", used, limitBytes)
 	if user.PackageEndDate != nil {
 		info += fmt.Sprintf("; expire=%d", user.PackageEndDate.Unix())

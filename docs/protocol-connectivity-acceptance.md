@@ -139,7 +139,7 @@ release acceptance through the panel on disposable test nodes:
 6. Delete only the disposable node IDs created by this run and confirm their
    listeners are gone.
 
-Imported Mihomo-only protocols such as TUIC, AnyTLS, and Snell are outside the
+Imported Mihomo-only protocols such as TUIC and AnyTLS are outside the
 managed Xray matrix. Test them separately with the deployed Mihomo version:
 configuration validation, an HTTP exit request, and UDP where that protocol
 promises UDP support.

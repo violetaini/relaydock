@@ -72,6 +72,11 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 		log.Printf("[TrafficLimitEnforcer] Failed to list users: %v", err)
 		return
 	}
+	billableTraffic, err := e.repo.ListUserBillableTraffic(ctx)
+	if err != nil {
+		log.Printf("[TrafficLimitEnforcer] Failed to list billable traffic: %v", err)
+		return
+	}
 
 	pkgCache := make(map[int64]*storage.Package)
 	now := time.Now()
@@ -141,12 +146,10 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 		// 还原"超额"标志:重置后用户应该重新有流量配额,wasOverLimit → 立即恢复入站。
 		if shouldResetThisMonth(now, user.IsReset, user.ResetDay, user.LastResetAt) {
 			log.Printf("[TrafficLimitEnforcer] User %s monthly reset (day=%d, last=%v)", user.Username, user.ResetDay, user.LastResetAt)
-			if err := e.repo.ResetUserTrafficCycle(ctx, user.Username); err != nil {
+			if err := e.repo.ResetUserTrafficCycleAt(ctx, user.Username, now); err != nil {
 				log.Printf("[TrafficLimitEnforcer] Failed to reset user %s: %v", user.Username, err)
 			} else {
-				if err := e.repo.UpdateUserLastResetAt(ctx, user.Username, now); err != nil {
-					log.Printf("[TrafficLimitEnforcer] Failed to write last_reset_at for %s: %v", user.Username, err)
-				}
+				billableTraffic[user.Username] = 0
 				// 复用现有"恢复入站"路径:如果用户之前因超额被踢,reset 后自动放回
 				if wasOver, _ := e.repo.IsUserOverLimit(ctx, user.Username); wasOver {
 					log.Printf("[TrafficLimitEnforcer] User %s back under limit after monthly reset, restoring inbounds", user.Username)
@@ -172,26 +175,25 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 			continue
 		}
 
-		// 加权流量:每行 user_email_traffic 乘以节点在套餐内的倍率(routed 子节点继承父节点)
-		totalTraffic, err := e.repo.GetUserWeightedTraffic(ctx, user.Username, pkg)
-		if err != nil {
-			log.Printf("[TrafficLimitEnforcer] Failed to get traffic for %s: %v", user.Username, err)
-			continue
-		}
-
 		wasOverLimit, _ := e.repo.IsUserOverLimit(ctx, user.Username)
-		usedWeighted := totalTraffic * pkg.TrafficMultiplier()
+		// Already weighted when each traffic delta was collected. Applying the
+		// current package here would retroactively rewrite historical usage.
+		usedWeighted := billableTraffic[user.Username]
 		isOverLimit := trafficLimitExceeded(usedWeighted, limitBytes)
 
-		// 流量 80% 预警(在没超限的 ramp 期触发一次,用 user_overflag 复用记忆易混淆,
-		// 借现有 IsTrafficThresholdNotified 同款表会跟 server 阈值冲突 → 简单:每次都判断,Send 端节流即可
-		// 实际重复触发会有,5min log throttle 兜底;若用户报"被打扰",再加专用记忆表)
+		// 流量 80% 预警按用户、当前限额原子去重。月度/手动重置会在同一事务清除此标记；
+		// 限额变化也会产生新 claim，因此不会沿用旧套餐的预警状态。
 		if !isOverLimit {
 			pct := float64(usedWeighted) / float64(limitBytes) * 100
 			if pct >= 80 {
-				usedGB := float64(usedWeighted) / (1024 * 1024 * 1024)
-				limitGB := float64(limitBytes) / (1024 * 1024 * 1024)
-				SendTrafficThreshold80Notification(ctx, user.Username, usedGB, limitGB)
+				claimed, claimErr := e.repo.ClaimUserTrafficThresholdNotification(ctx, user.Username, limitBytes)
+				if claimErr != nil {
+					log.Printf("[TrafficLimitEnforcer] Failed to claim 80%% notification for %s: %v", user.Username, claimErr)
+				} else if claimed {
+					usedGB := float64(usedWeighted) / (1024 * 1024 * 1024)
+					limitGB := float64(limitBytes) / (1024 * 1024 * 1024)
+					SendTrafficThreshold80Notification(ctx, user.Username, usedGB, limitGB)
+				}
 			}
 		}
 
@@ -225,12 +227,10 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 				if !shouldResetThisMonth(now, true, s.TrafficResetDay, s.LastTrafficResetAt) {
 					continue
 				}
-				if rErr := e.repo.ResetRemoteServerTrafficCycle(ctx, s.ID); rErr != nil {
+				if rErr := e.repo.ResetRemoteServerTrafficCycleAt(ctx, s.ID, now); rErr != nil {
 					log.Printf("[TrafficLimitEnforcer] reset server %d(%s) traffic failed: %v", s.ID, s.Name, rErr)
 					continue
 				}
-				_ = e.repo.UpdateRemoteServerLastTrafficResetAt(ctx, s.ID, now)
-				_ = e.repo.ClearTrafficThresholdNotified(ctx, s.ID) // 新周期清去重标记,越线可再次告警
 				log.Printf("[TrafficLimitEnforcer] server %d(%s) monthly traffic reset (day=%d)", s.ID, s.Name, s.TrafficResetDay)
 			}
 		} else {

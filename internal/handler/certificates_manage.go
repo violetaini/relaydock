@@ -41,12 +41,20 @@ func certDeployPaths(domain, dir string) (certPath, keyPath string) {
 type CertificateHandler struct {
 	repo               *storage.TrafficRepository
 	wsHandler          *RemoteWSHandler
-	acmeClient         *acme.Client
+	acmeClient         certificateACMEClient
 	onMasterURLChanged func(ctx context.Context, newURL string)
 	remoteManage       *RemoteManageHandler // 联邦(分享)服务器证书下发时,复用其 ForwardToAgent 走拥有方主控
 	localDeployer      func(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error
+	managedXrayRestart func(ctx context.Context, serverID int64, logPrefix string) error
+	renewals           sync.Map // certificate ID -> in-flight marker
 	xrayCertSyncMu     sync.Mutex
 	xrayCertSynced     sync.Map // "serverID:certID" -> certificate material fingerprint
+}
+
+type certificateACMEClient interface {
+	ObtainCertificateV2(context.Context, acme.CertRequest) (*acme.CertResult, error)
+	RenewCertificateV2(context.Context, acme.CertRequest, string, string) (*acme.CertResult, error)
+	ProcessCertResult(string, []byte, []byte) (*acme.CertResult, error)
 }
 
 func (h *CertificateHandler) SetOnMasterURLChanged(fn func(ctx context.Context, newURL string)) {
@@ -69,6 +77,32 @@ func (h *CertificateHandler) deployLocal(certPEM, keyPEM, certPath, keyPath, rel
 		return h.localDeployer(certPEM, keyPEM, certPath, keyPath, reloadTarget)
 	}
 	return acme.Deploy(certPEM, keyPEM, certPath, keyPath, reloadTarget)
+}
+
+func (h *CertificateHandler) beginRenewal(certID int64) bool {
+	if certID <= 0 {
+		return false
+	}
+	_, loaded := h.renewals.LoadOrStore(certID, struct{}{})
+	return !loaded
+}
+
+func (h *CertificateHandler) finishRenewal(certID int64) {
+	h.renewals.Delete(certID)
+}
+
+func (h *CertificateHandler) appendCertificateLogDurable(certID int64, message string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := h.repo.AppendCertificateLog(ctx, certID, message); err != nil {
+		log.Printf("[Certificate] append log for certificate %d: %v", certID, err)
+	}
+}
+
+func (h *CertificateHandler) updateCertificateStatusDurable(certID int64, status, message string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return h.repo.UpdateCertificateStatus(ctx, certID, status, message)
 }
 
 // 创建一个新的CertificateHandler。
@@ -325,10 +359,10 @@ func (h *CertificateHandler) UpdateCertificate(w http.ResponseWriter, r *http.Re
 	}
 	req.Domain = strings.TrimSpace(req.Domain)
 	req.Email = strings.TrimSpace(req.Email)
-	req.Provider = strings.TrimSpace(req.Provider)
-	req.ChallengeMode = strings.TrimSpace(req.ChallengeMode)
+	req.Provider = strings.ToLower(strings.TrimSpace(req.Provider))
+	req.ChallengeMode = strings.ToLower(strings.TrimSpace(req.ChallengeMode))
 	req.WebrootPath = strings.TrimSpace(req.WebrootPath)
-	req.DeployTarget = strings.TrimSpace(req.DeployTarget)
+	req.DeployTarget = strings.ToLower(strings.TrimSpace(req.DeployTarget))
 	req.DeployCertPath = strings.TrimSpace(req.DeployCertPath)
 	req.DeployKeyPath = strings.TrimSpace(req.DeployKeyPath)
 
@@ -458,8 +492,14 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	req.Domain = strings.TrimSpace(req.Domain)
+	req.Domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(req.Domain), "."))
 	req.Email = strings.TrimSpace(req.Email)
+	req.Provider = strings.ToLower(strings.TrimSpace(req.Provider))
+	req.ChallengeMode = strings.ToLower(strings.TrimSpace(req.ChallengeMode))
+	req.WebrootPath = strings.TrimSpace(req.WebrootPath)
+	req.DeployTarget = strings.ToLower(strings.TrimSpace(req.DeployTarget))
+	req.DeployCertPath = strings.TrimSpace(req.DeployCertPath)
+	req.DeployKeyPath = strings.TrimSpace(req.DeployKeyPath)
 
 	if req.Domain == "" {
 		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "域名不能为空"})
@@ -471,24 +511,78 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 	}
 
 	if req.Provider == "" {
-		req.Provider = "letsencrypt"
+		req.Provider = acme.CALetsEncrypt
 	}
 	if req.ChallengeMode == "" {
 		req.ChallengeMode = storage.CertChallengeStandalone
 	}
+	if req.Provider != acme.CALetsEncrypt && req.Provider != acme.CALetsEncryptStaging {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "不支持的证书颁发机构"})
+		return
+	}
+	baseDomain := strings.TrimPrefix(strings.ToLower(req.Domain), "*.")
+	if !validManagedDNSName(baseDomain) || (strings.Contains(req.Domain, "*") && !strings.HasPrefix(req.Domain, "*.")) {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "域名格式无效"})
+		return
+	}
+	switch req.ChallengeMode {
+	case storage.CertChallengeDNS:
+		if req.DNSProviderID <= 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "DNS-01 验证必须选择 DNS 提供商"})
+			return
+		}
+	case storage.CertChallengeWebroot:
+		if req.WebrootPath == "" {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "网站根目录不能为空"})
+			return
+		}
+		req.DNSProviderID = 0
+	case storage.CertChallengeStandalone:
+		req.DNSProviderID = 0
+	default:
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "不支持的验证方式"})
+		return
+	}
+	if strings.HasPrefix(req.Domain, "*.") && req.ChallengeMode != storage.CertChallengeDNS {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "泛域名证书必须使用 DNS-01 验证"})
+		return
+	}
+	switch req.DeployTarget {
+	case "", "none":
+		req.DeployTarget = "none"
+		req.DeployCertPath = ""
+		req.DeployKeyPath = ""
+		req.AutoDeploy = false
+	case "nginx", "xray", "both":
+		if req.DeployCertPath == "" || req.DeployKeyPath == "" {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "自动部署必须填写证书和私钥路径"})
+			return
+		}
+	default:
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "不支持的部署目标"})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
+	if req.ChallengeMode == storage.CertChallengeDNS {
+		if _, err := h.repo.GetDNSProvider(ctx, req.DNSProviderID); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "所选 DNS 提供商不存在"})
+			return
+		}
+	}
+	if req.RemoteServerID > 0 {
+		if _, err := h.repo.GetRemoteServer(ctx, req.RemoteServerID); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "目标服务器不存在"})
+			return
+		}
+	}
 
 	// 检查现有证书
 	existing, err := h.repo.GetCertificateByDomain(ctx, req.Domain, req.RemoteServerID)
 	if err == nil && existing != nil {
 		respondJSON(w, http.StatusConflict, map[string]any{"success": false, "message": "该域名的证书已存在"})
 		return
-	}
-
-	if req.DeployTarget == "" {
-		req.DeployTarget = "none"
 	}
 
 	// 先创建证书记录
@@ -518,9 +612,18 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	if !h.beginRenewal(cert.ID) {
+		_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusFailed, "证书申请状态冲突，请重试")
+		respondJSON(w, http.StatusConflict, map[string]any{"success": false, "message": "证书申请正在处理中，请勿重复提交"})
+		return
+	}
+
 	if req.RemoteServerID == 0 {
 		// 本地证书请求
-		go h.requestLocalCertificate(cert)
+		go func() {
+			defer h.finishRenewal(cert.ID)
+			h.requestLocalCertificate(cert)
+		}()
 		respondJSON(w, http.StatusAccepted, SingleCertificateResponse{
 			Success:     true,
 			Message:     "证书申请已提交，正在处理中...",
@@ -528,7 +631,10 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 		})
 	} else {
 		// 通过WebSocket远程证书请求
-		go h.requestRemoteCertificate(cert)
+		go func() {
+			defer h.finishRenewal(cert.ID)
+			h.requestRemoteCertificate(cert)
+		}()
 		respondJSON(w, http.StatusAccepted, SingleCertificateResponse{
 			Success:     true,
 			Message:     "证书申请已发送到远程服务器...",
@@ -542,9 +648,7 @@ func (h *CertificateHandler) requestLocalCertificate(cert *storage.Certificate) 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	appendLog := func(msg string) {
-		_ = h.repo.AppendCertificateLog(ctx, cert.ID, msg)
-	}
+	appendLog := func(msg string) { h.appendCertificateLogDurable(cert.ID, msg) }
 
 	appendLog("开始申请证书: " + cert.Domain)
 
@@ -552,7 +656,7 @@ func (h *CertificateHandler) requestLocalCertificate(cert *storage.Certificate) 
 	if err != nil {
 		log.Printf("[Certificate] buildCertRequest failed for %s: %v", cert.Domain, err)
 		appendLog("构建请求失败: " + err.Error())
-		_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusFailed, err.Error())
+		_ = h.updateCertificateStatusDurable(cert.ID, storage.CertStatusFailed, err.Error())
 		return
 	}
 
@@ -566,15 +670,19 @@ func (h *CertificateHandler) requestLocalCertificate(cert *storage.Certificate) 
 	if err != nil {
 		log.Printf("[Certificate] ObtainCertificate failed for %s: %v", cert.Domain, err)
 		appendLog("证书申请失败: " + err.Error())
-		_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusFailed, err.Error())
+		_ = h.updateCertificateStatusDurable(cert.ID, storage.CertStatusFailed, err.Error())
 		SendCertResultNotification(ctx, cert.Domain, false, err.Error())
 		return
 	}
 
 	appendLog(fmt.Sprintf("证书颁发成功, 有效期至 %s", result.ExpiryDate.Format("2006-01-02")))
 
-	if err := h.repo.UpdateCertificateIssued(ctx, cert.ID, result.CertPath, result.KeyPath, result.CertPEM, result.KeyPEM, result.IssueDate, result.ExpiryDate); err != nil {
+	persistCtx, persistCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err = h.repo.UpdateCertificateIssued(persistCtx, cert.ID, result.CertPath, result.KeyPath, result.CertPEM, result.KeyPEM, result.IssueDate, result.ExpiryDate)
+	persistCancel()
+	if err != nil {
 		log.Printf("[Certificate] UpdateCertificateIssued failed for %s: %v", cert.Domain, err)
+		_ = h.updateCertificateStatusDurable(cert.ID, storage.CertStatusFailed, "证书已签发，但保存证书记录失败: "+err.Error())
 		return
 	}
 
@@ -604,9 +712,7 @@ func (h *CertificateHandler) requestRemoteCertificate(cert *storage.Certificate)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	appendLog := func(msg string) {
-		_ = h.repo.AppendCertificateLog(ctx, cert.ID, msg)
-	}
+	appendLog := func(msg string) { h.appendCertificateLogDurable(cert.ID, msg) }
 
 	appendLog("开始远程证书申请: " + cert.Domain)
 
@@ -615,7 +721,7 @@ func (h *CertificateHandler) requestRemoteCertificate(cert *storage.Certificate)
 	if err != nil {
 		log.Printf("[Certificate] GetRemoteServer failed: %v", err)
 		appendLog("获取远程服务器信息失败: " + err.Error())
-		_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusFailed, "获取远程服务器信息失败")
+		h.markCertificateOperationFailed(cert, errors.New("获取远程服务器信息失败"))
 		return
 	}
 
@@ -624,7 +730,7 @@ func (h *CertificateHandler) requestRemoteCertificate(cert *storage.Certificate)
 	if !h.wsHandler.IsConnected(server.Token) {
 		log.Printf("[Certificate] Remote server %s is not connected", server.Name)
 		appendLog("远程服务器未连接")
-		_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusFailed, "远程服务器未连接")
+		h.markCertificateOperationFailed(cert, errors.New("远程服务器未连接"))
 		return
 	}
 
@@ -636,7 +742,7 @@ func (h *CertificateHandler) requestRemoteCertificate(cert *storage.Certificate)
 		if dnsErr != nil {
 			log.Printf("[Certificate] GetDNSProvider failed: %v", dnsErr)
 			appendLog("获取 DNS 凭证失败")
-			_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusFailed, "获取DNS凭证失败")
+			h.markCertificateOperationFailed(cert, errors.New("获取DNS凭证失败"))
 			return
 		}
 		dnsProviderType = dnsProvider.ProviderType
@@ -660,7 +766,7 @@ func (h *CertificateHandler) requestRemoteCertificate(cert *storage.Certificate)
 
 	if err := h.wsHandler.SendCertRequest(server.Token, payload); err != nil {
 		log.Printf("[Certificate] SendCertRequest failed: %v", err)
-		_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusFailed, "发送证书请求失败")
+		h.markCertificateOperationFailed(cert, errors.New("发送证书请求失败"))
 		return
 	}
 
@@ -695,14 +801,32 @@ func (h *CertificateHandler) RenewCertificate(w http.ResponseWriter, r *http.Req
 		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "获取证书失败"})
 		return
 	}
+	if cert.Provider == "manual" || cert.ChallengeMode == "manual" {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "手动上传证书不能通过 ACME 续期"})
+		return
+	}
+	if !h.beginRenewal(cert.ID) {
+		respondJSON(w, http.StatusConflict, map[string]any{"success": false, "message": "该证书正在申请或续期，请勿重复提交"})
+		return
+	}
 
 	// 将状态更新为待处理
-	_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusPending, "正在续期...")
+	if err := h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusPending, "正在续期..."); err != nil {
+		h.finishRenewal(cert.ID)
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "更新证书续期状态失败"})
+		return
+	}
 
 	if cert.RemoteServerID == 0 {
-		go h.renewLocalCertificate(cert)
+		go func() {
+			defer h.finishRenewal(cert.ID)
+			h.renewLocalCertificate(cert)
+		}()
 	} else {
-		go h.requestRemoteCertificate(cert)
+		go func() {
+			defer h.finishRenewal(cert.ID)
+			h.requestRemoteCertificate(cert)
+		}()
 	}
 
 	respondJSON(w, http.StatusAccepted, map[string]any{"success": true, "message": "证书续期已提交"})
@@ -712,32 +836,67 @@ func (h *CertificateHandler) RenewCertificate(w http.ResponseWriter, r *http.Req
 func (h *CertificateHandler) renewLocalCertificate(cert *storage.Certificate) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	h.appendCertificateLogDurable(cert.ID, "开始续期证书: "+cert.Domain)
 
 	certReq, err := h.buildCertRequest(ctx, cert)
 	if err != nil {
 		log.Printf("[Certificate] buildCertRequest failed for %s: %v", cert.Domain, err)
-		_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusFailed, err.Error())
+		h.markRenewalFailed(cert, err)
 		return
 	}
 
 	result, err := h.acmeClient.RenewCertificateV2(ctx, certReq, cert.CertPEM, cert.KeyPEM)
 	if err != nil {
 		log.Printf("[Certificate] RenewCertificate failed for %s: %v", cert.Domain, err)
-		_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusFailed, err.Error())
+		h.markRenewalFailed(cert, err)
+		SendCertResultNotification(ctx, cert.Domain, false, "续期失败，旧证书保持不变: "+err.Error())
 		return
 	}
 
-	if err := h.repo.UpdateCertificateIssued(ctx, cert.ID, result.CertPath, result.KeyPath, result.CertPEM, result.KeyPEM, result.IssueDate, result.ExpiryDate); err != nil {
+	persistCtx, persistCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err = h.repo.UpdateCertificateIssued(persistCtx, cert.ID, result.CertPath, result.KeyPath, result.CertPEM, result.KeyPEM, result.IssueDate, result.ExpiryDate)
+	persistCancel()
+	if err != nil {
 		log.Printf("[Certificate] UpdateCertificateIssued failed for %s: %v", cert.Domain, err)
+		h.markRenewalFailed(cert, fmt.Errorf("保存续签证书失败: %w", err))
 		return
 	}
 
 	log.Printf("[Certificate] Successfully renewed certificate for %s, expires %s", cert.Domain, result.ExpiryDate.Format("2006-01-02"))
+	h.appendCertificateLogDurable(cert.ID, fmt.Sprintf("证书续期成功，有效期至 %s", result.ExpiryDate.Format("2006-01-02")))
+	SendCertResultNotification(ctx, cert.Domain, true, fmt.Sprintf("续期成功，有效期至 %s", result.ExpiryDate.Format("2006-01-02")))
 
 	h.syncManagedXrayAfterMaterialUpdate(cert, result.CertPEM, result.KeyPEM)
 	// 如果配置则本地部署
 	h.deployAfterIssue(cert, result)
 	h.checkMasterCertReady(cert)
+}
+
+func (h *CertificateHandler) markRenewalFailed(cert *storage.Certificate, renewalErr error) {
+	status := storage.CertStatusFailed
+	message := "续期失败: " + renewalErr.Error()
+	if cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" && cert.ExpiryDate != nil && cert.ExpiryDate.After(time.Now()) {
+		status = storage.CertStatusValid
+		message = "续期失败，已保留当前有效证书: " + renewalErr.Error()
+	}
+	if cert == nil {
+		return
+	}
+	if err := h.updateCertificateStatusDurable(cert.ID, status, message); err != nil {
+		log.Printf("[Certificate] preserve certificate after renewal failure for %s: %v", cert.Domain, err)
+	}
+	h.appendCertificateLogDurable(cert.ID, message)
+}
+
+func (h *CertificateHandler) markCertificateOperationFailed(cert *storage.Certificate, operationErr error) {
+	if cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
+		h.markRenewalFailed(cert, operationErr)
+		return
+	}
+	if cert != nil {
+		_ = h.updateCertificateStatusDurable(cert.ID, storage.CertStatusFailed, operationErr.Error())
+		h.appendCertificateLogDurable(cert.ID, operationErr.Error())
+	}
 }
 
 // 处理 PATCH /api/admin/certificates/auto-renew
@@ -908,12 +1067,25 @@ func (h *CertificateHandler) checkAndRenewCertificates() {
 	for _, cert := range certs {
 		log.Printf("[Certificate] Auto-renewing certificate for %s (expires %s)", cert.Domain, cert.ExpiryDate.Format("2006-01-02"))
 
-		_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusPending, "自动续期中...")
+		if !h.beginRenewal(cert.ID) {
+			continue
+		}
+		if err := h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusPending, "自动续期中..."); err != nil {
+			h.finishRenewal(cert.ID)
+			log.Printf("[Certificate] mark auto-renew pending for %s: %v", cert.Domain, err)
+			continue
+		}
 
 		if cert.RemoteServerID == 0 {
-			go h.renewLocalCertificate(&cert)
+			go func(cert storage.Certificate) {
+				defer h.finishRenewal(cert.ID)
+				h.renewLocalCertificate(&cert)
+			}(cert)
 		} else {
-			go h.requestRemoteCertificate(&cert)
+			go func(cert storage.Certificate) {
+				defer h.finishRenewal(cert.ID)
+				h.requestRemoteCertificate(&cert)
+			}(cert)
 		}
 	}
 
@@ -1003,6 +1175,9 @@ func (h *CertificateHandler) deployAfterIssue(cert *storage.Certificate, result 
 	// 本地部署（主）
 	if err := h.deployLocal(result.CertPEM, result.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget); err != nil {
 		log.Printf("[Certificate] Local deploy failed for %s: %v", cert.Domain, err)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = h.repo.AppendCertificateLog(ctx, cert.ID, "自动部署失败，旧证书已恢复: "+err.Error())
 	} else {
 		log.Printf("[Certificate] Local deploy succeeded for %s to %s", cert.Domain, cert.DeployCertPath)
 	}
@@ -1262,23 +1437,28 @@ func (h *CertificateHandler) DeployCertificate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 更新部署设置
+	// 本地部署（主）
+	if err := h.deployLocal(cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget); err != nil {
+		log.Printf("[Certificate] Local deploy failed for %s: %v", cert.Domain, err)
+		_ = h.repo.AppendCertificateLog(r.Context(), cert.ID, "部署失败，已恢复旧证书: "+err.Error())
+		respondJSON(w, http.StatusBadGateway, map[string]any{"success": false, "message": "证书部署或服务重载失败，已恢复旧证书: " + err.Error()})
+		return
+	}
+
+	// 仅在文件和服务均成功切换后保存部署设置。
 	cert.DeployTarget = req.DeployTarget
 	cert.DeployCertPath = req.DeployCertPath
 	cert.DeployKeyPath = req.DeployKeyPath
 	if err := h.repo.UpdateCertificate(r.Context(), cert); err != nil {
 		log.Printf("[Certificate] UpdateCertificate deploy settings failed: %v", err)
-	}
-
-	// 本地部署（主）
-	if err := h.deployLocal(cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget); err != nil {
-		log.Printf("[Certificate] Local deploy failed for %s: %v", cert.Domain, err)
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "证书已部署，但保存部署设置失败"})
+		return
 	}
 
 	// 部署到所有远程服务器
 	h.deployToAllRemotes(cert.Domain, cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget)
 
-	respondJSON(w, http.StatusOK, map[string]any{"success": true, "message": "证书已部署到主服务器和所有远程服务器"})
+	respondJSON(w, http.StatusOK, map[string]any{"success": true, "message": "证书已部署到主服务器，远程服务器部署已提交"})
 }
 
 // DeployAutoDeployCertificates 将所有 auto_deploy 证书部署到特定的远程服务器。

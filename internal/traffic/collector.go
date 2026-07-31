@@ -405,45 +405,40 @@ func (c *Collector) ProcessRemoteMetrics(ctx context.Context, serverID int64, st
 	return nil
 }
 
-// aggregateAndUpsertUserTraffic 把 stats.User(key=email)里所有归到同一 username 的 cumulative 计数器加总,
-// 然后只对每个 username 调一次 UpsertUserTraffic。cumulative 计数器之和仍是 cumulative(每个组件计数器自身单调
-// 递增),delta 计算照常成立。
-//
-// 同时**并行双写** user_email_traffic — 保留 email 维度,供前端 drilldown 看"用户每个节点的流量"。
-// 老 user_traffic 是套餐扣减热路径,继续按 username 聚合;新表是 email 细分,只用于细粒度展示。
+// aggregateAndUpsertUserTraffic resolves the entire stats.User batch from one
+// cached attribution snapshot, then persists email and user counters in one
+// transaction. Billing multipliers are fixed on each collected delta.
 func aggregateAndUpsertUserTraffic(ctx context.Context, repo userTrafficRepo, serverID int64, userStats map[string]TrafficData, isXrayRestarted bool) {
-	type sum struct{ uplink, downlink int64 }
-	byUsername := make(map[string]*sum)
-	for emailKey, data := range userStats {
-		// 双写新表 — email 维度原样保留,即使 ResolveUsernameByEmail 解析不到 username 也写
-		// (野 client 也算"该 server 的 email 流量",前端可显示成"未识别节点")
-		if err := repo.UpsertUserEmailTraffic(ctx, serverID, emailKey, data.Uplink, data.Downlink, isXrayRestarted); err != nil {
-			log.Printf("[Traffic Collector] Failed to upsert user email traffic for %s on server %d: %v", emailKey, serverID, err)
-		}
-
-		username := repo.ResolveUsernameByEmail(ctx, emailKey)
-		if username == "" {
-			continue
-		}
-		if s, ok := byUsername[username]; ok {
-			s.uplink += data.Uplink
-			s.downlink += data.Downlink
-		} else {
-			byUsername[username] = &sum{uplink: data.Uplink, downlink: data.Downlink}
-		}
+	emails := make([]string, 0, len(userStats))
+	for email := range userStats {
+		emails = append(emails, email)
 	}
-	for username, s := range byUsername {
-		if err := repo.UpsertUserTraffic(ctx, serverID, username, s.uplink, s.downlink, isXrayRestarted); err != nil {
-			log.Printf("[Traffic Collector] Failed to upsert user traffic for %s on server %d: %v", username, serverID, err)
-		}
+	resolved, err := repo.ResolveUserTrafficBilling(ctx, serverID, emails)
+	if err != nil {
+		log.Printf("[Traffic Collector] Failed to resolve user traffic billing on server %d: %v", serverID, err)
+		return
+	}
+
+	samples := make([]storage.UserTrafficSample, 0, len(userStats))
+	for emailKey, data := range userStats {
+		billing := resolved[emailKey]
+		samples = append(samples, storage.UserTrafficSample{
+			Email:             emailKey,
+			Username:          billing.Username,
+			Uplink:            data.Uplink,
+			Downlink:          data.Downlink,
+			BillingMultiplier: billing.Multiplier,
+		})
+	}
+	if err := repo.UpsertUserTrafficBatch(ctx, serverID, samples, isXrayRestarted); err != nil {
+		log.Printf("[Traffic Collector] Failed to persist user traffic batch on server %d: %v", serverID, err)
 	}
 }
 
 // userTrafficRepo 只取 collector 实际用到的方法,避免去 import 整个 storage 接口
 type userTrafficRepo interface {
-	ResolveUsernameByEmail(ctx context.Context, email string) string
-	UpsertUserTraffic(ctx context.Context, serverID int64, username string, uplink, downlink int64, isXrayRestarted bool) error
-	UpsertUserEmailTraffic(ctx context.Context, serverID int64, email string, uplink, downlink int64, isXrayRestarted bool) error
+	ResolveUserTrafficBilling(ctx context.Context, serverID int64, emails []string) (map[string]storage.UserTrafficBilling, error)
+	UpsertUserTrafficBatch(ctx context.Context, serverID int64, samples []storage.UserTrafficSample, isXrayRestarted bool) error
 }
 
 // 为所有服务器创建每日快照

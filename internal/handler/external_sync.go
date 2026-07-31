@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/safefetch"
 	"github.com/violetaini/relaydock/internal/storage"
 
 	"gopkg.in/yaml.v3"
@@ -94,9 +95,7 @@ func syncExternalSubscriptionsManual(ctx context.Context, repo *storage.TrafficR
 
 	logger.Info("[外部订阅同步-手动] 外部订阅数量", "user", username, "count", len(externalSubs))
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := safefetch.NewClient(30*time.Second, maxSubscriptionBytes)
 
 	// 跟踪已同步的节点总数
 	totalNodesSynced := 0
@@ -205,9 +204,7 @@ func syncExternalSubscriptions(ctx context.Context, repo *storage.TrafficReposit
 
 	logger.Info("[外部订阅同步-自动] 用户共有外部订阅需要同步", "user", username, "count", len(subsToSync))
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := safefetch.NewClient(30*time.Second, maxSubscriptionBytes)
 
 	// 跟踪已同步的节点总数
 	totalNodesSynced := 0
@@ -569,12 +566,9 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 			}
 		default:
 			// 默认：按节点名称匹配
-			for i := range existingNodes {
-				if existingNodes[i].NodeName == node.NodeName {
-					existingNode = &existingNodes[i]
-					logger.Info("[外部订阅同步] 节点 按名称匹配成功", "node_name", node.NodeName)
-					break
-				}
+			existingNode = matchExternalNodeByName(existingNodes, sub.URL, node.NodeName)
+			if existingNode != nil {
+				logger.Info("[外部订阅同步] 节点 按名称匹配成功", "node_name", node.NodeName)
 			}
 			if existingNode == nil {
 				logger.Info("[外部订阅同步] 节点 按名称未找到匹配", "node_name", node.NodeName)
@@ -636,18 +630,22 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 					logger.Info("[外部订阅同步] 更新节点名称 ->", "value", oldNodeName, "node_name", node.NodeName)
 				}
 			} else {
-				logger.Info("[外部订阅同步] 保留原节点名称 (外部订阅名称)", "value", oldNodeName, "node_name", node.NodeName)
+				// Preserve the user's base name, but always replace (or remove) the
+				// generated traffic/expiry suffix. Otherwise every refresh leaves
+				// stale counters behind and name-based matching starts duplicating nodes.
+				existingNode.NodeName = preserveExternalNodeName(oldNodeName, node.NodeName, subInfoSuffix)
+				logger.Info("[外部订阅同步] 保留原节点名称", "value", oldNodeName, "node_name", existingNode.NodeName)
 				// 更新 ClashConfig 和 ParsedConfig 中的 name 字段为保留的节点名称
 				var clashConfig map[string]any
 				if err := json.Unmarshal([]byte(existingNode.ClashConfig), &clashConfig); err == nil {
-					clashConfig["name"] = oldNodeName
+					clashConfig["name"] = existingNode.NodeName
 					if updatedClash, err := json.Marshal(clashConfig); err == nil {
 						existingNode.ClashConfig = string(updatedClash)
 					}
 				}
 				var parsedConfig map[string]any
 				if err := json.Unmarshal([]byte(existingNode.ParsedConfig), &parsedConfig); err == nil {
-					parsedConfig["name"] = oldNodeName
+					parsedConfig["name"] = existingNode.NodeName
 					if updatedParsed, err := json.Marshal(parsedConfig); err == nil {
 						existingNode.ParsedConfig = string(updatedParsed)
 					}
@@ -937,9 +935,7 @@ func (h *SyncSingleExternalSubscriptionHandler) ServeHTTP(w http.ResponseWriter,
 
 	logger.Info("[Sync API] 开始同步单个订阅 (ID)", "name", targetSub.Name, "id", targetSub.ID)
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := safefetch.NewClient(30*time.Second, maxSubscriptionBytes)
 
 	nodeCount, updatedSub, err := syncSingleExternalSubscription(r.Context(), client, h.repo, h.subscribeDir, ownerUsername, *targetSub, userSettings)
 	if err != nil {
@@ -1029,6 +1025,39 @@ func buildSubInfoSuffix(sub storage.ExternalSubscription) string {
 		return ""
 	}
 	return " " + strings.Join(parts, " ")
+}
+
+var generatedSubInfoSuffixPattern = regexp.MustCompile(`(?:\s+(?:\d+(?:\.\d+)?[KMGT]B📊|\d+Days⏳))+$`)
+
+func stripGeneratedSubInfoSuffix(name string) string {
+	return strings.TrimSpace(generatedSubInfoSuffixPattern.ReplaceAllString(strings.TrimSpace(name), ""))
+}
+
+func refreshExternalNodeName(existingName, currentSuffix string) string {
+	return stripGeneratedSubInfoSuffix(existingName) + currentSuffix
+}
+
+func preserveExternalNodeName(existingName, incomingName, currentSuffix string) string {
+	if existingName == incomingName {
+		return existingName
+	}
+	return refreshExternalNodeName(existingName, currentSuffix)
+}
+
+func matchExternalNodeByName(nodes []storage.Node, sourceURL, incomingName string) *storage.Node {
+	for i := range nodes {
+		if nodes[i].RawURL == sourceURL && nodes[i].NodeName == incomingName {
+			return &nodes[i]
+		}
+	}
+
+	incomingBase := stripGeneratedSubInfoSuffix(incomingName)
+	for i := range nodes {
+		if nodes[i].RawURL == sourceURL && stripGeneratedSubInfoSuffix(nodes[i].NodeName) == incomingBase {
+			return &nodes[i]
+		}
+	}
+	return nil
 }
 
 func formatTrafficShort(bytes int64) string {

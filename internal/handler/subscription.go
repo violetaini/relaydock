@@ -18,6 +18,7 @@ import (
 
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/proxyparser/substore"
+	"github.com/violetaini/relaydock/internal/safefetch"
 	"github.com/violetaini/relaydock/internal/scriptengine"
 	"github.com/violetaini/relaydock/internal/storage"
 
@@ -920,7 +921,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", contentType)
 
 	// 远程服务器流量统计:
-	//   - 订阅创建者是普通用户且绑了套餐 → 用套餐口径(pkg.TrafficLimitBytes + 用户已用 × multiplier),
+	//   - 订阅创建者是普通用户且绑了套餐 → 用套餐限额与采集时固化的计费用量,
 	//     跟"流量信息"页一致,避免把全平台所有服务器流量塞进 subscription-userinfo。
 	//   - admin / 无套餐 / 找不到用户 → 沿用 stats_server_ids 那套老逻辑。
 	remoteTrafficLimit, remoteTrafficUsed := int64(0), int64(0)
@@ -931,8 +932,8 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			if user, uerr := h.repo.GetUser(r.Context(), creator); uerr == nil && user.Role != storage.RoleAdmin && user.PackageID > 0 {
 				if pkg, perr := h.repo.GetPackage(r.Context(), user.PackageID); perr == nil && pkg != nil {
 					remoteTrafficLimit = resolveTrafficLimitBytes(&user, pkg)
-					if raw, terr := h.repo.GetUserTotalTraffic(r.Context(), creator); terr == nil {
-						remoteTrafficUsed = raw * pkg.TrafficMultiplier()
+					if billed, terr := h.repo.GetUserBillableTraffic(r.Context(), creator); terr == nil {
+						remoteTrafficUsed = billed
 					}
 					usedPackageScope = true
 				}
@@ -1432,9 +1433,7 @@ func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.Traf
 
 	logger.Info("[Subscription] 用户需要同步的外部订阅", "user", username, "count", len(subsToSync), "match_rule", userSettings.MatchRule)
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := safefetch.NewClient(30*time.Second, maxSubscriptionBytes)
 
 	// 跟踪已同步的节点总数
 	totalNodesSynced := 0

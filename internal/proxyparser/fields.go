@@ -8,6 +8,13 @@ var skipCertVerifyAliases = []string{
 	"skip-cert-verify", "skip_cert_verify", "skipCertVerify",
 }
 
+// certFingerprintAliases covers the server certificate pin names emitted by
+// Xray, v2rayN, and Hysteria-compatible share links.
+var certFingerprintAliases = []string{
+	"pcs", "pinnedPeerCertSha256", "pinned_peer_cert_sha256",
+	"pinSHA256", "pinsha256", "tls-fingerprint",
+}
+
 // truthy 判断 query 值是否表示"真"。
 func truthy(s string) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
@@ -34,6 +41,10 @@ func boolFromAliases(params map[string]string, keys ...string) (val bool, presen
 // skipCertVerify 解析 skip-cert-verify 的全部别名。
 func skipCertVerify(params map[string]string) (val bool, present bool) {
 	return boolFromAliases(params, skipCertVerifyAliases...)
+}
+
+func certFingerprint(params map[string]string) string {
+	return firstNonEmpty(params, certFingerprintAliases...)
 }
 
 // firstNonEmpty 返回 params 中按 keys 顺序第一个非空值。

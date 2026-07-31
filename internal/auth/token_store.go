@@ -124,6 +124,23 @@ func (s *TokenStore) Revoke(token string) {
 	s.mu.Unlock()
 }
 
+// RevokeUser removes every in-memory session belonging to username. Persistent
+// session rows are deleted by the caller in the same account-disable flow.
+func (s *TokenStore) RevokeUser(username string) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return
+	}
+
+	s.mu.Lock()
+	for token, sess := range s.tokens {
+		if sess.username == username {
+			delete(s.tokens, token)
+		}
+	}
+	s.mu.Unlock()
+}
+
 func (s *TokenStore) RevokeAll() {
 	s.mu.Lock()
 	s.tokens = make(map[string]session)

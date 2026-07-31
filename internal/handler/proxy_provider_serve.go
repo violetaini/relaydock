@@ -3,7 +3,6 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/violetaini/relaydock/internal/logger"
 	"io"
 	"net"
 	"net/http"
@@ -12,7 +11,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/violetaini/relaydock/internal/logger"
 	"github.com/violetaini/relaydock/internal/proxyparser"
+	"github.com/violetaini/relaydock/internal/safefetch"
 	"github.com/violetaini/relaydock/internal/storage"
 	"gopkg.in/yaml.v3"
 )
@@ -111,7 +112,7 @@ func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error)
 	logger.Info("[SubscriptionCache] 缓存未命中，正在拉取", "url", sub.URL)
 
 	// 拉取订阅内容
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := safefetch.NewClient(30*time.Second, maxSubscriptionBytes)
 	req, err := http.NewRequest(http.MethodGet, sub.URL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -134,7 +135,7 @@ func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error)
 	}
 
 	// 限制读取大小,防恶意/故障订阅源返回超大 body 触发 OOM(订阅内容通常 <几 MB)
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBytes))
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response body: %w", err)
 	}

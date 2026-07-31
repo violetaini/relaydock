@@ -231,6 +231,12 @@ func parseVmessURL(uri string) (map[string]any, error) {
 	if fp := getString(config, "fp", ""); fp != "" {
 		node["client-fingerprint"] = fp
 	}
+	for _, key := range certFingerprintAliases {
+		if pin := getString(config, key, ""); pin != "" {
+			node["tls-fingerprint"] = pin
+			break
+		}
+	}
 
 	// Skip cert verify
 	if allowInsecure := config["allowInsecure"]; allowInsecure != nil {
@@ -791,6 +797,9 @@ func parseTrojanURL(uri string) (map[string]any, error) {
 	// Skip cert verify
 	scv, _ := skipCertVerify(queryParams)
 	node["skip-cert-verify"] = scv
+	if pin := certFingerprint(queryParams); pin != "" {
+		node["tls-fingerprint"] = pin
+	}
 
 	return node, nil
 }
@@ -863,10 +872,12 @@ func parseVlessURL(uri string) (map[string]any, error) {
 	// Skip cert verify（统一别名）
 	scv, _ := skipCertVerify(queryParams)
 	node["skip-cert-verify"] = scv
+	if pin := certFingerprint(queryParams); pin != "" {
+		node["tls-fingerprint"] = pin
+	}
 
 	// Reality
 	if security == "reality" {
-		node["skip-cert-verify"] = true
 		realityOpts := map[string]any{}
 		if pbk := firstNonEmpty(queryParams, "pbk", "public-key"); pbk != "" {
 			realityOpts["public-key"] = pbk
@@ -1067,7 +1078,7 @@ func parseHysteriaGeneric(uri string, protocol string) (map[string]any, error) {
 	}
 	// 证书 PIN（pinSHA256 → tls-fingerprint）：下游 substore producer 统一从 tls-fingerprint 读取
 	// （clash/clashmeta 再转 mihomo 的 fingerprint，loon 直接读 tls-fingerprint）。
-	if pin := firstNonEmpty(queryParams, "pinSHA256", "pinsha256"); pin != "" {
+	if pin := certFingerprint(queryParams); pin != "" {
 		node["tls-fingerprint"] = pin
 	}
 

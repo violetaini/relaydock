@@ -61,6 +61,27 @@ func uriEncodeComponent(s string) string {
 	return b.String()
 }
 
+// uriEncodeUserInfo preserves RFC 3986 characters that are valid inside an
+// authority userinfo component while escaping delimiters that would change
+// the URI structure.
+func uriEncodeUserInfo(s string) string {
+	const upperhex = "0123456789ABCDEF"
+	const safe = "-._~!$&'()*+,;=:"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			strings.ContainsRune(safe, rune(c)) {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(upperhex[c>>4])
+		b.WriteByte(upperhex[c&0x0F])
+	}
+	return b.String()
+}
+
 // uriTruthy 镜像 JS 真值判断 (if (proxy[key]))。注意:JS 中数字 0 为假,但字符串 "0" 为真;
 // 空串/nil/false/数字 0 视为假,其余为真。
 func uriTruthy(v interface{}) bool {
@@ -794,7 +815,7 @@ func (p *URIProducer) encodeShadowsocks(proxy Proxy) (string, error) {
 	// userinfo: 2022-blake3-* 不 base64 (JS line 828-832)
 	var userInfoPart string
 	if strings.HasPrefix(cipher, "2022-blake3-") {
-		userInfoPart = uriEncodeComponent(cipher) + ":" + uriEncodeComponent(password)
+		userInfoPart = uriEncodeUserInfo(cipher) + ":" + uriEncodeUserInfo(password)
 	} else {
 		userInfoPart = base64.StdEncoding.EncodeToString([]byte(cipher + ":" + password))
 	}
@@ -1028,7 +1049,7 @@ func (p *URIProducer) encodeHysteria2(proxy Proxy) (string, error) {
 	}
 
 	uri := fmt.Sprintf("hysteria2://%s@%s:%d?%s#%s",
-		uriEncodeComponent(password), server, port, strings.Join(ps, "&"), uriEncodeComponent(name))
+		uriEncodeUserInfo(password), server, port, strings.Join(ps, "&"), uriEncodeComponent(name))
 	return uri, nil
 }
 

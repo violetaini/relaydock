@@ -98,3 +98,29 @@ func TestRequireAdminRejectsInactiveAdministrator(t *testing.T) {
 		t.Fatalf("status=%d want=%d", response.Code, http.StatusForbidden)
 	}
 }
+
+func TestTokenStoreRevokeUserOnlyRemovesTargetSessions(t *testing.T) {
+	store := NewTokenStore(time.Hour)
+	aliceOne, _, err := store.Issue("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceTwo, _, err := store.Issue("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, _, err := store.Issue("bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store.RevokeUser(" alice ")
+	for _, token := range []string{aliceOne, aliceTwo} {
+		if _, ok := store.Lookup(token); ok {
+			t.Fatal("target user's session remained valid")
+		}
+	}
+	if username, ok := store.Lookup(bob); !ok || username != "bob" {
+		t.Fatalf("unrelated session was revoked: username=%q valid=%v", username, ok)
+	}
+}

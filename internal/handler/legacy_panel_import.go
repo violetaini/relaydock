@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/safefetch"
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
@@ -688,14 +689,10 @@ func sameURLOrigin(a, b *url.URL) bool {
 }
 
 func newLegacyPanelHTTPClient(source *url.URL) *http.Client {
-	return &http.Client{
-		CheckRedirect: func(next *http.Request, via []*http.Request) error {
-			if len(via) > 0 && !sameURLOrigin(source, next.URL) {
-				return errors.New("拒绝跳转到非同源地址")
-			}
-			return nil
-		},
-	}
+	host := source.Hostname()
+	parsed := net.ParseIP(host)
+	allowLoopback := strings.EqualFold(host, "localhost") || parsed != nil && parsed.IsLoopback()
+	return safefetch.NewSameOriginClient(defaultFetchTimeout, maxBackupSizeBytes+1, source, allowLoopback)
 }
 
 // ------- POST /api/admin/migrate/import-legacyPanel -------

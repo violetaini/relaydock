@@ -5,12 +5,14 @@ import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/violetaini/relaydock/internal/dnscredentials"
@@ -300,6 +302,9 @@ func (c *Client) setupWebrootChallenge(client *lego.Client, req CertRequest) err
 }
 
 func (c *Client) ProcessCertResult(domain string, certPEMBytes, keyPEMBytes []byte) (*CertResult, error) {
+	if _, err := tls.X509KeyPair(certPEMBytes, keyPEMBytes); err != nil {
+		return nil, fmt.Errorf("validate certificate and private key: %w", err)
+	}
 	expiryDate, issueDate, err := parseCertificateDates(certPEMBytes)
 	if err != nil {
 		return nil, fmt.Errorf("parse certificate: %w", err)
@@ -322,7 +327,15 @@ func (c *Client) ProcessCertResult(domain string, certPEMBytes, keyPEMBytes []by
 }
 
 func (c *Client) saveCertificate(domain string, certPEM, keyPEM []byte) (string, string, error) {
+	domain = strings.TrimSpace(domain)
+	if domain == "" || strings.ContainsAny(domain, `/\\`) {
+		return "", "", fmt.Errorf("invalid certificate domain")
+	}
 	domainDir := filepath.Join(c.certDir, domain)
+	rel, err := filepath.Rel(c.certDir, domainDir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("certificate domain escapes storage directory")
+	}
 	if err := os.MkdirAll(domainDir, 0700); err != nil {
 		return "", "", fmt.Errorf("create cert directory: %w", err)
 	}
@@ -330,11 +343,8 @@ func (c *Client) saveCertificate(domain string, certPEM, keyPEM []byte) (string,
 	certPath := filepath.Join(domainDir, "fullchain.pem")
 	keyPath := filepath.Join(domainDir, "privkey.pem")
 
-	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
-		return "", "", fmt.Errorf("write certificate: %w", err)
-	}
-	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
-		return "", "", fmt.Errorf("write private key: %w", err)
+	if _, err := writeCertKeyFilesAtomic(certPEM, keyPEM, certPath, keyPath); err != nil {
+		return "", "", err
 	}
 
 	return certPath, keyPath, nil

@@ -14,6 +14,7 @@ import (
 
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/logger"
+	"github.com/violetaini/relaydock/internal/safefetch"
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
@@ -49,13 +50,13 @@ func NewTrafficSummaryHandler(repo *storage.TrafficRepository) *TrafficSummaryHa
 		panic("traffic summary handler requires repository")
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := safefetch.NewClient(15*time.Second, maxSubscriptionBytes)
 	return newTrafficSummaryHandler(client, repo)
 }
 
 func newTrafficSummaryHandler(client *http.Client, repo *storage.TrafficRepository) *TrafficSummaryHandler {
 	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
+		client = safefetch.NewClient(15*time.Second, maxSubscriptionBytes)
 	}
 
 	return &TrafficSummaryHandler{client: client, repo: repo}
@@ -111,13 +112,12 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 			totalUsed += extUsed
 		}
 	} else if haveUser {
-		// 普通用户:套餐流量。已用按套餐流量倍率(oneway×1 / twoway×2)计费,
-		// 与限额判定口径一致(见 traffic_limit_enforcer:已用×TrafficMultiplier 比限额)。
+		// 普通用户:套餐流量。已用值在采集时按当时的套餐模式和节点倍率固化。
 		if user.PackageID > 0 {
 			if pkg, perr := h.repo.GetPackage(ctx, user.PackageID); perr == nil {
 				totalLimit += resolveTrafficLimitBytes(&user, pkg)
-				if raw, terr := h.repo.GetUserTotalTraffic(ctx, username); terr == nil {
-					totalUsed += raw * pkg.TrafficMultiplier()
+				if billed, terr := h.repo.GetUserBillableTraffic(ctx, username); terr == nil {
+					totalUsed += billed
 				}
 			}
 		}

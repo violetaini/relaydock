@@ -19,6 +19,7 @@ import (
 
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/logger"
+	"github.com/violetaini/relaydock/internal/safefetch"
 	"github.com/violetaini/relaydock/internal/storage"
 	"github.com/violetaini/relaydock/internal/validator"
 
@@ -26,7 +27,8 @@ import (
 )
 
 type subscribeFilesHandler struct {
-	repo *storage.TrafficRepository
+	repo        *storage.TrafficRepository
+	fetchClient *http.Client
 }
 
 var errSubscribeFilenameTargetExists = errors.New("目标订阅文件已存在")
@@ -139,7 +141,8 @@ func NewSubscribeFilesHandler(repo *storage.TrafficRepository) http.Handler {
 	}
 
 	return &subscribeFilesHandler{
-		repo: repo,
+		repo:        repo,
+		fetchClient: safefetch.NewClient(30*time.Second, maxSubscriptionBytes),
 	}
 }
 
@@ -366,12 +369,7 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 		req.Filename = filename
 	}
 
-	// 创建HTTP客户端并获取订阅内容
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	httpReq, err := http.NewRequest("GET", req.URL, nil)
+	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, req.URL, nil)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, errors.New("无效的订阅URL"))
 		return
@@ -380,7 +378,7 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 	// 添加User-Agent头
 	httpReq.Header.Set("User-Agent", "clash-meta/2.4.0")
 
-	resp, err := client.Do(httpReq)
+	resp, err := h.fetchClient.Do(httpReq)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, errors.New("无法获取订阅内容: "+err.Error()))
 		return
@@ -1034,8 +1032,8 @@ func (h *subscribeFilesHandler) handleTrafficForUser(ctx context.Context, w http
 		if user, err := h.repo.GetUser(ctx, username); err == nil && user.PackageID > 0 {
 			if pkg, perr := h.repo.GetPackage(ctx, user.PackageID); perr == nil {
 				limit = resolveTrafficLimitBytes(&user, pkg)
-				if raw, terr := h.repo.GetUserTotalTraffic(ctx, username); terr == nil {
-					used = raw * pkg.TrafficMultiplier()
+				if billed, terr := h.repo.GetUserBillableTraffic(ctx, username); terr == nil {
+					used = billed
 				}
 			}
 		}

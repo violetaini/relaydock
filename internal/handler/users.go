@@ -98,11 +98,7 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 			pkgMap[p.ID] = p
 		}
 
-		allTraffic, _ := repo.GetAllUserTraffic(r.Context())
-		trafficMap := make(map[string]int64)
-		for _, t := range allTraffic {
-			trafficMap[t.Username] += t.Uplink + t.Downlink
-		}
+		trafficMap, _ := repo.ListUserBillableTraffic(r.Context())
 
 		// 一次性查所有用户短码,避免列表循环里逐个 query(N+1)。
 		shortCodeMap, _ := repo.ListUserShortCodeInfo(r.Context())
@@ -145,7 +141,6 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 				used := trafficMap[user.Username]
 				if pkg, ok := pkgMap[pid]; ok {
 					entry.TrafficMultiplier = pkg.TrafficMultiplier()
-					used *= pkg.TrafficMultiplier()
 				}
 				entry.TrafficUsed = used
 				if trafficLimitExceeded(entry.TrafficUsed, entry.TrafficLimit) {
@@ -181,7 +176,7 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 //
 // 跟 user delete 路径区别:本接口 **保留** user_inbound_configs 行 (credential 留着),
 // 启用时能精确还原原 uuid/password,客户端订阅无需重新生成。
-func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher) http.Handler {
+func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher, tokens *auth.TokenStore) http.Handler {
 	if repo == nil {
 		panic("user status handler requires repository")
 	}
@@ -233,13 +228,27 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 			}
 		}
 
-		if err := repo.UpdateUserStatus(ctx, username, payload.IsActive); err != nil {
-			if errors.Is(err, storage.ErrUserNotFound) {
+		var statusErr error
+		if payload.IsActive {
+			statusErr = repo.UpdateUserStatus(ctx, username, true)
+		} else {
+			statusErr = repo.DisableUserAndDeleteSessions(ctx, username)
+		}
+		if statusErr != nil {
+			if errors.Is(statusErr, storage.ErrUserNotFound) {
 				writeError(w, http.StatusNotFound, errors.New("user not found"))
 				return
 			}
-			writeError(w, http.StatusInternalServerError, err)
+			writeError(w, http.StatusInternalServerError, statusErr)
 			return
+		}
+		if !payload.IsActive {
+			// Inactive users are already rejected by auth middleware, but deleting
+			// both stores makes revocation immediate and prevents a restart from
+			// loading a previously issued session back into memory.
+			if tokens != nil {
+				tokens.RevokeUser(username)
+			}
 		}
 
 		// 状态切换后,同步 xray inbound clients。

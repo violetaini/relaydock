@@ -625,7 +625,7 @@ func main() {
 	mux.Handle("/api/admin/users/traffic-limit", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserTrafficLimitHandler(repo)))
 	mux.Handle("/api/admin/users/node-limits", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserNodeLimitsHandler(repo, limiterPusher, capabilityManager)))
 	mux.Handle("/api/admin/users/delete", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserDeleteHandler(repo, remoteManageHandler, limiterPusher, managedNodesHandler)))
-	mux.Handle("/api/admin/users/status", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserStatusHandler(repo, remoteManageHandler, limiterPusher)))
+	mux.Handle("/api/admin/users/status", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserStatusHandler(repo, remoteManageHandler, limiterPusher, tokenStore)))
 
 	// 用户节点管理（普通用户查看套餐节点、管理自己的出站）
 	userNodesHandler := handler.NewUserNodesHandler(repo, remoteManageHandler)

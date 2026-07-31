@@ -11,6 +11,7 @@ import (
 
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/proxyparser/substore"
+	"github.com/violetaini/relaydock/internal/safefetch"
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
@@ -366,7 +367,7 @@ func templateToResponse(t storage.Template) templateResponse {
 }
 
 func fetchRemoteContent(url string, timeout time.Duration) (string, error) {
-	client := &http.Client{Timeout: timeout}
+	client := safefetch.NewClient(timeout, 10<<20)
 	resp, err := client.Get(url)
 	if err != nil {
 		return "", err

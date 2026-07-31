@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"path"
@@ -111,20 +112,50 @@ func certReferencedByManagedXrayPaths(cert *storage.Certificate, refs map[string
 	return refs[certPath] == keyPath
 }
 
-func (h *CertificateHandler) deployManagedXrayCert(ctx context.Context, server *storage.RemoteServer, cert *storage.Certificate) error {
-	if _, _, err := h.DeployCertToServerSync(ctx, server, cert); err != nil {
-		h.forgetXrayCertSync(server.ID, cert.ID)
-		return err
+func (h *CertificateHandler) restartManagedXray(ctx context.Context, serverID int64, logPrefix string) error {
+	if h.managedXrayRestart != nil {
+		return h.managedXrayRestart(ctx, serverID, logPrefix)
 	}
 	if h.remoteManage == nil {
-		h.forgetXrayCertSync(server.ID, cert.ID)
 		return fmt.Errorf("remote manage handler not initialized")
 	}
-	if err := h.remoteManage.restartXrayWithRecovery(ctx, server.ID, "CertificateSync"); err != nil {
-		h.forgetXrayCertSync(server.ID, cert.ID)
-		return err
+	return h.remoteManage.restartXrayWithRecovery(ctx, serverID, logPrefix)
+}
+
+func (h *CertificateHandler) restoreManagedXrayCert(ctx context.Context, server *storage.RemoteServer, previous *storage.Certificate) error {
+	if previous == nil || previous.CertPEM == "" || previous.KeyPEM == "" {
+		return fmt.Errorf("previous certificate material is unavailable")
+	}
+	if _, _, err := h.DeployCertToServerSync(ctx, server, previous); err != nil {
+		return fmt.Errorf("restore previous certificate files: %w", err)
+	}
+	if err := h.restartManagedXray(ctx, server.ID, "CertificateRollback"); err != nil {
+		h.forgetXrayCertSync(server.ID, previous.ID)
+		return fmt.Errorf("restart Xray with previous certificate: %w", err)
 	}
 	return nil
+}
+
+func (h *CertificateHandler) deployManagedXrayCert(ctx context.Context, server *storage.RemoteServer, cert, previous *storage.Certificate) error {
+	return h.repo.WithRemoteServerMutationLease(ctx, server.ID, func(leasedCtx context.Context) error {
+		if _, _, err := h.DeployCertToServerSync(leasedCtx, server, cert); err != nil {
+			h.forgetXrayCertSync(server.ID, cert.ID)
+			if previous != nil && previous.CertPEM != "" && previous.KeyPEM != "" {
+				rollbackErr := h.restoreManagedXrayCert(leasedCtx, server, previous)
+				return errors.Join(fmt.Errorf("deploy renewed certificate: %w", err), rollbackErr)
+			}
+			return err
+		}
+		if err := h.restartManagedXray(leasedCtx, server.ID, "CertificateSync"); err != nil {
+			h.forgetXrayCertSync(server.ID, cert.ID)
+			if previous != nil && previous.CertPEM != "" && previous.KeyPEM != "" {
+				rollbackErr := h.restoreManagedXrayCert(leasedCtx, server, previous)
+				return errors.Join(fmt.Errorf("restart Xray with renewed certificate: %w", err), rollbackErr)
+			}
+			return err
+		}
+		return nil
+	})
 }
 
 // syncManagedXrayAfterMaterialUpdate is called after a master-managed
@@ -138,6 +169,16 @@ func (h *CertificateHandler) syncManagedXrayAfterMaterialUpdate(cert *storage.Ce
 	updated.CertPEM = certPEM
 	updated.KeyPEM = keyPEM
 	updated.Status = storage.CertStatusValid
+	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	servers, err := h.repo.ListRemoteServers(lookupCtx)
+	lookupCancel()
+	if err != nil {
+		log.Printf("[Certificate] list remote servers for Xray certificate sync: %v", err)
+		return
+	}
+	if len(servers) == 0 {
+		return
+	}
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -145,18 +186,14 @@ func (h *CertificateHandler) syncManagedXrayAfterMaterialUpdate(cert *storage.Ce
 		h.xrayCertSyncMu.Lock()
 		defer h.xrayCertSyncMu.Unlock()
 
-		servers, err := h.repo.ListRemoteServers(ctx)
-		if err != nil {
-			log.Printf("[Certificate] list remote servers for Xray certificate sync: %v", err)
-			return
-		}
 		for i := range servers {
 			refs := h.managedXrayReferences(ctx, servers[i].ID)
 			if !certReferencedByManagedXrayPaths(&updated, refs) || !h.needsXrayCertSync(servers[i].ID, &updated) {
 				continue
 			}
-			if err := h.deployManagedXrayCert(ctx, &servers[i], &updated); err != nil {
+			if err := h.deployManagedXrayCert(ctx, &servers[i], &updated, cert); err != nil {
 				log.Printf("[Certificate] sync managed Xray certificate for %s on server %d: %v", updated.Domain, servers[i].ID, err)
+				_ = h.repo.AppendCertificateLog(ctx, updated.ID, fmt.Sprintf("服务器 %s 的 Xray 证书同步失败，已尝试恢复旧证书: %v", servers[i].Name, err))
 				continue
 			}
 			log.Printf("[Certificate] synced managed Xray certificate for %s on server %d", updated.Domain, servers[i].ID)
@@ -191,7 +228,7 @@ func (h *CertificateHandler) SyncManagedXrayCertificatesOnReconnect(ctx context.
 			!certReferencedByManagedXrayPaths(cert, refs) || !h.needsXrayCertSync(serverID, cert) {
 			continue
 		}
-		if err := h.deployManagedXrayCert(ctx, server, cert); err != nil {
+		if err := h.deployManagedXrayCert(ctx, server, cert, nil); err != nil {
 			log.Printf("[Certificate] reconnect sync for %s on server %d: %v", cert.Domain, serverID, err)
 			continue
 		}

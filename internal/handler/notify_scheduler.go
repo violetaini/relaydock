@@ -78,11 +78,22 @@ func notifyAsync(ctx context.Context, t notify.EventType, title, msg string) {
 		logNotifyReasonThrottled(t, string(reason))
 		return
 	}
+	sendContext := detachedNotifyContext(ctx)
 	go func() {
-		if err := n.Send(ctx, notify.Event{Type: t, Title: title, Message: msg}); err != nil {
+		if err := n.Send(sendContext, notify.Event{Type: t, Title: title, Message: msg}); err != nil {
 			log.Printf("[Notify] send failed event=%s: %v", t, err)
 		}
 	}()
+}
+
+func detachedNotifyContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	// HTTP request cancellation must not abort a notification after the handler
+	// has already accepted the event. Values are retained for observability;
+	// the Telegram client still enforces its own network timeout.
+	return context.WithoutCancel(ctx)
 }
 
 // logNotifyReasonThrottled 同一 (event, reason) pair 5 分钟内最多 log 一次,
@@ -277,35 +288,8 @@ func sendDailyTrafficNotification(ctx context.Context, repo *storage.TrafficRepo
 		}
 	}
 
-	allUserTraffic, err := repo.GetAllUserTraffic(ctx)
-	if err == nil && len(allUserTraffic) > 0 {
-		// 拉一次「子账号 email → 父用户名」映射,把子账号产生的流量合并到主用户头上
-		// (路由出站子账号的 user_traffic.username 是 email,不合并的话主账号和子账号会各占一行)
-		subToParent, _ := repo.ListSubaccountEmailToUsername(ctx)
-		userTotals := make(map[string]int64)
-		for _, ut := range allUserTraffic {
-			name := ut.Username
-			if parent, ok := subToParent[name]; ok && parent != "" {
-				name = parent
-			}
-			userTotals[name] += ut.Uplink + ut.Downlink
-		}
-
-		// 应用流量倍率
-		allUsers, _ := repo.ListUsersWithPackage(ctx)
-		packages, _ := repo.ListPackages(ctx)
-		pkgMap := make(map[int64]storage.Package)
-		for _, p := range packages {
-			pkgMap[p.ID] = p
-		}
-		for _, u := range allUsers {
-			if pkg, ok := pkgMap[u.PackageID]; ok {
-				if m := pkg.TrafficMultiplier(); m > 1 {
-					userTotals[u.Username] *= m
-				}
-			}
-		}
-
+	userTotals, err := repo.ListUserBillableTraffic(ctx)
+	if err == nil && len(userTotals) > 0 {
 		type userUsage struct {
 			name string
 			used int64

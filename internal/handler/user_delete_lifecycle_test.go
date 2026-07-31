@@ -130,7 +130,7 @@ func TestUserDeleteKeepsRetryTombstoneWhenAgentOffline(t *testing.T) {
 	statusResponse := httptest.NewRecorder()
 	statusRequest := httptest.NewRequest(http.MethodPost, "/api/admin/users/status",
 		strings.NewReader(`{"username":"alice","is_active":true}`))
-	NewUserStatusHandler(fixture.repo, nil, nil).ServeHTTP(statusResponse,
+	NewUserStatusHandler(fixture.repo, nil, nil, nil).ServeHTTP(statusResponse,
 		statusRequest.WithContext(auth.ContextWithUsername(statusRequest.Context(), "owner")))
 	if statusResponse.Code != http.StatusConflict {
 		t.Fatalf("pending deletion was re-enabled: status=%d body=%s", statusResponse.Code, statusResponse.Body.String())

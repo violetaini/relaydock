@@ -2,6 +2,8 @@ package substore
 
 import (
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestAnalyzeSubscription(t *testing.T) {
@@ -134,5 +136,53 @@ func TestMatchesFilter(t *testing.T) {
 		if result != tt.expected {
 			t.Errorf("matchesFilter(%q, %q) = %v, expected %v", tt.name, tt.filter, result, tt.expected)
 		}
+	}
+}
+
+func TestGenerateV3TemplatePreservesRuleProviders(t *testing.T) {
+	analysis, err := AnalyzeSubscription(`
+proxies:
+  - {name: edge, type: vless, server: edge.example.com, port: 443}
+proxy-groups:
+  - {name: proxy, type: select, proxies: [edge]}
+rules:
+  - RULE-SET,private,DIRECT
+  - MATCH,proxy
+rule-providers:
+  private:
+    type: http
+    behavior: domain
+    format: mrs
+    interval: 86400
+    url: https://rules.example.com/private.mrs
+    path: ./rules/private.mrs
+`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	generated := GenerateV3TemplateFromAnalysis(analysis)
+	var config map[string]any
+	if err := yaml.Unmarshal([]byte(generated), &config); err != nil {
+		t.Fatalf("generated template is invalid YAML: %v\n%s", err, generated)
+	}
+	providers, ok := config["rule-providers"].(map[string]any)
+	if !ok {
+		t.Fatalf("rule-providers missing from generated template: %s", generated)
+	}
+	private, ok := providers["private"].(map[string]any)
+	if !ok {
+		t.Fatalf("private provider missing: %#v", providers)
+	}
+	for key, want := range map[string]any{
+		"type": "http", "behavior": "domain", "format": "mrs",
+		"url": "https://rules.example.com/private.mrs", "path": "./rules/private.mrs",
+	} {
+		if private[key] != want {
+			t.Fatalf("provider %s = %#v, want %#v", key, private[key], want)
+		}
+	}
+	if private["interval"] != 86400 {
+		t.Fatalf("provider interval = %#v, want 86400", private["interval"])
 	}
 }

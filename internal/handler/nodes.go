@@ -18,6 +18,7 @@ import (
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/proxyparser"
 	"github.com/violetaini/relaydock/internal/proxyparser/substore"
+	"github.com/violetaini/relaydock/internal/safefetch"
 	"github.com/violetaini/relaydock/internal/storage"
 	"gopkg.in/yaml.v3"
 )
@@ -122,6 +123,7 @@ type nodesHandler struct {
 	subscribeDir    string
 	yamlSyncManager *YAMLSyncManager
 	remoteManage    *RemoteManageHandler
+	fetchClient     *http.Client
 }
 
 // 返回一个管理代理节点的仅管理处理程序。
@@ -135,6 +137,7 @@ func NewNodesHandler(repo *storage.TrafficRepository, subscribeDir string, remot
 		subscribeDir:    subscribeDir,
 		yamlSyncManager: NewYAMLSyncManager(subscribeDir, repo),
 		remoteManage:    remoteManage,
+		fetchClient:     safefetch.NewClient(30*time.Second, maxSubscriptionBytes),
 	}
 }
 
@@ -2300,12 +2303,7 @@ func (h *nodesHandler) handleFetchSubscription(w http.ResponseWriter, r *http.Re
 		userAgent = "clash-meta/2.4.0"
 	}
 
-	// 创建HTTP客户端并获取订阅内容
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	httpReq, err := http.NewRequest("GET", req.URL, nil)
+	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, req.URL, nil)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, errors.New("无效的订阅URL"))
 		return
@@ -2316,7 +2314,7 @@ func (h *nodesHandler) handleFetchSubscription(w http.ResponseWriter, r *http.Re
 
 	logger.Info("[订阅获取] 开始请求外部订阅", "url", req.URL, "user_agent", userAgent)
 
-	resp, err := client.Do(httpReq)
+	resp, err := h.fetchClient.Do(httpReq)
 	if err != nil {
 		logger.Info("[订阅获取] 请求失败", "url", req.URL, "error", err)
 		writeError(w, http.StatusBadRequest, errors.New("无法获取订阅内容: "+err.Error()))

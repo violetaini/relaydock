@@ -2552,6 +2552,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 			if strings.TrimSpace(wireGuardStringValue(inboundReq["mutation_id"])) == "" {
 				inboundReq["mutation_id"] = "managed-inbound:" + uuid.NewString()
 			}
+			applyManagedInboundSniffing(inboundReq)
 		} else if action == "remove" {
 			tag := strings.TrimSpace(wireGuardStringValue(inboundReq["tag"]))
 			if tag == "" {
@@ -2962,6 +2963,42 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(result)
+}
+
+// applyManagedInboundSniffing enforces the server-side product default for
+// every newly managed proxy inbound. Frontend presets are not a security or
+// correctness boundary: advanced JSON and direct API callers pass here too.
+// WireGuard must not be sniffed, while forwarding tunnel inbounds are not proxy
+// sessions and keep their own configuration untouched.
+func applyManagedInboundSniffing(request map[string]interface{}) {
+	if request == nil {
+		return
+	}
+	inbound, _ := request["inbound"].(map[string]interface{})
+	if inbound == nil {
+		return
+	}
+	protocol := canonicalManagedProtocol(wireGuardStringValue(inbound["protocol"]))
+	if isTunnelProtocol(protocol) {
+		return
+	}
+	if protocol == "wireguard" {
+		inbound["sniffing"] = map[string]interface{}{"enabled": false}
+		return
+	}
+
+	sniffing, _ := inbound["sniffing"].(map[string]interface{})
+	if sniffing == nil {
+		sniffing = make(map[string]interface{})
+	}
+	sniffing["enabled"] = true
+	if _, ok := sniffing["destOverride"]; !ok {
+		sniffing["destOverride"] = []interface{}{"http", "tls", "quic"}
+	}
+	if _, ok := sniffing["routeOnly"]; !ok {
+		sniffing["routeOnly"] = false
+	}
+	inbound["sniffing"] = sniffing
 }
 
 func (h *RemoteManageHandler) reconcileRemoteInboundOwnershipFromAgent(ctx context.Context, serverID int64, tag string) error {
@@ -4870,7 +4907,13 @@ func chooseClashServerHost(server *storage.RemoteServer) string {
 	if p := strings.TrimSpace(server.PullAddress); p != "" && net.ParseIP(p) == nil {
 		return p
 	}
-	return strings.TrimSpace(server.IPAddress)
+	if v4 := strings.TrimSpace(server.IPAddress); v4 != "" {
+		return v4
+	}
+	if server.IPv6Enabled {
+		return strings.TrimSpace(server.IPAddressV6)
+	}
+	return ""
 }
 
 // inboundToClashProxy 将 Xray 入站配置转换为 Clash 代理配置。
@@ -4942,6 +4985,7 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 		"name":   nodeName,
 		"server": serverHost,
 		"port":   nodePort,
+		"udp":    true,
 	}
 
 	switch protocol {
@@ -5064,7 +5108,11 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 		}
 
 	case "socks", "http":
-		proxy["type"] = protocol
+		if protocol == "socks" {
+			proxy["type"] = "socks5"
+		} else {
+			proxy["type"] = protocol
+		}
 		// client 为 nil 时(无认证模式),clash 配置不带 username/password,客户端按无认证直连。
 		if client != nil {
 			if user, ok := client["user"].(string); ok {
@@ -5178,7 +5226,9 @@ func (h *RemoteManageHandler) addStreamSettings(proxy map[string]interface{}, st
 	// 处理现实
 	if security == "reality" {
 		proxy["tls"] = true
-		proxy["skip-cert-verify"] = true
+		// Reality authenticates the peer with its public key. Keep the client
+		// flag false so exported configs do not misleadingly disable TLS checks.
+		proxy["skip-cert-verify"] = false
 		realitySettings, ok := streamSettings["realitySettings"].(map[string]interface{})
 		if !ok {
 			return fmt.Errorf("Reality 入站缺少 realitySettings")
