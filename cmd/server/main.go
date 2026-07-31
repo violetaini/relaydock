@@ -476,7 +476,12 @@ func main() {
 
 	// 流量采集与统计
 	trafficApiHandler := handler.NewTrafficHandler(repo, trafficCollector)
+	// Public-probe host metrics are intentionally process-local. They are fed
+	// by authenticated Agent reports and vanish on a control-plane restart
+	// instead of becoming stale persistent monitoring data.
+	probeMetricsStore := handler.NewProbeMetricsStore()
 	remoteTrafficHandler := handler.NewRemoteTrafficHandler(repo, trafficCollector, cryptoConfig)
+	remoteTrafficHandler.SetProbeMetricsStore(probeMetricsStore)
 	mux.Handle("/api/admin/traffic", auth.RequireAdmin(tokenStore, userRepo, trafficApiHandler))
 	mux.Handle("/api/admin/traffic/", auth.RequireAdmin(tokenStore, userRepo, trafficApiHandler))
 	mux.Handle("/api/remote/traffic", remoteTrafficHandler)
@@ -490,6 +495,7 @@ func main() {
 	// 远程服务器的 WebSocket 处理程序
 	remoteWSHandler := handler.NewRemoteWSHandler(repo, trafficCollector)
 	remoteWSHandler.SetCrypto(cryptoConfig)
+	remoteWSHandler.SetProbeMetricsStore(probeMetricsStore)
 	mux.Handle("/api/remote/ws", remoteWSHandler)
 
 	// 限速配置推送器
@@ -893,9 +899,12 @@ func main() {
 	})))
 	mux.HandleFunc("/api/public/login-wallpaper", systemSettingsHandler.GetLoginWallpaperPublic)
 
-	// 公开端点:伪装探针的只读服务器状态(无鉴权)。伪装关闭时返回 {enabled:false},开启时只吐白名单字段。
+	// 公开端点:伪装探针的只读服务器状态 + 共享 WebSocket 广播。两条路径复用
+	// 同一个严格白名单 DTO；伪装关闭时 HTTP 返回 {enabled:false}，WS 返回 404。
 	// 走明文(前端 shouldEncrypt 已放行 /api/public/);此处 remoteWSHandler 已构造(见上文)。
-	mux.Handle("/api/public/probe-servers", handler.NewProbePublicHandler(repo, remoteWSHandler))
+	probePublicHandler := handler.NewProbePublicHandler(repo, remoteWSHandler, probeMetricsStore)
+	mux.Handle("/api/public/probe-servers", probePublicHandler)
+	mux.Handle("/api/public/probe-ws", handler.NewProbeWSHandler(probePublicHandler))
 
 	// 伪装探针配置(开关 + 标题 + 展示的服务器 + 是否显名)
 	mux.Handle("/api/admin/system-settings/probe-disguise", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

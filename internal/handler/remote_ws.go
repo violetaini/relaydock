@@ -144,6 +144,9 @@ type WSTrafficPayload struct {
 	// System 系统级网卡累计 RX/TX,跟 HTTP path 的 RemoteTrafficRequest.System 同构。
 	// 用于 server.traffic_source='system' 时累加 system_*_cycle;nil = 老 agent 不上报,跳过。
 	System *RemoteSystemTraffic `json:"system,omitempty"`
+	// Sysmetrics is an optional, non-accounting payload for the public probe.
+	// Older Agents omit it; it is validated and retained in memory only.
+	Sysmetrics *ProbeSysWire `json:"sysmetrics,omitempty"`
 }
 
 // connCountsByServer 存各 server 最近一次上报的 group→当前并发连接数(内存、非持久)。用户视图"当前连接数"用。
@@ -350,6 +353,7 @@ type RemoteWSHandler struct {
 	limiterPusher     *LimiterConfigPusher
 	capabilityManager *capabilities.Manager
 	crypto            *CryptoConfig
+	probeStore        *ProbeMetricsStore
 	userSpeedCache    sync.Map // key: "serverID:email" -> int64 (Bytes/s)
 	// xrayConfigSyncCallback 在 auth 成功后异步触发(args: serverID + 上次 server.status),
 	// 实现见 RemoteManageHandler.SyncXrayConfigOnReconnect — 跨 handler 用 callback 注入避免循环依赖。
@@ -423,6 +427,12 @@ func (h *RemoteWSHandler) SetCrypto(cc *CryptoConfig) {
 	h.crypto = cc
 }
 
+// SetProbeMetricsStore injects the volatile store used by the public probe.
+// nil is valid and keeps reports compatible with older control planes.
+func (h *RemoteWSHandler) SetProbeMetricsStore(store *ProbeMetricsStore) {
+	h.probeStore = store
+}
+
 // SetXrayConfigSyncCallback 注册 agent WS auth 成功后的 xray 配置同步回调。
 // 由 RemoteManageHandler 在 main wire 时注入,避免 ws ↔ manage 互引导致的循环依赖。
 func (h *RemoteWSHandler) SetXrayConfigSyncCallback(cb func(ctx context.Context, serverID int64, prevStatus string)) {
@@ -447,6 +457,11 @@ const (
 	tokenConflictFreshness = 60 * time.Second
 	// token 冲突 cooldown:winnerIP 一旦确定,期内其它 IP 一律拒绝;到期自动失效,允许真换机。
 	tokenConflictCooldown = 60 * time.Second
+	// Every authenticated Agent write is bounded. Besides protecting protocol
+	// handlers, this prevents a half-open connection from holding sendMu and
+	// delaying a later public-probe configuration fanout indefinitely.
+	remoteWSWriteTimeout     = 10 * time.Second
+	probeConfigFanoutWorkers = 8
 )
 
 // ipFromRequest 提取客户端真实 IP,优先级:CF-Connecting-IP > X-Real-IP > X-Forwarded-For > RemoteAddr。
@@ -827,8 +842,22 @@ func (h *RemoteWSHandler) handleKeyExchange(conn *websocket.Conn, remoteAddr str
 
 // 发送加密消息（如有 session 则加密，否则明文）
 func (h *RemoteWSHandler) sendEncryptedMessage(wsConn *RemoteWSConnection, msg WSMessage) error {
+	return h.sendEncryptedMessageWithTimeout(wsConn, msg, remoteWSWriteTimeout)
+}
+
+// sendEncryptedMessageWithTimeout serializes a complete encrypted write and
+// bounds it when the caller supplies a deadline. Protocol writes use the
+// standard bounded path above; the zero case remains available for narrow
+// compatibility callers that intentionally manage their own deadline.
+func (h *RemoteWSHandler) sendEncryptedMessageWithTimeout(wsConn *RemoteWSConnection, msg WSMessage, timeout time.Duration) error {
 	wsConn.sendMu.Lock()
 	defer wsConn.sendMu.Unlock()
+	if timeout > 0 {
+		if err := wsConn.Conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+			return err
+		}
+		defer wsConn.Conn.SetWriteDeadline(time.Time{})
+	}
 
 	if wsConn.session != nil {
 		data, err := json.Marshal(msg)
@@ -1104,6 +1133,10 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 			}(wsConn, val)
 		}
 	}
+	// The public-probe collection policy is per server, so it cannot use the
+	// global BroadcastConfigUpdate helper.  Push it on every authenticated
+	// connection; HTTP-mode Agents receive the same values in traffic replies.
+	go h.PushProbeConfigToAgent(context.Background(), server.ID)
 
 	// embedded 模式：认证成功后推送限速配置。
 	if server.XrayMode == "embedded" && h.limiterPusher != nil {
@@ -1142,6 +1175,13 @@ func (h *RemoteWSHandler) handleTraffic(wsConn *RemoteWSConnection, payload json
 	if err := json.Unmarshal(payload, &trafficPayload); err != nil {
 		log.Printf("[Remote WS] Invalid traffic payload from server %s: %v", wsConn.ServerName, err)
 		return
+	}
+	// System metrics are independent of Xray counters.  Accepting them before
+	// the stats nil check lets an Agent expose host health even while Xray is
+	// intentionally absent or stopped; the authenticated WS connection is still
+	// the authority for server identity.
+	if h.probeStore != nil && trafficPayload.Sysmetrics != nil {
+		h.probeStore.IngestSys(wsConn.ServerID, *trafficPayload.Sysmetrics)
 	}
 
 	if trafficPayload.Stats == nil {
@@ -1434,6 +1474,65 @@ func (h *RemoteWSHandler) SendConfigUpdate(serverID int64, updates map[string]st
 		Type:    WSMsgTypeConfigUpdate,
 		Payload: payload,
 	})
+}
+
+// PushProbeConfigToAgent sends the explicit system-metric collection policy
+// to one authenticated Agent.  It is a no-op for offline servers.
+func (h *RemoteWSHandler) PushProbeConfigToAgent(ctx context.Context, serverID int64) {
+	if h == nil || h.repo == nil {
+		return
+	}
+	if err := h.SendConfigUpdate(serverID, ProbeConfigUpdates(ctx, h.repo, serverID)); err != nil {
+		log.Printf("[Remote WS] push probe configuration to server %d: %v", serverID, err)
+	}
+}
+
+// PushProbeConfigToAll recalculates the policy for every connected server.
+// The selected-server list is intentionally evaluated per connection, so a
+// server removed from the disguise receives explicit zeroes immediately.
+func (h *RemoteWSHandler) PushProbeConfigToAll(ctx context.Context) {
+	if h == nil || h.repo == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	serverIDs := make([]int64, 0)
+	h.conns.Range(func(_, value any) bool {
+		if conn, ok := value.(*RemoteWSConnection); ok {
+			serverIDs = append(serverIDs, conn.ServerID)
+		}
+		return true
+	})
+	if len(serverIDs) == 0 {
+		return
+	}
+	workers := probeConfigFanoutWorkers
+	if len(serverIDs) < workers {
+		workers = len(serverIDs)
+	}
+	jobs := make(chan int64)
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for range workers {
+		go func() {
+			defer wait.Done()
+			for serverID := range jobs {
+				h.PushProbeConfigToAgent(ctx, serverID)
+			}
+		}()
+	}
+	for _, serverID := range serverIDs {
+		select {
+		case jobs <- serverID:
+		case <-ctx.Done():
+			close(jobs)
+			wait.Wait()
+			return
+		}
+	}
+	close(jobs)
+	wait.Wait()
 }
 
 // BroadcastConfigUpdate 把 config_update 推给所有当前 WS-mode 在线 agent。

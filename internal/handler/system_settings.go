@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -260,13 +261,23 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "主服务器地址已更新"})
 }
 
-// 伪装探针配置的 4 个 KV 键。
+// 伪装探针配置。公开页只消费白名单 DTO；这些键只控制采集和展示，
+// 不会使任何服务器地址、令牌或入站配置变成公开数据。
 const (
-	probeDisguiseEnabledKey   = "probe_disguise_enabled"    // "1"/"" 开关
-	probeDisguiseTitleKey     = "probe_disguise_title"      // 伪装页标题(管理员自定义)
-	probeDisguiseServerIDsKey = "probe_disguise_server_ids" // JSON int64 数组:展示哪些服务器
-	probeDisguiseShowNameKey  = "probe_disguise_show_name"  // "1"/"" 是否显示服务器名
+	probeDisguiseEnabledKey       = "probe_disguise_enabled" // "1"/"" 开关
+	probeDisguiseTitleKey         = "probe_disguise_title"   // 伪装页标题(管理员自定义)
+	probeDisguiseLogoKey          = "probe_disguise_logo"    // 可选 logo URL/data:image
+	probeDisguiseBlockLoginKey    = "probe_disguise_block_login"
+	probeDisguiseServerIDsKey     = "probe_disguise_server_ids" // JSON int64 数组:展示哪些服务器
+	probeDisguiseShowNameKey      = "probe_disguise_show_name"  // "1"/"" 是否显示服务器名
+	probeDisguiseMetricCPUKey     = "probe_disguise_metric_cpu"
+	probeDisguiseMetricMemKey     = "probe_disguise_metric_mem"
+	probeDisguiseMetricDiskKey    = "probe_disguise_metric_disk"
+	probeDisguiseMetricTrafficKey = "probe_disguise_metric_traffic"
+	probeDisguiseMetricSpeedKey   = "probe_disguise_metric_speed"
 )
+
+const probeLogoMaxBytes = 128 * 1024
 
 // GetProbeDisguise 返回伪装探针配置(管理端)。
 func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.Request) {
@@ -277,8 +288,15 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	ctx := r.Context()
 	enabled, _ := h.repo.GetSystemSetting(ctx, probeDisguiseEnabledKey)
 	title, _ := h.repo.GetSystemSetting(ctx, probeDisguiseTitleKey)
+	logo, _ := h.repo.GetSystemSetting(ctx, probeDisguiseLogoKey)
+	blockLogin, _ := h.repo.GetSystemSetting(ctx, probeDisguiseBlockLoginKey)
 	showName, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowNameKey)
 	idsRaw, _ := h.repo.GetSystemSetting(ctx, probeDisguiseServerIDsKey)
+	metricCPU, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricCPUKey)
+	metricMem, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricMemKey)
+	metricDisk, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricDiskKey)
+	metricTraffic, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricTrafficKey)
+	metricSpeed, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricSpeedKey)
 
 	ids := []int64{}
 	if idsRaw != "" {
@@ -287,11 +305,27 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"success":    true,
-		"enabled":    enabled == "1",
-		"title":      title,
-		"server_ids": ids,
-		"show_name":  showName == "1",
+		"success":     true,
+		"enabled":     enabled == "1",
+		"title":       title,
+		"logo":        logo,
+		"block_login": blockLogin == "1",
+		"server_ids":  ids,
+		"show_name":   showName == "1",
+		"metric_cpu":  metricCPU != "0",
+		"metric_mem":  metricMem != "0",
+		"metric_disk": metricDisk != "0",
+		// Preserve the old probe page's default: traffic and speeds are shown
+		// unless an administrator explicitly disables them with "0".
+		"metric_traffic": metricTraffic != "0",
+		"metric_speed":   metricSpeed != "0",
+		// Friendly aliases consumed by the public-probe editor/frontend.
+		"show_cpu":     metricCPU != "0",
+		"show_memory":  metricMem != "0",
+		"show_disk":    metricDisk != "0",
+		"show_traffic": metricTraffic != "0",
+		"show_speed":   metricSpeed != "0",
+		"show_ping":    false,
 	})
 }
 
@@ -306,12 +340,34 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		Title     string  `json:"title"`
 		ServerIDs []int64 `json:"server_ids"`
 		ShowName  bool    `json:"show_name"`
+		// New fields intentionally use pointer semantics. Older frontends PUT
+		// the original four fields, and must not accidentally clear a newer
+		// metric selection.
+		Logo          *string `json:"logo"`
+		BlockLogin    *bool   `json:"block_login"`
+		MetricCPU     *bool   `json:"metric_cpu"`
+		MetricMem     *bool   `json:"metric_mem"`
+		MetricDisk    *bool   `json:"metric_disk"`
+		MetricTraffic *bool   `json:"metric_traffic"`
+		MetricSpeed   *bool   `json:"metric_speed"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "请求格式错误"})
 		return
+	}
+	var logo string
+	if req.Logo != nil {
+		logo = strings.TrimSpace(*req.Logo)
+		if len(logo) > probeLogoMaxBytes || (logo != "" && !strings.HasPrefix(logo, "/") &&
+			!strings.HasPrefix(logo, "https://") && !strings.HasPrefix(logo, "http://") &&
+			!strings.HasPrefix(logo, "data:image/")) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "logo 只支持站内路径、http(s) 或 data:image，且不能过大"})
+			return
+		}
 	}
 
 	ctx := r.Context()
@@ -338,6 +394,46 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "保存失败"})
 			return
 		}
+	}
+
+	if req.Logo != nil {
+		if err := h.repo.SetSystemSetting(ctx, probeDisguiseLogoKey, logo); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "保存失败"})
+			return
+		}
+	}
+	setBool := func(key string, value *bool, falseValue string) error {
+		if value == nil {
+			return nil
+		}
+		v := falseValue
+		if *value {
+			v = "1"
+		}
+		return h.repo.SetSystemSetting(ctx, key, v)
+	}
+	if err := setBool(probeDisguiseBlockLoginKey, req.BlockLogin, ""); err != nil ||
+		// Metric groups use an explicit false marker, because an unset value means
+		// the conservative default: collect and display the available live data.
+		setBool(probeDisguiseMetricCPUKey, req.MetricCPU, "0") != nil ||
+		setBool(probeDisguiseMetricMemKey, req.MetricMem, "0") != nil ||
+		setBool(probeDisguiseMetricDiskKey, req.MetricDisk, "0") != nil ||
+		setBool(probeDisguiseMetricTrafficKey, req.MetricTraffic, "0") != nil ||
+		setBool(probeDisguiseMetricSpeedKey, req.MetricSpeed, "0") != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "保存失败"})
+		return
+	}
+
+	if h.wsHandler != nil {
+		// The save path owns a database transaction, not a remote network write.
+		// Push on a detached context so a half-open Agent cannot stall the admin
+		// request after configuration has already been committed. Each write is
+		// separately deadline-bounded in SendConfigUpdate.
+		go h.wsHandler.PushProbeConfigToAll(context.WithoutCancel(ctx))
 	}
 
 	w.Header().Set("Content-Type", "application/json")

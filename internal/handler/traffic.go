@@ -788,9 +788,10 @@ func (h *TrafficHandler) writeJSON(w http.ResponseWriter, status int, data inter
 
 // RemoteTrafficHandler 处理来自远程服务器的流量报告
 type RemoteTrafficHandler struct {
-	repo      *storage.TrafficRepository
-	collector *traffic.Collector
-	crypto    *CryptoConfig
+	repo       *storage.TrafficRepository
+	collector  *traffic.Collector
+	crypto     *CryptoConfig
+	probeStore *ProbeMetricsStore
 }
 
 // 创建一个新的远程流量处理程序
@@ -802,12 +803,21 @@ func NewRemoteTrafficHandler(repo *storage.TrafficRepository, collector *traffic
 	}
 }
 
+// SetProbeMetricsStore injects the volatile public-probe metric store.  It is
+// optional so this handler remains usable by tests and older wiring.
+func (h *RemoteTrafficHandler) SetProbeMetricsStore(store *ProbeMetricsStore) {
+	h.probeStore = store
+}
+
 // RemoteTrafficRequest 表示来自远程服务器的流量报告
 type RemoteTrafficRequest struct {
 	Stats *traffic.XrayStats `json:"stats,omitempty"`
 	// System 系统级网卡累计 RX/TX(来自 agent /proc/net/dev),用于 server.traffic_source='system' 路径。
 	// nil = 老 agent 不支持上报,server 视图自动回退 xray 数据源。
 	System *RemoteSystemTraffic `json:"system,omitempty"`
+	// Sysmetrics is a live host-health report for the public probe. It does not
+	// participate in traffic accounting and is never persisted to SQLite.
+	Sysmetrics *ProbeSysWire `json:"sysmetrics,omitempty"`
 }
 
 // RemoteSystemTraffic 内嵌于 RemoteTrafficRequest,跟 agent 端 sendTrafficData / sendTrafficHTTP 的字段对齐。
@@ -870,7 +880,7 @@ func (h *RemoteTrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if req.Stats == nil {
+	if req.Stats == nil && req.System == nil && req.Sysmetrics == nil {
 		h.writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "No stats to process",
@@ -894,14 +904,17 @@ func (h *RemoteTrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		SendServerOnlineNotification(ctx, serverName, serverIP)
 	}
 
-	// 处理指标 — remoteServer 已经从 db 取过,直接用其 XrayBootTime
-	if err := h.collector.ProcessRemoteMetrics(ctx, serverID, req.Stats, remoteServer.XrayBootTime); err != nil {
-		log.Printf("[Remote Traffic] Failed to process metrics from %s: %v", remoteServer.Name, err)
-		h.writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"success": false,
-			"error":   "Failed to process metrics",
-		})
-		return
+	// Traffic accounting is optional for the probe. An Agent with no Xray (or
+	// a temporarily stopped Xray) can still supply safe host metrics.
+	if req.Stats != nil {
+		if err := h.collector.ProcessRemoteMetrics(ctx, serverID, req.Stats, remoteServer.XrayBootTime); err != nil {
+			log.Printf("[Remote Traffic] Failed to process metrics from %s: %v", remoteServer.Name, err)
+			h.writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+				"success": false,
+				"error":   "Failed to process metrics",
+			})
+			return
+		}
 	}
 
 	// 系统级网卡累计:把 delta 累加到 server.system_*_cycle(用于 traffic_source='system')。
@@ -912,12 +925,18 @@ func (h *RemoteTrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			log.Printf("[Remote Traffic] Failed to upsert system traffic for %s: %v", remoteServer.Name, err)
 		}
 	}
+	if h.probeStore != nil && req.Sysmetrics != nil {
+		h.probeStore.IngestSys(serverID, *req.Sysmetrics)
+	}
 
 	// 在 traffic 上报响应里捎带最新的 config 更新(HTTP-mode agent 没有持久连接,
 	// 走 traffic POST 的 response 把变化推回去,agent 收到后调 handleConfigUpdate 应用)。
 	configUpdates := map[string]string{}
 	if val, _ := h.repo.GetSystemSetting(ctx, "dashboard_refresh_interval_ms"); val != "" {
 		configUpdates["traffic_report_interval_ms"] = val
+	}
+	for key, value := range ProbeConfigUpdates(ctx, h.repo, serverID) {
+		configUpdates[key] = value
 	}
 	respData, _ := json.Marshal(map[string]interface{}{
 		"success":        true,
