@@ -3,7 +3,6 @@
 # Release images are assembled exclusively from the verified bundle produced by
 # this workflow run. This native stage validates the shared checksum manifest
 # before any target-platform image is created.
-ARG BUILDPLATFORM
 FROM --platform=$BUILDPLATFORM alpine:3.22 AS release-assets
 
 ARG TARGETARCH
