@@ -1,7 +1,7 @@
 package version
 
 // 版本是当前应用程序版本
-const Version = "0.5.4"
+const Version = "0.6.0"
 
 const AgentUserAgent = "relaydock-agent/0.1"
 
