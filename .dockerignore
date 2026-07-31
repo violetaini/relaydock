@@ -29,5 +29,5 @@ test-results/
 .vscode/
 .DS_Store
 
-# Do not exclude agent-assets, internal/web/dist, rule_templates, subscribes, or
-# templates: release CI populates or embeds them during the Docker build.
+# Do not exclude agent-assets, docker-release, internal/web/dist, rule_templates,
+# subscribes, or templates: release CI populates or embeds them during Docker builds.

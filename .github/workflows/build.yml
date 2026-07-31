@@ -12,6 +12,9 @@ on:
 permissions:
   contents: read
 
+env:
+  AGENT_SOURCE_SHA: f4c386bcd69890f6299983fe1d254c1ab82709f6
+
 jobs:
   verify:
     name: Test and Build
@@ -184,12 +187,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: violetaini/relaydock-agent
-          ref: f4c386bcd69890f6299983fe1d254c1ab82709f6
+          ref: ${{ env.AGENT_SOURCE_SHA }}
           path: agent-src
 
       - name: Verify pinned sources
-        run: |
-          test "$(git -C agent-src rev-parse HEAD)" = "f4c386bcd69890f6299983fe1d254c1ab82709f6"
+        run: test "$(git -C agent-src rev-parse HEAD)" = "$AGENT_SOURCE_SHA"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -218,9 +220,47 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  package:
+    name: Assemble verified release bundle
+    needs: [build, guard, agent, speedtester]
+    if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Download current-run binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release-bundle
+          merge-multiple: true
+
+      - name: Verify provenance and prepare checksums
+        run: |
+          scripts/verify-release-bundle.sh \
+            release-bundle \
+            "$GITHUB_SHA" \
+            "$AGENT_SOURCE_SHA" \
+            --write-checksums
+
+      - name: Upload verified release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle-${{ github.sha }}
+          path: release-bundle/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
   docker:
     name: Build and Push Docker Image
-    needs: [verify, agent]
+    needs: package
     if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
@@ -230,18 +270,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download Agent binaries
+      - name: Download verified release bundle
         uses: actions/download-artifact@v4
         with:
-          pattern: relaydock-agent-linux-*
-          path: agent-assets
-          merge-multiple: true
+          name: release-bundle-${{ github.sha }}
+          path: docker-release
 
-      - name: Verify Agent assets
+      - name: Verify release bundle checksums
         run: |
-          test -s agent-assets/relaydock-agent-linux-amd64
-          test -s agent-assets/relaydock-agent-linux-arm64
-          chmod 0755 agent-assets/relaydock-agent-linux-amd64 agent-assets/relaydock-agent-linux-arm64
+          cd docker-release
+          sha256sum -c checksums.txt
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -272,6 +310,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -281,23 +320,22 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, guard, agent, speedtester]
+    needs: package
     if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download binaries
+      - name: Download verified release bundle
         uses: actions/download-artifact@v4
         with:
+          name: release-bundle-${{ github.sha }}
           path: release
-          merge-multiple: true
 
-      - name: Prepare checksums
+      - name: Verify release bundle checksums
         run: |
-          chmod +x release/arcway-linux-* release/arcway-darwin-* release/arcway-expiry-guard-linux-* release/relaydock-agent-linux-* release/relaydock-speedtester-linux-*
           cd release
-          sha256sum arcway-* relaydock-agent-linux-* relaydock-speedtester-* > checksums.txt
+          sha256sum -c checksums.txt
 
       - name: Create release
         uses: softprops/action-gh-release@v2

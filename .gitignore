@@ -12,6 +12,7 @@ data/
 # Build and test output
 build/
 agent-assets/
+docker-release/
 release/
 /server
 __pycache__/
