@@ -15,10 +15,10 @@ import (
 )
 
 const (
-	xrayCoreReleasesURL       = "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=50"
+	xrayCoreReleasesURL       = "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=30"
 	xrayCoreVersionsCacheTTL  = 15 * time.Minute
 	xrayCoreVersionsTimeout   = 10 * time.Second
-	xrayCoreVersionsMaxBody   = 2 << 20
+	xrayCoreVersionsMaxBody   = 8 << 20
 	xrayCoreVersionsMaxItems  = 30
 	xrayInstallRequestMaxBody = 1024
 )

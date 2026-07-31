@@ -61,6 +61,23 @@ func TestFetchOfficialXrayCoreVersionsFiltersDraftsMalformedAndDuplicates(t *tes
 	}
 }
 
+func TestFetchOfficialXrayCoreVersionsAcceptsReleaseMetadataLargerThanTwoMiB(t *testing.T) {
+	largeBody := `[{"tag_name":"v26.7.28","name":"latest","prerelease":false,"body":"` +
+		strings.Repeat("x", (2<<20)+1024) + `"}]`
+	handler := NewRemoteManageHandler(nil, nil)
+	handler.httpClient = &http.Client{Transport: xrayVersionRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return xrayVersionHTTPResponse(http.StatusOK, largeBody), nil
+	})}
+
+	versions, fetchErr := handler.fetchOfficialXrayCoreVersions(context.Background())
+	if fetchErr != "" {
+		t.Fatal(fetchErr)
+	}
+	if len(versions) != 1 || versions[0].Version != "v26.7.28" {
+		t.Fatalf("versions=%+v", versions)
+	}
+}
+
 func TestFetchXrayCoreVersionsCoalescesAndFallsBackToStaleCache(t *testing.T) {
 	requestStarted := make(chan struct{})
 	releaseRequest := make(chan struct{})
