@@ -109,7 +109,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 }
 
 func (h *ProbePublicHandler) buildPayloadUncached(ctx context.Context) (map[string]any, error) {
-	if v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseEnabledKey); v != "1" {
+	if !probeDisguiseEnabled(ctx, h.repo) {
 		return map[string]any{"enabled": false}, nil
 	}
 

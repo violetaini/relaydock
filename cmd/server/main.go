@@ -899,6 +899,18 @@ func main() {
 		}
 	})))
 	mux.HandleFunc("/api/public/login-wallpaper", systemSettingsHandler.GetLoginWallpaperPublic)
+	// 项目品牌:管理员可自定义名称、Logo 和 favicon；登录前也只读公开这三个无敏感字段。
+	mux.Handle("/api/admin/system-settings/branding", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			systemSettingsHandler.GetBranding(w, r)
+		case http.MethodPut:
+			systemSettingsHandler.SetBranding(w, r)
+		default:
+			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		}
+	})))
+	mux.HandleFunc("/api/public/branding", systemSettingsHandler.GetBrandingPublic)
 
 	// 公开端点:伪装探针的只读服务器状态 + 共享 WebSocket 广播。两条路径复用
 	// 同一个严格白名单 DTO；伪装关闭时 HTTP 返回 {enabled:false}，WS 返回 404。

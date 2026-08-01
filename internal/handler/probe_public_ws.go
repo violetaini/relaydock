@@ -71,7 +71,7 @@ func (h *ProbeWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if value, _ := h.public.repo.GetSystemSetting(r.Context(), probeDisguiseEnabledKey); value != "1" {
+	if !probeDisguiseEnabled(r.Context(), h.public.repo) {
 		http.NotFound(w, r)
 		return
 	}

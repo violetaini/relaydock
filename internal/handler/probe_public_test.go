@@ -244,6 +244,47 @@ func TestProbeDisguiseDefaultsToAllServersUntilAnEmptySelectionIsSaved(t *testin
 	}
 }
 
+func TestProbeDisguiseEnabledDefaultsOnFreshInstallAndKeepsLegacyDisabled(t *testing.T) {
+	repo, _ := newProbePublicRepository(t)
+	settings := NewSystemSettingsHandler(repo, nil)
+
+	configResponse := httptest.NewRecorder()
+	settings.GetProbeDisguise(configResponse, httptest.NewRequest(http.MethodGet, "/api/admin/system-settings/probe-disguise", nil))
+	var config map[string]any
+	if err := json.Unmarshal(configResponse.Body.Bytes(), &config); err != nil {
+		t.Fatalf("decode default probe settings: %v", err)
+	}
+	if config["enabled"] != true {
+		t.Fatalf("fresh probe enabled=%#v, want true", config["enabled"])
+	}
+
+	public := NewProbePublicHandler(repo, nil, NewProbeMetricsStore())
+	response := httptest.NewRecorder()
+	public.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/public/probe-servers", nil))
+	if payload := decodeProbePayload(t, response); payload["enabled"] != true {
+		t.Fatalf("fresh public probe enabled=%#v, want true", payload["enabled"])
+	}
+
+	setProbePublicSetting(t, repo, probeDisguiseEnabledKey, "0")
+	public = NewProbePublicHandler(repo, nil, NewProbeMetricsStore())
+	response = httptest.NewRecorder()
+	public.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/public/probe-servers", nil))
+	if payload := decodeProbePayload(t, response); payload["enabled"] != false {
+		t.Fatalf("explicit disabled public probe=%#v, want false", payload["enabled"])
+	}
+
+	// Pre-change releases stored false as an empty switch. A non-empty
+	// companion setting identifies that legacy editor state and keeps it off.
+	setProbePublicSetting(t, repo, probeDisguiseEnabledKey, "")
+	setProbePublicSetting(t, repo, probeDisguiseMetricCPUKey, "1")
+	public = NewProbePublicHandler(repo, nil, NewProbeMetricsStore())
+	response = httptest.NewRecorder()
+	public.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/public/probe-servers", nil))
+	if payload := decodeProbePayload(t, response); payload["enabled"] != false {
+		t.Fatalf("legacy disabled public probe=%#v, want false", payload["enabled"])
+	}
+}
+
 func TestProbePublicPayloadHidesDisabledMetricFamiliesAndWorksWithoutStore(t *testing.T) {
 	repo, server := newProbePublicRepository(t)
 	enableProbeForServer(t, repo, server.ID)
@@ -418,6 +459,7 @@ func mapsEqual(got, want map[string]string) bool {
 
 func TestProbePublicWebSocketDisabledAndEnabled(t *testing.T) {
 	repo, server := newProbePublicRepository(t)
+	setProbePublicSetting(t, repo, probeDisguiseEnabledKey, "0")
 	public := NewProbePublicHandler(repo, nil, NewProbeMetricsStore())
 	wsHandler := NewProbeWSHandler(public)
 

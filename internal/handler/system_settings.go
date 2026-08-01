@@ -265,7 +265,7 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 // 伪装探针配置。公开页只消费白名单 DTO；这些键只控制公开展示，
 // 不会使任何服务器地址、令牌或入站配置变成公开数据。
 const (
-	probeDisguiseEnabledKey       = "probe_disguise_enabled" // "1"/"" 开关
+	probeDisguiseEnabledKey       = "probe_disguise_enabled" // "1" 开启，"0" 关闭；未配置默认开启
 	probeDisguiseTitleKey         = "probe_disguise_title"   // 伪装页标题(管理员自定义)
 	probeDisguiseLogoKey          = "probe_disguise_logo"    // 可选 logo URL/data:image
 	probeDisguiseBlockLoginKey    = "probe_disguise_block_login"
@@ -280,6 +280,51 @@ const (
 
 const probeLogoMaxBytes = 128 * 1024
 
+// probeDisguiseEnabled keeps a new installation useful without an extra
+// configuration step: no probe setting means the public page is enabled.
+//
+// Older releases persisted a disabled switch as an empty string. That is
+// indistinguishable from a missing setting on its own, so preserve the old
+// disabled behavior when any companion setting proves that the old editor was
+// saved. New writes always use the unambiguous "0" value.
+func probeDisguiseEnabled(ctx context.Context, repo *storage.TrafficRepository) bool {
+	if repo == nil {
+		return false
+	}
+	value, err := repo.GetSystemSetting(ctx, probeDisguiseEnabledKey)
+	if err != nil {
+		return false
+	}
+	switch value {
+	case "1":
+		return true
+	case "0":
+		return false
+	}
+
+	for _, key := range []string{
+		probeDisguiseTitleKey,
+		probeDisguiseLogoKey,
+		probeDisguiseBlockLoginKey,
+		probeDisguiseServerIDsKey,
+		probeDisguiseShowNameKey,
+		probeDisguiseMetricCPUKey,
+		probeDisguiseMetricMemKey,
+		probeDisguiseMetricDiskKey,
+		probeDisguiseMetricTrafficKey,
+		probeDisguiseMetricSpeedKey,
+	} {
+		configured, err := repo.GetSystemSetting(ctx, key)
+		if err != nil {
+			return false
+		}
+		if configured != "" {
+			return false
+		}
+	}
+	return true
+}
+
 // GetProbeDisguise 返回伪装探针配置(管理端)。
 func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -287,7 +332,6 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 		return
 	}
 	ctx := r.Context()
-	enabled, _ := h.repo.GetSystemSetting(ctx, probeDisguiseEnabledKey)
 	title, _ := h.repo.GetSystemSetting(ctx, probeDisguiseTitleKey)
 	logo, _ := h.repo.GetSystemSetting(ctx, probeDisguiseLogoKey)
 	blockLogin, _ := h.repo.GetSystemSetting(ctx, probeDisguiseBlockLoginKey)
@@ -320,7 +364,7 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"success":            true,
-		"enabled":            enabled == "1",
+		"enabled":            probeDisguiseEnabled(ctx, h.repo),
 		"title":              title,
 		"logo":               logo,
 		"block_login":        blockLogin == "1",
@@ -396,8 +440,12 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		}
 		return ""
 	}
+	enabledValue := "0"
+	if req.Enabled {
+		enabledValue = "1"
+	}
 	settings := []struct{ k, v string }{
-		{probeDisguiseEnabledKey, boolStr(req.Enabled)},
+		{probeDisguiseEnabledKey, enabledValue},
 		{probeDisguiseTitleKey, req.Title},
 		{probeDisguiseShowNameKey, boolStr(req.ShowName)},
 	}
@@ -912,6 +960,181 @@ func (h *SystemSettingsHandler) SetDefaultTheme(w http.ResponseWriter, r *http.R
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "默认主题已更新"})
+}
+
+// Branding settings are intentionally public: unauthenticated screens need
+// the project name and image URLs before a user can log in. An empty logo or
+// favicon tells the frontend to keep the bundled RelayDock asset.
+const (
+	brandingNameKey    = "branding_name"
+	brandingLogoKey    = "branding_logo"
+	brandingFaviconKey = "branding_favicon"
+
+	defaultBrandingName   = "RelayDock"
+	brandingImageMaxBytes = 128 * 1024
+	brandingNameMaxRunes  = 64
+)
+
+type brandingSettings struct {
+	Name    string `json:"name"`
+	Logo    string `json:"logo"`
+	Favicon string `json:"favicon"`
+}
+
+func (h *SystemSettingsHandler) brandingSettings(ctx context.Context) (brandingSettings, error) {
+	name, err := h.repo.GetSystemSetting(ctx, brandingNameKey)
+	if err != nil {
+		return brandingSettings{}, err
+	}
+	logo, err := h.repo.GetSystemSetting(ctx, brandingLogoKey)
+	if err != nil {
+		return brandingSettings{}, err
+	}
+	favicon, err := h.repo.GetSystemSetting(ctx, brandingFaviconKey)
+	if err != nil {
+		return brandingSettings{}, err
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = defaultBrandingName
+	}
+	return brandingSettings{Name: name, Logo: logo, Favicon: favicon}, nil
+}
+
+func normalizeBrandingName(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	if strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return "", errors.New("项目名称不能包含控制字符")
+	}
+	if len([]rune(value)) > brandingNameMaxRunes {
+		return "", fmt.Errorf("项目名称不能超过 %d 个字符", brandingNameMaxRunes)
+	}
+	return value, nil
+}
+
+func normalizeBrandingImage(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	if len(value) > brandingImageMaxBytes {
+		return "", errors.New("图片不能超过 128 KB")
+	}
+	if strings.IndexFunc(value, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) >= 0 {
+		return "", errors.New("图片地址不能包含空白或控制字符")
+	}
+	if strings.HasPrefix(value, "data:image/") {
+		return value, nil
+	}
+	if strings.HasPrefix(value, "/") && !strings.HasPrefix(value, "//") {
+		return value, nil
+	}
+	parsed, err := url.Parse(value)
+	if err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" && parsed.User == nil {
+		return value, nil
+	}
+	return "", errors.New("图片只支持站内路径、http(s) 或 data:image")
+}
+
+// GetBranding returns the project branding for the authenticated editor.
+func (h *SystemSettingsHandler) GetBranding(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	branding, err := h.brandingSettings(r.Context())
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "获取项目品牌失败"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"success": true,
+		"name":    branding.Name,
+		"logo":    branding.Logo,
+		"favicon": branding.Favicon,
+	})
+}
+
+// SetBranding saves the project name and optional public image assets. Empty
+// values intentionally restore the bundled RelayDock defaults.
+func (h *SystemSettingsHandler) SetBranding(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 3*brandingImageMaxBytes+4096)
+	var req brandingSettings
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "请求格式错误"})
+		return
+	}
+	name, err := normalizeBrandingName(req.Name)
+	if err == nil {
+		req.Logo, err = normalizeBrandingImage(req.Logo)
+	}
+	if err == nil {
+		req.Favicon, err = normalizeBrandingImage(req.Favicon)
+	}
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+		return
+	}
+
+	for _, setting := range []struct{ key, value string }{
+		{brandingNameKey, name},
+		{brandingLogoKey, req.Logo},
+		{brandingFaviconKey, req.Favicon},
+	} {
+		if err := h.repo.SetSystemSetting(r.Context(), setting.key, setting.value); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "保存项目品牌失败"})
+			return
+		}
+	}
+
+	branding, err := h.brandingSettings(r.Context())
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "读取项目品牌失败"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"success": true,
+		"message": "项目品牌已更新",
+		"name":    branding.Name,
+		"logo":    branding.Logo,
+		"favicon": branding.Favicon,
+	})
+}
+
+// GetBrandingPublic returns the same harmless branding data before login.
+func (h *SystemSettingsHandler) GetBrandingPublic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	branding, err := h.brandingSettings(r.Context())
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]any{"name": defaultBrandingName, "logo": "", "favicon": ""})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(branding)
 }
 
 // LoginWallpaperKey 是「自定义登录页壁纸」的 KV 键(存图片 URL,可为空)。
