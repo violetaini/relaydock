@@ -508,6 +508,12 @@ func TestProbePublicWebSocketDisabledAndEnabled(t *testing.T) {
 	}
 }
 
+func TestProbeWebSocketBroadcastUsesOneSecondLiveCadence(t *testing.T) {
+	if probeWSBroadcastPeriod != time.Second {
+		t.Fatalf("probe websocket broadcast period=%s, want %s", probeWSBroadcastPeriod, time.Second)
+	}
+}
+
 func TestProbeWebSocketReservesPendingClientLimits(t *testing.T) {
 	handler := NewProbeWSHandler(nil)
 	const address = "198.51.100.24"

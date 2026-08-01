@@ -12,8 +12,8 @@ import (
 )
 
 // ProbeWSHandler broadcasts one public-probe snapshot to every connected
-// visitor.  The page has a normal HTTP fallback, but sharing one calculation
-// every five seconds avoids N visitors independently polling SQLite and the
+// visitor. The page has a normal HTTP fallback, but sharing one calculation
+// every second avoids N visitors independently polling SQLite and the
 // metric store.
 //
 // This endpoint is intentionally unauthenticated. Connection limits, bounded
@@ -39,7 +39,7 @@ type probeWSClient struct {
 const (
 	probeWSMaxClients      = 200
 	probeWSMaxPerIP        = 5
-	probeWSBroadcastPeriod = 5 * time.Second
+	probeWSBroadcastPeriod = time.Second
 	probeWSWriteTimeout    = 10 * time.Second
 	probeWSPongTimeout     = 60 * time.Second
 	probeWSPingPeriod      = 25 * time.Second
