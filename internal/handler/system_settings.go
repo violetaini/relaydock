@@ -609,9 +609,9 @@ func (h *SystemSettingsHandler) SetShortLinkEnabled(w http.ResponseWriter, r *ht
 
 // dashboardRefreshKey 是前端 dashboard 轮询间隔的 system_settings key,毫秒。
 // 跟 traffic_collect_interval(master collector 内部 polling)解耦:
-// agent 5s push 决定数据新鲜度,collector 60s 只是兜底;前端轮询频率是 UX 选项,默认 5000ms。
+// Agent 的上报周期决定数据新鲜度，collector 只是兜底；后台实时视图默认每秒更新。
 const dashboardRefreshKey = "dashboard_refresh_interval_ms"
-const dashboardRefreshDefault = 5000
+const dashboardRefreshDefault = 1000
 
 // GetPublicIntervals 给所有登录用户(包括普通用户),返回前端 dashboard 应用的轮询间隔(ms)。
 func (h *SystemSettingsHandler) GetPublicIntervals(w http.ResponseWriter, r *http.Request) {
@@ -634,7 +634,7 @@ func (h *SystemSettingsHandler) GetPublicIntervals(w http.ResponseWriter, r *htt
 }
 
 // SetDashboardRefresh admin-only,设置前端 dashboard 轮询间隔(ms)。生效:下次前端拉到该值。
-// clamp 到 [1000, 60000] 范围,默认 5000。
+// clamp 到 [1000, 60000] 范围,默认 1000。
 func (h *SystemSettingsHandler) SetDashboardRefresh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		w.WriteHeader(http.StatusMethodNotAllowed)

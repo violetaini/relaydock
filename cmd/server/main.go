@@ -427,8 +427,8 @@ func main() {
 	// 流量收集器（早期创建，以便可以与处理程序共享）
 	trafficCollector := traffic.NewCollector(repo)
 	// 主控本机自采间隔跟随「上报间隔」(dashboard_refresh_interval_ms,会同步给所有 agent),
-	// 与 agent 保持一致;未设置时用默认 5000ms。speed 仍用 speed_collect_interval。
-	reportMs := 5000
+	// 与 Agent 保持一致;未设置时默认每秒上报。speed 仍用 speed_collect_interval。
+	reportMs := 1000
 	if val, _ := repo.GetSystemSetting(context.Background(), "dashboard_refresh_interval_ms"); val != "" {
 		if n, err := strconv.Atoi(val); err == nil && n >= 1000 && n <= 60000 {
 			reportMs = n
@@ -975,7 +975,7 @@ func main() {
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
 	})))
-	// 公开:所有登录用户可拿前端 dashboard 刷新间隔(默认 5000ms,admin 可在系统设置改)
+	// 公开:所有登录用户可拿前端 dashboard 刷新间隔(默认 1000ms,admin 可在系统设置改)
 	mux.Handle("/api/system-config/refetch-interval", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(systemSettingsHandler.GetPublicIntervals)))
 	// admin:写前端 dashboard 刷新间隔,clamp [1000, 60000] ms
 	mux.Handle("/api/admin/system-settings/dashboard-refresh", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(systemSettingsHandler.SetDashboardRefresh)))

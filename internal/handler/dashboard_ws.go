@@ -189,7 +189,7 @@ func (h *DashboardWSHub) stopTicker() {
 
 // refreshInterval 跟随系统设置 dashboard_refresh_interval_ms(与前端原轮询同频),clamp [1s,60s]。
 func (h *DashboardWSHub) refreshInterval() time.Duration {
-	ms := 5000
+	ms := 1000
 	if v, _ := h.repo.GetSystemSetting(context.Background(), "dashboard_refresh_interval_ms"); v != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 1000 && n <= 60000 {
 			ms = n
