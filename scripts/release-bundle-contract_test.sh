@@ -218,36 +218,20 @@ PATH="$FAKE_BIN_DIR:$PATH" \
     --release-tag "$RELEASE_TAG" \
     --api-contract 1
 
-FRONTEND_ONLY_BUNDLE="$TEST_ROOT/frontend-only-bundle"
-cp -a "$BUNDLE_DIR" "$FRONTEND_ONLY_BUNDLE"
-RELAYDOCK_RELEASE_SCOPE=frontend-only \
-RELAYDOCK_CONTROL_PLANE_VERSION=1.2.0 \
-TEST_MAIN_COMMIT="$MAIN_COMMIT" \
-TEST_AGENT_COMMIT="$AGENT_COMMIT" \
-PATH="$FAKE_BIN_DIR:$PATH" \
+if RELAYDOCK_RELEASE_SCOPE=frontend-only \
+  TEST_MAIN_COMMIT="$MAIN_COMMIT" \
+  TEST_AGENT_COMMIT="$AGENT_COMMIT" \
+  PATH="$FAKE_BIN_DIR:$PATH" \
   "$VERIFIER" \
-    "$FRONTEND_ONLY_BUNDLE" \
+    "$BUNDLE_DIR" \
     "$MAIN_COMMIT" \
     "$AGENT_COMMIT" \
     --release-tag "$RELEASE_TAG" \
     --api-contract 1 \
-    --write-manifest \
-    --write-checksums
-node - "$FRONTEND_ONLY_BUNDLE/relaydock-release-manifest.json" <<'NODE'
-const fs = require("fs");
-
-const manifest = JSON.parse(fs.readFileSync(process.argv.at(-1), "utf8"));
-const assetCount = Object.values(manifest.components).reduce((count, component) => count + component.assets.length, 0);
-if (manifest.components.web.changed !== true ||
-    manifest.components.control_plane.changed !== false ||
-    manifest.components.control_plane.version !== "1.2.0" ||
-    manifest.components.guard_assets.changed !== false ||
-    manifest.components.agent_install_assets.changed !== false ||
-    manifest.components.speedtester_assets.changed !== false ||
-    assetCount !== 14) {
-  throw new Error("frontend-only release scope did not preserve non-web components");
-}
-NODE
+    --write-manifest >/dev/null 2>&1; then
+  echo "verifier accepted an unsafe frontend-only stable release" >&2
+  exit 1
+fi
 
 printf 'unexpected\n' >"$BUNDLE_DIR/unexpected-asset"
 if TEST_MAIN_COMMIT="$MAIN_COMMIT" \

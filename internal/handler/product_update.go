@@ -830,26 +830,15 @@ func backupProductDatabase(job productUpdateJob) ([]productDatabaseBackup, error
 }
 
 func productDatabasePath(dataDirectory string) (string, error) {
-	configured := strings.TrimSpace(os.Getenv("ARCWAY_DATABASE_PATH"))
-	if configured == "" {
-		configured = strings.TrimSpace(os.Getenv("DATABASE_PATH"))
+	if !filepath.IsAbs(dataDirectory) {
+		return "", errors.New("产品更新数据目录必须是绝对路径")
 	}
-	if configured == "" {
-		configured = filepath.Join(dataDirectory, "arcway.db")
-	}
-	if !filepath.IsAbs(configured) {
-		return "", errors.New("DATABASE_PATH 必须是绝对路径")
-	}
-	return filepath.Clean(configured), nil
+	return filepath.Join(filepath.Clean(dataDirectory), "arcway.db"), nil
 }
 
 func productDatabasePathForJob(job productUpdateJob) (string, error) {
-	if strings.TrimSpace(job.DatabasePath) != "" {
-		if !filepath.IsAbs(job.DatabasePath) {
-			return "", errors.New("产品更新数据库路径必须是绝对路径")
-		}
-		return filepath.Clean(job.DatabasePath), nil
-	}
+	// DatabasePath was persisted by an early transaction format. Ignore it on
+	// recovery: the main process always opens <data-directory>/arcway.db.
 	return productDatabasePath(job.DataDirectory)
 }
 

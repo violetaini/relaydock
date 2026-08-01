@@ -677,6 +677,30 @@ func TestProductUpdateSystemctlCommand(t *testing.T) {
 	}
 }
 
+func TestProductDatabasePathUsesServiceDataDirectory(t *testing.T) {
+	dataDirectory := filepath.Join(t.TempDir(), "data")
+	wrongPath := filepath.Join(t.TempDir(), "wrong.db")
+	t.Setenv("ARCWAY_DATABASE_PATH", wrongPath)
+	t.Setenv("DATABASE_PATH", filepath.Join(t.TempDir(), "also-wrong.db"))
+
+	path, err := productDatabasePath(dataDirectory)
+	if err != nil {
+		t.Fatalf("productDatabasePath() error = %v", err)
+	}
+	want := filepath.Join(dataDirectory, "arcway.db")
+	if path != want {
+		t.Fatalf("productDatabasePath() = %q, want %q", path, want)
+	}
+
+	path, err = productDatabasePathForJob(productUpdateJob{DataDirectory: dataDirectory, DatabasePath: wrongPath})
+	if err != nil {
+		t.Fatalf("productDatabasePathForJob() error = %v", err)
+	}
+	if path != want {
+		t.Fatalf("productDatabasePathForJob() = %q, want %q", path, want)
+	}
+}
+
 func productTestManagedWebRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()

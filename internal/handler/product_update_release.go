@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/violetaini/relaydock/internal/productrelease"
+	"github.com/violetaini/relaydock/internal/runtimepaths"
 	"github.com/violetaini/relaydock/internal/version"
 )
 
@@ -325,17 +326,7 @@ func productBinaryAssetName() string {
 }
 
 func productDataDirectory() (string, error) {
-	if configured := strings.TrimSpace(os.Getenv("ARCWAY_DATA_DIR")); configured != "" {
-		if !filepath.IsAbs(configured) {
-			return "", errors.New("ARCWAY_DATA_DIR 必须是绝对路径")
-		}
-		return filepath.Clean(configured), nil
-	}
-	workingDirectory, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(workingDirectory, "data"), nil
+	return runtimepaths.DataDirectory()
 }
 
 func populateProductUpdateEnvironment(info *UpdateInfo, environment updateEnvironment) {

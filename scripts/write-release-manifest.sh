@@ -5,10 +5,8 @@ usage() {
   cat >&2 <<'EOF'
 usage: write-release-manifest.sh <bundle-dir> <output-file> <release-tag> <backend-commit> <agent-commit> [api-contract]
 
-Set RELAYDOCK_RELEASE_SCOPE=frontend-only only when the deployed control-plane
-version and API contract remain unchanged; it marks only the web component as
-changed. RELAYDOCK_CONTROL_PLANE_VERSION defaults to the release tag without
-the v prefix and records the version expected from the running server binary.
+Stable releases are coordinated product releases: their tag must match the
+control-plane version and all installable components are marked as changed.
 EOF
 }
 
@@ -24,7 +22,7 @@ BACKEND_COMMIT="$4"
 AGENT_COMMIT="$5"
 API_CONTRACT="${6:-1}"
 RELEASE_SCOPE="${RELAYDOCK_RELEASE_SCOPE:-full}"
-CONTROL_PLANE_VERSION="${RELAYDOCK_CONTROL_PLANE_VERSION:-${RELEASE_TAG#v}}"
+CONTROL_PLANE_VERSION="${RELEASE_TAG#v}"
 
 if [ ! -d "$BUNDLE_DIR" ]; then
   echo "release bundle directory does not exist: $BUNDLE_DIR" >&2
@@ -48,14 +46,10 @@ if [[ ! "$CONTROL_PLANE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "control-plane version must use X.Y.Z: $CONTROL_PLANE_VERSION" >&2
   exit 2
 fi
-case "$RELEASE_SCOPE" in
-  full|frontend-only)
-    ;;
-  *)
-    echo "release scope must be full or frontend-only: $RELEASE_SCOPE" >&2
-    exit 2
-    ;;
-esac
+if [ "$RELEASE_SCOPE" != "full" ]; then
+  echo "stable releases only support the full release scope" >&2
+  exit 2
+fi
 
 BACKEND_COMMIT="$(tr '[:upper:]' '[:lower:]' <<<"$BACKEND_COMMIT")"
 AGENT_COMMIT="$(tr '[:upper:]' '[:lower:]' <<<"$AGENT_COMMIT")"
@@ -131,17 +125,10 @@ write_component() {
   printf '    }'
 }
 
-if [ "$RELEASE_SCOPE" = "frontend-only" ]; then
-  CONTROL_PLANE_CHANGED=false
-  GUARD_CHANGED=false
-  AGENT_CHANGED=false
-  SPEEDTESTER_CHANGED=false
-else
-  CONTROL_PLANE_CHANGED=true
-  GUARD_CHANGED=true
-  AGENT_CHANGED=true
-  SPEEDTESTER_CHANGED=true
-fi
+CONTROL_PLANE_CHANGED=true
+GUARD_CHANGED=true
+AGENT_CHANGED=true
+SPEEDTESTER_CHANGED=true
 WEB_CHANGED=true
 
 OUTPUT_DIR="$(dirname "$OUTPUT_FILE")"

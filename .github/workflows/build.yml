@@ -8,14 +8,6 @@ on:
         required: true
         default: false
         type: boolean
-      release_scope:
-        description: full, or frontend-only when the control-plane version and API stay unchanged
-        required: true
-        default: full
-        type: choice
-        options:
-          - full
-          - frontend-only
 
 permissions:
   contents: read
@@ -50,9 +42,11 @@ jobs:
             scripts/write-release-manifest.sh \
             scripts/verify-release-bundle.sh \
             scripts/release-bundle-contract_test.sh \
+            scripts/release_transaction_test.sh \
             scripts/deploy-frontend.sh \
             scripts/deploy-frontend_test.sh
           scripts/release-bundle-contract_test.sh
+          bash scripts/release_transaction_test.sh
           bash scripts/deploy-frontend_test.sh
 
       - name: Validate release Dockerfile
@@ -251,8 +245,6 @@ jobs:
     needs: [build, guard, agent, speedtester]
     if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
-    env:
-      RELAYDOCK_RELEASE_SCOPE: ${{ inputs.release_scope }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -275,19 +267,7 @@ jobs:
           api_contract="$(sed -nE 's/^[[:space:]]*const[[:space:]]+APIContract[[:space:]]*=[[:space:]]*([1-9][0-9]*)[[:space:]]*$/\1/p' internal/version/version.go)"
           test "$(printf '%s\n' "$release_version" | grep -c .)" = 1
           test "$(printf '%s\n' "$api_contract" | grep -c .)" = 1
-          case "$RELAYDOCK_RELEASE_SCOPE" in
-            full)
-              test "v$release_version" = "$GITHUB_REF_NAME"
-              ;;
-            frontend-only)
-              test "v$release_version" != "$GITHUB_REF_NAME"
-              ;;
-            *)
-              echo "unsupported release scope: $RELAYDOCK_RELEASE_SCOPE" >&2
-              exit 1
-              ;;
-          esac
-          echo "RELAYDOCK_CONTROL_PLANE_VERSION=$release_version" >> "$GITHUB_ENV"
+          test "v$release_version" = "$GITHUB_REF_NAME"
           echo "RELEASE_API_CONTRACT=$api_contract" >> "$GITHUB_ENV"
 
       - name: Build deterministic frontend release asset

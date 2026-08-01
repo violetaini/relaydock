@@ -31,6 +31,7 @@ import (
 	"github.com/violetaini/relaydock/internal/notify"
 	"github.com/violetaini/relaydock/internal/patches"
 	"github.com/violetaini/relaydock/internal/proxygroups"
+	"github.com/violetaini/relaydock/internal/runtimepaths"
 	"github.com/violetaini/relaydock/internal/securechan"
 	"github.com/violetaini/relaydock/internal/storage"
 	"github.com/violetaini/relaydock/internal/traffic"
@@ -133,8 +134,14 @@ func main() {
 	initTimezone()
 	logger.Info("RelayDock 服务器启动中", "version", version.Version)
 
+	dataDirectory, err := runtimepaths.DataDirectory()
+	if err != nil {
+		logger.Error("数据目录初始化失败", "error", err)
+		os.Exit(1)
+	}
+
 	// 启动日志清理任务（每天凌晨3点清理7天前的日志）
-	go startLogCleanup()
+	go startLogCleanup(dataDirectory)
 
 	// 从文件加载配置（如果指定）
 	var config *ServerConfig
@@ -147,7 +154,7 @@ func main() {
 		log.Printf("Loaded configuration from %s", *configPath)
 	}
 
-	repo, err := storage.NewTrafficRepository(filepath.Join("data", "arcway.db"))
+	repo, err := storage.NewTrafficRepository(filepath.Join(dataDirectory, "arcway.db"))
 	if err != nil {
 		logger.Error("流量数据库初始化失败", "error", err)
 		os.Exit(1)
@@ -156,7 +163,7 @@ func main() {
 
 	addr := getAddr(config, repo)
 
-	masterIdentity, err := securechan.LoadOrGenerate(filepath.Join("data", "arcway_master.key"))
+	masterIdentity, err := securechan.LoadOrGenerate(filepath.Join(dataDirectory, "arcway_master.key"))
 	if err != nil {
 		logger.Error("加密密钥初始化失败", "error", err)
 		os.Exit(1)
@@ -1610,8 +1617,8 @@ func startDailySnapshotTask(ctx context.Context, trafficHandler *handler.Traffic
 }
 
 // 启动日志清理任务
-func startLogCleanup() {
-	logManager := logger.NewLogManager("data/logs")
+func startLogCleanup(dataDirectory string) {
+	logManager := logger.NewLogManager(filepath.Join(dataDirectory, "logs"))
 
 	// 一轮清理：debug 日志(log_*, 7天) + lumberjack 主日志(arcway*, 兜底保留最新2个)
 	runCleanup := func() {

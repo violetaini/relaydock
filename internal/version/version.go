@@ -1,7 +1,7 @@
 package version
 
 // 版本是当前应用程序版本
-const Version = "0.6.5"
+const Version = "0.6.6"
 
 // APIContract is the compatibility level shared by the control-plane HTTP API
 // and externally deployed frontend bundles. It changes only when a frontend
