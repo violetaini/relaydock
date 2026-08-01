@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/violetaini/relaydock/internal/logger"
+	"github.com/violetaini/relaydock/internal/productrelease"
 	"github.com/violetaini/relaydock/internal/version"
 )
 
@@ -32,6 +33,7 @@ const (
 	updateScopeControlPlane    = "control_plane_only"
 	updateScopeFull            = "full"
 	maxUpdateBinarySize        = 256 << 20
+	releaseManifestAssetName   = "relaydock-release-manifest.json"
 )
 
 var (
@@ -44,24 +46,37 @@ var (
 
 // UpdateInfo包含版本更新信息
 type UpdateInfo struct {
-	CurrentVersion  string `json:"current_version"`
-	LatestVersion   string `json:"latest_version"`
-	HasUpdate       bool   `json:"has_update"`
-	ReleaseURL      string `json:"release_url"`
-	DownloadURL     string `json:"download_url"`
-	ReleaseNotes    string `json:"release_notes"`
-	DeploymentMode  string `json:"deployment_mode"`
-	UpdateScope     string `json:"update_scope"`
-	ExternalWebRoot bool   `json:"external_web_root"`
-	CanApply        bool   `json:"can_apply"`
-	Warning         string `json:"warning,omitempty"`
-	expectedSHA256  string
-	guardAssetDir   string
-	guardAssets     []updateReleaseAsset
-	missingGuards   []string
-	agentAssetDir   string
-	agentAssets     []updateReleaseAsset
-	missingAgents   []string
+	CurrentVersion      string                   `json:"current_version"`
+	LatestVersion       string                   `json:"latest_version"`
+	HasUpdate           bool                     `json:"has_update"`
+	ReleaseURL          string                   `json:"release_url"`
+	DownloadURL         string                   `json:"download_url"`
+	ReleaseNotes        string                   `json:"release_notes"`
+	DeploymentMode      string                   `json:"deployment_mode"`
+	UpdateScope         string                   `json:"update_scope"`
+	ExternalWebRoot     bool                     `json:"external_web_root"`
+	CanApply            bool                     `json:"can_apply"`
+	Warning             string                   `json:"warning,omitempty"`
+	ProductRelease      string                   `json:"product_release,omitempty"`
+	TargetRelease       string                   `json:"target_release,omitempty"`
+	APIContract         int                      `json:"api_contract,omitempty"`
+	ManagedExternalWeb  bool                     `json:"managed_external_web"`
+	TransactionState    string                   `json:"transaction_state,omitempty"`
+	Components          []ProductComponentStatus `json:"components,omitempty"`
+	expectedSHA256      string
+	guardAssetDir       string
+	guardAssets         []updateReleaseAsset
+	missingGuards       []string
+	agentAssetDir       string
+	agentAssets         []updateReleaseAsset
+	missingAgents       []string
+	speedtesterAssetDir string
+	speedtesterAssets   []updateReleaseAsset
+	missingSpeedtesters []string
+	productManifest     *productrelease.Manifest
+	productAssets       map[string]updateReleaseAsset
+	managedWebRoot      string
+	productStateUnsafe  bool
 }
 
 type updateEnvironment struct {
@@ -79,6 +94,7 @@ type updateReleaseAsset struct {
 	TargetPath  string
 	GOOS        string
 	GOARCH      string
+	Size        int64
 }
 
 type preparedUpdateFile struct {
@@ -97,13 +113,19 @@ type UpdateProgress struct {
 }
 
 type UpdateStatus struct {
-	CurrentVersion  string `json:"current_version"`
-	DeploymentMode  string `json:"deployment_mode"`
-	UpdateScope     string `json:"update_scope"`
-	ExternalWebRoot bool   `json:"external_web_root"`
-	CanApply        bool   `json:"can_apply"`
-	UpdateRunning   bool   `json:"update_running"`
-	Warning         string `json:"warning,omitempty"`
+	CurrentVersion     string                   `json:"current_version"`
+	DeploymentMode     string                   `json:"deployment_mode"`
+	UpdateScope        string                   `json:"update_scope"`
+	ExternalWebRoot    bool                     `json:"external_web_root"`
+	CanApply           bool                     `json:"can_apply"`
+	UpdateRunning      bool                     `json:"update_running"`
+	Warning            string                   `json:"warning,omitempty"`
+	ProductRelease     string                   `json:"product_release,omitempty"`
+	TargetRelease      string                   `json:"target_release,omitempty"`
+	APIContract        int                      `json:"api_contract,omitempty"`
+	ManagedExternalWeb bool                     `json:"managed_external_web"`
+	TransactionState   string                   `json:"transaction_state,omitempty"`
+	Components         []ProductComponentStatus `json:"components,omitempty"`
 }
 
 // GitHubRelease 表示版本的 GitHub API 响应
@@ -118,6 +140,7 @@ type GitHubReleaseAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Digest             string `json:"digest"`
+	Size               int64  `json:"size"`
 }
 
 func detectUpdateEnvironment(docker bool, externalWebRoot string) updateEnvironment {
@@ -153,7 +176,8 @@ func detectUpdateEnvironment(docker bool, externalWebRoot string) updateEnvironm
 func currentUpdateEnvironment() updateEnvironment {
 	environment := detectUpdateEnvironment(isDocker(), os.Getenv("ARCWAY_WEB_ROOT"))
 	environment = populateGuardEnvironment(environment, os.Getenv("ARCWAY_GUARD_ASSET_DIR"))
-	return populateAgentEnvironment(environment, os.Getenv("ARCWAY_AGENT_ASSET_DIR"))
+	environment = populateAgentEnvironment(environment, os.Getenv("ARCWAY_AGENT_ASSET_DIR"))
+	return populateSpeedtesterEnvironment(environment, os.Getenv(speedtesterAssetDirEnv))
 }
 
 func populateGuardEnvironment(environment updateEnvironment, guardAssetDir string) updateEnvironment {
@@ -224,7 +248,27 @@ func populateAgentEnvironment(environment updateEnvironment, agentAssetDir strin
 	return environment
 }
 
+func populateSpeedtesterEnvironment(environment updateEnvironment, speedtesterAssetDir string) updateEnvironment {
+	if environment.DeploymentMode == updateDeploymentDocker {
+		return environment
+	}
+	speedtesterAssetDir = strings.TrimSpace(speedtesterAssetDir)
+	if speedtesterAssetDir == "" {
+		return environment
+	}
+	if !filepath.IsAbs(speedtesterAssetDir) {
+		environment.CanApply = false
+		environment.UpdateScope = updateScopeNone
+		environment.Warning = appendUpdateWarning(environment.Warning, "ARCWAY_SPEEDTESTER_ASSET_DIR 必须是绝对路径，网页更新已禁用。")
+	}
+	return environment
+}
+
 func populateUpdateEnvironment(info *UpdateInfo, environment updateEnvironment) {
+	if info.productManifest != nil {
+		populateProductUpdateEnvironment(info, environment)
+		return
+	}
 	info.DeploymentMode = environment.DeploymentMode
 	info.UpdateScope = environment.UpdateScope
 	info.ExternalWebRoot = environment.ExternalWebRoot
@@ -287,11 +331,12 @@ func finishUpdateSession(lock *systemUpdateLock) {
 
 func validateRequestedVersion(r *http.Request, info *UpdateInfo) error {
 	requested := strings.TrimSpace(strings.TrimPrefix(r.URL.Query().Get("version"), "v"))
-	if requested == "" {
-		return nil
-	}
-	if requested != info.LatestVersion {
+	if requested != "" && requested != info.LatestVersion {
 		return fmt.Errorf("最新版本已从 %s 变为 %s，请重新检查并确认", requested, info.LatestVersion)
+	}
+	requestedRelease := strings.TrimSpace(r.URL.Query().Get("release"))
+	if requestedRelease != "" && info.TargetRelease != "" && requestedRelease != info.TargetRelease {
+		return fmt.Errorf("目标产品发布已从 %s 变为 %s，请重新检查并确认", requestedRelease, info.TargetRelease)
 	}
 	return nil
 }
@@ -302,6 +347,9 @@ func validateUpdateForApply(info *UpdateInfo) error {
 			return errors.New(info.Warning)
 		}
 		return errors.New("当前部署方式不支持网页内更新")
+	}
+	if info.productManifest != nil {
+		return validateProductUpdateForApply(info)
 	}
 	if info.DownloadURL == "" {
 		return errors.New("未找到适合当前系统的下载链接")
@@ -339,16 +387,29 @@ func NewUpdateStatusHandler() http.Handler {
 			return
 		}
 		environment := currentUpdateEnvironment()
+		productRelease, targetRelease, managedExternalWeb, transactionState, components, productWarning := localProductUpdateStatus(environment)
+		productBusy := productTransactionActive(transactionState)
+		canApply := environment.CanApply && !productBusy
+		updateRunning := updateInProgress.Load() || productBusy
+		if productBusy {
+			productWarning = appendUpdateWarning(productWarning, "产品更新事务尚未结束，已阻止再次更新。")
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(UpdateStatus{
-			CurrentVersion:  version.Version,
-			DeploymentMode:  environment.DeploymentMode,
-			UpdateScope:     environment.UpdateScope,
-			ExternalWebRoot: environment.ExternalWebRoot,
-			CanApply:        environment.CanApply,
-			UpdateRunning:   updateInProgress.Load(),
-			Warning:         environment.Warning,
+			CurrentVersion:     version.Version,
+			DeploymentMode:     environment.DeploymentMode,
+			UpdateScope:        environment.UpdateScope,
+			ExternalWebRoot:    environment.ExternalWebRoot,
+			CanApply:           canApply,
+			UpdateRunning:      updateRunning,
+			Warning:            appendUpdateWarning(environment.Warning, productWarning),
+			ProductRelease:     productRelease,
+			TargetRelease:      targetRelease,
+			APIContract:        version.APIContract,
+			ManagedExternalWeb: managedExternalWeb,
+			TransactionState:   transactionState,
+			Components:         components,
 		})
 	})
 }
@@ -423,6 +484,28 @@ func NewUpdateApplyHandler() http.Handler {
 
 		if err := validateUpdateForApply(info); err != nil {
 			writeUpdateError(w, http.StatusConflict, err)
+			return
+		}
+		if info.productManifest != nil {
+			job, scheduled, err := applyProductRelease(info, nil)
+			if err != nil {
+				writeUpdateError(w, http.StatusBadGateway, fmt.Errorf("准备产品更新事务失败: %w", err))
+				return
+			}
+			message := job.Message
+			if scheduled {
+				message = "产品更新事务已安排，控制端将短暂重启并自动完成健康检查。"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status":            "accepted",
+				"message":           message,
+				"update_scope":      info.UpdateScope,
+				"product_release":   info.ProductRelease,
+				"target_release":    job.ReleaseID,
+				"transaction_state": job.Phase,
+			})
 			return
 		}
 
@@ -579,6 +662,20 @@ func NewUpdateApplySSEHandler() http.Handler {
 			sendProgress("error", 0, err.Error())
 			return
 		}
+		if info.productManifest != nil {
+			job, scheduled, err := applyProductRelease(info, sendProgress)
+			if err != nil {
+				sendProgress("error", 0, fmt.Sprintf("准备产品更新事务失败: %v", err))
+				return
+			}
+			if scheduled {
+				sendProgress("health_check", 0, "独立更新事务已启动，正在等待新的控制端完成健康检查...")
+			} else {
+				sendProgress("health_check", 0, "外置前端已切换，正在确认发布状态...")
+			}
+			sendProgress("done", 100, job.Message)
+			return
+		}
 
 		// 2.有进度下载
 		sendProgress("downloading", 0, "正在下载更新...")
@@ -726,15 +823,16 @@ func checkLatestVersion() (*UpdateInfo, error) {
 	hasUpdate := compareVersions(version.Version, latestVersion)
 
 	info := &UpdateInfo{
-		CurrentVersion: version.Version,
-		LatestVersion:  latestVersion,
-		HasUpdate:      hasUpdate,
-		ReleaseURL:     release.HTMLURL,
-		DownloadURL:    downloadURL,
-		ReleaseNotes:   release.Body,
-		expectedSHA256: expectedSHA256,
-		guardAssetDir:  strings.TrimSpace(os.Getenv("ARCWAY_GUARD_ASSET_DIR")),
-		agentAssetDir:  strings.TrimSpace(os.Getenv("ARCWAY_AGENT_ASSET_DIR")),
+		CurrentVersion:      version.Version,
+		LatestVersion:       latestVersion,
+		HasUpdate:           hasUpdate,
+		ReleaseURL:          release.HTMLURL,
+		DownloadURL:         downloadURL,
+		ReleaseNotes:        release.Body,
+		expectedSHA256:      expectedSHA256,
+		guardAssetDir:       strings.TrimSpace(os.Getenv("ARCWAY_GUARD_ASSET_DIR")),
+		agentAssetDir:       strings.TrimSpace(os.Getenv("ARCWAY_AGENT_ASSET_DIR")),
+		speedtesterAssetDir: strings.TrimSpace(os.Getenv(speedtesterAssetDirEnv)),
 	}
 	if info.guardAssetDir != "" {
 		for _, arch := range []string{"amd64", "arm64"} {
@@ -778,25 +876,36 @@ func checkLatestVersion() (*UpdateInfo, error) {
 			})
 		}
 	}
+	if err := populateProductReleaseInfo(info, release); err != nil {
+		return nil, fmt.Errorf("验证产品发布清单: %w", err)
+	}
 	return info, nil
 }
 
 func selectReleaseAsset(release GitHubRelease, binaryName string) (string, string, error) {
+	asset, digest, err := selectGitHubReleaseAsset(release, binaryName)
+	if err != nil || asset.Name == "" {
+		return "", "", err
+	}
+	return asset.BrowserDownloadURL, digest, nil
+}
+
+func selectGitHubReleaseAsset(release GitHubRelease, name string) (GitHubReleaseAsset, string, error) {
 	for _, asset := range release.Assets {
-		if asset.Name != binaryName {
+		if asset.Name != name {
 			continue
 		}
-		expectedPath := "/" + githubRepo + "/releases/download/" + release.TagName + "/" + binaryName
+		expectedPath := "/" + githubRepo + "/releases/download/" + release.TagName + "/" + name
 		if err := validateGitHubURL(asset.BrowserDownloadURL, expectedPath); err != nil {
-			return "", "", fmt.Errorf("GitHub 发布包地址无效: %w", err)
+			return GitHubReleaseAsset{}, "", fmt.Errorf("GitHub 发布包地址无效: %w", err)
 		}
 		digest := strings.TrimSpace(asset.Digest)
 		if !strings.HasPrefix(digest, "sha256:") || !sha256Pattern.MatchString(strings.TrimPrefix(digest, "sha256:")) {
-			return "", "", fmt.Errorf("GitHub 发布包 %s 缺少有效的 SHA-256 digest", binaryName)
+			return GitHubReleaseAsset{}, "", fmt.Errorf("GitHub 发布包 %s 缺少有效的 SHA-256 digest", name)
 		}
-		return asset.BrowserDownloadURL, strings.ToLower(strings.TrimPrefix(digest, "sha256:")), nil
+		return asset, strings.ToLower(strings.TrimPrefix(digest, "sha256:")), nil
 	}
-	return "", "", nil
+	return GitHubReleaseAsset{}, "", nil
 }
 
 func validateGitHubURL(rawURL, expectedPath string) error {
@@ -1191,13 +1300,24 @@ func copyFileAtomically(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	committed = true
-	if dir, err := os.Open(destinationDir); err == nil {
-		if syncErr := dir.Sync(); syncErr != nil {
-			logger.Warn("[系统更新] 同步程序目录失败", "path", destinationDir, "error", syncErr)
-		}
-		_ = dir.Close()
+	if err := syncUpdateDirectory(destinationDir); err != nil {
+		return fmt.Errorf("同步更新目录 %s: %w", destinationDir, err)
 	}
 	return nil
+}
+
+var syncUpdateDirectory = syncUpdateDirectoryOnDisk
+
+func syncUpdateDirectoryOnDisk(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return err
+	}
+	return directory.Close()
 }
 
 func backupUpdateFiles(files []preparedUpdateFile) error {
@@ -1225,7 +1345,10 @@ func installUpdateFiles(files []preparedUpdateFile) error {
 	for i := range files {
 		if err := replaceBinary(files[i].SourcePath, files[i].TargetPath); err != nil {
 			installErr := fmt.Errorf("替换 %s: %w", files[i].Name, err)
-			if rollbackErr := rollbackUpdateFiles(files[:i]); rollbackErr != nil {
+			// A directory fsync can fail after replaceBinary has already renamed
+			// the new file into place. Include this entry in the rollback; if its
+			// rename did not occur, restoring the backup is harmless.
+			if rollbackErr := rollbackUpdateFiles(files[:i+1]); rollbackErr != nil {
 				return errors.Join(installErr, fmt.Errorf("恢复已替换文件: %w", rollbackErr))
 			}
 			return installErr
@@ -1246,6 +1369,10 @@ func rollbackUpdateFiles(files []preparedUpdateFile) error {
 		}
 		if err := os.Remove(file.TargetPath); err != nil && !os.IsNotExist(err) {
 			rollbackErrors = append(rollbackErrors, fmt.Errorf("移除新增的 %s: %w", file.Name, err))
+		} else if err == nil {
+			if syncErr := syncUpdateDirectory(filepath.Dir(file.TargetPath)); syncErr != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("同步移除 %s 的目录: %w", file.Name, syncErr))
+			}
 		}
 	}
 	return errors.Join(rollbackErrors...)

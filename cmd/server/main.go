@@ -96,7 +96,16 @@ func main() {
 	// 解析命令行标志
 	configPath := flag.String("c", "", "Path to configuration file")
 	firewallRulesPath := flag.String("arcway-firewall-rules", "", "Print public Xray inbound firewall rules and exit")
+	productUpdateJobPath := flag.String("arcway-update-helper", "", "Run the isolated product update helper for a transaction file")
 	flag.Parse()
+	if *productUpdateJobPath != "" {
+		logger.Init()
+		if err := handler.RunProductUpdateHelper(*productUpdateJobPath); err != nil {
+			logger.Error("产品更新事务失败", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *firewallRulesPath != "" {
 		rules, err := agentfirewall.RulesFromFile(*firewallRulesPath)
 		if err != nil {
@@ -111,6 +120,16 @@ func main() {
 
 	// 初始化logger
 	logger.Init()
+	if waitForRecovery, err := handler.ResumeProductUpdateOnStartup(); err != nil {
+		logger.Error("产品更新恢复失败", "error", err)
+		os.Exit(1)
+	} else if waitForRecovery {
+		// The transient helper will stop this service before it touches the
+		// database or binary. Keep this process inert until systemd delivers that
+		// stop, rather than starting a potentially inconsistent control plane.
+		logger.Warn("检测到中断的产品更新，已安排独立恢复事务")
+		select {}
+	}
 	initTimezone()
 	logger.Info("RelayDock 服务器启动中", "version", version.Version)
 
@@ -373,6 +392,9 @@ func main() {
 	mux.Handle("/api/admin/update/check", auth.RequireAdmin(tokenStore, userRepo, handler.NewUpdateCheckHandler()))
 	mux.Handle("/api/admin/update/apply", auth.RequireAdmin(tokenStore, userRepo, handler.NewUpdateApplyHandler()))
 	mux.Handle("/api/admin/update/apply-sse", auth.RequireAdmin(tokenStore, userRepo, handler.NewUpdateApplySSEHandler()))
+	// This endpoint is used only by the root-owned update helper over loopback
+	// with a one-time transaction token. It does not expose a public health API.
+	mux.Handle("/api/internal/update-health", handler.NewUpdateHealthHandler())
 	mux.Handle("/api/admin/proxy-groups/sync", auth.RequireAdmin(tokenStore, userRepo, handler.NewProxyGroupsSyncHandler(repo, proxyGroupsStore)))
 
 	// Template V3 端点（仅限管理员）

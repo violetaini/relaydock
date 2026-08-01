@@ -501,6 +501,50 @@ func TestInstallUpdateFilesRollsBackEarlierFiles(t *testing.T) {
 	}
 }
 
+func TestInstallUpdateFilesRollsBackCurrentFileAfterPostRenameSyncFailure(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "new")
+	target := filepath.Join(dir, "arcway")
+	backup := filepath.Join(dir, "arcway.bak")
+	for path, content := range map[string]string{
+		source: "new version",
+		target: "old version",
+		backup: "old version",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	previousSync := syncUpdateDirectory
+	syncCalls := 0
+	syncUpdateDirectory = func(string) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return errors.New("simulated directory fsync failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { syncUpdateDirectory = previousSync })
+
+	files := []preparedUpdateFile{{
+		Name:       "arcway",
+		SourcePath: source,
+		TargetPath: target,
+		BackupPath: backup,
+		HadTarget:  true,
+	}}
+	if err := installUpdateFiles(files); err == nil {
+		t.Fatal("post-rename sync failure unexpectedly completed")
+	}
+	content, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "old version" {
+		t.Fatalf("current file was not rolled back after post-rename failure: %q", content)
+	}
+}
+
 func TestRestartSelfReturnsExecFailure(t *testing.T) {
 	previous := execProcess
 	execProcess = func(string, []string, []string) error {

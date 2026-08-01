@@ -77,6 +77,16 @@ requested_release="$3"
 [[ "$requested_release" == "-" ]] && requested_release=""
 releases="$root/releases"
 
+normalize_managed_target() {
+    local target="$1"
+    if [[ "$target" == /* ]]; then
+        [[ "$target" == "$root/releases/"* ]] || return 1
+        target="releases/${target#"$root/releases/"}"
+    fi
+    [[ "$target" =~ ^releases/([A-Za-z0-9][A-Za-z0-9._-]*)$ ]] || return 1
+    printf '%s\n' "$target"
+}
+
 [[ "$mode" == "rollback" && "$root" =~ ^(/[A-Za-z0-9._-]+){3,}$ && "/$root/" != *"/../"* && "/$root/" != *"/./"* ]] || exit 2
 [[ -d "$root" && ! -L "$root" && -d "$releases" && ! -L "$releases" ]] || {
     echo "ERROR: no switchable frontend releases found under $root" >&2
@@ -100,12 +110,11 @@ exec 9<>"$lock"
 flock -x 9
 [[ -L "$root/current" ]] || { echo "ERROR: current release link is missing" >&2; exit 1; }
 
-current_target="$(readlink "$root/current")"
-[[ "$current_target" =~ ^releases/([A-Za-z0-9][A-Za-z0-9._-]*)$ ]] || {
+current_target="$(normalize_managed_target "$(readlink "$root/current")")" || {
     echo "ERROR: current link does not point to a managed release" >&2
     exit 1
 }
-current_release="${BASH_REMATCH[1]}"
+current_release="${current_target#releases/}"
 current_dir="$releases/$current_release"
 [[ -d "$current_dir" && ! -L "$current_dir" && -d "$current_dir/assets" && ! -L "$current_dir/assets" ]] || {
     echo "ERROR: current release is missing or unsafe" >&2
@@ -118,9 +127,8 @@ fi
 release="$requested_release"
 if [[ -z "$release" ]]; then
     if [[ -L "$root/previous" ]]; then
-        previous_target="$(readlink "$root/previous")"
-        if [[ "$previous_target" =~ ^releases/([A-Za-z0-9][A-Za-z0-9._-]*)$ && -d "$root/$previous_target" && ! -L "$root/$previous_target" ]]; then
-            release="${BASH_REMATCH[1]}"
+        if previous_target="$(normalize_managed_target "$(readlink "$root/previous")")" && [[ -d "$root/$previous_target" && ! -L "$root/$previous_target" ]]; then
+            release="${previous_target#releases/}"
         fi
     fi
     if [[ -z "$release" ]]; then
@@ -297,6 +305,17 @@ flock -x 9
 releases="$root/releases"
 target="$releases/$release"
 staging="$releases/.staging-$release"
+
+normalize_managed_target() {
+    local target="$1"
+    if [[ "$target" == /* ]]; then
+        [[ "$target" == "$root/releases/"* ]] || return 1
+        target="releases/${target#"$root/releases/"}"
+    fi
+    [[ "$target" =~ ^releases/([A-Za-z0-9][A-Za-z0-9._-]*)$ ]] || return 1
+    printf '%s\n' "$target"
+}
+
 if [[ -e "$releases" || -L "$releases" ]]; then
     [[ -d "$releases" && ! -L "$releases" && "$(stat -c %u "$releases")" == "$(id -u)" ]] || { echo "ERROR: unsafe releases directory: $releases" >&2; exit 1; }
     if find "$releases" -maxdepth 0 -perm /0022 -print -quit | grep -q .; then
@@ -346,8 +365,11 @@ if [[ -e "$root/current" && ! -L "$root/current" ]]; then
     exit 1
 fi
 if [[ -L "$root/current" ]]; then
-    current_target="$(readlink "$root/current")"
-    [[ "$current_target" =~ ^releases/([A-Za-z0-9][A-Za-z0-9._-]*)$ && -d "$root/$current_target" && ! -L "$root/$current_target" ]] || {
+    current_target="$(normalize_managed_target "$(readlink "$root/current")")" || {
+        echo "ERROR: current link does not point to a managed release" >&2
+        exit 1
+    }
+    [[ -d "$root/$current_target" && ! -L "$root/$current_target" ]] || {
         echo "ERROR: current link does not point to a managed release" >&2
         exit 1
     }
