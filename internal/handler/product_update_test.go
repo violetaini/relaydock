@@ -89,9 +89,6 @@ func TestAdoptLegacyEmbeddedProductStateRecordsVerifiedComponents(t *testing.T) 
 	guardDir := t.TempDir()
 	guardAMD64, resolvedGuardAMD64 := productTestWriteResolvedAsset(t, guardDir, "guard-amd64", "guard-amd64")
 	guardARM64, resolvedGuardARM64 := productTestWriteResolvedAsset(t, guardDir, "guard-arm64", "guard-arm64")
-	agentDir := t.TempDir()
-	agentAMD64, resolvedAgentAMD64 := productTestWriteResolvedAsset(t, agentDir, "agent-amd64", "agent-amd64")
-	agentARM64, resolvedAgentARM64 := productTestWriteResolvedAsset(t, agentDir, "agent-arm64", "agent-arm64")
 	webAsset := productTestAsset("relaydock-web.tar.gz")
 
 	manifest := productrelease.Manifest{
@@ -101,7 +98,6 @@ func TestAdoptLegacyEmbeddedProductStateRecordsVerifiedComponents(t *testing.T) 
 			productrelease.ComponentControlPlane: {Version: version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{controlAsset}},
 			productrelease.ComponentWeb:          {Version: "v" + version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{webAsset}},
 			productrelease.ComponentGuard:        {Version: version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{guardAMD64, guardARM64}},
-			productrelease.ComponentAgent:        {Version: "legacy-agent-commit", APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{agentAMD64, agentARM64}},
 			productrelease.ComponentSpeedtester:  {Version: version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{productTestAsset("speedtester")}},
 		},
 	}
@@ -109,12 +105,10 @@ func TestAdoptLegacyEmbeddedProductStateRecordsVerifiedComponents(t *testing.T) 
 		resolvedControl.Name:    resolvedControl,
 		resolvedGuardAMD64.Name: resolvedGuardAMD64,
 		resolvedGuardARM64.Name: resolvedGuardARM64,
-		resolvedAgentAMD64.Name: resolvedAgentAMD64,
-		resolvedAgentARM64.Name: resolvedAgentARM64,
 		webAsset.Name:           {Name: webAsset.Name, SHA256: webAsset.SHA256, Size: webAsset.Size},
 		"speedtester":           {Name: "speedtester", SHA256: strings.Repeat("a", 64), Size: 1},
 	}
-	info := &UpdateInfo{guardAssetDir: guardDir, agentAssetDir: agentDir}
+	info := &UpdateInfo{guardAssetDir: guardDir}
 
 	installed, changed, err := adoptLegacyEmbeddedProductState(stateDir, "", manifest, assets, info)
 	if err != nil || !changed {
@@ -123,7 +117,7 @@ func TestAdoptLegacyEmbeddedProductStateRecordsVerifiedComponents(t *testing.T) 
 	if productReleaseNeedsApply(installed, manifest, info) {
 		t.Fatalf("verified legacy installation remained pending: %+v", installed)
 	}
-	for _, name := range []string{productrelease.ComponentControlPlane, productrelease.ComponentWeb, productrelease.ComponentGuard, productrelease.ComponentAgent} {
+	for _, name := range []string{productrelease.ComponentControlPlane, productrelease.ComponentWeb, productrelease.ComponentGuard} {
 		if _, exists := installed.Components[name]; !exists {
 			t.Fatalf("legacy adoption did not record %s: %+v", name, installed)
 		}
@@ -175,6 +169,19 @@ func TestAdoptLegacyEmbeddedProductStateLeavesUnverifiedOptionalAssetsPending(t 
 	}
 	if !productReleaseNeedsApply(installed, manifest, info) {
 		t.Fatalf("tampered guard was not left pending: %+v", installed)
+	}
+}
+
+func TestLocalProductComponentStatusesSkipsLegacyAgentInstallAssets(t *testing.T) {
+	installed := productrelease.InstalledState{
+		Components: map[string]productrelease.InstalledComponent{
+			productrelease.ComponentControlPlane: {Version: version.Version, APIContract: version.APIContract},
+			"agent_install_assets":               {Version: "legacy-agent", APIContract: version.APIContract},
+		},
+	}
+	statuses := localProductComponentStatuses(installed)
+	if len(statuses) != 1 || statuses[0].Name != productrelease.ComponentControlPlane {
+		t.Fatalf("local statuses retained legacy Agent component: %+v", statuses)
 	}
 }
 

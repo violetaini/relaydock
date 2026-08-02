@@ -493,7 +493,6 @@ func main() {
 	mux.Handle("/api/remote/token/refresh", http.HandlerFunc(xrayServerHandler.RefreshRemoteToken))
 	mux.Handle("/api/remote/install.sh", http.HandlerFunc(xrayServerHandler.GetRemoteInstallScript))
 	mux.Handle("/api/remote/expiry-guard", http.HandlerFunc(xrayServerHandler.GetExpiryGuardAsset))
-	mux.Handle("/api/remote/relaydock-agent", http.HandlerFunc(xrayServerHandler.GetAgentAsset))
 	mux.Handle("/api/remote/install-begin", http.HandlerFunc(xrayServerHandler.BeginRemoteInstallation))
 	mux.Handle("/api/remote/install-renew", http.HandlerFunc(xrayServerHandler.RenewRemoteInstallation))
 	mux.Handle("/api/remote/install-quiesce", http.HandlerFunc(xrayServerHandler.QuiesceRemoteInstallation))

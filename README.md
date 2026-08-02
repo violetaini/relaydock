@@ -49,7 +49,7 @@ RelayDock 面向合租节点和小型代理服务运营场景。管理员集中�
 
 ## 快速安装
 
-安装器会从 GitHub Release 下载控制端、节点到期守卫和两种 Linux 架构的受管 Agent 安装包，并使用 Release 中发布的 SHA-256 清单完成校验后再替换文件。
+安装器会从 GitHub Release 下载控制端、节点到期守卫和测速资产，并使用 Release 中发布的 SHA-256 清单完成校验后再替换文件。受管服务器接入时，节点安装脚本会从对应版本的 GitHub Release 直接下载两种 Linux 架构的 Agent 并校验 `checksums.txt`；面板不再托管 Agent 二进制。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash
@@ -123,7 +123,7 @@ systemctl restart arcway
 curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash -s -- update
 ```
 
-脚本先校验 `checksums.txt`，再更新控制端、守卫、Agent 安装资产和测速资产，并保留现有端口与数据。它**不会**替换外置前端，也不会执行产品清单、API 协议和网页健康检查事务；成功迁移后，后续稳定版本优先在面板更新。
+脚本先校验 `checksums.txt`，再更新控制端、守卫和测速资产，并保留现有端口与数据。Agent 仅由节点接入脚本从同版本 GitHub Release 直接下载。它**不会**替换外置前端，也不会执行产品清单、API 协议和网页健康检查事务；成功迁移后，后续稳定版本优先在面板更新。
 
 ### Docker Compose 更新
 
@@ -204,7 +204,7 @@ PORT=12889 DATABASE_PATH=./data/arcway.db ./arcway
 
 - [relaydock](https://github.com/violetaini/relaydock) 是主仓库，提供 API、远端管理能力、安装与发布，并内嵌 Web 控制台。
 - [relaydock-frontend](https://github.com/violetaini/relaydock-frontend) 是独立的 React / TypeScript 前端源码。
-- [relaydock-agent](https://github.com/violetaini/relaydock-agent) 是受管服务器 Agent 源码及带签名的自升级发布源。
+- [relaydock-agent](https://github.com/violetaini/relaydock-agent) 是受管服务器 Agent 源码；节点安装器从 [`relaydock`](https://github.com/violetaini/relaydock/releases) 同版本 GitHub Release 直接取得已校验二进制。
 
 发布新前端时，先在前端仓库执行 `npm ci --include=dev && npm run build`，再用生成的 `dist/` 整体替换本仓库的 `internal/web/dist/`。不要手工编辑已构建的哈希资源。
 
@@ -244,7 +244,7 @@ systemctl restart arcway
 
 ### 当前版本与验收记录
 
-当前正式产品版本为 [`v0.6.7`](https://github.com/violetaini/relaydock/releases/tag/v0.6.7)。该版本修复了旧版嵌入式独立安装升级后的产品状态兼容引导，并将控制端、前端、到期守卫、Agent 安装资产和 Speedtester 绑定到同一个产品发布清单，要求清单、Git 标签、后端版本和 API 协议一致。每个 GitHub Release 还会附带对应版本的中文更新说明，说明具体变更和更新方式。
+当前正式产品版本为 [`v0.6.8`](https://github.com/violetaini/relaydock/releases/tag/v0.6.8)。该版本将控制端、前端、到期守卫和 Speedtester 绑定到同一个产品发布清单，要求清单、Git 标签、后端版本和 API 协议一致。受管 Agent 保留为该 Release 的下载资产，但只由节点安装脚本从 GitHub 直接下载并校验同版本 `checksums.txt`。每个 GitHub Release 还会附带对应版本的中文更新说明，说明具体变更和更新方式。
 
 完整的架构、组件边界、发布事务、生产验收、已知限制和后续维护检查项见
 [项目状态与发布进展](docs/project-status.md)。

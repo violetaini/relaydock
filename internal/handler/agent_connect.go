@@ -603,16 +603,6 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 		http.Error(w, "Expiry guard release asset is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	agentSHA256AMD64, err := agentAssetSHA256("relaydock-agent-linux-amd64")
-	if err != nil {
-		http.Error(w, "Agent release asset is unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	agentSHA256ARM64, err := agentAssetSHA256("relaydock-agent-linux-arm64")
-	if err != nil {
-		http.Error(w, "Agent release asset is unavailable", http.StatusServiceUnavailable)
-		return
-	}
 	panelSourceIPs, err := configuredPanelSourceIPs()
 	if err != nil {
 		http.Error(w, "Panel source IPs are not configured", http.StatusServiceUnavailable)
@@ -840,12 +830,10 @@ ARCH=$(uname -m)
 case $ARCH in
     x86_64)
         ARCH_NAME="amd64"
-        AGENT_SHA256=` + shellSingleQuote(agentSHA256AMD64) + `
         GUARD_SHA256=` + shellSingleQuote(guardSHA256AMD64) + `
         ;;
     aarch64|arm64)
         ARCH_NAME="arm64"
-        AGENT_SHA256=` + shellSingleQuote(agentSHA256ARM64) + `
         GUARD_SHA256=` + shellSingleQuote(guardSHA256ARM64) + `
         ;;
     *)
@@ -858,6 +846,50 @@ if ! command -v curl >/dev/null 2>&1; then
     echo "ERROR: install curl before retrying; no system packages were changed" >&2
     exit 1
 fi
+
+release_asset_sha256() {
+    local asset_name="$1" checksums_url="$2" checksums_file="$3" checksum=""
+    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 60 \
+        -o "$checksums_file" "$checksums_url"; then
+        echo "ERROR: unable to download GitHub Release checksums for $asset_name" >&2
+        return 1
+    fi
+    checksum=$(awk -v name="$asset_name" '
+        $2 == name {
+            if (NF != 2 || length($1) != 64 || $1 !~ /^[0-9a-fA-F]+$/) invalid = 1
+            else { count++; value = tolower($1) }
+        }
+        END {
+            if (invalid || count != 1) exit 1
+            print value
+        }
+    ' "$checksums_file") || {
+        echo "ERROR: GitHub Release checksums do not contain one valid entry for $asset_name" >&2
+        return 1
+    }
+    printf '%s\n' "$checksum"
+}
+
+download_verified_github_asset() {
+    local label="$1" destination="$2" expected_sha256="$3" github_url="$4"
+    local candidate="${destination}.download" actual_sha256=""
+    rm -f "$candidate"
+
+    echo "Downloading $label from GitHub Release..."
+    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 180 \
+        -o "$candidate" "$github_url"; then
+        echo "ERROR: unable to download $label from GitHub Release; check GitHub access and temporary storage" >&2
+        rm -f "$candidate"
+        return 1
+    fi
+    actual_sha256=$(sha256sum "$candidate" | awk '{ print $1 }')
+    if [ "$actual_sha256" != "$expected_sha256" ]; then
+        echo "ERROR: $label SHA-256 verification failed; installation aborted" >&2
+        rm -f "$candidate"
+        return 1
+    fi
+    mv -f "$candidate" "$destination"
+}
 
 download_verified_asset() {
     local label="$1" destination="$2" expected_sha256="$3" github_url="$4" master_url="$5"
@@ -896,8 +928,8 @@ download_verified_asset() {
 }
 
 AGENT_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/relaydock-agent-linux-${ARCH_NAME}"
-AGENT_MASTER_URL="${MASTER_URL}/api/remote/relaydock-agent?arch=${ARCH_NAME}"
-download_verified_asset "relaydock-agent" "$AGENT_DOWNLOAD" "$AGENT_SHA256" "$AGENT_GITHUB_URL" "$AGENT_MASTER_URL" || exit 1
+AGENT_SHA256=$(release_asset_sha256 "relaydock-agent-linux-${ARCH_NAME}" "${ASSET_RELEASE_BASE_URL}/checksums.txt" "$DOWNLOAD_DIR/relaydock-agent-checksums.txt") || exit 1
+download_verified_github_asset "relaydock-agent" "$AGENT_DOWNLOAD" "$AGENT_SHA256" "$AGENT_GITHUB_URL" || exit 1
 
 GUARD_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/arcway-expiry-guard-linux-${ARCH_NAME}"
 GUARD_MASTER_URL="${MASTER_URL}/api/remote/expiry-guard?arch=${ARCH_NAME}"

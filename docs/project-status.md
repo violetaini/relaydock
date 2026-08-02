@@ -6,16 +6,17 @@
 
 RelayDock 是一个由 Go 控制面、React 管理控制台和受管服务器 Agent
 组成的多服务器 Xray 运维与订阅交付系统。当前正式版本为
-[`v0.6.6`](https://github.com/violetaini/relaydock/releases/tag/v0.6.6)：
+[`v0.6.8`](https://github.com/violetaini/relaydock/releases/tag/v0.6.8)：
 
-- 后端提交：`74555fd1ef64e930989b10fa638d382f68ce134c`
+- 后端提交：对应 Git 标签 `v0.6.8`
 - 前端提交：`95fd6249f196f0b8c99e556d2edd77d0e61aa2a7`
 - 产品发布协议：`1`
 - 正式生产地址：[arcway.chitanda.org](https://arcway.chitanda.org)
 
-该版本建立了完整产品发布事务。后端、网页、受管 Agent 安装包、到期守卫
-和测速组件由同一个 GitHub Release 清单约束，不再把“更新后端”和“更新
-前端”视为两件互不相关的操作。
+该版本建立了完整产品发布事务。后端、网页、到期守卫和测速组件由同一个
+GitHub Release 清单约束，不再把“更新后端”和“更新前端”视为两件互不相关的
+操作。受管 Agent 由节点安装脚本从对应版本 GitHub Release 直接下载并校验，
+不再通过面板托管的本地资产端点分发。
 
 ## 代码库与运行架构
 
@@ -23,7 +24,7 @@ RelayDock 是一个由 Go 控制面、React 管理控制台和受管服务器 Ag
 | --- | --- | --- |
 | 控制面 | [`violetaini/relaydock`](https://github.com/violetaini/relaydock) | Go API、数据库、远端服务器管理、安装器、发布工作流、内嵌前端与产品更新事务 |
 | 管理控制台 | [`violetaini/relaydock-frontend`](https://github.com/violetaini/relaydock-frontend) | React / TypeScript 控制台、公开探针页、响应式交互与设置页面 |
-| 受管节点 | [`violetaini/relaydock-agent`](https://github.com/violetaini/relaydock-agent) | 与控制面建立加密连接、汇报节点状态、流量和服务数据，并执行经授权的管理操作 |
+| 受管节点 | [`violetaini/relaydock-agent`](https://github.com/violetaini/relaydock-agent) | 与控制面建立加密连接、汇报节点状态、流量和服务数据，并执行经授权的管理操作；节点安装器从控制面同版本 GitHub Release 直接下载二进制 |
 | 生产运行时 | `arcway.service` | 运行控制面；可从内嵌前端或受管外置前端目录提供网页 |
 
 前端源码独立维护，但正式发布时构建产物会同步进入后端的
@@ -72,15 +73,17 @@ RelayDock 是一个由 Go 控制面、React 管理控制台和受管服务器 Ag
 ### 发布内容
 
 每个稳定产品 Release 都必须含有 `checksums.txt` 和
-`relaydock-release-manifest.json`，并由清单声明以下五类组件：
+`relaydock-release-manifest.json`，并由清单声明以下四类受管组件：
 
 | 组件 | 内容 |
 | --- | --- |
 | `control_plane` | 各受支持平台的控制面二进制 |
 | `web` | 带版本元数据的 `relaydock-web.tar.gz` |
 | `guard_assets` | Linux AMD64 / ARM64 到期守卫 |
-| `agent_install_assets` | Linux AMD64 / ARM64 受管 Agent 安装资产 |
 | `speedtester_assets` | Linux 与 Windows 的测速组件 |
+
+Linux AMD64 / ARM64 Agent 二进制仍随 GitHub Release 提供，并由节点安装脚本
+直接下载对应版本的 `checksums.txt` 后校验；它不是面板一键更新管理的本地组件。
 
 稳定发布要求 Git 标签、后端版本、发布清单 `release_id` 和 API 协议一致。发布
 工作流拒绝将稳定版本声明为仅前端更新，以避免出现前端已更新、控制端尚未更新
@@ -136,7 +139,7 @@ RelayDock 是一个由 Go 控制面、React 管理控制台和受管服务器 Ag
 
 - `arcway.service` 正常运行，网页 `current` 指向 `releases/v0.6.6`，前端元数据
   与后端提交和 API 协议匹配。
-- 控制面、守卫、Agent 和测速资产与 Release 的 9 个实际部署文件逐一进行哈希对比。
+- 控制面、守卫和测速资产与 Release 的实际部署文件逐一进行哈希对比；Agent 由节点安装脚本按对应 GitHub Release 的校验和直接取得。
 - 三台受管服务器 `Edge 154`、`Edge 170`、`Oracle` 均保持连接且 Xray 正在运行。
 - 公共 WebSocket 连续四帧间隔约为 `995ms`、`1000ms`、`999ms`；REST 回退轮询约
   `1.1s`。三台服务器的流量均持续增长。

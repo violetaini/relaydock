@@ -230,12 +230,6 @@ func prepareProductUpdateFiles(info *UpdateInfo, transactionID string, onProgres
 	}); err != nil {
 		return nil, nil, err
 	}
-	if err := appendManaged(productrelease.ComponentAgent, info.agentAssetDir, []productAssetSpecification{
-		{Name: "relaydock-agent-linux-amd64", GOOS: "linux", GOARCH: "amd64"},
-		{Name: "relaydock-agent-linux-arm64", GOOS: "linux", GOARCH: "arm64"},
-	}); err != nil {
-		return nil, nil, err
-	}
 	if err := appendManaged(productrelease.ComponentSpeedtester, info.speedtesterAssetDir, []productAssetSpecification{
 		{Name: "relaydock-speedtester-linux-amd64", GOOS: "linux", GOARCH: "amd64"},
 		{Name: "relaydock-speedtester-linux-arm64", GOOS: "linux", GOARCH: "arm64"},

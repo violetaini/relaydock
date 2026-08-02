@@ -52,7 +52,6 @@ func installExpiryGuardAssetFixtures(t *testing.T) {
 		}
 	}
 	t.Setenv(expiryGuardAssetDirEnv, assetDirectory)
-	installAgentAssetFixtures(t)
 }
 
 func requestExpiryGuardAsset(handler *XrayServerHandler, method, arch, authorization string) *httptest.ResponseRecorder {
@@ -151,20 +150,13 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	}
 
 	script := response.Body.String()
-	agentSHA256AMD64, err := agentAssetSHA256("relaydock-agent-linux-amd64")
-	if err != nil {
-		t.Fatalf("agentAssetSHA256 amd64: %v", err)
-	}
-	agentSHA256ARM64, err := agentAssetSHA256("relaydock-agent-linux-arm64")
-	if err != nil {
-		t.Fatalf("agentAssetSHA256 arm64: %v", err)
-	}
 	for _, expected := range []string{
-		"/api/remote/relaydock-agent?arch=${ARCH_NAME}",
-		agentSHA256AMD64,
-		agentSHA256ARM64,
 		"ASSET_RELEASE_BASE_URL='https://github.com/violetaini/relaydock/releases/download/v" + version.Version + "'",
 		"AGENT_GITHUB_URL=\"${ASSET_RELEASE_BASE_URL}/relaydock-agent-linux-${ARCH_NAME}\"",
+		"release_asset_sha256() {",
+		"download_verified_github_asset() {",
+		"AGENT_SHA256=$(release_asset_sha256 \"relaydock-agent-linux-${ARCH_NAME}\" \"${ASSET_RELEASE_BASE_URL}/checksums.txt\" \"$DOWNLOAD_DIR/relaydock-agent-checksums.txt\") || exit 1",
+		"download_verified_github_asset \"relaydock-agent\" \"$AGENT_DOWNLOAD\" \"$AGENT_SHA256\" \"$AGENT_GITHUB_URL\" || exit 1",
 		"GUARD_GITHUB_URL=\"${ASSET_RELEASE_BASE_URL}/arcway-expiry-guard-linux-${ARCH_NAME}\"",
 		"Downloading $label from GitHub Release...",
 		"Downloading $label from master fallback...",
@@ -288,6 +280,25 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	}
 	if strings.Contains(script, "AGENT_VERSION=") {
 		t.Fatal("install script depends on an independently moving upstream Agent release")
+	}
+	for _, forbidden := range []string{
+		"/api/remote/relaydock-agent",
+		"AGENT_MASTER_URL=",
+		"download_verified_asset \"relaydock-agent\"",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("install script retains Agent panel fallback: %q", forbidden)
+		}
+	}
+	agentDownloadStart := strings.Index(script, `AGENT_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/relaydock-agent-linux-${ARCH_NAME}"`)
+	guardDownloadStart := strings.Index(script, `GUARD_GITHUB_URL="${ASSET_RELEASE_BASE_URL}/arcway-expiry-guard-linux-${ARCH_NAME}"`)
+	if agentDownloadStart < 0 || guardDownloadStart <= agentDownloadStart {
+		t.Fatal("installer Agent download block is incomplete")
+	}
+	for _, forbidden := range []string{"MASTER_URL", "CURL_AUTH_HEADER_FILE", `-H @"$CURL_AUTH_HEADER_FILE"`} {
+		if strings.Contains(script[agentDownloadStart:guardDownloadStart], forbidden) {
+			t.Fatalf("Agent GitHub download block leaked panel fallback data: %q", forbidden)
+		}
 	}
 	if strings.Contains(script, "external Xray mode requires a working Xray installation") {
 		t.Fatal("install script still requires Xray before installing an external-mode Agent")

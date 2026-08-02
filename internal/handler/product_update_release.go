@@ -101,7 +101,7 @@ func populateProductReleaseInfo(info *UpdateInfo, release GitHubRelease) error {
 
 // adoptLegacyEmbeddedProductState recognizes the last step of the legacy
 // updater. Before product manifests existed, it replaced the control-plane
-// binary and configured Guard/Agent assets in place, but could not record the
+// binary and configured managed local assets in place, but could not record the
 // product transaction state added later. A verified embedded deployment can
 // safely seed that state, avoiding a redundant second update prompt.
 func adoptLegacyEmbeddedProductState(stateDir, externalWebRoot string, manifest productrelease.Manifest, assets map[string]updateReleaseAsset, info *UpdateInfo) (productrelease.InstalledState, bool, error) {
@@ -138,7 +138,6 @@ func adoptLegacyEmbeddedProductState(stateDir, externalWebRoot string, manifest 
 		productrelease.ComponentWeb:          {Version: web.Version, APIContract: web.APIContract},
 	}
 	adoptLegacyManagedProductComponent(components, productrelease.ComponentGuard, info.guardAssetDir, manifest, assets)
-	adoptLegacyManagedProductComponent(components, productrelease.ComponentAgent, info.agentAssetDir, manifest, assets)
 	adoptLegacyManagedProductComponent(components, productrelease.ComponentSpeedtester, info.speedtesterAssetDir, manifest, assets)
 
 	state := productrelease.InstalledState{
@@ -304,7 +303,6 @@ func productComponentStatuses(installed productrelease.InstalledState, manifest 
 		productrelease.ComponentControlPlane,
 		productrelease.ComponentWeb,
 		productrelease.ComponentGuard,
-		productrelease.ComponentAgent,
 		productrelease.ComponentSpeedtester,
 	}
 	statuses := make([]ProductComponentStatus, 0, len(names))
@@ -365,8 +363,6 @@ func productComponentRequired(name string, info *UpdateInfo) bool {
 		return true
 	case productrelease.ComponentGuard:
 		return strings.TrimSpace(info.guardAssetDir) != ""
-	case productrelease.ComponentAgent:
-		return strings.TrimSpace(info.agentAssetDir) != ""
 	case productrelease.ComponentSpeedtester:
 		return strings.TrimSpace(info.speedtesterAssetDir) != ""
 	default:
@@ -382,8 +378,6 @@ func productComponentLabel(name string) string {
 		return "外置前端"
 	case productrelease.ComponentGuard:
 		return "守卫资产"
-	case productrelease.ComponentAgent:
-		return "Agent 安装资产"
 	case productrelease.ComponentSpeedtester:
 		return "测速安装资产"
 	default:
@@ -483,7 +477,6 @@ func productReleaseRequiresHelper(info *UpdateInfo) bool {
 		switch component.Name {
 		case productrelease.ComponentControlPlane,
 			productrelease.ComponentGuard,
-			productrelease.ComponentAgent,
 			productrelease.ComponentSpeedtester:
 			return true
 		}
@@ -537,7 +530,6 @@ func localProductUpdateStatus(environment updateEnvironment) (productRelease str
 		components = productComponentStatuses(installed, job.Manifest, &UpdateInfo{
 			HasUpdate:           !productTransactionTerminal(job.Phase),
 			guardAssetDir:       strings.TrimSpace(os.Getenv("ARCWAY_GUARD_ASSET_DIR")),
-			agentAssetDir:       strings.TrimSpace(os.Getenv("ARCWAY_AGENT_ASSET_DIR")),
 			speedtesterAssetDir: strings.TrimSpace(os.Getenv(speedtesterAssetDirEnv)),
 		})
 		for index := range components {
@@ -553,14 +545,19 @@ func localProductUpdateStatus(environment updateEnvironment) (productRelease str
 }
 
 func localProductComponentStatuses(installed productrelease.InstalledState) []ProductComponentStatus {
-	names := make([]string, 0, len(installed.Components))
-	for name := range installed.Components {
-		names = append(names, name)
+	names := []string{
+		productrelease.ComponentControlPlane,
+		productrelease.ComponentWeb,
+		productrelease.ComponentGuard,
+		productrelease.ComponentSpeedtester,
 	}
 	sort.Strings(names)
 	statuses := make([]ProductComponentStatus, 0, len(names))
 	for _, name := range names {
-		component := installed.Components[name]
+		component, exists := installed.Components[name]
+		if !exists {
+			continue
+		}
 		statuses = append(statuses, ProductComponentStatus{
 			Name:           name,
 			Label:          productComponentLabel(name),

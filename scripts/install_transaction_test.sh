@@ -70,13 +70,17 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$url" ] && [ -n "$output" ] || exit 2
 asset=${url##*/}
+case "$asset" in
+    relaydock-agent-linux-*)
+        echo "installer must not download panel-local Agent assets: $asset" >&2
+        exit 95
+        ;;
+esac
 if [ "$asset" = "checksums.txt" ]; then
     for name in \
         arcway-linux-amd64 \
         arcway-expiry-guard-linux-amd64 \
         arcway-expiry-guard-linux-arm64 \
-        relaydock-agent-linux-amd64 \
-        relaydock-agent-linux-arm64 \
         relaydock-speedtester-linux-amd64 \
         relaydock-speedtester-linux-arm64 \
         relaydock-speedtester-windows-amd64.exe \
@@ -202,6 +206,8 @@ make_old_installation() {
     data_dir="$case_root/data"
     config_dir="$case_root/config"
     guard_dir="$case_root/lib/guard-assets"
+    # Simulate an old panel-local Agent cache. It must remain untouched by
+    # updates because remote Agents now fetch from GitHub Release directly.
     agent_dir="$case_root/lib/agent-assets"
     speedtester_dir="$case_root/lib/speedtester-assets"
     unit_dir="$case_root/systemd"
@@ -249,8 +255,6 @@ EOF
     cp "$install_dir/arcway.bak" "$expected_dir/arcway.bak"
     cp "$guard_dir/arcway-expiry-guard-linux-amd64" "$expected_dir/guard-amd64"
     cp "$guard_dir/arcway-expiry-guard-linux-arm64" "$expected_dir/guard-arm64"
-    cp "$agent_dir/relaydock-agent-linux-amd64" "$expected_dir/agent-amd64"
-    cp "$agent_dir/relaydock-agent-linux-arm64" "$expected_dir/agent-arm64"
     cp "$speedtester_dir/relaydock-speedtester-linux-amd64" "$expected_dir/speedtester-linux-amd64"
     cp "$speedtester_dir/relaydock-speedtester-linux-arm64" "$expected_dir/speedtester-linux-arm64"
     cp "$speedtester_dir/relaydock-speedtester-windows-amd64.exe" "$expected_dir/speedtester-windows-amd64.exe"
@@ -279,7 +283,7 @@ run_fault_case() {
     systemctl_fail_command=""
     verify_fail=0
     case "$failpoint" in
-        after_binary_swap|after_first_guard_swap|after_first_agent_swap|after_first_speedtester_swap)
+        after_binary_swap|after_first_guard_swap|after_first_speedtester_swap)
             script_failpoint=$failpoint
             ;;
         daemon_reload_failure)
@@ -320,8 +324,6 @@ run_fault_case() {
     assert_file_equals "$case_root/expected/arcway.bak" "$case_root/bin/arcway.bak"
     assert_file_equals "$case_root/expected/guard-amd64" "$case_root/lib/guard-assets/arcway-expiry-guard-linux-amd64"
     assert_file_equals "$case_root/expected/guard-arm64" "$case_root/lib/guard-assets/arcway-expiry-guard-linux-arm64"
-    assert_file_equals "$case_root/expected/agent-amd64" "$case_root/lib/agent-assets/relaydock-agent-linux-amd64"
-    assert_file_equals "$case_root/expected/agent-arm64" "$case_root/lib/agent-assets/relaydock-agent-linux-arm64"
     if [ "$speedtester_state" = missing ]; then
         [ ! -e "$case_root/lib/speedtester-assets" ] || fail "$failpoint left a newly-created speedtester asset directory"
     else
@@ -357,7 +359,6 @@ run_fault_case() {
 
 run_fault_case after_binary_swap enabled active
 run_fault_case after_first_guard_swap enabled-runtime inactive
-run_fault_case after_first_agent_swap enabled active
 run_fault_case after_first_speedtester_swap enabled active
 run_fault_case after_first_speedtester_swap enabled active missing
 run_fault_case daemon_reload_failure disabled active
@@ -422,7 +423,6 @@ set -e
 [ "$unsupported_result" -ne 0 ] || fail "unsupported enable state unexpectedly succeeded"
 assert_file_equals "$UNSUPPORTED_ROOT/expected/arcway" "$UNSUPPORTED_ROOT/bin/arcway"
 assert_file_equals "$UNSUPPORTED_ROOT/expected/guard-amd64" "$UNSUPPORTED_ROOT/lib/guard-assets/arcway-expiry-guard-linux-amd64"
-assert_file_equals "$UNSUPPORTED_ROOT/expected/agent-amd64" "$UNSUPPORTED_ROOT/lib/agent-assets/relaydock-agent-linux-amd64"
 assert_file_equals "$UNSUPPORTED_ROOT/expected/arcway.service" "$UNSUPPORTED_ROOT/systemd/arcway.service"
 assert_file_equals "$UNSUPPORTED_ROOT/expected/version" "$UNSUPPORTED_ROOT/data/.version"
 [ "$(cat "$UNSUPPORTED_ROOT/state/active")" = active ] || fail "unsupported state check stopped the service"
@@ -450,8 +450,8 @@ grep -q '^new-arcway-linux-amd64$' "$SUCCESS_ROOT/bin/arcway" || fail "successfu
 grep -q '^old-binary$' "$SUCCESS_ROOT/bin/arcway.bak" || fail "successful reinstall did not atomically retain prior binary"
 grep -q '^new-arcway-expiry-guard-linux-amd64$' "$SUCCESS_ROOT/lib/guard-assets/arcway-expiry-guard-linux-amd64" || fail "successful reinstall did not replace amd64 guard"
 grep -q '^new-arcway-expiry-guard-linux-arm64$' "$SUCCESS_ROOT/lib/guard-assets/arcway-expiry-guard-linux-arm64" || fail "successful reinstall did not replace arm64 guard"
-grep -q '^new-relaydock-agent-linux-amd64$' "$SUCCESS_ROOT/lib/agent-assets/relaydock-agent-linux-amd64" || fail "successful reinstall did not replace amd64 Agent"
-grep -q '^new-relaydock-agent-linux-arm64$' "$SUCCESS_ROOT/lib/agent-assets/relaydock-agent-linux-arm64" || fail "successful reinstall did not replace arm64 Agent"
+grep -q '^old-agent-amd64$' "$SUCCESS_ROOT/lib/agent-assets/relaydock-agent-linux-amd64" || fail "successful reinstall changed the legacy Agent cache"
+grep -q '^old-agent-arm64$' "$SUCCESS_ROOT/lib/agent-assets/relaydock-agent-linux-arm64" || fail "successful reinstall changed the legacy Agent cache"
 grep -q '^new-relaydock-speedtester-linux-amd64$' "$SUCCESS_ROOT/lib/speedtester-assets/relaydock-speedtester-linux-amd64" || fail "successful reinstall did not replace linux amd64 speedtester"
 grep -q '^new-relaydock-speedtester-linux-arm64$' "$SUCCESS_ROOT/lib/speedtester-assets/relaydock-speedtester-linux-arm64" || fail "successful reinstall did not replace linux arm64 speedtester"
 grep -q '^new-relaydock-speedtester-windows-amd64.exe$' "$SUCCESS_ROOT/lib/speedtester-assets/relaydock-speedtester-windows-amd64.exe" || fail "successful reinstall did not replace windows amd64 speedtester"
@@ -461,7 +461,9 @@ grep -q '^v-test$' "$SUCCESS_ROOT/data/.version" || fail "successful reinstall d
 [ "$(cat "$SUCCESS_ROOT/state/active")" = active ] || fail "successful reinstall is not active"
 [ -s "$SUCCESS_ROOT/verify.log" ] || fail "successful reinstall did not verify staged unit"
 grep -q '^Environment="PORT=19090"$' "$SUCCESS_ROOT/systemd/arcway.service" || fail "explicit PORT did not override the existing port"
-grep -q "^Environment=\"ARCWAY_AGENT_ASSET_DIR=$SUCCESS_ROOT/lib/agent-assets\"$" "$SUCCESS_ROOT/systemd/arcway.service" || fail "reinstall did not preserve the Agent asset directory"
+if grep -q '^Environment="ARCWAY_AGENT_ASSET_DIR=' "$SUCCESS_ROOT/systemd/arcway.service"; then
+    fail "reinstall retained the obsolete Agent asset directory setting"
+fi
 grep -q "^Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=$SUCCESS_ROOT/lib/speedtester-assets\"$" "$SUCCESS_ROOT/systemd/arcway.service" || fail "reinstall did not preserve the speedtester asset directory"
 
 # A non-interactive reinstall keeps the current port when PORT is not provided.
@@ -484,7 +486,6 @@ grep -q '^Environment="PORT=18080"$' "$INHERIT_PORT_ROOT/systemd/arcway.service"
 LEGACY_UPDATE_ROOT="$TEST_ROOT/legacy-update"
 make_old_installation "$LEGACY_UPDATE_ROOT" enabled active
 sed -i '/^Environment="ARCWAY_GUARD_ASSET_DIR=/d' "$LEGACY_UPDATE_ROOT/systemd/arcway.service"
-sed -i '/^Environment="ARCWAY_AGENT_ASSET_DIR=/d' "$LEGACY_UPDATE_ROOT/systemd/arcway.service"
 sed -i "s|^Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=.*|Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=$LEGACY_UPDATE_ROOT/lib/ignored-speedtester-assets\"|" "$LEGACY_UPDATE_ROOT/systemd/arcway.service"
 sed -i "/^\[Service\]/a EnvironmentFile=$LEGACY_UPDATE_ROOT/config/arcway.env" "$LEGACY_UPDATE_ROOT/systemd/arcway.service"
 printf '%s\n' \
@@ -501,10 +502,13 @@ PATH="$MOCK_BIN:/usr/bin:/bin" \
     bash "$INSTALL_SCRIPT" update >"$LEGACY_UPDATE_ROOT/output.log" 2>&1
 grep -q '^new-arcway-linux-amd64$' "$LEGACY_UPDATE_ROOT/bin/arcway" || fail "legacy update did not preserve the binary directory"
 grep -q '^new-arcway-expiry-guard-linux-amd64$' "$LEGACY_UPDATE_ROOT/lib/guard-assets/arcway-expiry-guard-linux-amd64" || fail "legacy update did not preserve the guard directory"
-grep -q '^new-relaydock-agent-linux-amd64$' "$LEGACY_UPDATE_ROOT/lib/agent-assets/relaydock-agent-linux-amd64" || fail "legacy update did not preserve the Agent directory"
+grep -q '^old-agent-amd64$' "$LEGACY_UPDATE_ROOT/lib/agent-assets/relaydock-agent-linux-amd64" || fail "legacy update changed the Agent cache"
 grep -q '^new-relaydock-speedtester-windows-arm64.exe$' "$LEGACY_UPDATE_ROOT/lib/speedtester-assets/relaydock-speedtester-windows-arm64.exe" || fail "legacy update did not preserve the speedtester directory"
 grep -q '^v-test$' "$LEGACY_UPDATE_ROOT/data/.version" || fail "legacy update did not preserve the data directory"
-grep -q "^Environment=\"ARCWAY_AGENT_ASSET_DIR=$LEGACY_UPDATE_ROOT/lib/agent-assets\"$" "$LEGACY_UPDATE_ROOT/systemd/arcway.service" || fail "legacy update did not persist the detected Agent directory"
+if grep -q '^Environment="ARCWAY_AGENT_ASSET_DIR=' "$LEGACY_UPDATE_ROOT/systemd/arcway.service"; then
+    fail "legacy update retained the obsolete Agent asset directory setting"
+fi
+grep -q "^ARCWAY_AGENT_ASSET_DIR=$LEGACY_UPDATE_ROOT/lib/agent-assets$" "$LEGACY_UPDATE_ROOT/config/arcway.env" || fail "legacy update changed the operator EnvironmentFile"
 grep -q "^Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=$LEGACY_UPDATE_ROOT/lib/speedtester-assets\"$" "$LEGACY_UPDATE_ROOT/systemd/arcway.service" || fail "legacy update did not persist the detected speedtester directory"
 [ ! -e "$LEGACY_UPDATE_ROOT/lib/ignored-speedtester-assets" ] || fail "legacy update ignored EnvironmentFile precedence"
 [ "$(cat "$LEGACY_UPDATE_ROOT/state/active")" = active ] || fail "legacy update did not restart the service"
@@ -589,7 +593,7 @@ PATH="$MOCK_BIN:/usr/bin:/bin" \
     bash "$INSTALL_SCRIPT" uninstall >"$UNINSTALL_ROOT/output.log" 2>&1
 [ -f "$UNINSTALL_ROOT/data/arcway.db" ] || fail "non-interactive uninstall deleted data by default"
 [ ! -e "$UNINSTALL_ROOT/bin/arcway" ] || fail "uninstall did not remove the binary"
-[ ! -e "$UNINSTALL_ROOT/lib/agent-assets/relaydock-agent-linux-amd64" ] || fail "uninstall did not remove Agent assets"
+[ -e "$UNINSTALL_ROOT/lib/agent-assets/relaydock-agent-linux-amd64" ] || fail "uninstall removed the legacy Agent cache"
 [ ! -e "$UNINSTALL_ROOT/lib/speedtester-assets/relaydock-speedtester-linux-amd64" ] || fail "uninstall did not remove linux amd64 speedtester"
 [ ! -e "$UNINSTALL_ROOT/lib/speedtester-assets/relaydock-speedtester-linux-arm64" ] || fail "uninstall did not remove linux arm64 speedtester"
 [ ! -e "$UNINSTALL_ROOT/lib/speedtester-assets/relaydock-speedtester-windows-amd64.exe" ] || fail "uninstall did not remove windows amd64 speedtester"

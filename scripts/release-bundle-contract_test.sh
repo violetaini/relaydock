@@ -48,7 +48,7 @@ grep -Fq '"release_id": "v1.2.3"' "$EXTRACT_DIR/relaydock-release.json"
 grep -Fq "\"backend_commit\": \"$MAIN_COMMIT\"" "$EXTRACT_DIR/relaydock-release.json"
 grep -Fq '"api_contract": 1' "$EXTRACT_DIR/relaydock-release.json"
 
-COMPONENT_ASSETS=(
+RELEASE_ASSETS=(
   arcway-linux-amd64
   arcway-linux-arm64
   arcway-darwin-amd64
@@ -63,7 +63,7 @@ COMPONENT_ASSETS=(
   relaydock-speedtester-windows-amd64.exe
   relaydock-speedtester-windows-arm64.exe
 )
-for asset in "${COMPONENT_ASSETS[@]}"; do
+for asset in "${RELEASE_ASSETS[@]}"; do
   printf 'test asset: %s\n' "$asset" >"$BUNDLE_DIR/$asset"
 done
 
@@ -126,6 +126,8 @@ grep -Fq '"web": {' "$BUNDLE_DIR/relaydock-release-manifest.json"
 grep -Fq '"version": "1.2.3"' "$BUNDLE_DIR/relaydock-release-manifest.json"
 grep -Fq '"changed": true' "$BUNDLE_DIR/relaydock-release-manifest.json"
 grep -Fq '"size": ' "$BUNDLE_DIR/relaydock-release-manifest.json"
+grep -Fq 'relaydock-agent-linux-amd64' "$BUNDLE_DIR/checksums.txt"
+grep -Fq 'relaydock-agent-linux-arm64' "$BUNDLE_DIR/checksums.txt"
 grep -Fq 'relaydock-web.tar.gz' "$BUNDLE_DIR/checksums.txt"
 grep -Fq 'relaydock-release-manifest.json' "$BUNDLE_DIR/checksums.txt"
 
@@ -138,7 +140,6 @@ const expected = {
   control_plane: ["1.2.3", 5],
   web: ["v1.2.3", 1],
   guard_assets: ["1.2.3", 2],
-  agent_install_assets: ["89abcdef0123456789abcdef0123456789abcdef", 2],
   speedtester_assets: ["1.2.3", 4],
 };
 
@@ -146,6 +147,9 @@ if (manifest.schema !== 1 || manifest.release_id !== "v1.2.3" ||
     manifest.backend_commit !== "0123456789abcdef0123456789abcdef01234567" ||
     manifest.api_contract !== 1 || Object.keys(components).length !== Object.keys(expected).length) {
   throw new Error("unexpected release manifest header");
+}
+if ("agent_install_assets" in components) {
+  throw new Error("Agent assets must not be panel-managed release components");
 }
 for (const [name, [version, assetCount]] of Object.entries(expected)) {
   const component = components[name];
@@ -184,7 +188,7 @@ func main() {
 	}
 	control := manifest.Components[productrelease.ComponentControlPlane]
 	web := manifest.Components[productrelease.ComponentWeb]
-	if manifest.ReleaseID != "v1.2.3" || control.Version != "1.2.3" || !control.Changed || len(web.Assets) != 1 || web.Assets[0].Name != "relaydock-web.tar.gz" || web.Assets[0].Size < 1 || len(manifest.AssetNames()) != 14 {
+	if manifest.ReleaseID != "v1.2.3" || control.Version != "1.2.3" || !control.Changed || len(web.Assets) != 1 || web.Assets[0].Name != "relaydock-web.tar.gz" || web.Assets[0].Size < 1 || len(manifest.AssetNames()) != 12 {
 		panic(fmt.Sprintf("unexpected manifest: %+v", manifest))
 	}
 	metadataRaw, err := os.ReadFile(os.Args[2])

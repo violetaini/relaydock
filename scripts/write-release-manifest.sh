@@ -6,7 +6,9 @@ usage() {
 usage: write-release-manifest.sh <bundle-dir> <output-file> <release-tag> <backend-commit> <agent-commit> [api-contract]
 
 Stable releases are coordinated product releases: their tag must match the
-control-plane version and all installable components are marked as changed.
+control-plane version and all panel-managed components are marked as changed.
+The Agent commit remains release provenance; Agent binaries are delivered by
+the GitHub Release checksums rather than as a panel-managed component.
 EOF
 }
 
@@ -64,10 +66,6 @@ CONTROL_PLANE_ASSETS=(
 GUARD_ASSETS=(
   arcway-expiry-guard-linux-amd64
   arcway-expiry-guard-linux-arm64
-)
-AGENT_ASSETS=(
-  relaydock-agent-linux-amd64
-  relaydock-agent-linux-arm64
 )
 SPEEDTESTER_ASSETS=(
   relaydock-speedtester-linux-amd64
@@ -127,7 +125,6 @@ write_component() {
 
 CONTROL_PLANE_CHANGED=true
 GUARD_CHANGED=true
-AGENT_CHANGED=true
 SPEEDTESTER_CHANGED=true
 WEB_CHANGED=true
 
@@ -155,8 +152,6 @@ trap cleanup EXIT
   write_component "web" "$RELEASE_TAG" "$WEB_CHANGED" "${FRONTEND_ASSETS[@]}"
   printf ',\n'
   write_component "guard_assets" "$CONTROL_PLANE_VERSION" "$GUARD_CHANGED" "${GUARD_ASSETS[@]}"
-  printf ',\n'
-  write_component "agent_install_assets" "$AGENT_COMMIT" "$AGENT_CHANGED" "${AGENT_ASSETS[@]}"
   printf ',\n'
   write_component "speedtester_assets" "$CONTROL_PLANE_VERSION" "$SPEEDTESTER_CHANGED" "${SPEEDTESTER_ASSETS[@]}"
   printf '\n'

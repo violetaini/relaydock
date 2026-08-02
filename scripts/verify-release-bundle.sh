@@ -104,7 +104,7 @@ SPEEDTESTER_ASSETS=(
   relaydock-speedtester-windows-arm64.exe
 )
 FRONTEND_ASSETS=(relaydock-web.tar.gz)
-COMPONENT_ASSETS=(
+RELEASE_ASSETS=(
   "${CONTROL_PLANE_ASSETS[@]}"
   "${GUARD_ASSETS[@]}"
   "${AGENT_ASSETS[@]}"
@@ -113,7 +113,7 @@ COMPONENT_ASSETS=(
 )
 MANIFEST_FILE=relaydock-release-manifest.json
 CHECKSUM_FILE=checksums.txt
-CHECKSUM_INPUTS=("${COMPONENT_ASSETS[@]}" "$MANIFEST_FILE")
+CHECKSUM_INPUTS=("${RELEASE_ASSETS[@]}" "$MANIFEST_FILE")
 ALLOWED_FILES=("${CHECKSUM_INPUTS[@]}" "$CHECKSUM_FILE")
 
 contains_allowed_file() {
@@ -127,7 +127,7 @@ contains_allowed_file() {
   return 1
 }
 
-for filename in "${COMPONENT_ASSETS[@]}"; do
+for filename in "${RELEASE_ASSETS[@]}"; do
   if [ ! -s "$BUNDLE_DIR/$filename" ] || [ -L "$BUNDLE_DIR/$filename" ]; then
     echo "missing or unsafe release asset: $filename" >&2
     exit 1
@@ -304,4 +304,4 @@ fi
   sha256sum -c "$CHECKSUM_FILE"
 )
 
-echo "Verified ${#COMPONENT_ASSETS[@]} component assets plus release metadata."
+echo "Verified ${#RELEASE_ASSETS[@]} release assets plus release metadata."
