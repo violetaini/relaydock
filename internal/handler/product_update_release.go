@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/violetaini/relaydock/internal/productrelease"
 	"github.com/violetaini/relaydock/internal/runtimepaths"
@@ -62,7 +63,17 @@ func populateProductReleaseInfo(info *UpdateInfo, release GitHubRelease) error {
 	if err != nil {
 		return err
 	}
-	installed, managedRoot, stateWarning := loadCurrentProductState(stateDir, strings.TrimSpace(os.Getenv("ARCWAY_WEB_ROOT")))
+	externalWebRoot := strings.TrimSpace(os.Getenv("ARCWAY_WEB_ROOT"))
+	installed, managedRoot, stateWarning := loadCurrentProductState(stateDir, externalWebRoot)
+	adoptionWarning := ""
+	if stateWarning == "" {
+		adopted, changed, adoptionErr := adoptLegacyEmbeddedProductState(stateDir, externalWebRoot, manifest, assets, info)
+		if adoptionErr != nil {
+			adoptionWarning = "无法记录旧版更新后的产品状态，仍可通过面板执行完整更新。"
+		} else if changed {
+			installed = adopted
+		}
+	}
 	info.productManifest = &manifest
 	info.productAssets = assets
 	info.managedWebRoot = managedRoot
@@ -76,6 +87,9 @@ func populateProductReleaseInfo(info *UpdateInfo, release GitHubRelease) error {
 		info.Warning = appendUpdateWarning(info.Warning, stateWarning)
 		info.productStateUnsafe = true
 	}
+	if adoptionWarning != "" {
+		info.Warning = appendUpdateWarning(info.Warning, adoptionWarning)
+	}
 	if transaction, transactionErr := loadProductUpdateJob(stateDir); transactionErr == nil {
 		info.TransactionState = transaction.Phase
 		info.TargetRelease = targetProductRelease(manifest.ReleaseID, &transaction)
@@ -83,6 +97,75 @@ func populateProductReleaseInfo(info *UpdateInfo, release GitHubRelease) error {
 		info.Warning = appendUpdateWarning(info.Warning, "无法读取上次产品更新事务状态，网页更新已暂停。")
 	}
 	return nil
+}
+
+// adoptLegacyEmbeddedProductState recognizes the last step of the legacy
+// updater. Before product manifests existed, it replaced the control-plane
+// binary and configured Guard/Agent assets in place, but could not record the
+// product transaction state added later. A verified embedded deployment can
+// safely seed that state, avoiding a redundant second update prompt.
+func adoptLegacyEmbeddedProductState(stateDir, externalWebRoot string, manifest productrelease.Manifest, assets map[string]updateReleaseAsset, info *UpdateInfo) (productrelease.InstalledState, bool, error) {
+	if strings.TrimSpace(externalWebRoot) != "" || manifest.ReleaseID != "v"+version.Version {
+		return productrelease.InstalledState{}, false, nil
+	}
+	if _, err := productrelease.LoadInstalledState(stateDir); err == nil {
+		return productrelease.InstalledState{}, false, nil
+	} else if !productrelease.IsNotExist(err) {
+		return productrelease.InstalledState{}, false, err
+	}
+	if _, err := loadProductUpdateJob(stateDir); err == nil {
+		return productrelease.InstalledState{}, false, nil
+	} else if !productrelease.IsNotExist(err) {
+		return productrelease.InstalledState{}, false, err
+	}
+
+	control, hasControl := manifest.Components[productrelease.ComponentControlPlane]
+	web, hasWeb := manifest.Components[productrelease.ComponentWeb]
+	if !hasControl || !hasWeb || !control.Changed || !web.Changed || strings.TrimPrefix(control.Version, "v") != version.Version || control.APIContract != version.APIContract || web.APIContract != version.APIContract {
+		return productrelease.InstalledState{}, false, nil
+	}
+	controlAsset, exists := assets[productBinaryAssetName()]
+	if !exists {
+		return productrelease.InstalledState{}, false, nil
+	}
+	executable, err := os.Executable()
+	if err != nil || verifyReleaseAssetFile(executable, controlAsset) != nil {
+		return productrelease.InstalledState{}, false, nil
+	}
+
+	components := map[string]productrelease.InstalledComponent{
+		productrelease.ComponentControlPlane: {Version: control.Version, APIContract: control.APIContract},
+		productrelease.ComponentWeb:          {Version: web.Version, APIContract: web.APIContract},
+	}
+	adoptLegacyManagedProductComponent(components, productrelease.ComponentGuard, info.guardAssetDir, manifest, assets)
+	adoptLegacyManagedProductComponent(components, productrelease.ComponentAgent, info.agentAssetDir, manifest, assets)
+	adoptLegacyManagedProductComponent(components, productrelease.ComponentSpeedtester, info.speedtesterAssetDir, manifest, assets)
+
+	state := productrelease.InstalledState{
+		Schema:     productrelease.SchemaVersion,
+		ReleaseID:  manifest.ReleaseID,
+		UpdatedAt:  time.Now().UTC(),
+		Components: components,
+	}
+	if err := productrelease.WriteInstalledState(stateDir, state); err != nil {
+		return productrelease.InstalledState{}, false, err
+	}
+	return state, true, nil
+}
+
+func adoptLegacyManagedProductComponent(components map[string]productrelease.InstalledComponent, componentName, assetDir string, manifest productrelease.Manifest, assets map[string]updateReleaseAsset) {
+	component, exists := manifest.Components[componentName]
+	assetDir = strings.TrimSpace(assetDir)
+	if !exists || !component.Changed || assetDir == "" || !filepath.IsAbs(assetDir) {
+		return
+	}
+	for _, declared := range component.Assets {
+		asset, exists := assets[declared.Name]
+		if !exists || verifyReleaseAssetFile(filepath.Join(assetDir, declared.Name), asset) != nil {
+			return
+		}
+	}
+	components[componentName] = productrelease.InstalledComponent{Version: component.Version, APIContract: component.APIContract}
 }
 
 func targetProductRelease(manifestRelease string, transaction *productUpdateJob) string {

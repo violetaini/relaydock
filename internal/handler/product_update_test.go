@@ -59,6 +59,137 @@ func productTestInstalledState(releaseID string, manifest productrelease.Manifes
 	return productrelease.NewInstalledState(releaseID, manifest.Components)
 }
 
+func productTestResolvedAsset(t *testing.T, path, name string) (productrelease.Asset, updateReleaseAsset) {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(content))
+	asset := productrelease.Asset{Name: name, SHA256: digest, Size: int64(len(content))}
+	return asset, updateReleaseAsset{Name: name, SHA256: digest, Size: int64(len(content))}
+}
+
+func productTestWriteResolvedAsset(t *testing.T, directory, name, content string) (productrelease.Asset, updateReleaseAsset) {
+	t.Helper()
+	path := filepath.Join(directory, name)
+	if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return productTestResolvedAsset(t, path, name)
+}
+
+func TestAdoptLegacyEmbeddedProductStateRecordsVerifiedComponents(t *testing.T) {
+	stateDir := t.TempDir()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlAsset, resolvedControl := productTestResolvedAsset(t, executable, productBinaryAssetName())
+	guardDir := t.TempDir()
+	guardAMD64, resolvedGuardAMD64 := productTestWriteResolvedAsset(t, guardDir, "guard-amd64", "guard-amd64")
+	guardARM64, resolvedGuardARM64 := productTestWriteResolvedAsset(t, guardDir, "guard-arm64", "guard-arm64")
+	agentDir := t.TempDir()
+	agentAMD64, resolvedAgentAMD64 := productTestWriteResolvedAsset(t, agentDir, "agent-amd64", "agent-amd64")
+	agentARM64, resolvedAgentARM64 := productTestWriteResolvedAsset(t, agentDir, "agent-arm64", "agent-arm64")
+	webAsset := productTestAsset("relaydock-web.tar.gz")
+
+	manifest := productrelease.Manifest{
+		Schema:    productrelease.SchemaVersion,
+		ReleaseID: "v" + version.Version,
+		Components: map[string]productrelease.Component{
+			productrelease.ComponentControlPlane: {Version: version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{controlAsset}},
+			productrelease.ComponentWeb:          {Version: "v" + version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{webAsset}},
+			productrelease.ComponentGuard:        {Version: version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{guardAMD64, guardARM64}},
+			productrelease.ComponentAgent:        {Version: "legacy-agent-commit", APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{agentAMD64, agentARM64}},
+			productrelease.ComponentSpeedtester:  {Version: version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{productTestAsset("speedtester")}},
+		},
+	}
+	assets := map[string]updateReleaseAsset{
+		resolvedControl.Name:    resolvedControl,
+		resolvedGuardAMD64.Name: resolvedGuardAMD64,
+		resolvedGuardARM64.Name: resolvedGuardARM64,
+		resolvedAgentAMD64.Name: resolvedAgentAMD64,
+		resolvedAgentARM64.Name: resolvedAgentARM64,
+		webAsset.Name:           {Name: webAsset.Name, SHA256: webAsset.SHA256, Size: webAsset.Size},
+		"speedtester":           {Name: "speedtester", SHA256: strings.Repeat("a", 64), Size: 1},
+	}
+	info := &UpdateInfo{guardAssetDir: guardDir, agentAssetDir: agentDir}
+
+	installed, changed, err := adoptLegacyEmbeddedProductState(stateDir, "", manifest, assets, info)
+	if err != nil || !changed {
+		t.Fatalf("legacy adoption changed=%v err=%v", changed, err)
+	}
+	if productReleaseNeedsApply(installed, manifest, info) {
+		t.Fatalf("verified legacy installation remained pending: %+v", installed)
+	}
+	for _, name := range []string{productrelease.ComponentControlPlane, productrelease.ComponentWeb, productrelease.ComponentGuard, productrelease.ComponentAgent} {
+		if _, exists := installed.Components[name]; !exists {
+			t.Fatalf("legacy adoption did not record %s: %+v", name, installed)
+		}
+	}
+	if _, exists := installed.Components[productrelease.ComponentSpeedtester]; exists {
+		t.Fatalf("unconfigured speedtester was recorded: %+v", installed)
+	}
+	persisted, err := productrelease.LoadInstalledState(stateDir)
+	if err != nil || persisted.ReleaseID != manifest.ReleaseID {
+		t.Fatalf("persisted legacy adoption = %+v, %v", persisted, err)
+	}
+}
+
+func TestAdoptLegacyEmbeddedProductStateLeavesUnverifiedOptionalAssetsPending(t *testing.T) {
+	stateDir := t.TempDir()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlAsset, resolvedControl := productTestResolvedAsset(t, executable, productBinaryAssetName())
+	guardDir := t.TempDir()
+	guardAsset, resolvedGuard := productTestWriteResolvedAsset(t, guardDir, "guard", "guard-current")
+	if err := os.WriteFile(filepath.Join(guardDir, guardAsset.Name), []byte("guard-tampered"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	webAsset := productTestAsset("relaydock-web.tar.gz")
+	manifest := productrelease.Manifest{
+		Schema:    productrelease.SchemaVersion,
+		ReleaseID: "v" + version.Version,
+		Components: map[string]productrelease.Component{
+			productrelease.ComponentControlPlane: {Version: version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{controlAsset}},
+			productrelease.ComponentWeb:          {Version: "v" + version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{webAsset}},
+			productrelease.ComponentGuard:        {Version: version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{guardAsset}},
+		},
+	}
+	assets := map[string]updateReleaseAsset{
+		resolvedControl.Name: resolvedControl,
+		resolvedGuard.Name:   resolvedGuard,
+		webAsset.Name:        {Name: webAsset.Name, SHA256: webAsset.SHA256, Size: webAsset.Size},
+	}
+	info := &UpdateInfo{guardAssetDir: guardDir}
+
+	installed, changed, err := adoptLegacyEmbeddedProductState(stateDir, "", manifest, assets, info)
+	if err != nil || !changed {
+		t.Fatalf("legacy adoption changed=%v err=%v", changed, err)
+	}
+	if _, exists := installed.Components[productrelease.ComponentGuard]; exists {
+		t.Fatalf("tampered guard was recorded: %+v", installed)
+	}
+	if !productReleaseNeedsApply(installed, manifest, info) {
+		t.Fatalf("tampered guard was not left pending: %+v", installed)
+	}
+}
+
+func TestAdoptLegacyEmbeddedProductStateDoesNotAdoptExternalFrontend(t *testing.T) {
+	stateDir := t.TempDir()
+	manifest := productTestManifest("v"+version.Version, true, true)
+	installed, changed, err := adoptLegacyEmbeddedProductState(stateDir, "/opt/arcway/web/current", manifest, nil, &UpdateInfo{})
+	if err != nil || changed || len(installed.Components) != 0 {
+		t.Fatalf("external frontend legacy state was adopted: changed=%v installed=%+v err=%v", changed, installed, err)
+	}
+	if _, err := productrelease.LoadInstalledState(stateDir); !productrelease.IsNotExist(err) {
+		t.Fatalf("external frontend created installed state: %v", err)
+	}
+}
+
 func TestProductComponentStatusAllowsTargetControlPlaneAPI(t *testing.T) {
 	manifest := productTestManifest("v1.2.3", true, true)
 	manifest.Components[productrelease.ComponentControlPlane] = productrelease.Component{
