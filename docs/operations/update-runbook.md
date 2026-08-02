@@ -267,6 +267,9 @@ https://<panel-domain>/relaydock-release.json
 6. 通过 `scripts/release-bundle-contract_test.sh` 和
    `scripts/release_transaction_test.sh`，覆盖发布契约、成功切换和健康检查失败回滚。
 7. 发布后在控制面与所有受管服务器检查服务、心跳、流量、实时状态和网页元数据。
+8. 从 `docs/release-notes/TEMPLATE.md` 创建并提交对应的
+   `docs/release-notes/vX.Y.Z.md`。说明必须列出本次更新、兼容性、更新方式、
+   已完成验证和完整变更链接；发布脚本与 GitHub 工作流都会拒绝缺失或仍含占位符的说明。
 
 同名 Git 标签不可重打。若发布被取消、资产不完整或契约校验失败，应修复后使用新的
 版本号重新发布。每次稳定发布和生产验收后，更新

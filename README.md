@@ -244,7 +244,7 @@ systemctl restart arcway
 
 ### 当前版本与验收记录
 
-当前正式产品版本为 [`v0.6.6`](https://github.com/violetaini/relaydock/releases/tag/v0.6.6)。该版本将控制端、前端、到期守卫、Agent 安装资产和 Speedtester 绑定到同一个产品发布清单，并要求清单、Git 标签、后端版本和 API 协议一致。
+当前正式产品版本为 [`v0.6.7`](https://github.com/violetaini/relaydock/releases/tag/v0.6.7)。该版本修复了旧版嵌入式独立安装升级后的产品状态兼容引导，并将控制端、前端、到期守卫、Agent 安装资产和 Speedtester 绑定到同一个产品发布清单，要求清单、Git 标签、后端版本和 API 协议一致。每个 GitHub Release 还会附带对应版本的中文更新说明，说明具体变更和更新方式。
 
 完整的架构、组件边界、发布事务、生产验收、已知限制和后续维护检查项见
 [项目状态与发布进展](docs/project-status.md)。

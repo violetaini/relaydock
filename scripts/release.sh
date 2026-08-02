@@ -17,7 +17,7 @@ if ! gh workflow view build.yml --repo violetaini/relaydock >/dev/null; then
     echo "ERROR: cannot access the release workflow; no commit or tag was created" >&2
     exit 1
 fi
-if ! git diff --quiet || ! git diff --cached --quiet; then
+if [[ -n "$(git status --porcelain)" ]]; then
     echo "ERROR: release requires a clean worktree" >&2
     exit 1
 fi
@@ -30,25 +30,35 @@ case "$BUMP" in
     *) echo "ERROR: expected major, minor, patch, or X.Y.Z" >&2; exit 1 ;;
 esac
 
-if git ls-remote --exit-code --tags origin "refs/tags/v$NEW_VERSION" >/dev/null 2>&1; then
-    echo "ERROR: v$NEW_VERSION already exists on origin; choose a new version" >&2
+RELEASE_TAG="v$NEW_VERSION"
+RELEASE_NOTES="docs/release-notes/$RELEASE_TAG.md"
+if ! bash scripts/verify-release-notes.sh "$RELEASE_TAG"; then
+    echo "ERROR: release notes for $RELEASE_TAG must be complete before creating a tag" >&2
+    exit 1
+fi
+if ! git ls-files --error-unmatch "$RELEASE_NOTES" >/dev/null 2>&1; then
+    echo "ERROR: $RELEASE_NOTES must be committed before creating a tag" >&2
+    exit 1
+fi
+if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+    echo "ERROR: $RELEASE_TAG already exists on origin; choose a new version" >&2
     exit 1
 fi
 
 bash scripts/sync-version.sh "$NEW_VERSION"
 git add internal/version/version.go
 git commit -m "release: v$NEW_VERSION"
-git tag -a "v$NEW_VERSION" -m "RelayDock v$NEW_VERSION"
-git push --atomic origin main "refs/tags/v$NEW_VERSION"
+git tag -a "$RELEASE_TAG" -m "RelayDock $RELEASE_TAG"
+git push --atomic origin main "refs/tags/$RELEASE_TAG"
 
 if ! gh workflow run build.yml \
     --repo violetaini/relaydock \
-    --ref "v$NEW_VERSION" \
+    --ref "$RELEASE_TAG" \
     -f publish=true; then
-    echo "ERROR: v$NEW_VERSION was pushed, but the release workflow was not started." >&2
-    echo "Retry: gh workflow run build.yml --repo violetaini/relaydock --ref v$NEW_VERSION -f publish=true" >&2
+    echo "ERROR: $RELEASE_TAG was pushed, but the release workflow was not started." >&2
+    echo "Retry: gh workflow run build.yml --repo violetaini/relaydock --ref $RELEASE_TAG -f publish=true" >&2
     exit 1
 fi
 
-echo "RelayDock Backend v$NEW_VERSION tagged. The explicitly requested GitHub build has been started."
-echo "Release: https://github.com/violetaini/relaydock/releases/tag/v$NEW_VERSION"
+echo "RelayDock Backend $RELEASE_TAG tagged. The explicitly requested GitHub build has been started."
+echo "Release: https://github.com/violetaini/relaydock/releases/tag/$RELEASE_TAG"

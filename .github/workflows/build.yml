@@ -23,6 +23,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify tagged release notes
+        if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
+        run: scripts/verify-release-notes.sh "$GITHUB_REF_NAME"
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -43,10 +47,13 @@ jobs:
             scripts/verify-release-bundle.sh \
             scripts/release-bundle-contract_test.sh \
             scripts/release_transaction_test.sh \
+            scripts/verify-release-notes.sh \
+            scripts/release-notes-contract_test.sh \
             scripts/deploy-frontend.sh \
             scripts/deploy-frontend_test.sh
           scripts/release-bundle-contract_test.sh
           bash scripts/release_transaction_test.sh
+          bash scripts/release-notes-contract_test.sh
           bash scripts/deploy-frontend_test.sh
 
       - name: Validate release Dockerfile
@@ -367,6 +374,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+
+      - name: Verify release notes
+        run: scripts/verify-release-notes.sh "$GITHUB_REF_NAME"
+
       - name: Download verified release bundle
         uses: actions/download-artifact@v4
         with:
@@ -383,7 +396,8 @@ jobs:
         with:
           draft: false
           prerelease: false
-          generate_release_notes: true
+          generate_release_notes: false
+          body_path: docs/release-notes/${{ github.ref_name }}.md
           files: |
             release/arcway-*
             release/relaydock-agent-linux-*
