@@ -46,7 +46,7 @@ if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2
 fi
 
 bash scripts/sync-version.sh "$NEW_VERSION"
-git add internal/version/version.go
+git add internal/version/version.go cmd/relaydock-speedtester/VERSION
 git commit -m "release: v$NEW_VERSION"
 git tag -a "$RELEASE_TAG" -m "RelayDock $RELEASE_TAG"
 git push --atomic origin main "refs/tags/$RELEASE_TAG"

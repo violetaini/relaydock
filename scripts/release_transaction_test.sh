@@ -10,7 +10,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$TEST_ROOT/scripts" "$TEST_ROOT/internal/version" "$TEST_ROOT/bin" "$TEST_ROOT/docs/release-notes"
+mkdir -p "$TEST_ROOT/scripts" "$TEST_ROOT/internal/version" "$TEST_ROOT/cmd/relaydock-speedtester" "$TEST_ROOT/bin" "$TEST_ROOT/docs/release-notes"
 cp "$SCRIPT_DIR/release.sh" "$SCRIPT_DIR/sync-version.sh" "$SCRIPT_DIR/verify-release-notes.sh" "$TEST_ROOT/scripts/"
 printf 'package version\n\nconst Version = "0.6.6"\n' >"$TEST_ROOT/internal/version/version.go"
 
@@ -111,7 +111,8 @@ fi
 
 PATH="$TEST_ROOT/bin:/usr/bin:/bin" GIT_LOG="$git_log" bash "$TEST_ROOT/scripts/release.sh" 0.6.7 >/dev/null
 grep -Fq 'Version = "0.6.7"' "$TEST_ROOT/internal/version/version.go"
-grep -Fxq 'add internal/version/version.go' "$git_log"
+grep -Fxq '0.6.7' "$TEST_ROOT/cmd/relaydock-speedtester/VERSION"
+grep -Fxq 'add internal/version/version.go cmd/relaydock-speedtester/VERSION' "$git_log"
 grep -Fxq 'commit -m release: v0.6.7' "$git_log"
 grep -Fxq 'tag -a v0.6.7 -m RelayDock v0.6.7' "$git_log"
 grep -Fxq 'push --atomic origin main refs/tags/v0.6.7' "$git_log"
