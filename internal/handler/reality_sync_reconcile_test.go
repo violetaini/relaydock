@@ -267,6 +267,42 @@ func TestReconcileManagedRealityInboundRestoresPublishedClient(t *testing.T) {
 	}
 }
 
+func TestReconcileManagedRealityInboundAddsCompatibilityMinimumWithoutOverwritingCustomValue(t *testing.T) {
+	node := realitySyncStoredNode()
+	admin := map[string]interface{}{
+		"id":    realitySyncStoredUUID,
+		"email": "admin",
+		"flow":  "xtls-rprx-vision",
+	}
+
+	t.Run("missing value is repaired", func(t *testing.T) {
+		inbound := realitySyncInbound([]interface{}{admin})
+		reconciled, changed, managed, err := reconcileManagedRealityInbound(inbound, &node, "admin")
+		if err != nil || !managed || !changed {
+			t.Fatalf("managed=%v changed=%v err=%v, want managed compatibility repair", managed, changed, err)
+		}
+		stream := reconciled["streamSettings"].(map[string]interface{})
+		reality := stream["realitySettings"].(map[string]interface{})
+		if got := reality["minClientVer"]; got != managedRealityMinClientVersion {
+			t.Fatalf("minClientVer=%#v, want %q", got, managedRealityMinClientVersion)
+		}
+	})
+
+	t.Run("explicit value remains untouched", func(t *testing.T) {
+		inbound := realitySyncInbound([]interface{}{admin})
+		stream := inbound["streamSettings"].(map[string]interface{})
+		stream["realitySettings"].(map[string]interface{})["minClientVer"] = "26.3.27"
+		reconciled, changed, managed, err := reconcileManagedRealityInbound(inbound, &node, "admin")
+		if err != nil || !managed || changed {
+			t.Fatalf("managed=%v changed=%v err=%v, want preserved explicit value", managed, changed, err)
+		}
+		reality := reconciled["streamSettings"].(map[string]interface{})["realitySettings"].(map[string]interface{})
+		if got := reality["minClientVer"]; got != "26.3.27" {
+			t.Fatalf("minClientVer=%#v, want explicit value preserved", got)
+		}
+	})
+}
+
 func TestMergeManagedPhysicalNodeConfigLeavesRoutedNodeUntouched(t *testing.T) {
 	parentID := int64(41)
 	routed := realitySyncStoredNode()

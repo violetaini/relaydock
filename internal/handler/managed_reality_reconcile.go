@@ -62,6 +62,7 @@ func reconcileManagedRealityInbound(inbound map[string]interface{}, node *storag
 	if err != nil {
 		return inbound, false, true, fmt.Errorf("clone Reality inbound: %w", err)
 	}
+	compatibilityChanged := applyManagedRealityCompatibilityToInbound(candidate)
 	settings, _ := candidate["settings"].(map[string]interface{})
 	if settings == nil {
 		return inbound, false, true, errorsForRealitySettings()
@@ -102,7 +103,7 @@ func reconcileManagedRealityInbound(inbound map[string]interface{}, node *storag
 	}
 	settings["clients"] = append([]interface{}{newOwner}, remaining...)
 	candidate["settings"] = settings
-	return candidate, !reflect.DeepEqual(candidate, inbound), true, nil
+	return candidate, compatibilityChanged || !reflect.DeepEqual(candidate, inbound), true, nil
 }
 
 func errorsForRealitySettings() error {

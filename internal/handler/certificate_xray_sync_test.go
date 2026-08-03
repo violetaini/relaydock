@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -100,11 +99,11 @@ func TestCertReferencedByManagedXrayPaths(t *testing.T) {
 	}
 }
 
-func TestManagedXrayCertificateMaterialUpdateDeploysAndRestartsReferencedAgent(t *testing.T) {
+func TestManagedXrayCertificateMaterialUpdateDeploysWithoutRestartingReferencedAgent(t *testing.T) {
 	var deploys atomic.Int64
 	var restarts atomic.Int64
 	var deployed WSCertDeployPayload
-	restarted := make(chan struct{}, 1)
+	deployedSignal := make(chan struct{}, 1)
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -116,15 +115,13 @@ func TestManagedXrayCertificateMaterialUpdateDeploysAndRestartsReferencedAgent(t
 			}
 			deploys.Add(1)
 			_, _ = w.Write([]byte(`{"success":true}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/api/child/services/control":
-			restarts.Add(1)
-			_, _ = w.Write([]byte(`{"success":true}`))
-		case r.Method == http.MethodGet && r.URL.Path == "/api/child/services/status":
-			_, _ = w.Write([]byte(`{"xray":{"running":true}}`))
 			select {
-			case restarted <- struct{}{}:
+			case deployedSignal <- struct{}{}:
 			default:
 			}
+		case r.Method == http.MethodPost && r.URL.Path == "/api/child/services/control":
+			restarts.Add(1)
+			http.Error(w, "certificate material updates must not restart Xray", http.StatusInternalServerError)
 		default:
 			http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
 		}
@@ -155,15 +152,20 @@ func TestManagedXrayCertificateMaterialUpdateDeploysAndRestartsReferencedAgent(t
 	h.syncManagedXrayAfterMaterialUpdate(cert, "renewed-certificate", "renewed-key")
 
 	select {
-	case <-restarted:
+	case <-deployedSignal:
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the referenced agent certificate deployment and Xray restart")
+		t.Fatal("timed out waiting for the referenced agent certificate deployment")
 	}
+	// The material update runs in a background task. It holds this mutex for
+	// the whole deployment, so reacquiring it confirms no later service-control
+	// request can be issued by this synchronization pass.
+	h.xrayCertSyncMu.Lock()
+	h.xrayCertSyncMu.Unlock()
 	if got := deploys.Load(); got != 1 {
 		t.Fatalf("certificate deployments = %d, want 1", got)
 	}
-	if got := restarts.Load(); got != 1 {
-		t.Fatalf("Xray restarts = %d, want 1", got)
+	if got := restarts.Load(); got != 0 {
+		t.Fatalf("Xray restarts = %d, want 0 for a content-only certificate update", got)
 	}
 	if deployed.CertPEM != "renewed-certificate" || deployed.KeyPEM != "renewed-key" {
 		t.Fatalf("unexpected renewed certificate material: %#v", deployed)
@@ -176,9 +178,15 @@ func TestManagedXrayCertificateMaterialUpdateDeploysAndRestartsReferencedAgent(t
 	}
 }
 
-func TestManagedXrayCertificateRestartFailureRestoresPreviousMaterial(t *testing.T) {
+func TestManagedXrayCertificateDeploymentFailureRestoresPreviousMaterialWithoutRestart(t *testing.T) {
 	var deployments []WSCertDeployPayload
+	var restarts atomic.Int64
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/child/services/control" {
+			restarts.Add(1)
+			http.Error(w, "certificate rollback must not restart Xray", http.StatusInternalServerError)
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/api/child/cert/deploy" {
 			http.Error(w, "unexpected request", http.StatusNotFound)
 			return
@@ -189,6 +197,10 @@ func TestManagedXrayCertificateRestartFailureRestoresPreviousMaterial(t *testing
 			return
 		}
 		deployments = append(deployments, payload)
+		if len(deployments) == 1 {
+			http.Error(w, "simulated certificate write failure", http.StatusBadGateway)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"success":true}`))
 	}))
@@ -205,26 +217,18 @@ func TestManagedXrayCertificateRestartFailureRestoresPreviousMaterial(t *testing
 
 	h := NewCertificateHandler(repo, nil)
 	h.SetRemoteManage(NewRemoteManageHandler(repo, nil))
-	restarts := 0
-	h.managedXrayRestart = func(context.Context, int64, string) error {
-		restarts++
-		if restarts == 1 {
-			return errors.New("renewed certificate rejected by Xray")
-		}
-		return nil
-	}
 	err := h.deployManagedXrayCert(context.Background(), server, &renewed, previous)
-	if err == nil || !strings.Contains(err.Error(), "renewed certificate rejected") {
-		t.Fatalf("expected renewed certificate restart failure, got %v", err)
-	}
-	if restarts != 2 {
-		t.Fatalf("restart calls=%d want renewed attempt plus rollback recovery", restarts)
+	if err == nil || !strings.Contains(err.Error(), "simulated certificate write failure") {
+		t.Fatalf("expected renewed certificate deployment failure, got %v", err)
 	}
 	if len(deployments) != 2 {
 		t.Fatalf("deployments=%d want renewed and rollback payloads: %#v", len(deployments), deployments)
 	}
 	if deployments[0].CertPEM != renewed.CertPEM || deployments[1].CertPEM != previous.CertPEM {
 		t.Fatalf("unexpected deployment order: %#v", deployments)
+	}
+	if got := restarts.Load(); got != 0 {
+		t.Fatalf("Xray restarts = %d, want 0 during certificate rollback", got)
 	}
 	if !h.needsXrayCertSync(server.ID, &renewed) {
 		t.Fatal("renewed material must remain pending after rollback")

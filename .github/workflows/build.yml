@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  AGENT_SOURCE_SHA: 52d5601484149c4cb80fb80aff248c96bd8e63f8
+  AGENT_SOURCE_SHA: 72d5e90b57909cebc21cb48603c76f3e7328ee19
 
 jobs:
   verify:

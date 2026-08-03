@@ -45,7 +45,6 @@ type CertificateHandler struct {
 	onMasterURLChanged func(ctx context.Context, newURL string)
 	remoteManage       *RemoteManageHandler // 联邦(分享)服务器证书下发时,复用其 ForwardToAgent 走拥有方主控
 	localDeployer      func(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error
-	managedXrayRestart func(ctx context.Context, serverID int64, logPrefix string) error
 	renewals           sync.Map // certificate ID -> in-flight marker
 	xrayCertSyncMu     sync.Mutex
 	xrayCertSynced     sync.Map // "serverID:certID" -> certificate material fingerprint

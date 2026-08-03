@@ -112,45 +112,33 @@ func certReferencedByManagedXrayPaths(cert *storage.Certificate, refs map[string
 	return refs[certPath] == keyPath
 }
 
-func (h *CertificateHandler) restartManagedXray(ctx context.Context, serverID int64, logPrefix string) error {
-	if h.managedXrayRestart != nil {
-		return h.managedXrayRestart(ctx, serverID, logPrefix)
-	}
-	if h.remoteManage == nil {
-		return fmt.Errorf("remote manage handler not initialized")
-	}
-	return h.remoteManage.restartXrayWithRecovery(ctx, serverID, logPrefix)
-}
-
-func (h *CertificateHandler) restoreManagedXrayCert(ctx context.Context, server *storage.RemoteServer, previous *storage.Certificate) error {
+// restoreManagedXrayCertFiles puts the previous PEM pair back at the same
+// panel-managed paths. Xray keeps serving the currently loaded pair while its
+// file watcher observes the replacement, so this deliberately does not
+// restart the process.
+func (h *CertificateHandler) restoreManagedXrayCertFiles(ctx context.Context, server *storage.RemoteServer, previous *storage.Certificate) error {
 	if previous == nil || previous.CertPEM == "" || previous.KeyPEM == "" {
 		return fmt.Errorf("previous certificate material is unavailable")
 	}
-	if _, _, err := h.DeployCertToServerSync(ctx, server, previous); err != nil {
-		return fmt.Errorf("restore previous certificate files: %w", err)
-	}
-	if err := h.restartManagedXray(ctx, server.ID, "CertificateRollback"); err != nil {
+	if _, _, err := h.deployCertToServerSyncLeased(ctx, server, previous); err != nil {
 		h.forgetXrayCertSync(server.ID, previous.ID)
-		return fmt.Errorf("restart Xray with previous certificate: %w", err)
+		return fmt.Errorf("restore previous certificate files: %w", err)
 	}
 	return nil
 }
 
+// deployManagedXrayCert only replaces the PEM contents at paths already
+// referenced by the active/pending Xray snapshot. Xray hot-reloads file-backed
+// TLS certificates, so a content-only renewal must not interrupt proxy traffic
+// by restarting Xray. Snapshot changes such as certificateFile/keyFile path
+// changes are applied by their normal configuration mutation flow.
 func (h *CertificateHandler) deployManagedXrayCert(ctx context.Context, server *storage.RemoteServer, cert, previous *storage.Certificate) error {
 	return h.repo.WithRemoteServerMutationLease(ctx, server.ID, func(leasedCtx context.Context) error {
-		if _, _, err := h.DeployCertToServerSync(leasedCtx, server, cert); err != nil {
+		if _, _, err := h.deployCertToServerSyncLeased(leasedCtx, server, cert); err != nil {
 			h.forgetXrayCertSync(server.ID, cert.ID)
 			if previous != nil && previous.CertPEM != "" && previous.KeyPEM != "" {
-				rollbackErr := h.restoreManagedXrayCert(leasedCtx, server, previous)
+				rollbackErr := h.restoreManagedXrayCertFiles(leasedCtx, server, previous)
 				return errors.Join(fmt.Errorf("deploy renewed certificate: %w", err), rollbackErr)
-			}
-			return err
-		}
-		if err := h.restartManagedXray(leasedCtx, server.ID, "CertificateSync"); err != nil {
-			h.forgetXrayCertSync(server.ID, cert.ID)
-			if previous != nil && previous.CertPEM != "" && previous.KeyPEM != "" {
-				rollbackErr := h.restoreManagedXrayCert(leasedCtx, server, previous)
-				return errors.Join(fmt.Errorf("restart Xray with renewed certificate: %w", err), rollbackErr)
 			}
 			return err
 		}
@@ -203,7 +191,7 @@ func (h *CertificateHandler) syncManagedXrayAfterMaterialUpdate(cert *storage.Ce
 
 // SyncManagedXrayCertificatesOnReconnect runs after the Agent configuration
 // snapshot refresh. A successful unchanged deployment is skipped so ordinary
-// reconnects cannot cause repeated Xray restarts.
+// reconnects cannot cause repeated certificate writes.
 func (h *CertificateHandler) SyncManagedXrayCertificatesOnReconnect(ctx context.Context, serverID int64) {
 	h.xrayCertSyncMu.Lock()
 	defer h.xrayCertSyncMu.Unlock()

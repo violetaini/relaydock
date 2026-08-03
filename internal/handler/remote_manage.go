@@ -2553,6 +2553,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 				inboundReq["mutation_id"] = "managed-inbound:" + uuid.NewString()
 			}
 			applyManagedInboundSniffing(inboundReq)
+			applyManagedRealityCompatibility(inboundReq)
 		} else if action == "remove" {
 			tag := strings.TrimSpace(wireGuardStringValue(inboundReq["tag"]))
 			if tag == "" {
@@ -2999,6 +3000,58 @@ func applyManagedInboundSniffing(request map[string]interface{}) {
 		sniffing["routeOnly"] = false
 	}
 	inbound["sniffing"] = sniffing
+}
+
+const managedRealityMinClientVersion = "1.0.0"
+
+// applyManagedRealityCompatibility keeps panel-created REALITY inbounds usable
+// with Mihomo/Clash Meta when a newer Xray core applies a restrictive implicit
+// minimum client version. A meaningful value supplied by the caller always wins;
+// an empty value is equivalent to omitting the Xray setting and gets the panel
+// compatibility default instead.
+func applyManagedRealityCompatibility(request map[string]interface{}) {
+	if request == nil {
+		return
+	}
+	inbound, _ := request["inbound"].(map[string]interface{})
+	applyManagedRealityCompatibilityToInbound(inbound)
+}
+
+// applyManagedRealityCompatibilityToInbound returns whether it supplied the
+// panel compatibility default. It is shared by create/update handling and
+// managed-node reconciliation so existing panel-owned REALITY inbounds do not
+// retain an implicit minimum after a newer Xray core upgrade.
+func applyManagedRealityCompatibilityToInbound(inbound map[string]interface{}) bool {
+	if inbound == nil {
+		return false
+	}
+	streamSettings, _ := inbound["streamSettings"].(map[string]interface{})
+	if streamSettings == nil {
+		return false
+	}
+	security, _ := streamSettings["security"].(string)
+	if !strings.EqualFold(strings.TrimSpace(security), "reality") {
+		return false
+	}
+	realitySettings, _ := streamSettings["realitySettings"].(map[string]interface{})
+	if realitySettings == nil {
+		return false
+	}
+	if existing, exists := realitySettings["minClientVer"]; exists {
+		switch value := existing.(type) {
+		case string:
+			if strings.TrimSpace(value) != "" {
+				return false
+			}
+		case nil:
+			// JSON null is not a usable explicit version.
+		default:
+			// Preserve malformed explicit values so Xray validation can report them.
+			return false
+		}
+	}
+	realitySettings["minClientVer"] = managedRealityMinClientVersion
+	return true
 }
 
 func (h *RemoteManageHandler) reconcileRemoteInboundOwnershipFromAgent(ctx context.Context, serverID int64, tag string) error {
