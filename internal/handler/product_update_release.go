@@ -82,7 +82,8 @@ func populateProductReleaseInfo(info *UpdateInfo, release GitHubRelease) error {
 	info.APIContract = manifest.Components[productrelease.ComponentWeb].APIContract
 	info.ManagedExternalWeb = strings.TrimSpace(os.Getenv("ARCWAY_WEB_ROOT")) != "" && managedRoot != ""
 	info.HasUpdate = productReleaseNeedsApply(installed, manifest, info)
-	info.Components = productComponentStatuses(installed, manifest, info)
+	info.productInternalComponents = productInternalComponentStatuses(installed, manifest, info)
+	info.Components = visibleProductComponentStatuses(info.productInternalComponents)
 	if stateWarning != "" {
 		info.Warning = appendUpdateWarning(info.Warning, stateWarning)
 		info.productStateUnsafe = true
@@ -138,7 +139,6 @@ func adoptLegacyEmbeddedProductState(stateDir, externalWebRoot string, manifest 
 		productrelease.ComponentWeb:          {Version: web.Version, APIContract: web.APIContract},
 	}
 	adoptLegacyManagedProductComponent(components, productrelease.ComponentGuard, info.guardAssetDir, manifest, assets)
-	adoptLegacyManagedProductComponent(components, productrelease.ComponentSpeedtester, info.speedtesterAssetDir, manifest, assets)
 
 	state := productrelease.InstalledState{
 		Schema:     productrelease.SchemaVersion,
@@ -229,7 +229,7 @@ func loadCurrentProductState(stateDir, externalWebRoot string) (productrelease.I
 	if err == nil {
 		root := managedExternalRoot(externalWebRoot)
 		if strings.TrimSpace(externalWebRoot) != "" && root == "" {
-			return installed, "", "外置前端不是受管发布目录，无法安全执行网页内完整更新。"
+			return installed, "", "当前前端不是受管发布目录，无法安全执行网页内完整更新。"
 		}
 		if root == "" {
 			return installed, root, ""
@@ -241,7 +241,7 @@ func loadCurrentProductState(stateDir, externalWebRoot string) (productrelease.I
 	}
 	root := managedExternalRoot(externalWebRoot)
 	if strings.TrimSpace(externalWebRoot) != "" && root == "" {
-		return legacy, "", "外置前端不是受管发布目录，无法安全执行网页内完整更新。"
+		return legacy, "", "当前前端不是受管发布目录，无法安全执行网页内完整更新。"
 	}
 	if root != "" {
 		metadata, metadataErr := currentManagedWebMetadata(root)
@@ -282,7 +282,7 @@ func currentManagedWebMetadata(root string) (productrelease.WebMetadata, error) 
 		return productrelease.WebMetadata{}, err
 	}
 	if metadata.ReleaseID != releaseID {
-		return productrelease.WebMetadata{}, errors.New("外置前端元数据与当前发布目录不一致")
+		return productrelease.WebMetadata{}, errors.New("前端元数据与当前发布目录不一致")
 	}
 	return metadata, nil
 }
@@ -299,11 +299,16 @@ func managedExternalRoot(externalWebRoot string) string {
 }
 
 func productComponentStatuses(installed productrelease.InstalledState, manifest productrelease.Manifest, info *UpdateInfo) []ProductComponentStatus {
+	return visibleProductComponentStatuses(productInternalComponentStatuses(installed, manifest, info))
+}
+
+// productInternalComponentStatuses retains release dependencies that are
+// applied with the backend but are not separate products in the panel.
+func productInternalComponentStatuses(installed productrelease.InstalledState, manifest productrelease.Manifest, info *UpdateInfo) []ProductComponentStatus {
 	names := []string{
 		productrelease.ComponentControlPlane,
 		productrelease.ComponentWeb,
 		productrelease.ComponentGuard,
-		productrelease.ComponentSpeedtester,
 	}
 	statuses := make([]ProductComponentStatus, 0, len(names))
 	for _, name := range names {
@@ -339,6 +344,38 @@ func productComponentStatuses(installed productrelease.InstalledState, manifest 
 	return statuses
 }
 
+func visibleProductComponentStatuses(internal []ProductComponentStatus) []ProductComponentStatus {
+	statuses := make([]ProductComponentStatus, 0, 2)
+	var guard *ProductComponentStatus
+	for _, component := range internal {
+		switch component.Name {
+		case productrelease.ComponentControlPlane, productrelease.ComponentWeb:
+			statuses = append(statuses, component)
+		case productrelease.ComponentGuard:
+			componentCopy := component
+			guard = &componentCopy
+		}
+	}
+	if guard != nil {
+		for index := range statuses {
+			if statuses[index].Name != productrelease.ComponentControlPlane {
+				continue
+			}
+			// Guard is part of the backend delivery. Reflect an internal Guard
+			// update on the backend row so the release summary remains accurate.
+			if guard.Action != "keep" {
+				statuses[index].Action = "update"
+				statuses[index].Status = "pending"
+			}
+			if guard.Required && !guard.Compatible {
+				statuses[index].Compatible = false
+			}
+		}
+	}
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Name < statuses[j].Name })
+	return statuses
+}
+
 func productReleaseNeedsApply(installed productrelease.InstalledState, manifest productrelease.Manifest, info *UpdateInfo) bool {
 	for name := range manifest.Components {
 		if productComponentNeedsApply(installed, manifest, name, info) {
@@ -363,8 +400,6 @@ func productComponentRequired(name string, info *UpdateInfo) bool {
 		return true
 	case productrelease.ComponentGuard:
 		return strings.TrimSpace(info.guardAssetDir) != ""
-	case productrelease.ComponentSpeedtester:
-		return strings.TrimSpace(info.speedtesterAssetDir) != ""
 	default:
 		return false
 	}
@@ -373,13 +408,11 @@ func productComponentRequired(name string, info *UpdateInfo) bool {
 func productComponentLabel(name string) string {
 	switch name {
 	case productrelease.ComponentControlPlane:
-		return "控制端程序"
+		return "后端"
 	case productrelease.ComponentWeb:
-		return "外置前端"
+		return "前端"
 	case productrelease.ComponentGuard:
-		return "守卫资产"
-	case productrelease.ComponentSpeedtester:
-		return "测速安装资产"
+		return "后端配套资产"
 	default:
 		return name
 	}
@@ -428,7 +461,7 @@ func populateProductUpdateEnvironment(info *UpdateInfo, environment updateEnviro
 	if info.ExternalWebRoot {
 		if !info.ManagedExternalWeb {
 			info.CanApply = false
-			info.Warning = appendUpdateWarning(info.Warning, "外置前端未使用受管发布目录，已禁用网页内完整更新。")
+			info.Warning = appendUpdateWarning(info.Warning, "当前前端未使用受管发布目录，已禁用网页内完整更新。")
 		} else {
 			info.Warning = removeLegacyExternalWebWarning(info.Warning)
 		}
@@ -443,7 +476,7 @@ func populateProductUpdateEnvironment(info *UpdateInfo, environment updateEnviro
 	}
 	if !info.ExternalWebRoot && info.productManifest.Components[productrelease.ComponentWeb].Changed && !info.productManifest.Components[productrelease.ComponentControlPlane].Changed {
 		info.CanApply = false
-		info.Warning = appendUpdateWarning(info.Warning, "嵌入式前端无法单独切换，请使用包含控制端程序的完整发布。")
+		info.Warning = appendUpdateWarning(info.Warning, "内嵌前端无法单独切换，请使用包含后端的完整发布。")
 	}
 	if runtime.GOOS != "linux" && productReleaseRequiresHelper(info) {
 		info.CanApply = false
@@ -470,14 +503,17 @@ func populateProductUpdateEnvironment(info *UpdateInfo, environment updateEnviro
 }
 
 func productReleaseRequiresHelper(info *UpdateInfo) bool {
-	for _, component := range info.Components {
+	components := info.productInternalComponents
+	if len(components) == 0 {
+		components = info.Components
+	}
+	for _, component := range components {
 		if component.Action != "update" {
 			continue
 		}
 		switch component.Name {
 		case productrelease.ComponentControlPlane,
-			productrelease.ComponentGuard,
-			productrelease.ComponentSpeedtester:
+			productrelease.ComponentGuard:
 			return true
 		}
 	}
@@ -505,7 +541,7 @@ func removeLegacyExternalWebWarning(warning string) string {
 	}
 	filtered := make([]string, 0, len(parts))
 	for _, part := range parts {
-		if strings.Contains(part, "外置前端需单独发布") {
+		if strings.Contains(part, "前端需单独发布") {
 			continue
 		}
 		filtered = append(filtered, part)
@@ -528,9 +564,8 @@ func localProductUpdateStatus(environment updateEnvironment) (productRelease str
 		transactionState = job.Phase
 		targetRelease = job.ReleaseID
 		components = productComponentStatuses(installed, job.Manifest, &UpdateInfo{
-			HasUpdate:           !productTransactionTerminal(job.Phase),
-			guardAssetDir:       strings.TrimSpace(os.Getenv("ARCWAY_GUARD_ASSET_DIR")),
-			speedtesterAssetDir: strings.TrimSpace(os.Getenv(speedtesterAssetDirEnv)),
+			HasUpdate:     !productTransactionTerminal(job.Phase),
+			guardAssetDir: strings.TrimSpace(os.Getenv("ARCWAY_GUARD_ASSET_DIR")),
 		})
 		for index := range components {
 			components[index].Status = transactionComponentStatus(job.Phase, components[index])
@@ -548,8 +583,6 @@ func localProductComponentStatuses(installed productrelease.InstalledState) []Pr
 	names := []string{
 		productrelease.ComponentControlPlane,
 		productrelease.ComponentWeb,
-		productrelease.ComponentGuard,
-		productrelease.ComponentSpeedtester,
 	}
 	sort.Strings(names)
 	statuses := make([]ProductComponentStatus, 0, len(names))

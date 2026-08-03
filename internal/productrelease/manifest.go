@@ -19,7 +19,6 @@ const (
 	ComponentControlPlane = "control_plane"
 	ComponentWeb          = "web"
 	ComponentGuard        = "guard_assets"
-	ComponentSpeedtester  = "speedtester_assets"
 )
 
 var (

@@ -45,24 +45,6 @@ RUN mkdir -p /app/guard-assets \
         -o /app/guard-assets/arcway-expiry-guard-linux-arm64 \
         ./cmd/arcway-expiry-guard
 
-RUN mkdir -p /app/speedtester-assets \
-    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-        -trimpath -ldflags="-s -w" \
-        -o /app/speedtester-assets/relaydock-speedtester-linux-amd64 \
-        ./cmd/relaydock-speedtester \
-    && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build \
-        -trimpath -ldflags="-s -w" \
-        -o /app/speedtester-assets/relaydock-speedtester-linux-arm64 \
-        ./cmd/relaydock-speedtester \
-    && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build \
-        -trimpath -ldflags="-s -w" \
-        -o /app/speedtester-assets/relaydock-speedtester-windows-amd64.exe \
-        ./cmd/relaydock-speedtester \
-    && CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build \
-        -trimpath -ldflags="-s -w" \
-        -o /app/speedtester-assets/relaydock-speedtester-windows-arm64.exe \
-        ./cmd/relaydock-speedtester
-
 # Final stage - 用 nginx 官方 Docker base(mainline-bookworm),跟 install-nginx.sh 同款"最新 nginx mainline"语义。
 # 该镜像默认编译 --with-http_v3_module 且静态链 QuicTLS,完整支持 listen ... quic;
 # 之前 debian:bookworm-slim apt 装的 nginx 1.22.1 不带 HTTP/3 模块,EnableHTTPS 写入含 quic 指令的
@@ -100,7 +82,6 @@ RUN groupadd -g 1000 appuser && \
 # Copy binary from builder
 COPY --from=backend-builder /app/server /app/server
 COPY --from=backend-builder /app/guard-assets /app/guard-assets
-COPY --from=backend-builder /app/speedtester-assets /app/speedtester-assets
 
 # Copy rule templates directory
 COPY --from=backend-builder /app/rule_templates /app/rule_templates
@@ -110,7 +91,7 @@ COPY docker-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Set proper ownership for app files
-RUN chown -R appuser:appuser /app/server /app/guard-assets /app/speedtester-assets /app/rule_templates
+RUN chown -R appuser:appuser /app/server /app/guard-assets /app/rule_templates
 
 # Volume for persistent data
 VOLUME ["/app/data", "/app/subscribes"]
@@ -122,7 +103,6 @@ VOLUME ["/app/data", "/app/subscribes"]
 # is preserved.
 ENV BIND_HOST=0.0.0.0
 ENV ARCWAY_GUARD_ASSET_DIR=/app/guard-assets
-ENV ARCWAY_SPEEDTESTER_ASSET_DIR=/app/speedtester-assets
 
 # Expose port
 EXPOSE 12889

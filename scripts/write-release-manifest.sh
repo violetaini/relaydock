@@ -67,12 +67,6 @@ GUARD_ASSETS=(
   arcway-expiry-guard-linux-amd64
   arcway-expiry-guard-linux-arm64
 )
-SPEEDTESTER_ASSETS=(
-  relaydock-speedtester-linux-amd64
-  relaydock-speedtester-linux-arm64
-  relaydock-speedtester-windows-amd64.exe
-  relaydock-speedtester-windows-arm64.exe
-)
 FRONTEND_ASSETS=(relaydock-web.tar.gz)
 
 asset_metadata() {
@@ -125,7 +119,6 @@ write_component() {
 
 CONTROL_PLANE_CHANGED=true
 GUARD_CHANGED=true
-SPEEDTESTER_CHANGED=true
 WEB_CHANGED=true
 
 OUTPUT_DIR="$(dirname "$OUTPUT_FILE")"
@@ -152,8 +145,6 @@ trap cleanup EXIT
   write_component "web" "$RELEASE_TAG" "$WEB_CHANGED" "${FRONTEND_ASSETS[@]}"
   printf ',\n'
   write_component "guard_assets" "$CONTROL_PLANE_VERSION" "$GUARD_CHANGED" "${GUARD_ASSETS[@]}"
-  printf ',\n'
-  write_component "speedtester_assets" "$CONTROL_PLANE_VERSION" "$SPEEDTESTER_CHANGED" "${SPEEDTESTER_ASSETS[@]}"
   printf '\n'
   printf '  }\n'
   printf '}\n'

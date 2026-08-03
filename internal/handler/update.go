@@ -46,34 +46,32 @@ var (
 
 // UpdateInfo包含版本更新信息
 type UpdateInfo struct {
-	CurrentVersion      string                   `json:"current_version"`
-	LatestVersion       string                   `json:"latest_version"`
-	HasUpdate           bool                     `json:"has_update"`
-	ReleaseURL          string                   `json:"release_url"`
-	DownloadURL         string                   `json:"download_url"`
-	ReleaseNotes        string                   `json:"release_notes"`
-	DeploymentMode      string                   `json:"deployment_mode"`
-	UpdateScope         string                   `json:"update_scope"`
-	ExternalWebRoot     bool                     `json:"external_web_root"`
-	CanApply            bool                     `json:"can_apply"`
-	Warning             string                   `json:"warning,omitempty"`
-	ProductRelease      string                   `json:"product_release,omitempty"`
-	TargetRelease       string                   `json:"target_release,omitempty"`
-	APIContract         int                      `json:"api_contract,omitempty"`
-	ManagedExternalWeb  bool                     `json:"managed_external_web"`
-	TransactionState    string                   `json:"transaction_state,omitempty"`
-	Components          []ProductComponentStatus `json:"components,omitempty"`
-	expectedSHA256      string
-	guardAssetDir       string
-	guardAssets         []updateReleaseAsset
-	missingGuards       []string
-	speedtesterAssetDir string
-	speedtesterAssets   []updateReleaseAsset
-	missingSpeedtesters []string
-	productManifest     *productrelease.Manifest
-	productAssets       map[string]updateReleaseAsset
-	managedWebRoot      string
-	productStateUnsafe  bool
+	CurrentVersion            string                   `json:"current_version"`
+	LatestVersion             string                   `json:"latest_version"`
+	HasUpdate                 bool                     `json:"has_update"`
+	ReleaseURL                string                   `json:"release_url"`
+	DownloadURL               string                   `json:"download_url"`
+	ReleaseNotes              string                   `json:"release_notes"`
+	DeploymentMode            string                   `json:"deployment_mode"`
+	UpdateScope               string                   `json:"update_scope"`
+	ExternalWebRoot           bool                     `json:"external_web_root"`
+	CanApply                  bool                     `json:"can_apply"`
+	Warning                   string                   `json:"warning,omitempty"`
+	ProductRelease            string                   `json:"product_release,omitempty"`
+	TargetRelease             string                   `json:"target_release,omitempty"`
+	APIContract               int                      `json:"api_contract,omitempty"`
+	ManagedExternalWeb        bool                     `json:"managed_external_web"`
+	TransactionState          string                   `json:"transaction_state,omitempty"`
+	Components                []ProductComponentStatus `json:"components,omitempty"`
+	expectedSHA256            string
+	guardAssetDir             string
+	guardAssets               []updateReleaseAsset
+	missingGuards             []string
+	productManifest           *productrelease.Manifest
+	productAssets             map[string]updateReleaseAsset
+	productInternalComponents []ProductComponentStatus
+	managedWebRoot            string
+	productStateUnsafe        bool
 }
 
 type updateEnvironment struct {
@@ -160,7 +158,7 @@ func detectUpdateEnvironment(docker bool, externalWebRoot string) updateEnvironm
 	}
 	if external {
 		environment.UpdateScope = updateScopeBackendOnly
-		environment.Warning = "当前使用外置前端目录，外置前端需单独发布。"
+		environment.Warning = "当前使用单独部署的前端，前端需单独发布。"
 	}
 	if runtime.GOOS == "windows" {
 		environment.UpdateScope = updateScopeNone
@@ -172,8 +170,7 @@ func detectUpdateEnvironment(docker bool, externalWebRoot string) updateEnvironm
 
 func currentUpdateEnvironment() updateEnvironment {
 	environment := detectUpdateEnvironment(isDocker(), os.Getenv("ARCWAY_WEB_ROOT"))
-	environment = populateGuardEnvironment(environment, os.Getenv("ARCWAY_GUARD_ASSET_DIR"))
-	return populateSpeedtesterEnvironment(environment, os.Getenv(speedtesterAssetDirEnv))
+	return populateGuardEnvironment(environment, os.Getenv("ARCWAY_GUARD_ASSET_DIR"))
 }
 
 func populateGuardEnvironment(environment updateEnvironment, guardAssetDir string) updateEnvironment {
@@ -185,17 +182,17 @@ func populateGuardEnvironment(environment updateEnvironment, guardAssetDir strin
 		if environment.UpdateScope == updateScopeFull {
 			environment.UpdateScope = updateScopeControlPlane
 		}
-		environment.Warning = appendUpdateWarning(environment.Warning, "未配置守卫资产目录，本次只能更新控制端程序和面板；守卫资产需通过安装脚本更新。")
+		environment.Warning = appendUpdateWarning(environment.Warning, "未配置后端配套文件目录，本次只能更新后端和前端；请通过安装脚本补齐配套文件。")
 		return environment
 	}
 	if !filepath.IsAbs(guardAssetDir) {
 		environment.CanApply = false
 		environment.UpdateScope = updateScopeNone
-		environment.Warning = appendUpdateWarning(environment.Warning, "ARCWAY_GUARD_ASSET_DIR 必须是绝对路径，网页更新已禁用。")
+		environment.Warning = appendUpdateWarning(environment.Warning, "后端配套文件目录无效，网页更新已禁用。")
 		return environment
 	}
 	if environment.ExternalWebRoot && environment.CanApply {
-		environment.Warning = "本次会更新控制端程序和守卫资产；外置前端需单独发布。"
+		environment.Warning = "本次会更新后端；前端需单独发布。"
 	}
 	var missing []string
 	for _, arch := range []string{"amd64", "arm64"} {
@@ -205,23 +202,7 @@ func populateGuardEnvironment(environment updateEnvironment, guardAssetDir strin
 		}
 	}
 	if len(missing) > 0 {
-		environment.Warning = appendUpdateWarning(environment.Warning, "当前守卫资产不完整，将在本次更新中补齐："+strings.Join(missing, "、")+"。")
-	}
-	return environment
-}
-
-func populateSpeedtesterEnvironment(environment updateEnvironment, speedtesterAssetDir string) updateEnvironment {
-	if environment.DeploymentMode == updateDeploymentDocker {
-		return environment
-	}
-	speedtesterAssetDir = strings.TrimSpace(speedtesterAssetDir)
-	if speedtesterAssetDir == "" {
-		return environment
-	}
-	if !filepath.IsAbs(speedtesterAssetDir) {
-		environment.CanApply = false
-		environment.UpdateScope = updateScopeNone
-		environment.Warning = appendUpdateWarning(environment.Warning, "ARCWAY_SPEEDTESTER_ASSET_DIR 必须是绝对路径，网页更新已禁用。")
+		environment.Warning = appendUpdateWarning(environment.Warning, "当前后端配套文件不完整，将在本次更新中补齐。")
 	}
 	return environment
 }
@@ -242,7 +223,7 @@ func populateUpdateEnvironment(info *UpdateInfo, environment updateEnvironment) 
 	}
 	if info.guardAssetDir != "" && len(info.missingGuards) > 0 {
 		info.CanApply = false
-		info.Warning = appendUpdateWarning(info.Warning, "最新发布缺少守卫资产 "+strings.Join(info.missingGuards, "、")+"；为避免版本不一致，网页更新已禁用。")
+		info.Warning = appendUpdateWarning(info.Warning, "最新发布缺少后端配套文件；为避免版本不一致，网页更新已禁用。")
 	}
 }
 
@@ -319,16 +300,13 @@ func validateUpdateForApply(info *UpdateInfo) error {
 }
 
 func updateCompletionMessages(info *UpdateInfo) (string, string) {
-	components := "控制端程序"
+	components := "后端"
 	if !info.ExternalWebRoot {
-		components += "与内嵌面板"
-	}
-	if len(info.guardAssets) == 2 {
-		components += "及守卫资产"
+		components += "和前端"
 	}
 	done := components + "更新完成"
 	if info.ExternalWebRoot {
-		done += "；外置前端未更新"
+		done += "；前端未更新"
 	}
 	return done + "，正在重启服务...", done
 }
@@ -482,7 +460,7 @@ func NewUpdateApplyHandler() http.Handler {
 		}
 		guardFiles, cleanupGuards, err := prepareGuardUpdateFiles(info, nil)
 		if err != nil {
-			writeUpdateError(w, http.StatusBadGateway, fmt.Errorf("准备守卫资产失败，尚未替换任何文件: %w", err))
+			writeUpdateError(w, http.StatusBadGateway, fmt.Errorf("准备后端配套文件失败，尚未替换任何文件: %w", err))
 			return
 		}
 		defer cleanupGuards()
@@ -619,7 +597,7 @@ func NewUpdateApplySSEHandler() http.Handler {
 			if scheduled {
 				sendProgress("health_check", 0, "独立更新事务已启动，正在等待新的控制端完成健康检查...")
 			} else {
-				sendProgress("health_check", 0, "外置前端已切换，正在确认发布状态...")
+				sendProgress("health_check", 0, "前端已切换，正在确认发布状态...")
 			}
 			sendProgress("done", 100, job.Message)
 			return
@@ -656,10 +634,10 @@ func NewUpdateApplySSEHandler() http.Handler {
 			return
 		}
 		guardFiles, cleanupGuards, err := prepareGuardUpdateFiles(info, func(name string) {
-			sendProgress("downloading", 100, "正在下载并校验守卫资产 "+name+"...")
+			sendProgress("downloading", 100, "正在下载并校验后端配套文件 "+name+"...")
 		})
 		if err != nil {
-			sendProgress("error", 0, fmt.Sprintf("准备守卫资产失败，尚未替换任何文件: %v", err))
+			sendProgress("error", 0, fmt.Sprintf("准备后端配套文件失败，尚未替换任何文件: %v", err))
 			return
 		}
 		defer cleanupGuards()
@@ -671,7 +649,7 @@ func NewUpdateApplySSEHandler() http.Handler {
 		}
 
 		// 4. 所有发布文件校验完成后，再统一备份和替换。
-		sendProgress("backing_up", 0, "正在备份控制端程序与配套资产...")
+		sendProgress("backing_up", 0, "正在备份后端与配套文件...")
 		files := append([]preparedUpdateFile{}, guardFiles...)
 		files = append(files, preparedUpdateFile{
 			Name:       "arcway",
@@ -685,7 +663,7 @@ func NewUpdateApplySSEHandler() http.Handler {
 		}
 
 		// 5. 守卫资产先替换、主程序最后替换；任一失败会恢复此前文件。
-		sendProgress("replacing", 0, "正在原子替换控制端程序与配套资产...")
+		sendProgress("replacing", 0, "正在原子替换后端与配套文件...")
 		logger.Info("[系统更新] 正在替换更新文件", "file_count", len(files))
 		if err := installUpdateFiles(files); err != nil {
 			sendProgress("error", 0, fmt.Sprintf("替换失败: %v", err))
@@ -762,15 +740,14 @@ func checkLatestVersion() (*UpdateInfo, error) {
 	hasUpdate := compareVersions(version.Version, latestVersion)
 
 	info := &UpdateInfo{
-		CurrentVersion:      version.Version,
-		LatestVersion:       latestVersion,
-		HasUpdate:           hasUpdate,
-		ReleaseURL:          release.HTMLURL,
-		DownloadURL:         downloadURL,
-		ReleaseNotes:        release.Body,
-		expectedSHA256:      expectedSHA256,
-		guardAssetDir:       strings.TrimSpace(os.Getenv("ARCWAY_GUARD_ASSET_DIR")),
-		speedtesterAssetDir: strings.TrimSpace(os.Getenv(speedtesterAssetDirEnv)),
+		CurrentVersion: version.Version,
+		LatestVersion:  latestVersion,
+		HasUpdate:      hasUpdate,
+		ReleaseURL:     release.HTMLURL,
+		DownloadURL:    downloadURL,
+		ReleaseNotes:   release.Body,
+		expectedSHA256: expectedSHA256,
+		guardAssetDir:  strings.TrimSpace(os.Getenv("ARCWAY_GUARD_ASSET_DIR")),
 	}
 	if info.guardAssetDir != "" {
 		for _, arch := range []string{"amd64", "arm64"} {

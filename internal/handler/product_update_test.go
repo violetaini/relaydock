@@ -98,7 +98,6 @@ func TestAdoptLegacyEmbeddedProductStateRecordsVerifiedComponents(t *testing.T) 
 			productrelease.ComponentControlPlane: {Version: version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{controlAsset}},
 			productrelease.ComponentWeb:          {Version: "v" + version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{webAsset}},
 			productrelease.ComponentGuard:        {Version: version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{guardAMD64, guardARM64}},
-			productrelease.ComponentSpeedtester:  {Version: version.Version, APIContract: version.APIContract, Changed: true, Assets: []productrelease.Asset{productTestAsset("speedtester")}},
 		},
 	}
 	assets := map[string]updateReleaseAsset{
@@ -106,7 +105,6 @@ func TestAdoptLegacyEmbeddedProductStateRecordsVerifiedComponents(t *testing.T) 
 		resolvedGuardAMD64.Name: resolvedGuardAMD64,
 		resolvedGuardARM64.Name: resolvedGuardARM64,
 		webAsset.Name:           {Name: webAsset.Name, SHA256: webAsset.SHA256, Size: webAsset.Size},
-		"speedtester":           {Name: "speedtester", SHA256: strings.Repeat("a", 64), Size: 1},
 	}
 	info := &UpdateInfo{guardAssetDir: guardDir}
 
@@ -121,9 +119,6 @@ func TestAdoptLegacyEmbeddedProductStateRecordsVerifiedComponents(t *testing.T) 
 		if _, exists := installed.Components[name]; !exists {
 			t.Fatalf("legacy adoption did not record %s: %+v", name, installed)
 		}
-	}
-	if _, exists := installed.Components[productrelease.ComponentSpeedtester]; exists {
-		t.Fatalf("unconfigured speedtester was recorded: %+v", installed)
 	}
 	persisted, err := productrelease.LoadInstalledState(stateDir)
 	if err != nil || persisted.ReleaseID != manifest.ReleaseID {
@@ -172,10 +167,12 @@ func TestAdoptLegacyEmbeddedProductStateLeavesUnverifiedOptionalAssetsPending(t 
 	}
 }
 
-func TestLocalProductComponentStatusesSkipsLegacyAgentInstallAssets(t *testing.T) {
+func TestLocalProductComponentStatusesHidesInternalAndLegacyComponents(t *testing.T) {
 	installed := productrelease.InstalledState{
 		Components: map[string]productrelease.InstalledComponent{
 			productrelease.ComponentControlPlane: {Version: version.Version, APIContract: version.APIContract},
+			productrelease.ComponentGuard:        {Version: version.Version, APIContract: version.APIContract},
+			"speedtester_assets":                 {Version: "legacy-speedtester", APIContract: version.APIContract},
 			"agent_install_assets":               {Version: "legacy-agent", APIContract: version.APIContract},
 		},
 	}
@@ -223,7 +220,7 @@ func TestProductComponentStatusAllowsTargetControlPlaneAPI(t *testing.T) {
 	}
 }
 
-func TestProductReleaseRecognizesLaterOptionalAssetSetup(t *testing.T) {
+func TestProductReleaseTreatsGuardAsPartOfBackendStatus(t *testing.T) {
 	manifest := productTestManifest("v1.2.3", false, false)
 	manifest.Components[productrelease.ComponentGuard] = productrelease.Component{
 		Version:     version.Version,
@@ -237,10 +234,26 @@ func TestProductReleaseRecognizesLaterOptionalAssetSetup(t *testing.T) {
 		t.Fatal("newly configured guard assets were not marked for installation")
 	}
 	statuses := productComponentStatuses(installed, manifest, info)
+	if len(statuses) != 2 {
+		t.Fatalf("visible component count = %d, statuses=%+v", len(statuses), statuses)
+	}
 	for _, status := range statuses {
-		if status.Name == productrelease.ComponentGuard && (status.Action != "update" || !status.Required) {
-			t.Fatalf("guard status = %+v", status)
+		if status.Name == productrelease.ComponentGuard {
+			t.Fatalf("guard leaked into visible statuses: %+v", statuses)
 		}
+		if status.Name == productrelease.ComponentControlPlane {
+			if status.Label != "后端" || status.Action != "update" {
+				t.Fatalf("backend did not represent required guard update: %+v", status)
+			}
+		}
+		if status.Name == productrelease.ComponentWeb && status.Label != "前端" {
+			t.Fatalf("frontend label = %+v", status)
+		}
+	}
+	internal := productInternalComponentStatuses(installed, manifest, info)
+	info.productInternalComponents = internal
+	if !productReleaseRequiresHelper(info) {
+		t.Fatalf("guard update did not retain the update helper: %+v", internal)
 	}
 }
 

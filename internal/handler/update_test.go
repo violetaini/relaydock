@@ -58,7 +58,7 @@ func TestDetectUpdateEnvironment(t *testing.T) {
 			scope:       updateScopeBackendOnly,
 			external:    true,
 			canApply:    true,
-			warningPart: "外置前端",
+			warningPart: "前端",
 		},
 		{
 			name:        "docker cannot apply in place",
@@ -105,7 +105,7 @@ func TestPopulateGuardEnvironment(t *testing.T) {
 	if withoutDir.UpdateScope != updateScopeControlPlane || !withoutDir.CanApply {
 		t.Fatalf("unexpected environment without guard dir: %+v", withoutDir)
 	}
-	if !strings.Contains(withoutDir.Warning, "守卫资产目录") {
+	if !strings.Contains(withoutDir.Warning, "后端配套文件目录") {
 		t.Fatalf("missing guard warning: %q", withoutDir.Warning)
 	}
 

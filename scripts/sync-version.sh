@@ -16,5 +16,6 @@ fi
 
 sed -i "s/const Version = \".*\"/const Version = \"$VERSION\"/" \
     "$PROJECT_ROOT/internal/version/version.go"
+printf '%s\n' "$VERSION" > "$PROJECT_ROOT/cmd/relaydock-speedtester/VERSION"
 
-echo "RelayDock Backend version synchronized: $VERSION"
+echo "RelayDock versions synchronized: $VERSION"

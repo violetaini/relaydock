@@ -14,7 +14,6 @@ SERVICE_NAME="arcway"
 DATA_DIR="${ARCWAY_DATA_DIR:-/etc/arcway}"
 CONFIG_DIR="${ARCWAY_CONFIG_DIR:-$DATA_DIR}"
 GUARD_ASSET_DIR="${ARCWAY_GUARD_ASSET_DIR:-/usr/local/lib/arcway/guard-assets}"
-SPEEDTESTER_ASSET_DIR="${ARCWAY_SPEEDTESTER_ASSET_DIR:-/usr/local/lib/arcway/speedtester-assets}"
 SYSTEMD_UNIT_DIR="${ARCWAY_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 SERVICE_FILE="$SYSTEMD_UNIT_DIR/${SERVICE_NAME}.service"
 INSTALL_LOCK_FILE="${ARCWAY_INSTALL_LOCK_FILE:-/run/arcway-install.lock}"
@@ -33,8 +32,6 @@ UPDATE_MANAGED_DIR_MODES=()
 ATOMIC_STAGE_PATHS=()
 GUARD_PARENT_DIR=""
 OLD_GUARD_PARENT_PRESENT=false
-SPEEDTESTER_PARENT_DIR=""
-OLD_SPEEDTESTER_PARENT_PRESENT=false
 PRESERVE_TMP_DIR=false
 
 # 颜色输出
@@ -59,20 +56,16 @@ echo_error() {
 detect_existing_installation_paths() {
     [ -f "$SERVICE_FILE" ] || return 0
 
-    local requested_action=${1:-}
     local existing_exec=""
     local existing_working_dir=""
     local existing_database=""
     local existing_guard_dir=""
-    local existing_speedtester_dir=""
-    local env_file_speedtester_dir=""
     local existing_env_file=""
 
     existing_exec=$(sed -n 's/^ExecStart=\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
     existing_working_dir=$(sed -n 's/^WorkingDirectory=\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
     existing_database=$(sed -n 's/^Environment="DATABASE_PATH=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
     existing_guard_dir=$(sed -n 's/^Environment="ARCWAY_GUARD_ASSET_DIR=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
-    existing_speedtester_dir=$(sed -n 's/^Environment="ARCWAY_SPEEDTESTER_ASSET_DIR=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
     existing_env_file=$(sed -n 's/^EnvironmentFile=-\{0,1\}\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
 
     if [ -n "$existing_env_file" ] && [ -f "$existing_env_file" ]; then
@@ -82,28 +75,12 @@ detect_existing_installation_paths() {
         if [ -z "$existing_guard_dir" ]; then
             existing_guard_dir=$(sed -n 's/^ARCWAY_GUARD_ASSET_DIR=\(.*\)$/\1/p' "$existing_env_file" | head -n 1)
         fi
-        env_file_speedtester_dir=$(sed -n 's/^ARCWAY_SPEEDTESTER_ASSET_DIR=\(.*\)$/\1/p' "$existing_env_file" | tail -n 1)
-        if [ -n "$env_file_speedtester_dir" ]; then
-            env_file_speedtester_dir=${env_file_speedtester_dir#\"}
-            env_file_speedtester_dir=${env_file_speedtester_dir%\"}
-            # systemd EnvironmentFile values override Environment= assignments.
-            existing_speedtester_dir="$env_file_speedtester_dir"
-        fi
     fi
 
     existing_database=${existing_database#\"}
     existing_database=${existing_database%\"}
     existing_guard_dir=${existing_guard_dir#\"}
     existing_guard_dir=${existing_guard_dir%\"}
-    existing_speedtester_dir=${existing_speedtester_dir#\"}
-    existing_speedtester_dir=${existing_speedtester_dir%\"}
-
-    if [ "$requested_action" = update ] && [ "${ARCWAY_SPEEDTESTER_ASSET_DIR+x}" = "x" ] \
-        && [ -n "$env_file_speedtester_dir" ] && [ "$env_file_speedtester_dir" != "$SPEEDTESTER_ASSET_DIR" ]; then
-        echo_error "EnvironmentFile 中的 ARCWAY_SPEEDTESTER_ASSET_DIR 会覆盖目标目录"
-        echo_error "请先将 $existing_env_file 中的值改为 $SPEEDTESTER_ASSET_DIR"
-        return 1
-    fi
 
     if [ "${ARCWAY_INSTALL_DIR+x}" != "x" ] && [ -n "$existing_exec" ] && [ "$(basename "$existing_exec")" = "$SERVICE_NAME" ]; then
         INSTALL_DIR=$(dirname "$existing_exec")
@@ -122,14 +99,6 @@ detect_existing_installation_paths() {
     fi
     if [ "${ARCWAY_GUARD_ASSET_DIR+x}" != "x" ] && [ -n "$existing_guard_dir" ]; then
         GUARD_ASSET_DIR="$existing_guard_dir"
-    fi
-    if [ "${ARCWAY_SPEEDTESTER_ASSET_DIR+x}" != "x" ]; then
-        if [ -n "$existing_speedtester_dir" ]; then
-            SPEEDTESTER_ASSET_DIR="$existing_speedtester_dir"
-        elif [ -n "$existing_exec" ] && [ -d "$(dirname "$existing_exec")/speedtester-assets" ]; then
-            # Pre-variable installations may keep assets beside the panel binary.
-            SPEEDTESTER_ASSET_DIR="$(dirname "$existing_exec")/speedtester-assets"
-        fi
     fi
 
     if [ -n "$existing_exec" ]; then
@@ -302,17 +271,6 @@ download_binary() {
         fi
     done
 
-    for speedtester in \
-        relaydock-speedtester-linux-amd64 \
-        relaydock-speedtester-linux-arm64 \
-        relaydock-speedtester-windows-amd64.exe \
-        relaydock-speedtester-windows-arm64.exe; do
-        if ! wget -q "https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${speedtester}" -O "$TMP_DIR/$speedtester"; then
-            echo_error "下载 RelayDock speedtester 失败: $speedtester"
-            exit 1
-        fi
-    done
-
     if ! wget -q "https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/checksums.txt" -O "$TMP_DIR/checksums.txt"; then
         echo_error "下载校验和失败"
         exit 1
@@ -320,11 +278,7 @@ download_binary() {
     for asset in \
         "$BINARY_NAME" \
         arcway-expiry-guard-linux-amd64 \
-        arcway-expiry-guard-linux-arm64 \
-        relaydock-speedtester-linux-amd64 \
-        relaydock-speedtester-linux-arm64 \
-        relaydock-speedtester-windows-amd64.exe \
-        relaydock-speedtester-windows-arm64.exe; do
+        arcway-expiry-guard-linux-arm64; do
         expected=$(awk -v name="$asset" '$2 == name { print $1; exit }' "$TMP_DIR/checksums.txt")
         actual=$(sha256sum "$TMP_DIR/$asset" | awk '{ print $1 }')
         if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
@@ -353,23 +307,6 @@ install_binary() {
         guard_index=$((guard_index + 1))
         if [ "$guard_index" -eq 1 ]; then
             if ! arcway_test_failpoint after_first_guard_swap; then
-                return 1
-            fi
-        fi
-    done
-    install -d -m 0755 "$SPEEDTESTER_ASSET_DIR"
-    speedtester_index=0
-    for speedtester in \
-        relaydock-speedtester-linux-amd64 \
-        relaydock-speedtester-linux-arm64 \
-        relaydock-speedtester-windows-amd64.exe \
-        relaydock-speedtester-windows-arm64.exe; do
-        if ! atomic_install_file "$TMP_DIR/$speedtester" "$SPEEDTESTER_ASSET_DIR/$speedtester" 0755; then
-            return 1
-        fi
-        speedtester_index=$((speedtester_index + 1))
-        if [ "$speedtester_index" -eq 1 ]; then
-            if ! arcway_test_failpoint after_first_speedtester_swap; then
                 return 1
             fi
         fi
@@ -440,10 +377,6 @@ begin_update_transaction() {
         "$INSTALL_DIR/${SERVICE_NAME}.bak"
         "$GUARD_ASSET_DIR/arcway-expiry-guard-linux-amd64"
         "$GUARD_ASSET_DIR/arcway-expiry-guard-linux-arm64"
-        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-linux-amd64"
-        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-linux-arm64"
-        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-windows-amd64.exe"
-        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-windows-arm64.exe"
         "$SERVICE_FILE"
         "$DATA_DIR/.version"
     )
@@ -453,18 +386,11 @@ begin_update_transaction() {
     track_transaction_directory "$DATA_DIR"
     track_transaction_directory "$CONFIG_DIR"
     track_transaction_directory "$GUARD_ASSET_DIR"
-    track_transaction_directory "$SPEEDTESTER_ASSET_DIR"
     GUARD_PARENT_DIR=$(dirname "$GUARD_ASSET_DIR")
     OLD_GUARD_PARENT_PRESENT=false
     if [ -d "$GUARD_PARENT_DIR" ]; then
         OLD_GUARD_PARENT_PRESENT=true
     fi
-    SPEEDTESTER_PARENT_DIR=$(dirname "$SPEEDTESTER_ASSET_DIR")
-    OLD_SPEEDTESTER_PARENT_PRESENT=false
-    if [ -d "$SPEEDTESTER_PARENT_DIR" ]; then
-        OLD_SPEEDTESTER_PARENT_PRESENT=true
-    fi
-
     for tracked_path in "${UPDATE_TRACKED_PATHS[@]}"; do
         backup_path="$UPDATE_BACKUP_DIR$tracked_path"
         mkdir -p "$(dirname "$backup_path")"
@@ -636,10 +562,6 @@ rollback_update_transaction() {
     if [ "$OLD_GUARD_PARENT_PRESENT" = false ] && [ -n "$GUARD_PARENT_DIR" ]; then
         rmdir "$GUARD_PARENT_DIR" >/dev/null 2>&1 || true
     fi
-    if [ "$OLD_SPEEDTESTER_PARENT_PRESENT" = false ] && [ -n "$SPEEDTESTER_PARENT_DIR" ]; then
-        rmdir "$SPEEDTESTER_PARENT_DIR" >/dev/null 2>&1 || true
-    fi
-
     if ! systemctl daemon-reload >/dev/null 2>&1; then
         rollback_failed=true
     fi
@@ -770,7 +692,6 @@ Environment="PORT=$PORT_INPUT"
 Environment="DATABASE_PATH=$DATA_DIR/data/arcway.db"
 Environment="LOG_LEVEL=info"
 Environment="ARCWAY_GUARD_ASSET_DIR=$GUARD_ASSET_DIR"
-Environment="ARCWAY_SPEEDTESTER_ASSET_DIR=$SPEEDTESTER_ASSET_DIR"
 Environment="ARCWAY_PANEL_IPS=$PANEL_SOURCE_IPS"
 
 # 安全选项
@@ -818,34 +739,11 @@ update_systemd_service_settings() {
         fi
     fi
 
-    # Agent binaries are fetched directly from the matching GitHub Release by
-    # the remote installer. Drop the obsolete panel-local unit setting, but do
-    # not touch a legacy asset directory or operator-managed EnvironmentFile.
+    # Agent and speedtester binaries are fetched directly from GitHub by their
+    # own installers. Drop obsolete panel-local unit settings, but do not
+    # touch a legacy asset directory or operator-managed EnvironmentFile.
     sed -i '/^Environment="ARCWAY_AGENT_ASSET_DIR=/d' "$staged_unit"
-
-    speedtester_env_file=$(sed -n 's/^EnvironmentFile=-\{0,1\}\([^[:space:]]*\).*$/\1/p' "$staged_unit" | head -n 1)
-    speedtester_env_file=${speedtester_env_file#\"}
-    speedtester_env_file=${speedtester_env_file%\"}
-    env_file_speedtester_dir=""
-    if [ -n "$speedtester_env_file" ] && [ -f "$speedtester_env_file" ]; then
-        env_file_speedtester_dir=$(sed -n 's/^ARCWAY_SPEEDTESTER_ASSET_DIR=\(.*\)$/\1/p' "$speedtester_env_file" | tail -n 1)
-        env_file_speedtester_dir=${env_file_speedtester_dir#\"}
-        env_file_speedtester_dir=${env_file_speedtester_dir%\"}
-    fi
-    if [ -n "$env_file_speedtester_dir" ] && [ "$env_file_speedtester_dir" != "$SPEEDTESTER_ASSET_DIR" ]; then
-        echo_error "EnvironmentFile 中的 ARCWAY_SPEEDTESTER_ASSET_DIR 会覆盖目标目录"
-        echo_error "请先将 $speedtester_env_file 中的值改为 $SPEEDTESTER_ASSET_DIR"
-        return 1
-    fi
-
-    escaped_speedtester_asset_dir=$(printf '%s' "$SPEEDTESTER_ASSET_DIR" | sed 's/[&|\\]/\\&/g')
-    if grep -q '^Environment="ARCWAY_SPEEDTESTER_ASSET_DIR=' "$staged_unit"; then
-        sed -i "s|^Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=.*\"$|Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=$escaped_speedtester_asset_dir\"|" "$staged_unit"
-    elif grep -q '^Environment="ARCWAY_GUARD_ASSET_DIR=' "$staged_unit"; then
-        sed -i "/^Environment=\"ARCWAY_GUARD_ASSET_DIR=/a Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=$escaped_speedtester_asset_dir\"" "$staged_unit"
-    else
-        sed -i "/^\[Install\]/i Environment=\"ARCWAY_SPEEDTESTER_ASSET_DIR=$escaped_speedtester_asset_dir\"" "$staged_unit"
-    fi
+    sed -i '/^Environment="ARCWAY_SPEEDTESTER_ASSET_DIR=/d' "$staged_unit"
 
     if ! verify_and_commit_systemd_unit "$staged_unit"; then
         return 1
@@ -1043,12 +941,8 @@ uninstall_service() {
     rm -f "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak"
     rm -f "$INSTALL_DIR"/.arcway.arcway-stage.*
     rm -rf "$GUARD_ASSET_DIR"
-    rm -f \
-        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-linux-amd64" \
-        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-linux-arm64" \
-        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-windows-amd64.exe" \
-        "$SPEEDTESTER_ASSET_DIR/relaydock-speedtester-windows-arm64.exe"
-    rmdir "$SPEEDTESTER_ASSET_DIR" >/dev/null 2>&1 || true
+    # Legacy speedtester assets are intentionally left untouched. They are no
+    # longer managed by the panel and may be owned by an operator.
     echo_info "✓ 程序文件已删除"
     echo ""
 

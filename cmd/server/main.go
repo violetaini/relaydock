@@ -642,7 +642,6 @@ func main() {
 	speedTesterWS := handler.NewSpeedTesterWSHandler(repo)
 	speedTesterWS.SetCapabilityManager(capabilityManager)
 	mux.Handle("/api/speedtest/tester/ws", speedTesterWS) // 家用测速端反向连入(token 认证,无 JWT)
-	mux.Handle("/api/public/relaydock-speedtester/", handler.NewSpeedtesterAssetHandler())
 	speedTestHandler := handler.NewSpeedTestHandler(repo, capabilityManager)
 	speedTestHandler.SetTesterWS(speedTesterWS)
 	mux.Handle("/api/admin/speedtest/", auth.RequireAdmin(tokenStore, userRepo, speedTestHandler))

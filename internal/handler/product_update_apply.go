@@ -128,7 +128,7 @@ func applyProductRelease(info *UpdateInfo, onProgress func(step string, progress
 	}
 
 	if onProgress != nil {
-		onProgress("activating", 0, "正在原子切换已验证的外置前端...")
+		onProgress("activating", 0, "正在原子切换已验证的前端...")
 	}
 	webLock, err := acquireProductWebLock(web.Root)
 	if err != nil {
@@ -142,7 +142,7 @@ func applyProductRelease(info *UpdateInfo, onProgress func(step string, progress
 	}
 	job.Activation = &activation
 	job.RollbackReady = true
-	if err := setProductUpdatePhase(&job, "activating", "已记录前端回滚点，正在原子切换已验证的外置前端..."); err != nil {
+	if err := setProductUpdatePhase(&job, "activating", "已记录前端回滚点，正在原子切换已验证的前端..."); err != nil {
 		_ = failProductUpdateJob(&job, err)
 		return productUpdateJob{}, false, err
 	}
@@ -156,7 +156,7 @@ func applyProductRelease(info *UpdateInfo, onProgress func(step string, progress
 		return productUpdateJob{}, false, rollbackWebOnlyProductUpdate(&job, fmt.Errorf("record installed product release: %w", err))
 	}
 	job.Phase = "committed"
-	job.Message = "外置前端已更新并与当前控制端 API 兼容"
+	job.Message = "前端已更新并与当前后端 API 兼容"
 	job.Error = ""
 	if err := writeProductUpdateJob(job); err != nil {
 		return productUpdateJob{}, false, rollbackWebOnlyProductUpdate(&job, fmt.Errorf("commit frontend product release: %w", err))
@@ -169,10 +169,10 @@ func validateProductUpdateForApply(info *UpdateInfo) error {
 		return errors.New("产品发布清单不可用")
 	}
 	if info.ExternalWebRoot && !info.ManagedExternalWeb {
-		return errors.New("外置前端不是受管发布目录，不能由网页安全更新")
+		return errors.New("当前前端不是受管发布目录，不能由网页安全更新")
 	}
 	if !info.ExternalWebRoot && info.productManifest.Components[productrelease.ComponentWeb].Changed && !info.productManifest.Components[productrelease.ComponentControlPlane].Changed {
-		return errors.New("嵌入式前端无法单独切换，请使用包含控制端程序的完整发布")
+		return errors.New("内嵌前端无法单独切换，请使用包含后端的完整发布")
 	}
 	if runtime.GOOS != "linux" && productReleaseRequiresHelper(info) {
 		return errors.New("当前操作系统不支持 systemd 事务更新")
@@ -230,14 +230,6 @@ func prepareProductUpdateFiles(info *UpdateInfo, transactionID string, onProgres
 	}); err != nil {
 		return nil, nil, err
 	}
-	if err := appendManaged(productrelease.ComponentSpeedtester, info.speedtesterAssetDir, []productAssetSpecification{
-		{Name: "relaydock-speedtester-linux-amd64", GOOS: "linux", GOARCH: "amd64"},
-		{Name: "relaydock-speedtester-linux-arm64", GOOS: "linux", GOARCH: "arm64"},
-		{Name: "relaydock-speedtester-windows-amd64.exe", GOOS: "windows", GOARCH: "amd64"},
-		{Name: "relaydock-speedtester-windows-arm64.exe", GOOS: "windows", GOARCH: "arm64"},
-	}); err != nil {
-		return nil, nil, err
-	}
 
 	control := manifest.Components[productrelease.ComponentControlPlane]
 	if control.Changed {
@@ -246,7 +238,7 @@ func prepareProductUpdateFiles(info *UpdateInfo, transactionID string, onProgres
 			return nil, nil, fmt.Errorf("产品发布缺少此平台控制端资产 %s", productBinaryAssetName())
 		}
 		if onProgress != nil {
-			onProgress("downloading", 0, "正在下载并校验控制端程序...")
+			onProgress("downloading", 0, "正在下载并校验后端...")
 		}
 		source, err := stageProductReleaseAsset(info, transactionID, asset)
 		if err != nil {
@@ -298,7 +290,7 @@ func prepareProductWebRelease(info *UpdateInfo, transactionID string, onProgress
 		return nil, false, nil
 	}
 	if !info.ManagedExternalWeb || info.managedWebRoot == "" {
-		return nil, false, errors.New("外置前端不是受管发布目录")
+		return nil, false, errors.New("当前前端不是受管发布目录")
 	}
 	if len(web.Assets) != 1 {
 		return nil, false, errors.New("前端发布必须恰好包含一个归档")
@@ -308,7 +300,7 @@ func prepareProductWebRelease(info *UpdateInfo, transactionID string, onProgress
 		return nil, false, errors.New("前端发布归档不存在")
 	}
 	if onProgress != nil {
-		onProgress("staging_web", 0, "正在下载、校验并暂存外置前端...")
+		onProgress("staging_web", 0, "正在下载、校验并暂存前端...")
 	}
 	archive, err := stageProductReleaseAsset(info, transactionID, asset)
 	if err != nil {
@@ -324,7 +316,7 @@ func prepareProductWebRelease(info *UpdateInfo, transactionID string, onProgress
 		return nil, false, err
 	}
 	if onProgress != nil {
-		onProgress("staging_web", 100, "外置前端已完成校验并暂存，尚未切换线上页面。")
+		onProgress("staging_web", 100, "前端已完成校验并暂存，尚未切换线上页面。")
 	}
 	return &productWebPreparation{Root: info.managedWebRoot, Staging: staging, Metadata: metadata}, true, nil
 }

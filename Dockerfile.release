@@ -14,10 +14,9 @@ RUN set -eux; \
     case "$TARGETARCH" in amd64|arm64) ;; *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; esac; \
     sha256sum -c checksums.txt; \
     test -s "arcway-linux-$TARGETARCH"; \
-    mkdir -p /image/guard-assets /image/speedtester-assets; \
+    mkdir -p /image/guard-assets; \
     install -m 0755 "arcway-linux-$TARGETARCH" /image/server; \
     install -m 0755 arcway-expiry-guard-linux-* /image/guard-assets/; \
-    install -m 0755 relaydock-speedtester-linux-* relaydock-speedtester-windows-* /image/speedtester-assets/; \
     install -m 0644 checksums.txt /image/release-checksums.txt
 
 # Keep the runtime identical to the source-built image. Only the compilation
@@ -44,7 +43,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=release-assets --chown=1000:1000 /image/server /app/server
 COPY --from=release-assets --chown=1000:1000 /image/guard-assets /app/guard-assets
-COPY --from=release-assets --chown=1000:1000 /image/speedtester-assets /app/speedtester-assets
 COPY --from=release-assets /image/release-checksums.txt /app/release-checksums.txt
 COPY --chown=1000:1000 rule_templates /app/rule_templates
 COPY docker-entrypoint.sh /entrypoint.sh
@@ -54,7 +52,6 @@ VOLUME ["/app/data", "/app/subscribes"]
 
 ENV BIND_HOST=0.0.0.0
 ENV ARCWAY_GUARD_ASSET_DIR=/app/guard-assets
-ENV ARCWAY_SPEEDTESTER_ASSET_DIR=/app/speedtester-assets
 
 EXPOSE 12889
 

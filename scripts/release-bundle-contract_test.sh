@@ -140,7 +140,6 @@ const expected = {
   control_plane: ["1.2.3", 5],
   web: ["v1.2.3", 1],
   guard_assets: ["1.2.3", 2],
-  speedtester_assets: ["1.2.3", 4],
 };
 
 if (manifest.schema !== 1 || manifest.release_id !== "v1.2.3" ||
@@ -188,7 +187,7 @@ func main() {
 	}
 	control := manifest.Components[productrelease.ComponentControlPlane]
 	web := manifest.Components[productrelease.ComponentWeb]
-	if manifest.ReleaseID != "v1.2.3" || control.Version != "1.2.3" || !control.Changed || len(web.Assets) != 1 || web.Assets[0].Name != "relaydock-web.tar.gz" || web.Assets[0].Size < 1 || len(manifest.AssetNames()) != 12 {
+	if manifest.ReleaseID != "v1.2.3" || control.Version != "1.2.3" || !control.Changed || len(web.Assets) != 1 || web.Assets[0].Name != "relaydock-web.tar.gz" || web.Assets[0].Size < 1 || len(manifest.AssetNames()) != 8 {
 		panic(fmt.Sprintf("unexpected manifest: %+v", manifest))
 	}
 	metadataRaw, err := os.ReadFile(os.Args[2])
