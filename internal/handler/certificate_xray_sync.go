@@ -50,10 +50,28 @@ func managedXrayCertPaths(domain string) (string, string) {
 	return path.Join(managedXrayCertDir, name+".pem"), path.Join(managedXrayCertDir, name+".key")
 }
 
+type managedXrayCertReference struct {
+	keyPath        string
+	oneTimeLoading bool
+}
+
 // collectManagedXrayCertPaths accepts only certificate/key pairs below the
 // panel-managed directory. User-managed paths are deliberately not touched.
 func collectManagedXrayCertPaths(configJSON string) map[string]string {
+	details := collectManagedXrayCertReferences(configJSON)
 	refs := make(map[string]string)
+	for certPath, reference := range details {
+		refs[certPath] = reference.keyPath
+	}
+	return refs
+}
+
+// collectManagedXrayCertReferences also records whether the surrounding TLS
+// configuration disables Xray's certificate file watcher. oneTimeLoading may
+// live on the certificate object or its enclosing TLS settings, so the walk
+// carries that flag to nested certificate references.
+func collectManagedXrayCertReferences(configJSON string) map[string]managedXrayCertReference {
+	refs := make(map[string]managedXrayCertReference)
 	if strings.TrimSpace(configJSON) == "" {
 		return refs
 	}
@@ -63,28 +81,37 @@ func collectManagedXrayCertPaths(configJSON string) map[string]string {
 		return refs
 	}
 
-	var walk func(any)
-	walk = func(value any) {
+	var walk func(any, bool)
+	walk = func(value any, inheritedOneTimeLoading bool) {
 		switch node := value.(type) {
 		case map[string]any:
+			oneTimeLoading := inheritedOneTimeLoading
+			if configured, ok := node["oneTimeLoading"].(bool); ok && configured {
+				oneTimeLoading = true
+			}
 			certPath, _ := node["certificateFile"].(string)
 			keyPath, _ := node["keyFile"].(string)
 			certPath = path.Clean(strings.TrimSpace(certPath))
 			keyPath = path.Clean(strings.TrimSpace(keyPath))
 			if strings.HasPrefix(certPath, managedXrayCertDir+"/") &&
 				strings.HasPrefix(keyPath, managedXrayCertDir+"/") {
-				refs[certPath] = keyPath
+				if existing, exists := refs[certPath]; !exists || existing.keyPath == keyPath {
+					refs[certPath] = managedXrayCertReference{
+						keyPath:        keyPath,
+						oneTimeLoading: oneTimeLoading || existing.oneTimeLoading,
+					}
+				}
 			}
 			for _, child := range node {
-				walk(child)
+				walk(child, oneTimeLoading)
 			}
 		case []any:
 			for _, child := range node {
-				walk(child)
+				walk(child, inheritedOneTimeLoading)
 			}
 		}
 	}
-	walk(root)
+	walk(root, false)
 	return refs
 }
 
@@ -112,15 +139,54 @@ func certReferencedByManagedXrayPaths(cert *storage.Certificate, refs map[string
 	return refs[certPath] == keyPath
 }
 
+func (h *CertificateHandler) managedXrayCertificateUsesOneTimeLoading(ctx context.Context, serverID int64, cert *storage.Certificate) bool {
+	if cert == nil {
+		return false
+	}
+	current, err := h.repo.GetCurrentXraySnapshot(ctx, serverID)
+	if err != nil || current == nil {
+		return false
+	}
+	certPath, keyPath := managedXrayCertPaths(cert.Domain)
+	reference, found := collectManagedXrayCertReferences(current.ConfigJSON)[certPath]
+	return found && reference.keyPath == keyPath && reference.oneTimeLoading
+}
+
+// managedXrayCertificateReloadTarget keeps the normal renewal path strictly
+// non-disruptive. A user can explicitly set oneTimeLoading, which disables
+// Xray's file watcher; in that exceptional case an active Xray needs one
+// controlled restart to load the replacement. A stopped or unreachable Xray
+// is never started for a certificate update: it will read the new files when
+// the user starts it later.
+func (h *CertificateHandler) managedXrayCertificateReloadTarget(ctx context.Context, server *storage.RemoteServer, cert *storage.Certificate) string {
+	if server == nil || !h.managedXrayCertificateUsesOneTimeLoading(ctx, server.ID, cert) {
+		return "none"
+	}
+	if h.remoteManage == nil {
+		log.Printf("[Certificate] %s on server %d uses oneTimeLoading; leaving files pending because live Xray status is unavailable", cert.Domain, server.ID)
+		return "none"
+	}
+	status, err := h.remoteManage.remoteXrayServiceStatus(ctx, server.ID)
+	if err != nil || status == nil || !status.Running {
+		if err != nil {
+			log.Printf("[Certificate] %s on server %d uses oneTimeLoading; leaving files pending because Xray status is unavailable: %v", cert.Domain, server.ID, err)
+		} else {
+			log.Printf("[Certificate] %s on server %d uses oneTimeLoading while Xray is stopped; new files will load on the next user start", cert.Domain, server.ID)
+		}
+		return "none"
+	}
+	return "xray"
+}
+
 // restoreManagedXrayCertFiles puts the previous PEM pair back at the same
 // panel-managed paths. Xray keeps serving the currently loaded pair while its
-// file watcher observes the replacement, so this deliberately does not
-// restart the process.
-func (h *CertificateHandler) restoreManagedXrayCertFiles(ctx context.Context, server *storage.RemoteServer, previous *storage.Certificate) error {
+// file watcher observes the replacement. The caller may request the one
+// exceptional oneTimeLoading recovery restart described above.
+func (h *CertificateHandler) restoreManagedXrayCertFiles(ctx context.Context, server *storage.RemoteServer, previous *storage.Certificate, reloadTarget string) error {
 	if previous == nil || previous.CertPEM == "" || previous.KeyPEM == "" {
 		return fmt.Errorf("previous certificate material is unavailable")
 	}
-	if _, _, err := h.deployCertToServerSyncLeased(ctx, server, previous); err != nil {
+	if _, _, err := h.deployCertToServerSyncLeasedWithReload(ctx, server, previous, reloadTarget); err != nil {
 		h.forgetXrayCertSync(server.ID, previous.ID)
 		return fmt.Errorf("restore previous certificate files: %w", err)
 	}
@@ -134,10 +200,11 @@ func (h *CertificateHandler) restoreManagedXrayCertFiles(ctx context.Context, se
 // changes are applied by their normal configuration mutation flow.
 func (h *CertificateHandler) deployManagedXrayCert(ctx context.Context, server *storage.RemoteServer, cert, previous *storage.Certificate) error {
 	return h.repo.WithRemoteServerMutationLease(ctx, server.ID, func(leasedCtx context.Context) error {
-		if _, _, err := h.deployCertToServerSyncLeased(leasedCtx, server, cert); err != nil {
+		reloadTarget := h.managedXrayCertificateReloadTarget(leasedCtx, server, cert)
+		if _, _, err := h.deployCertToServerSyncLeasedWithReload(leasedCtx, server, cert, reloadTarget); err != nil {
 			h.forgetXrayCertSync(server.ID, cert.ID)
 			if previous != nil && previous.CertPEM != "" && previous.KeyPEM != "" {
-				rollbackErr := h.restoreManagedXrayCertFiles(leasedCtx, server, previous)
+				rollbackErr := h.restoreManagedXrayCertFiles(leasedCtx, server, previous, reloadTarget)
 				return errors.Join(fmt.Errorf("deploy renewed certificate: %w", err), rollbackErr)
 			}
 			return err

@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -49,6 +50,30 @@ func TestCollectManagedXrayCertPaths(t *testing.T) {
 func TestCollectManagedXrayCertPathsInvalidJSON(t *testing.T) {
 	if refs := collectManagedXrayCertPaths("{"); len(refs) != 0 {
 		t.Fatalf("invalid JSON must not produce references: %#v", refs)
+	}
+}
+
+func TestCollectManagedXrayCertReferencesTracksOneTimeLoading(t *testing.T) {
+	config := `{
+		"inbounds": [{
+			"streamSettings": {
+				"tlsSettings": {
+					"oneTimeLoading": true,
+					"certificates": [{
+						"certificateFile": "/usr/local/etc/xray/certs/example.com.pem",
+						"keyFile": "/usr/local/etc/xray/certs/example.com.key"
+					}]
+				}
+			}
+		}]
+	}`
+
+	reference, found := collectManagedXrayCertReferences(config)["/usr/local/etc/xray/certs/example.com.pem"]
+	if !found {
+		t.Fatal("managed certificate reference was not collected")
+	}
+	if reference.keyPath != "/usr/local/etc/xray/certs/example.com.key" || !reference.oneTimeLoading {
+		t.Fatalf("unexpected managed certificate reference: %#v", reference)
 	}
 }
 
@@ -175,6 +200,54 @@ func TestManagedXrayCertificateMaterialUpdateDeploysWithoutRestartingReferencedA
 	}
 	if h.needsXrayCertSync(server.ID, &storage.Certificate{ID: cert.ID, CertPEM: "renewed-certificate", KeyPEM: "renewed-key"}) {
 		t.Fatal("successful renewed deployment must be remembered by its certificate fingerprint")
+	}
+}
+
+func TestManagedXrayCertificateOneTimeLoadingReloadsOnlyWhenXrayIsRunning(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		xrayRunning bool
+		wantReload  string
+	}{
+		{name: "running", xrayRunning: true, wantReload: "xray"},
+		{name: "stopped", xrayRunning: false, wantReload: "none"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var deployed WSCertDeployPayload
+			agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/api/child/services/status":
+					_, _ = w.Write([]byte(fmt.Sprintf(`{"success":true,"xray":{"installed":true,"running":%t}}`, test.xrayRunning)))
+				case "/api/child/cert/deploy":
+					if err := json.NewDecoder(r.Body).Decode(&deployed); err != nil {
+						t.Errorf("decode certificate deployment: %v", err)
+						http.Error(w, "invalid payload", http.StatusBadRequest)
+						return
+					}
+					_, _ = w.Write([]byte(`{"success":true}`))
+				default:
+					http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+				}
+			}))
+			defer agent.Close()
+
+			repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
+			cert := &storage.Certificate{ID: 44, Domain: "hy.example.test", CertPEM: "renewed-certificate", KeyPEM: "renewed-key"}
+			config := `{"inbounds":[{"streamSettings":{"security":"tls","tlsSettings":{"oneTimeLoading":true,"certificates":[{"certificateFile":"/usr/local/etc/xray/certs/hy.example.test.pem","keyFile":"/usr/local/etc/xray/certs/hy.example.test.key"}]}}}]}`
+			if _, err := repo.UpsertCurrentXraySnapshot(context.Background(), server.ID, config, storage.XraySnapshotSourceMasterWrite); err != nil {
+				t.Fatalf("UpsertCurrentXraySnapshot: %v", err)
+			}
+
+			h := NewCertificateHandler(repo, nil)
+			h.SetRemoteManage(NewRemoteManageHandler(repo, nil))
+			if err := h.deployManagedXrayCert(context.Background(), server, cert, nil); err != nil {
+				t.Fatalf("deploy managed Xray certificate: %v", err)
+			}
+			if deployed.Reload != test.wantReload {
+				t.Fatalf("reload=%q, want %q", deployed.Reload, test.wantReload)
+			}
+		})
 	}
 }
 

@@ -1121,8 +1121,9 @@ func main() {
 	certHandler.SetRemoteManage(remoteManageHandler) // 联邦服务器证书下发走拥有方主控
 	remoteManageHandler.SetCertificateHandler(certHandler)
 	// Refresh the Agent Xray snapshot before using it to reconcile panel-managed
-	// certificate material. The latter is content-deduplicated and only restarts
-	// Xray when a referenced certificate actually changed.
+	// certificate material. The latter is content-deduplicated and uses Xray's
+	// file watcher without a restart, except when the inbound explicitly opts
+	// into oneTimeLoading and the live process must reload the replacement.
 	remoteWSHandler.SetXrayConfigSyncCallback(func(ctx context.Context, serverID int64, prevStatus string) {
 		remoteManageHandler.SyncXrayConfigOnReconnect(ctx, serverID, prevStatus)
 		certHandler.SyncManagedXrayCertificatesOnReconnect(ctx, serverID)

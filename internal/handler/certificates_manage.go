@@ -1281,16 +1281,27 @@ func (h *CertificateHandler) DeployCertToServerSync(ctx context.Context, server 
 }
 
 func (h *CertificateHandler) deployCertToServerSyncLeased(ctx context.Context, server *storage.RemoteServer, cert *storage.Certificate) (string, string, error) {
+	return h.deployCertToServerSyncLeasedWithReload(ctx, server, cert, "none")
+}
+
+func (h *CertificateHandler) deployCertToServerSyncLeasedWithReload(ctx context.Context, server *storage.RemoteServer, cert *storage.Certificate, reloadTarget string) (string, string, error) {
 	name := certDeployFilename(cert.Domain)
 	certPath := "/usr/local/etc/xray/certs/" + name + ".pem"
 	keyPath := "/usr/local/etc/xray/certs/" + name + ".key"
+	reloadTarget = strings.ToLower(strings.TrimSpace(reloadTarget))
+	if reloadTarget == "" {
+		reloadTarget = "none"
+	}
+	if reloadTarget != "none" && reloadTarget != "xray" {
+		return "", "", fmt.Errorf("unsupported managed Xray certificate reload target %q", reloadTarget)
+	}
 	payload := WSCertDeployPayload{
 		Domain:   cert.Domain,
 		CertPEM:  cert.CertPEM,
 		KeyPEM:   cert.KeyPEM,
 		CertPath: certPath,
 		KeyPath:  keyPath,
-		Reload:   "none",
+		Reload:   reloadTarget,
 	}
 
 	// Use the request/response management path whenever available. It selects WS
@@ -1307,7 +1318,7 @@ func (h *CertificateHandler) deployCertToServerSyncLeased(ctx context.Context, s
 			return "", "", err
 		}
 		h.rememberXrayCertSync(server.ID, cert)
-		log.Printf("[Certificate] Sync cert_deploy to %s for %s", server.Name, payload.Domain)
+		log.Printf("[Certificate] Sync cert_deploy to %s for %s (reload=%s)", server.Name, payload.Domain, payload.Reload)
 		return certPath, keyPath, nil
 	}
 
@@ -1317,7 +1328,7 @@ func (h *CertificateHandler) deployCertToServerSyncLeased(ctx context.Context, s
 		return "", "", err
 	}
 	h.rememberXrayCertSync(server.ID, cert)
-	log.Printf("[Certificate] Sync cert_deploy via HTTP to %s for %s", server.Name, payload.Domain)
+	log.Printf("[Certificate] Sync cert_deploy via HTTP to %s for %s (reload=%s)", server.Name, payload.Domain, payload.Reload)
 	return certPath, keyPath, nil
 }
 

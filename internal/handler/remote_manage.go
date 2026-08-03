@@ -2553,7 +2553,6 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 				inboundReq["mutation_id"] = "managed-inbound:" + uuid.NewString()
 			}
 			applyManagedInboundSniffing(inboundReq)
-			applyManagedRealityCompatibility(inboundReq)
 		} else if action == "remove" {
 			tag := strings.TrimSpace(wireGuardStringValue(inboundReq["tag"]))
 			if tag == "" {
@@ -3004,11 +3003,11 @@ func applyManagedInboundSniffing(request map[string]interface{}) {
 
 const managedRealityMinClientVersion = "1.0.0"
 
-// applyManagedRealityCompatibility keeps panel-created REALITY inbounds usable
+// applyManagedRealityCompatibility keeps panel-managed REALITY nodes usable
 // with Mihomo/Clash Meta when a newer Xray core applies a restrictive implicit
-// minimum client version. A meaningful value supplied by the caller always wins;
-// an empty value is equivalent to omitting the Xray setting and gets the panel
-// compatibility default instead.
+// minimum client version. The raw inbound API intentionally remains low-level;
+// it preserves a user's omitted field and upstream default. A meaningful value
+// supplied by the managed-node caller always wins.
 func applyManagedRealityCompatibility(request map[string]interface{}) {
 	if request == nil {
 		return
@@ -3169,6 +3168,7 @@ func (h *RemoteManageHandler) HandleCreateManagedNode(w http.ResponseWriter, r *
 		return
 	}
 	inbound["tag"] = tag
+	applyManagedRealityCompatibility(request)
 	body, err = json.Marshal(request)
 	if err != nil {
 		remoteWriteError(w, http.StatusBadRequest, "failed to normalize request")
