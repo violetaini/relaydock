@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/violetaini/relaydock/internal/componentcatalog"
 )
 
 func TestResolveMihomoReleaseAssetUsesStableLatestPlatformAssets(t *testing.T) {
@@ -124,6 +126,38 @@ func TestMihomoCoreStatusAndManagedUpdate(t *testing.T) {
 	}
 	if downloadCalls != 1 || !updated.Ready || updated.Source != "managed" || updated.CurrentVersion != "1.19.29" || updated.UpdateAvailable {
 		t.Fatalf("updated status = %#v, download calls = %d", updated, downloadCalls)
+	}
+}
+
+func TestAutoUpdateManagedMihomoLeavesMissingCoreUninstalled(t *testing.T) {
+	requireLinux(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("MIHOMO_BIN", "")
+	t.Setenv("PATH", "")
+	resolveCalls, installCalls := 0, 0
+	status, err := autoUpdateManagedMihomo(context.Background(), func(context.Context) (mihomoAssetSpec, ghAsset, error) {
+		resolveCalls++
+		return testLatestResolver("1.19.29")(context.Background())
+	}, func(context.Context, ghAsset, mihomoAssetSpec, string) error {
+		installCalls++
+		return nil
+	})
+	if err != nil || status.Source != "none" || resolveCalls != 0 || installCalls != 0 {
+		t.Fatalf("status = %#v, resolve calls = %d, install calls = %d, err = %v", status, resolveCalls, installCalls, err)
+	}
+}
+
+func TestLatestMihomoAssetUsesBackendCatalog(t *testing.T) {
+	want, supported := componentcatalog.Mihomo(runtime.GOOS, runtime.GOARCH)
+	if !supported {
+		t.Skipf("no managed Mihomo target for %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	spec, asset, err := latestMihomoAsset(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Version != want.Version || spec.Name != want.Name || asset.BrowserDownloadURL != want.URL || asset.Digest != "sha256:"+want.SHA256 || asset.Size <= 0 {
+		t.Fatalf("backend catalog resolver = %#v / %#v, want %#v", spec, asset, want)
 	}
 }
 

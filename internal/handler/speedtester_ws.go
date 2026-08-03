@@ -13,6 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/violetaini/relaydock/internal/capabilities"
+	"github.com/violetaini/relaydock/internal/componentcatalog"
 	"github.com/violetaini/relaydock/internal/speedtest"
 	"github.com/violetaini/relaydock/internal/storage"
 )
@@ -23,19 +24,58 @@ import (
 
 // stWSMsg 测速端 WS 消息(双向复用)。
 type stWSMsg struct {
-	Type        string  `json:"type"`
-	JobID       string  `json:"job_id,omitempty"`
-	ClashConfig string  `json:"clash_config,omitempty"`
-	Bytes       int64   `json:"bytes,omitempty"`
-	URL         string  `json:"url,omitempty"`
-	Threads     int     `json:"threads,omitempty"`      // 并发下载线程数(默认 1)
-	LatencyOnly bool    `json:"latency_only,omitempty"` // true 仅测真连接延迟(Cloudflare 204)
-	DownMbps    float64 `json:"down_mbps,omitempty"`
-	LatencyMs   int64   `json:"latency_ms,omitempty"`
-	EgressIP    string  `json:"egress_ip,omitempty"`
-	Status      string  `json:"status,omitempty"`
-	Error       string  `json:"error,omitempty"`
-	Name        string  `json:"name,omitempty"`
+	Type        string   `json:"type"`
+	JobID       string   `json:"job_id,omitempty"`
+	ClashConfig string   `json:"clash_config,omitempty"`
+	Bytes       int64    `json:"bytes,omitempty"`
+	URL         string   `json:"url,omitempty"`
+	Threads     int      `json:"threads,omitempty"`      // 并发下载线程数(默认 1)
+	LatencyOnly bool     `json:"latency_only,omitempty"` // true 仅测真连接延迟(Cloudflare 204)
+	DownMbps    float64  `json:"down_mbps,omitempty"`
+	LatencyMs   int64    `json:"latency_ms,omitempty"`
+	EgressIP    string   `json:"egress_ip,omitempty"`
+	Status      string   `json:"status,omitempty"`
+	Error       string   `json:"error,omitempty"`
+	Name        string   `json:"name,omitempty"`
+	Version     string   `json:"version,omitempty"`
+	Caps        []string `json:"caps,omitempty"`
+	GOOS        string   `json:"goos,omitempty"`
+	GOARCH      string   `json:"goarch,omitempty"`
+
+	// update is sent only to clients that explicitly advertise self_update_v1.
+	// The three fields point at an immutable, backend-approved Release asset and
+	// its checksum manifest rather than a moving "latest" URL.
+	AssetName    string `json:"asset_name,omitempty"`
+	DownloadURL  string `json:"download_url,omitempty"`
+	ChecksumsURL string `json:"checksums_url,omitempty"`
+}
+
+const speedtesterSelfUpdateCapability = "self_update_v1"
+
+func speedtesterUpdateMessage(currentVersion string, caps []string, goos, goarch string) (stWSMsg, bool) {
+	if !hasSpeedtesterCapability(caps, speedtesterSelfUpdateCapability) {
+		return stWSMsg{}, false
+	}
+	asset, checksumsURL, supported := componentcatalog.Speedtester(goos, goarch)
+	if !supported || currentVersion == "" || componentcatalog.VersionCompare(currentVersion, asset.Version) >= 0 {
+		return stWSMsg{}, false
+	}
+	return stWSMsg{
+		Type:         "update",
+		Version:      asset.Version,
+		AssetName:    asset.Name,
+		DownloadURL:  asset.URL,
+		ChecksumsURL: checksumsURL,
+	}, true
+}
+
+func hasSpeedtesterCapability(caps []string, wanted string) bool {
+	for _, capability := range caps {
+		if capability == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 type testerConn struct {
@@ -128,9 +168,21 @@ func (h *SpeedTesterWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 				default:
 				}
 			}
-		case "hello", "ping":
+		case "hello":
 			h.repo.TouchSpeedTester(context.Background(), tester.ID)
 			_ = tc.send(stWSMsg{Type: "pong"})
+			if update, available := speedtesterUpdateMessage(msg.Version, msg.Caps, msg.GOOS, msg.GOARCH); available {
+				if err := tc.send(update); err != nil {
+					log.Printf("[SpeedTester] tester %d update dispatch failed: %v", tester.ID, err)
+				}
+			}
+		case "ping":
+			h.repo.TouchSpeedTester(context.Background(), tester.ID)
+			_ = tc.send(stWSMsg{Type: "pong"})
+		case "update_result":
+			if msg.Status != "ok" {
+				log.Printf("[SpeedTester] tester %d update failed: %s", tester.ID, msg.Error)
+			}
 		}
 	}
 }

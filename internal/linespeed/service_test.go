@@ -176,6 +176,78 @@ func TestInstallAndRemovePinnedOfficialBinary(t *testing.T) {
 	}
 }
 
+func TestAutoUpdateReplacesKnownOlderLicensedBinary(t *testing.T) {
+	oldBinary := []byte("official old fixture")
+	newBinary := []byte("official new fixture")
+	newArchive := makeTarFixture(t, tarFixtureEntry{name: managedBinaryName, body: newBinary})
+	service := newOfficialFixtureService(t, newArchive, newBinary)
+	service.artifactsOverride[0].version = Version
+	service.legacyArtifactsOverride = []artifact{{
+		version:   "1.1.0",
+		name:      "old-fixture",
+		binarySHA: testDigest(oldBinary),
+	}}
+	service.runCommand = func(_ context.Context, _ string, args []string, files []*os.File, _ []string, _, _ int64) ([]byte, []byte, error) {
+		if !reflect.DeepEqual(args, []string{"--version"}) || len(files) != 1 {
+			t.Fatalf("unexpected command: %#v", args)
+		}
+		if _, err := files[0].Seek(0, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(files[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Equal(data, oldBinary) {
+			return []byte("Speedtest by Ookla 1.1.0 (fixture)\n"), nil, nil
+		}
+		if bytes.Equal(data, newBinary) {
+			return []byte("Speedtest by Ookla " + Version + " (fixture)\n"), nil, nil
+		}
+		return nil, nil, errors.New("unknown fixture binary")
+	}
+	if err := service.ensureManagedDirectories(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(service.binaryPath(), oldBinary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.writeLicenseMarker(); err != nil {
+		t.Fatal(err)
+	}
+
+	before := service.Status(context.Background())
+	if !before.Installed || !before.Owned || !before.LicenseAccepted || !before.UpdateAvailable || before.Version != "1.1.0" || before.TargetVersion != Version {
+		t.Fatalf("pre-update status = %#v", before)
+	}
+	after, err := service.AutoUpdate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Installed || after.UpdateAvailable || after.Version != Version || !after.LicenseAccepted {
+		t.Fatalf("post-update status = %#v", after)
+	}
+	got, err := os.ReadFile(service.binaryPath())
+	if err != nil || !bytes.Equal(got, newBinary) {
+		t.Fatalf("updated binary = %q, err = %v", got, err)
+	}
+}
+
+func TestLegacyLicenseMarkerRemainsAcceptedForAutomaticUpdates(t *testing.T) {
+	binary := []byte("official fixture")
+	archive := makeTarFixture(t, tarFixtureEntry{name: managedBinaryName, body: binary})
+	service := newOfficialFixtureService(t, archive, binary)
+	if err := service.ensureManagedDirectories(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManagedFileAtomically(service.licenseMarkerPath(), []byte(legacyLicenseMarkerContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !service.hasTrustedLicenseMarker() {
+		t.Fatal("existing version-bound consent marker was not accepted")
+	}
+}
+
 func TestRemoveClearsTrustedRuntimeStateAndInterruptedTemps(t *testing.T) {
 	binary := []byte("official fixture")
 	archive := makeTarFixture(t, tarFixtureEntry{name: managedBinaryName, body: binary})

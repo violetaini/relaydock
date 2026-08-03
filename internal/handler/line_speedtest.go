@@ -34,6 +34,10 @@ type lineSpeedService interface {
 	Run(context.Context) (linespeed.Result, error)
 }
 
+type lineSpeedAutoUpdater interface {
+	AutoUpdate(context.Context) (linespeed.Status, error)
+}
+
 type LineSpeedTestHandler struct {
 	repo        *storage.TrafficRepository
 	remote      *RemoteManageHandler
@@ -53,6 +57,21 @@ func NewLineSpeedTestHandler(repo *storage.TrafficRepository, remote *RemoteMana
 		failJob:     repo.FailLineSpeedTestResult,
 		running:     make(map[string]struct{}),
 	}
+}
+
+// AutoUpdate keeps a locally panel-managed, licensed Ookla CLI at the version
+// pinned by this backend. Remote Agents reconcile their own local CLI when
+// they run a compatible Agent build; unmanaged servers are never touched.
+func (h *LineSpeedTestHandler) AutoUpdate(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	updater, ok := h.local.(lineSpeedAutoUpdater)
+	if !ok {
+		return nil
+	}
+	_, err := updater.AutoUpdate(ctx)
+	return err
 }
 
 type lineSpeedTargetRequest struct {

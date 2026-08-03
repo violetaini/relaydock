@@ -7,6 +7,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -62,9 +64,17 @@ type wsMsg struct {
 	// 要判的是"这个地址从本机所在网络能不能连上",套代理就失去意义了。
 	Version   string        `json:"version,omitempty"` // hello 携带,主控据此展示
 	Caps      []string      `json:"caps,omitempty"`    // hello 携带的能力集,老版本没有此字段
+	GOOS      string        `json:"goos,omitempty"`
+	GOARCH    string        `json:"goarch,omitempty"`
 	Targets   []string      `json:"targets,omitempty"` // master→tester:待拨测的 host:port 列表
 	TimeoutMS int           `json:"timeout_ms,omitempty"`
 	Results   []probeResult `json:"results,omitempty"` // tester→master
+
+	// 后端只向声明 self_update_v1 的客户端发送精确 GitHub Release 资源和
+	// checksums.txt；更新器会校验后再替换自身。
+	AssetName    string `json:"asset_name,omitempty"`
+	DownloadURL  string `json:"download_url,omitempty"`
+	ChecksumsURL string `json:"checksums_url,omitempty"`
 }
 
 // probeResult 单个目标的拨测结果。
@@ -104,6 +114,17 @@ func main() {
 	resetBackoff := func() { backoff = time.Second }
 	for {
 		err := connectAndServe(wsURL, *name, resetBackoff)
+		if errors.Is(err, ErrSelfUpdateRestartRequired) {
+			log.Printf("[speedtester] 已校验并应用更新，正在重启到新版本")
+			shouldExit, restartErr := restartAfterSelfUpdate()
+			if restartErr != nil {
+				log.Printf("[speedtester] 更新后的重启失败: %v", restartErr)
+				return
+			}
+			if shouldExit {
+				return
+			}
+		}
 		if err != nil {
 			log.Printf("[speedtester] 连接断开: %v;%v 后重连", err, backoff)
 		} else {
@@ -198,11 +219,14 @@ func connectAndServe(wsURL, name string, onConnected func()) error {
 	// 否则给老测速端派 probe 会被静默丢弃,主控只能干等超时。
 	// probe6:本机能拨通公网 IPv6 才声明 —— 否则主控会把 v6 节点(都是外网 v6 地址)误报被墙
 	//(此测速端对所有 v6 目标都 network unreachable)。有 probe6 的源才被主控派去探 v6 节点。
-	caps := []string{"speedtest", "probe"}
+	caps := []string{"speedtest", "probe", "self_update_v1"}
 	if hasIPv6() {
 		caps = append(caps, "probe6")
 	}
-	_ = send(wsMsg{Type: "hello", Name: name, Version: version, Caps: caps})
+	_ = send(wsMsg{
+		Type: "hello", Name: name, Version: version, Caps: caps,
+		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
+	})
 
 	// 心跳保活 — 应用层 ping(主控收到回 pong 一样会续 deadline)
 	stop := make(chan struct{})
@@ -238,6 +262,16 @@ func connectAndServe(wsURL, name string, onConnected func()) error {
 			go runJob(msg, send)
 		case "probe":
 			go runProbe(msg, send)
+		case "update":
+			err := applySelfUpdate(context.Background(), msg.Version, msg.AssetName, msg.DownloadURL, msg.ChecksumsURL)
+			if errors.Is(err, ErrSelfUpdateRestartRequired) {
+				_ = send(wsMsg{Type: "update_result", Status: "ok", Version: msg.Version})
+				return err
+			}
+			if err != nil {
+				log.Printf("[speedtester] 自动更新失败: %v", err)
+				_ = send(wsMsg{Type: "update_result", Status: "failed", Version: msg.Version, Error: err.Error()})
+			}
 		}
 		// pong 等忽略
 	}

@@ -23,6 +23,7 @@ import (
 	"github.com/violetaini/relaydock/internal/capabilities"
 	"github.com/violetaini/relaydock/internal/captcha"
 	"github.com/violetaini/relaydock/internal/child"
+	"github.com/violetaini/relaydock/internal/componentupdate"
 	"github.com/violetaini/relaydock/internal/ddns"
 	"github.com/violetaini/relaydock/internal/event"
 	"github.com/violetaini/relaydock/internal/handler"
@@ -33,6 +34,7 @@ import (
 	"github.com/violetaini/relaydock/internal/proxygroups"
 	"github.com/violetaini/relaydock/internal/runtimepaths"
 	"github.com/violetaini/relaydock/internal/securechan"
+	"github.com/violetaini/relaydock/internal/speedtest"
 	"github.com/violetaini/relaydock/internal/storage"
 	"github.com/violetaini/relaydock/internal/traffic"
 	"github.com/violetaini/relaydock/internal/version"
@@ -1303,6 +1305,23 @@ func main() {
 	remoteWSHandler.StartCleanupLoop(collectorCtx, 1*time.Minute)
 	// 启动通知调度器
 	go handler.StartNotifyScheduler(collectorCtx, repo)
+
+	// 外部测速组件由当前后端的内置目录明确指定版本。启动时立即对比，
+	// 之后定期重试下载失败项；只更新已由 Arcway 管理的副本。
+	componentTasks := []componentupdate.Task{{
+		Name: "Ookla Speedtest",
+		Run:  lineSpeedTestHandler.AutoUpdate,
+	}}
+	if capabilityManager.HasFeature(capabilities.FeatureSpeedTest) {
+		componentTasks = append(componentTasks, componentupdate.Task{
+			Name: "Mihomo",
+			Run: func(ctx context.Context) error {
+				_, err := speedtest.AutoUpdateManagedMihomo(ctx)
+				return err
+			},
+		})
+	}
+	componentupdate.Scheduler{Tasks: componentTasks}.Start(collectorCtx)
 
 	// 一次性数据迁移:给老 routed 节点补 creator 的 user_subaccounts 行 — 让 admin 自己用 routed 节点的
 	// 流量能走 user_subaccounts 命中而不依赖 ResolveUsernameByEmail 的 _admin__ 反查 fallback。

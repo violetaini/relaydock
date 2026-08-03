@@ -22,12 +22,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/violetaini/relaydock/internal/componentcatalog"
 )
 
 const mihomoCacheDir = "data/bin"
 
 // minMihomoVersion:snell v4/v5 支持自 mihomo v1.19.26 起(v1.19.25 及更早会报 "snell version error: 4")。
-// 定位到的 mihomo 若低于此版本则跳过、重新下载上游最新版,确保能对 snell 节点测速。
+// 定位到的 mihomo 若低于此版本则跳过、重新下载后端批准版本,确保能对 snell 节点测速。
 const minMihomoVersion = "1.19.26"
 
 const (
@@ -195,8 +197,8 @@ func inspectMihomoLocked() MihomoCoreStatus {
 type mihomoLatestResolver func(context.Context) (mihomoAssetSpec, ghAsset, error)
 type mihomoAssetInstaller func(context.Context, ghAsset, mihomoAssetSpec, string) error
 
-// getMihomoCoreStatus 返回本地核心状态，并尝试查询上游 latest。
-// latest 查询失败不会让已安装核心变为不可用。
+// getMihomoCoreStatus 返回本地核心状态，并加载当前后端内置的目标版本。
+// 目标版本不可用不会让已安装核心变为不可用。
 func getMihomoCoreStatus(ctx context.Context, resolve mihomoLatestResolver) MihomoCoreStatus {
 	mihomoMu.Lock()
 	status := inspectMihomoLocked()
@@ -213,13 +215,14 @@ func getMihomoCoreStatus(ctx context.Context, resolve mihomoLatestResolver) Miho
 	return applyMihomoLatest(status, spec.Version)
 }
 
-// GetMihomoCoreStatus 返回主控本机当前生效的 Mihomo、可管理性和上游最新版本。
+// GetMihomoCoreStatus 返回主控本机当前生效的 Mihomo、可管理性和当前
+// Arcway 后端批准的目标版本。运行中的后端不会隐式跟随上游 latest。
 func GetMihomoCoreStatus(ctx context.Context) MihomoCoreStatus {
 	return getMihomoCoreStatus(ctx, latestMihomoAsset)
 }
 
 // EnsureMihomo 返回可用的 mihomo 二进制路径;按序尝试:env MIHOMO_BIN → data/bin/mihomo →
-// $PATH → 从 GitHub releases 自动下载到 data/bin/mihomo。
+// $PATH → 从当前后端批准的 GitHub release 自动下载到 data/bin/mihomo。
 func EnsureMihomo(ctx context.Context) (string, error) {
 	mihomoMu.Lock()
 	defer mihomoMu.Unlock()
@@ -232,19 +235,38 @@ func EnsureMihomo(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("mihomo 不支持在 %s/%s 自动下载，请通过 MIHOMO_BIN 提供可信二进制", runtime.GOOS, runtime.GOARCH)
 	}
 	local := filepath.Join(mihomoCacheDir, mihomoBinName())
-	// 自动下载上游最新版(支持 snell)。若 data/bin 里是过旧版本会被更新。
+	// 自动下载当前后端批准的版本(支持 snell)。若 data/bin 里是过旧版本会被更新。
 	if err := downloadMihomo(ctx, local); err != nil {
 		return "", fmt.Errorf("mihomo 不可用且自动下载失败: %w", err)
 	}
 	return local, nil
 }
 
-// InstallManagedMihomo 安装或更新 Arcway 管理的核心到 MetaCubeX/mihomo 上游最新版。
-// 外部 MIHOMO_BIN/PATH 核心永远不会被覆盖；高于上游 latest 的受管核心也不会降级。
+// InstallManagedMihomo 安装或更新 Arcway 管理的核心到当前后端批准的
+// MetaCubeX/mihomo 版本。外部 MIHOMO_BIN/PATH 核心永远不会被覆盖；
+// 高于目标版本的受管核心也不会降级。
 func InstallManagedMihomo(ctx context.Context) (MihomoCoreStatus, error) {
 	return installManagedMihomo(ctx, latestMihomoAsset, func(ctx context.Context, asset ghAsset, spec mihomoAssetSpec, dst string) error {
 		return downloadMihomoAsset(ctx, &http.Client{Timeout: 5 * time.Minute}, asset, spec, dst)
 	})
+}
+
+// AutoUpdateManagedMihomo only updates an already Arcway-managed copy. It does
+// not install an unused core and never overwrites MIHOMO_BIN or PATH copies.
+func AutoUpdateManagedMihomo(ctx context.Context) (MihomoCoreStatus, error) {
+	return autoUpdateManagedMihomo(ctx, latestMihomoAsset, func(ctx context.Context, asset ghAsset, spec mihomoAssetSpec, dst string) error {
+		return downloadMihomoAsset(ctx, &http.Client{Timeout: 5 * time.Minute}, asset, spec, dst)
+	})
+}
+
+func autoUpdateManagedMihomo(ctx context.Context, resolve mihomoLatestResolver, install mihomoAssetInstaller) (MihomoCoreStatus, error) {
+	mihomoMu.Lock()
+	status := inspectMihomoLocked()
+	mihomoMu.Unlock()
+	if status.Source != "managed" {
+		return status, nil
+	}
+	return installManagedMihomo(ctx, resolve, install)
 }
 
 func installManagedMihomo(ctx context.Context, resolve mihomoLatestResolver, install mihomoAssetInstaller) (MihomoCoreStatus, error) {
@@ -261,7 +283,7 @@ func installManagedMihomo(ctx context.Context, resolve mihomoLatestResolver, ins
 	spec, asset, err := resolve(ctx)
 	if err != nil {
 		status.LatestError = err.Error()
-		return status, fmt.Errorf("查询 Mihomo 上游最新版失败: %w", err)
+		return status, fmt.Errorf("读取后端指定的 Mihomo 版本失败: %w", err)
 	}
 	status = applyMihomoLatest(status, spec.Version)
 	if status.Ready && versionGTE(status.CurrentVersion, spec.Version) {
@@ -292,7 +314,7 @@ func fileExists(p string) bool {
 	return err == nil && !st.IsDir()
 }
 
-// downloadMihomo 从 MetaCubeX/mihomo 官方 latest release 下载当前平台资源。
+// downloadMihomo 从当前后端批准的 MetaCubeX/mihomo release 下载当前平台资源。
 func downloadMihomo(ctx context.Context, dst string) error {
 	spec, asset, err := latestMihomoAsset(ctx)
 	if err != nil {
@@ -302,17 +324,46 @@ func downloadMihomo(ctx context.Context, dst string) error {
 }
 
 func latestMihomoAsset(ctx context.Context) (mihomoAssetSpec, ghAsset, error) {
+	_ = ctx
 	if !managedMihomoPlatform(runtime.GOOS, runtime.GOARCH) {
 		return mihomoAssetSpec{}, ghAsset{}, fmt.Errorf(
 			"mihomo 不支持在 %s/%s 自动下载，请通过 MIHOMO_BIN 提供可信二进制",
 			runtime.GOOS, runtime.GOARCH,
 		)
 	}
-	rel, err := fetchLatestRelease(ctx)
-	if err != nil {
-		return mihomoAssetSpec{}, ghAsset{}, err
+	asset, ok := componentcatalog.Mihomo(runtime.GOOS, runtime.GOARCH)
+	if !ok {
+		return mihomoAssetSpec{}, ghAsset{}, fmt.Errorf("mihomo 不支持在 %s/%s 自动下载", runtime.GOOS, runtime.GOARCH)
 	}
-	return resolveMihomoReleaseAsset(rel, runtime.GOOS, runtime.GOARCH)
+	spec := mihomoAssetSpec{
+		Tag:     "v" + asset.Version,
+		Version: asset.Version,
+		Name:    asset.Name,
+		Digest:  "sha256:" + asset.SHA256,
+	}
+	githubAsset := ghAsset{
+		Name:               asset.Name,
+		BrowserDownloadURL: asset.URL,
+		Digest:             "sha256:" + asset.SHA256,
+		State:              "uploaded",
+		ContentType:        "application/gzip",
+		Size:               mihomoCatalogAssetSize(runtime.GOOS, runtime.GOARCH),
+	}
+	if err := validateMihomoReleaseAsset(spec.Tag, githubAsset); err != nil {
+		return mihomoAssetSpec{}, ghAsset{}, fmt.Errorf("后端 Mihomo 目录无效: %w", err)
+	}
+	return spec, githubAsset, nil
+}
+
+func mihomoCatalogAssetSize(goos, goarch string) int64 {
+	switch goos + "/" + goarch {
+	case "linux/amd64":
+		return 17881563
+	case "linux/arm64":
+		return 16051759
+	default:
+		return 0
+	}
 }
 
 func resolveMihomoReleaseAsset(rel *ghRelease, goos, goarch string) (mihomoAssetSpec, ghAsset, error) {

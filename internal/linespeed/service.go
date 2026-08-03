@@ -22,26 +22,32 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/violetaini/relaydock/internal/componentcatalog"
 )
 
 const (
 	Implementation       = "Ookla Speedtest CLI"
-	Version              = "1.2.0"
+	Version              = componentcatalog.OoklaVersion
 	ResultImplementation = Implementation + " " + Version
 
-	officialDownloadBase       = "https://install.speedtest.net/app/cli/"
-	defaultOperationTimeout    = 5 * time.Minute
-	maxArchiveSize             = int64(16 << 20)
-	maxExtractedArchiveSize    = int64(32 << 20)
-	maxBinarySize              = int64(16 << 20)
-	maxStdoutSize              = int64(1 << 20)
-	maxStderrSize              = int64(64 << 10)
-	managedBinaryFDPath        = "/proc/self/fd/3"
-	managedBinaryName          = "speedtest"
-	licenseMarkerName          = ".license-accepted"
-	licenseMarkerContents      = "arcway-ookla-speedtest-license-accepted-v1.2.0\n"
-	managedHomeDirectoryName   = "home"
-	managedConfigDirectoryName = "xdg-config"
+	officialDownloadBase    = "https://install.speedtest.net/app/cli/"
+	defaultOperationTimeout = 5 * time.Minute
+	maxArchiveSize          = int64(16 << 20)
+	maxExtractedArchiveSize = int64(32 << 20)
+	maxBinarySize           = int64(16 << 20)
+	maxStdoutSize           = int64(1 << 20)
+	maxStderrSize           = int64(64 << 10)
+	managedBinaryFDPath     = "/proc/self/fd/3"
+	managedBinaryName       = "speedtest"
+	licenseMarkerName       = ".license-accepted"
+	// The consent record intentionally has its own schema version rather than
+	// the Ookla binary version. A binary update must not discard a consent that
+	// the user already explicitly gave.
+	licenseMarkerContents       = "arcway-ookla-speedtest-license-accepted-schema-v1\n"
+	legacyLicenseMarkerContents = "arcway-ookla-speedtest-license-accepted-v1.2.0\n"
+	managedHomeDirectoryName    = "home"
+	managedConfigDirectoryName  = "xdg-config"
 )
 
 var (
@@ -56,6 +62,7 @@ var (
 // digests. The executable digest keeps future status/run checks independent of
 // the downloaded archive after installation.
 type artifact struct {
+	version    string
 	name       string
 	url        string
 	archiveSHA string
@@ -64,18 +71,21 @@ type artifact struct {
 
 var linuxArtifacts = map[string][]artifact{
 	"amd64": {{
+		version:    Version,
 		name:       "x86_64",
 		url:        officialDownloadBase + "ookla-speedtest-1.2.0-linux-x86_64.tgz",
 		archiveSHA: "5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7",
 		binarySHA:  "31f1124c5ab8acdae6b9fe1741e704df420f9f2e7d429679fabe62075453c051",
 	}},
 	"arm64": {{
+		version:    Version,
 		name:       "aarch64",
 		url:        officialDownloadBase + "ookla-speedtest-1.2.0-linux-aarch64.tgz",
 		archiveSHA: "3953d231da3783e2bf8904b6dd72767c5c6e533e163d3742fd0437affa431bd3",
 		binarySHA:  "d99fa13293f658b53eaa79fe81f4b210db39fdfc1e9698f33da3f234a6008df7",
 	}},
 	"386": {{
+		version:    Version,
 		name:       "i386",
 		url:        officialDownloadBase + "ookla-speedtest-1.2.0-linux-i386.tgz",
 		archiveSHA: "9ff7e18dbae7ee0e03c66108445a2fb6ceea6c86f66482e1392f55881b772fe8",
@@ -85,12 +95,14 @@ var linuxArtifacts = map[string][]artifact{
 	// common armv7 deployment) and fall back to armel when its binary cannot run.
 	"arm": {
 		{
+			version:    Version,
 			name:       "armhf",
 			url:        officialDownloadBase + "ookla-speedtest-1.2.0-linux-armhf.tgz",
 			archiveSHA: "e45fcdebbd8a185553535533dd032d6b10bc8c64eee4139b1147b9c09835d08d",
 			binarySHA:  "66ad57568664e6f8580e14ad67316a57038fd22b30548bef98531df4ebcc8956",
 		},
 		{
+			version:    Version,
 			name:       "armel",
 			url:        officialDownloadBase + "ookla-speedtest-1.2.0-linux-armel.tgz",
 			archiveSHA: "629a455a2879224bd0dbd4b36d8c721dda540717937e4660b4d2c966029466bf",
@@ -98,6 +110,11 @@ var linuxArtifacts = map[string][]artifact{
 		},
 	},
 }
+
+// legacyLinuxArtifacts is deliberately kept when the target is advanced. It
+// lets the next backend recognize the immediately previous verified install and
+// replace it automatically instead of treating it as foreign software.
+var legacyLinuxArtifacts = map[string][]artifact{}
 
 type Status struct {
 	Supported bool `json:"supported"`
@@ -111,6 +128,8 @@ type Status struct {
 	LicenseAccepted bool   `json:"license_accepted"`
 	Implementation  string `json:"implementation"`
 	Version         string `json:"version,omitempty"`
+	TargetVersion   string `json:"target_version,omitempty"`
+	UpdateAvailable bool   `json:"update_available"`
 }
 
 type Result struct {
@@ -129,14 +148,15 @@ type Result struct {
 type commandRunner func(context.Context, string, []string, []*os.File, []string, int64, int64) ([]byte, []byte, error)
 
 type Service struct {
-	dir               string
-	client            *http.Client
-	runCommand        commandRunner
-	goos              string
-	goarch            string
-	artifactsOverride []artifact
-	operation         chan struct{}
-	running           atomic.Bool
+	dir                     string
+	client                  *http.Client
+	runCommand              commandRunner
+	goos                    string
+	goarch                  string
+	artifactsOverride       []artifact
+	legacyArtifactsOverride []artifact
+	operation               chan struct{}
+	running                 atomic.Bool
 }
 
 func NewService(dir string) *Service {
@@ -162,14 +182,16 @@ func (s *Service) Status(ctx context.Context) Status {
 	status.Supported = s.goos == "linux" && len(artifacts) > 0
 	status.Managed = status.Supported
 	status.Running = s.running.Load()
+	status.TargetVersion = Version
 	if !status.Supported {
 		return status
 	}
-	if _, binary, ok := s.openInstalled(ctx, artifacts); ok {
+	if item, binary, ok := s.openInstalled(ctx, s.knownArtifacts()); ok {
 		_ = binary.Close()
 		status.Installed = true
 		status.Owned = true
-		status.Version = Version
+		status.Version = artifactVersion(item)
+		status.UpdateAvailable = componentcatalog.VersionCompare(status.Version, Version) < 0
 		status.LicenseAccepted = s.hasTrustedLicenseMarker()
 	}
 	return status
@@ -195,7 +217,7 @@ func (s *Service) Install(ctx context.Context, acceptLicense bool) (Status, erro
 	if err := s.ensureManagedDirectories(); err != nil {
 		return s.Status(ctx), err
 	}
-	if current := s.Status(ctx); current.Installed {
+	if current := s.Status(ctx); current.Installed && !current.UpdateAvailable {
 		if !current.LicenseAccepted {
 			if err := s.writeLicenseMarker(); err != nil {
 				return s.Status(ctx), err
@@ -204,11 +226,41 @@ func (s *Service) Install(ctx context.Context, acceptLicense bool) (Status, erro
 		return s.Status(ctx), nil
 	}
 
+	return s.installTargetLocked(ctx, true)
+}
+
+// AutoUpdate keeps an already panel-managed, licensed CLI aligned with the
+// version baked into this backend. It never installs a new CLI merely because
+// the backend started, preserving the explicit Ookla license-consent flow.
+func (s *Service) AutoUpdate(ctx context.Context) (Status, error) {
+	if s == nil || s.goos != "linux" || len(s.supportedArtifacts()) == 0 {
+		return Status{Implementation: Implementation}, ErrUnsupported
+	}
+	if !s.acquire() {
+		return s.Status(ctx), ErrBusy
+	}
+	defer s.release()
+
+	ctx, cancel := operationContext(ctx)
+	defer cancel()
+	current := s.Status(ctx)
+	if !current.Installed || !current.Owned || !current.LicenseAccepted || !current.UpdateAvailable {
+		return current, nil
+	}
+	if err := s.ensureManagedDirectories(); err != nil {
+		return s.Status(ctx), err
+	}
+	return s.installTargetLocked(ctx, false)
+}
+
+func (s *Service) installTargetLocked(ctx context.Context, recordLicense bool) (Status, error) {
 	var installErrors []string
 	for _, item := range s.supportedArtifacts() {
 		if err := s.installArtifact(ctx, item); err == nil {
-			if markerErr := s.writeLicenseMarker(); markerErr != nil {
-				return s.Status(ctx), markerErr
+			if recordLicense {
+				if markerErr := s.writeLicenseMarker(); markerErr != nil {
+					return s.Status(ctx), markerErr
+				}
 			}
 			return s.Status(ctx), nil
 		} else {
@@ -293,7 +345,7 @@ func (s *Service) Run(ctx context.Context) (Result, error) {
 	if err := s.ensureManagedDirectories(); err != nil {
 		return Result{}, err
 	}
-	_, binary, installed := s.openInstalled(ctx, s.supportedArtifacts())
+	_, binary, installed := s.openInstalled(ctx, s.knownArtifacts())
 	if !installed {
 		return Result{}, ErrNotInstalled
 	}
@@ -328,6 +380,35 @@ func (s *Service) supportedArtifacts() []artifact {
 	return linuxArtifacts[s.goarch]
 }
 
+// knownArtifacts includes the current target and any explicitly retained old
+// targets. Keeping old trusted digests lets a newer backend identify a prior
+// panel installation as an upgrade candidate instead of mislabelling it as an
+// unmanaged binary.
+func (s *Service) knownArtifacts() []artifact {
+	current := s.supportedArtifacts()
+	if s == nil {
+		return current
+	}
+	legacy := legacyLinuxArtifacts[s.goarch]
+	if s.legacyArtifactsOverride != nil {
+		legacy = s.legacyArtifactsOverride
+	}
+	if len(legacy) == 0 {
+		return current
+	}
+	known := make([]artifact, 0, len(current)+len(legacy))
+	known = append(known, current...)
+	known = append(known, legacy...)
+	return known
+}
+
+func artifactVersion(item artifact) string {
+	if item.version != "" {
+		return item.version
+	}
+	return Version
+}
+
 func (s *Service) installArtifact(ctx context.Context, item artifact) error {
 	archivePath, err := s.downloadVerifiedArchive(ctx, item)
 	if err != nil {
@@ -349,7 +430,7 @@ func (s *Service) installArtifact(ctx context.Context, item artifact) error {
 	if err != nil {
 		return fmt.Errorf("校验解出的 Ookla Speedtest CLI: %w", err)
 	}
-	validVersion := s.checkVersion(ctx, binary)
+	validVersion := s.checkVersion(ctx, binary, artifactVersion(item))
 	closeErr := binary.Close()
 	if !validVersion {
 		return errors.New("下载的 Ookla Speedtest CLI 不能报告固定版本")
@@ -540,7 +621,7 @@ func (s *Service) openInstalled(ctx context.Context, artifacts []artifact) (arti
 		if err != nil {
 			continue
 		}
-		if s.checkVersion(ctx, binary) {
+		if s.checkVersion(ctx, binary, artifactVersion(item)) {
 			return item, binary, true
 		}
 		_ = binary.Close()
@@ -548,7 +629,7 @@ func (s *Service) openInstalled(ctx context.Context, artifacts []artifact) (arti
 	return artifact{}, nil, false
 }
 
-func (s *Service) checkVersion(ctx context.Context, binary *os.File) bool {
+func (s *Service) checkVersion(ctx context.Context, binary *os.File, expectedVersion string) bool {
 	if binary == nil {
 		return false
 	}
@@ -563,7 +644,7 @@ func (s *Service) checkVersion(ctx context.Context, binary *os.File) bool {
 		return false
 	}
 	output := strings.TrimSpace(string(append(stdout, stderr...)))
-	return strings.Contains(output, "Speedtest by Ookla "+Version)
+	return strings.Contains(output, "Speedtest by Ookla "+expectedVersion)
 }
 
 func (s *Service) ensureManagedDirectories() error {
@@ -585,11 +666,14 @@ func (s *Service) ensureManagedDirectories() error {
 }
 
 func (s *Service) hasTrustedLicenseMarker() bool {
-	marker, err := openTrustedManagedFile(s.licenseMarkerPath(), markerSHA256(), int64(len(licenseMarkerContents)))
-	if err != nil {
-		return false
+	for _, contents := range []string{licenseMarkerContents, legacyLicenseMarkerContents} {
+		marker, err := openTrustedManagedFile(s.licenseMarkerPath(), markerSHA256(contents), int64(len(contents)))
+		if err != nil {
+			continue
+		}
+		return marker.Close() == nil
 	}
-	return marker.Close() == nil
+	return false
 }
 
 func (s *Service) writeLicenseMarker() error {
@@ -812,8 +896,8 @@ func fileSHA256FromOpenFile(file *os.File, maxSize int64) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func markerSHA256() string {
-	sum := sha256.Sum256([]byte(licenseMarkerContents))
+func markerSHA256(contents string) string {
+	sum := sha256.Sum256([]byte(contents))
 	return hex.EncodeToString(sum[:])
 }
 
