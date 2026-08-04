@@ -15,12 +15,15 @@ import (
 )
 
 type packageLeaseAgent struct {
-	requests       atomic.Int64
-	addClientCalls atomic.Int64
-	restartStarted chan struct{}
-	releaseRestart <-chan struct{}
-	restartOnce    sync.Once
-	batchResult    string
+	requests        atomic.Int64
+	addClientCalls  atomic.Int64
+	serviceControls atomic.Int64
+	restartStarted  chan struct{}
+	releaseRestart  <-chan struct{}
+	restartOnce     sync.Once
+	batchResult     string
+	runtimeWarnings []string
+	xrayRunning     *bool
 }
 
 func (a *packageLeaseAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -33,13 +36,15 @@ func (a *packageLeaseAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			result = "ok"
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"success":         true,
-			"inbound_results": []string{result},
+			"success":          true,
+			"inbound_results":  []string{result},
+			"runtime_warnings": a.runtimeWarnings,
 		})
 	case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
 		a.addClientCalls.Add(1)
 		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "changed": true})
 	case r.Method == http.MethodPost && r.URL.Path == "/api/child/services/control":
+		a.serviceControls.Add(1)
 		if a.restartStarted != nil {
 			a.restartOnce.Do(func() { close(a.restartStarted) })
 			if a.releaseRestart != nil {
@@ -48,7 +53,11 @@ func (a *packageLeaseAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/child/services/status":
-		_ = json.NewEncoder(w).Encode(map[string]any{"xray": map[string]any{"running": true}})
+		running := true
+		if a.xrayRunning != nil {
+			running = *a.xrayRunning
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "xray": map[string]any{"installed": true, "running": running}})
 	default:
 		http.NotFound(w, r)
 	}
@@ -97,54 +106,50 @@ func TestInboundBatchActiveInstallationDoesNotReachAgentOrReserveCredential(t *t
 	}
 }
 
-func TestInstallationBeginWaitsForInboundBatchRestartAndReservation(t *testing.T) {
+func TestInboundBatchNoOpDoesNotRestartXray(t *testing.T) {
 	restartStarted := make(chan struct{})
-	releaseRestart := make(chan struct{})
 	agent := &packageLeaseAgent{
 		restartStarted: restartStarted,
-		releaseRestart: releaseRestart,
 		batchResult:    "ok (no-op)",
 	}
 	repo, server, remote := newPackageLeaseFixture(t, agent)
 
-	applyDone := make(chan error, 1)
-	go func() {
-		applyDone <- applyInboundClientsBatchToAgent(context.Background(), remote, repo, server.ID, []InboundClientAddItem{packageBatchItem(server.ID)})
-	}()
+	if err := applyInboundClientsBatchToAgent(context.Background(), remote, repo, server.ID, []InboundClientAddItem{packageBatchItem(server.ID)}); err != nil {
+		t.Fatalf("applyInboundClientsBatchToAgent: %v", err)
+	}
 	select {
 	case <-restartStarted:
-	case err := <-applyDone:
-		t.Fatalf("batch apply returned before required restart: %v", err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("batch apply did not reach required restart")
+		t.Fatal("idempotent inbound batch unexpectedly restarted Xray")
+	case <-time.After(100 * time.Millisecond):
 	}
 
 	config, err := repo.GetUserInboundConfig(context.Background(), "alice", server.ID, "vless-in")
 	if err != nil || config == nil {
 		t.Fatalf("credential was not reserved before Agent publish: config=%+v err=%v", config, err)
 	}
+}
 
-	beginDone := make(chan error, 1)
-	go func() {
-		beginDone <- repo.BeginRemoteServerInstallation(context.Background(), server.ID, "package-batch-wait", time.Now().Add(time.Minute))
-	}()
-	select {
-	case err := <-beginDone:
-		t.Fatalf("installation Begin returned during required restart: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
+func TestInboundBatchRuntimeWarningDoesNotRestartXray(t *testing.T) {
+	agent := &packageLeaseAgent{runtimeWarnings: []string{"vless-in: runtime apply deferred"}}
+	repo, server, remote := newPackageLeaseFixture(t, agent)
 
-	close(releaseRestart)
-	if err := <-applyDone; err != nil {
+	if err := applyInboundClientsBatchToAgent(context.Background(), remote, repo, server.ID, []InboundClientAddItem{packageBatchItem(server.ID)}); err != nil {
 		t.Fatalf("applyInboundClientsBatchToAgent: %v", err)
 	}
-	select {
-	case err := <-beginDone:
-		if err != nil {
-			t.Fatalf("Begin after batch transaction: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Begin remained blocked after batch transaction")
+	if got := agent.serviceControls.Load(); got != 0 {
+		t.Fatalf("runtime warning made %d Xray control request(s)", got)
+	}
+}
+
+func TestPackageRestartSkipsStoppedXray(t *testing.T) {
+	stopped := false
+	agent := &packageLeaseAgent{xrayRunning: &stopped}
+	_, server, remote := newPackageLeaseFixture(t, agent)
+
+	restartXrayInParallel(context.Background(), remote, map[int64]bool{server.ID: true}, "PackageStoppedTest")
+
+	if got := agent.serviceControls.Load(); got != 0 {
+		t.Fatalf("stopped package server made %d Xray control request(s)", got)
 	}
 }
 

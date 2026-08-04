@@ -35,6 +35,24 @@ func TestCertificateHandlerUsesInjectedLocalDeployer(t *testing.T) {
 	}
 }
 
+func TestAutomaticCertificateReloadTargetNeverRestartsXray(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  string
+		ok    bool
+	}{
+		{input: "nginx", want: "nginx", ok: true},
+		{input: "xray", want: "none", ok: true},
+		{input: "both", want: "nginx", ok: true},
+		{input: "none", want: "", ok: false},
+	} {
+		got, ok := automaticCertificateReloadTarget(test.input)
+		if got != test.want || ok != test.ok {
+			t.Fatalf("automaticCertificateReloadTarget(%q) = (%q, %v), want (%q, %v)", test.input, got, ok, test.want, test.ok)
+		}
+	}
+}
+
 func TestPublicDNSProviderNeverSerializesCredentials(t *testing.T) {
 	provider := storage.DNSProvider{
 		ID:           7,

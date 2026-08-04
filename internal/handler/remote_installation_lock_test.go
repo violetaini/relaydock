@@ -345,67 +345,41 @@ func TestXrayInstallStreamRetriesPersistedDeferredConfigWithoutChangingOrdinaryU
 	}
 }
 
-func TestHandleScanResultInstallationLockChecksBeforeQueueAndBeforeWrite(t *testing.T) {
-	configRequested := make(chan struct{}, 4)
-	releaseConfig := make(chan struct{})
+func TestHandleScanResultDoesNotAutoDeployStoppedXray(t *testing.T) {
+	var agentRequests atomic.Int32
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/child/xray/config" {
-			http.NotFound(w, r)
-			return
-		}
-		configRequested <- struct{}{}
-		<-releaseConfig
-		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "config": `{}`})
+		agentRequests.Add(1)
+		http.Error(w, "scan result must not call the Agent", http.StatusInternalServerError)
 	}))
 	defer agent.Close()
 
 	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
-	deployed := make(chan struct{}, 4)
+	deployed := make(chan struct{}, 1)
 	handler := NewRemoteManageHandler(repo, nil)
 	handler.SetStealSelfDeployer(func(context.Context, int64) error {
 		deployed <- struct{}{}
 		return nil
 	})
 
-	ctx := context.Background()
-	if err := repo.BeginRemoteServerInstallation(ctx, server.ID, "first-install", time.Now().Add(time.Minute)); err != nil {
-		t.Fatal(err)
-	}
+	// A stopped core may have been stopped explicitly by the administrator.
+	// Scanning may persist that status but must not inspect/write its config,
+	// invoke the 443 deployer, or start the core.
 	handler.HandleScanResult(server.ID, WSScanResultPayload{XrayRunning: false})
 	select {
-	case <-configRequested:
-		t.Fatal("active installation reached automatic config inspection")
 	case <-deployed:
-		t.Fatal("active installation reached automatic deployment")
-	case <-time.After(100 * time.Millisecond):
-	}
-	finalizeRemoteInstallationForTest(t, repo, server.ID, "first-install")
-
-	// The first gate is open here. Block config inspection, acquire a new lock,
-	// then release the request: the in-goroutine gate must stop the actual write.
-	handler.HandleScanResult(server.ID, WSScanResultPayload{XrayRunning: false})
-	select {
-	case <-configRequested:
-	case <-time.After(2 * time.Second):
-		t.Fatal("automatic config inspection was not attempted")
-	}
-	if err := repo.BeginRemoteServerInstallation(ctx, server.ID, "racing-install", time.Now().Add(time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	close(releaseConfig)
-	select {
-	case <-deployed:
-		t.Fatal("installation acquired after queue did not block automatic deployment")
+		t.Fatal("scan result invoked automatic deployment for a stopped Xray core")
 	case <-time.After(150 * time.Millisecond):
 	}
-	finalizeRemoteInstallationForTest(t, repo, server.ID, "racing-install")
+	if got := agentRequests.Load(); got != 0 {
+		t.Fatalf("scan result made %d unexpected Agent request(s)", got)
+	}
 
-	// Once explicitly finalized, a later scan is allowed to deploy.
-	handler.HandleScanResult(server.ID, WSScanResultPayload{XrayRunning: false})
-	select {
-	case <-deployed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("finalized installation remained blocked")
+	updated, err := repo.GetRemoteServer(context.Background(), server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.XrayRunning {
+		t.Fatal("scan result did not persist the stopped Xray status")
 	}
 }
 

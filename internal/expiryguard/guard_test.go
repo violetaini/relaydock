@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -182,7 +183,7 @@ func TestGuardEncryptedAPIAndAgentTokenPersistence(t *testing.T) {
 	}
 }
 
-func TestGuardRestartsXrayAfterDeferredRemoval(t *testing.T) {
+func TestGuardDefersDeferredRemovalWithoutRestartingXray(t *testing.T) {
 	var mu sync.Mutex
 	paths := make([]string, 0, 3)
 	agent := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -212,12 +213,13 @@ func TestGuardRestartsXrayAfterDeferredRemoval(t *testing.T) {
 	entry.Key = key
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := guard.removeClient(ctx, entry); err != nil {
-		t.Fatalf("removeClient() error = %v", err)
+	err = guard.removeClient(ctx, entry)
+	if err == nil || !strings.Contains(err.Error(), "deferred") {
+		t.Fatalf("removeClient() error = %v, want deferred retry", err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	want := []string{"/api/child/inbounds", "/api/child/services/control", "/api/child/services/status"}
+	want := []string{"/api/child/inbounds"}
 	if len(paths) != len(want) {
 		t.Fatalf("paths = %v, want %v", paths, want)
 	}

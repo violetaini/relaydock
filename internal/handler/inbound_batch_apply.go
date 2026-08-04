@@ -168,7 +168,9 @@ func withPreparedInboundBatchMutation(ctx context.Context, repo *storage.Traffic
 //   - 改造:0 次 GET(cred 用 master InboundCache 算)+ 1 次 batch-apply → 整 server 1 次 round-trip
 //
 // 老 agent(无 batch-apply 端点)→ 返回 ErrAgentBatchNotSupported,caller 应 fallback 逐个 addUserToInbound。
-// 凭据预留、Agent ACK 和必要重启都在同一台服务器的 mutation lease 内完成。
+// 凭据预留和 Agent ACK 都在同一台服务器的 mutation lease 内完成。入站
+// client 变更由 Agent 走 HandlerService 热替换；无论幂等 no-op 还是运行时
+// 延后，都不能为了补偿而启动或重启 Xray。
 // Agent 任一 item 未确认即返回错误，不把部分失败伪装成成功。
 func applyInboundClientsBatchToAgent(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, serverID int64, items []InboundClientAddItem) error {
 	if len(items) == 0 {
@@ -228,18 +230,18 @@ func applyInboundClientsBatchToAgentLocked(ctx context.Context, rm *RemoteManage
 	if len(resp.InboundResults) != len(items) {
 		return fmt.Errorf("batch-apply returned incomplete item results")
 	}
-	needsRestart := len(resp.RuntimeWarnings) > 0
 	for i, result := range resp.InboundResults {
-		noOp, resultErr := validateAgentBatchItemResult(result)
+		_, resultErr := validateAgentBatchItemResult(result)
 		if resultErr != nil {
 			return fmt.Errorf("batch-apply item %d failed: %w", i, resultErr)
 		}
-		needsRestart = needsRestart || noOp
 	}
-	if needsRestart {
-		if err := rm.restartXrayWithRecovery(ctx, serverID, "InboundBatchApply"); err != nil {
-			return fmt.Errorf("apply persisted inbound batch to Xray: %w", err)
-		}
+	if len(resp.RuntimeWarnings) > 0 {
+		// The durable config has already been updated. A stopped Xray can be an
+		// intentional operator choice, so retain the Agent's deferred-recovery
+		// path instead of turning a package mutation into an implicit start.
+		log.Printf("[InboundBatchApply] server=%d Agent deferred inbound runtime apply; Xray lifecycle left unchanged: %s",
+			serverID, strings.Join(resp.RuntimeWarnings, "; "))
 	}
 
 	return nil

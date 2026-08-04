@@ -362,8 +362,11 @@ func (g *Guard) removeClient(ctx context.Context, entry Schedule) error {
 	if !ack.Success {
 		return errors.New("agent did not acknowledge client removal")
 	}
-	if strings.TrimSpace(ack.RuntimeWarning) != "" || strings.Contains(strings.ToLower(ack.Message), "no-op") {
-		return g.restartXray(ctx)
+	if strings.TrimSpace(ack.RuntimeWarning) != "" {
+		// The Agent has persisted the removal but could not change the live
+		// inbound. Keep this expiry entry for a later retry; a scheduler must
+		// never turn an intentionally stopped Xray into a start request.
+		return fmt.Errorf("agent deferred client removal without restarting Xray: %s", strings.TrimSpace(ack.RuntimeWarning))
 	}
 	return nil
 }
@@ -397,43 +400,6 @@ func (g *Guard) agentRequest(ctx context.Context, method, path string, payload i
 		return nil, fmt.Errorf("agent returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	return raw, nil
-}
-
-func (g *Guard) restartXray(ctx context.Context) error {
-	raw, err := g.agentRequest(ctx, http.MethodPost, "/api/child/services/control", map[string]string{
-		"service": "xray",
-		"action":  "restart",
-	})
-	if err != nil {
-		return fmt.Errorf("restart Xray after deferred removal: %w", err)
-	}
-	var ack struct {
-		Success bool `json:"success"`
-	}
-	if json.Unmarshal(raw, &ack) != nil || !ack.Success {
-		return errors.New("Agent did not acknowledge Xray restart")
-	}
-
-	ticker := time.NewTicker(150 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		raw, err := g.agentRequest(ctx, http.MethodGet, "/api/child/services/status", nil)
-		if err == nil {
-			var status struct {
-				Xray *struct {
-					Running bool `json:"running"`
-				} `json:"xray"`
-			}
-			if json.Unmarshal(raw, &status) == nil && status.Xray != nil && status.Xray.Running {
-				return nil
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("verify Xray restart: %w", ctx.Err())
-		case <-ticker.C:
-		}
-	}
 }
 
 func (g *Guard) finishAttempt(entry Schedule, attemptErr error, now time.Time) {

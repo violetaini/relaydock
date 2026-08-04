@@ -26,7 +26,6 @@ import (
 	"github.com/violetaini/relaydock/internal/securechan"
 	"github.com/violetaini/relaydock/internal/storage"
 	"github.com/violetaini/relaydock/internal/version"
-	"github.com/violetaini/relaydock/templates"
 )
 
 // RemoteManageHandler 处理需要转发到子服务器的管理请求
@@ -133,69 +132,6 @@ func withRemoteInstallationSafeMutation(ctx context.Context, repo *storage.Traff
 		}
 	}
 	return err
-}
-
-func (h *RemoteManageHandler) deployDefaultConfig(parentCtx context.Context, serverID int64) {
-	ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
-	defer cancel()
-
-	// 已存在配置则不下发 — 保护现网 inbound/outbound/routing,只在全新装机时初始化默认模板。
-	// 历史 BUG:scan_result xray_running=false 一旦上报(xray 启动失败 / 短暂故障 / 配置冲突),
-	// 这里就会无脑下发默认模板覆盖现有配置,导致服务器再次上线时业务入站全部丢失。
-	if cur, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/xray/config", nil); err == nil {
-		// 解析返回:{ "success": true, "config": "<json string>" }
-		var resp struct {
-			Success bool   `json:"success"`
-			Config  string `json:"config"`
-		}
-		if json.Unmarshal(cur, &resp) == nil && resp.Success {
-			cfg := strings.TrimSpace(resp.Config)
-			// 判 "有效配置" 标准:能 parse + 至少包含 1 个非 api 的 inbound 或 1 个非默认 outbound
-			if cfg != "" && hasNonTemplateContent(cfg) {
-				log.Printf("[Remote Manage] Server %d already has non-empty xray config, skip auto-deploy default template", serverID)
-				return
-			}
-		}
-	}
-
-	configTpl, err := templates.ReadFile("default/config.json")
-	if err != nil {
-		log.Printf("[Remote Manage] Failed to read default/config.json template: %v", err)
-		return
-	}
-
-	configPayload, _ := json.Marshal(map[string]string{
-		"config": string(configTpl),
-	})
-	if _, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/xray/config", configPayload); err != nil {
-		log.Printf("[Remote Manage] Failed to deploy default config to server %d: %v", serverID, err)
-		return
-	}
-
-	if err := h.restartXrayWithRecovery(ctx, serverID, "AutoDeployDefault"); err != nil {
-		log.Printf("[Remote Manage] %v", err)
-		return
-	}
-	log.Printf("[Remote Manage] Auto-deployed default config to server %d (was empty)", serverID)
-}
-
-// serverHasXrayContent 查 server 当前 xray config 是否已有用户内容(非空模板),复用 hasNonTemplateContent。
-// GET /api/child/xray/config 读的是 agent 上的 config.json 文件、不依赖 xray 进程,xray 挂时也能返回。
-// GET / 解析失败保守返回 true(视为有内容、不覆盖),优先保护存量配置(宁可漏一次自动部署,也不误覆盖用户配置)。
-func (h *RemoteManageHandler) serverHasXrayContent(ctx context.Context, serverID int64) bool {
-	cur, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/xray/config", nil)
-	if err != nil {
-		return true
-	}
-	var resp struct {
-		Success bool   `json:"success"`
-		Config  string `json:"config"`
-	}
-	if json.Unmarshal(cur, &resp) != nil || !resp.Success {
-		return true
-	}
-	cfg := strings.TrimSpace(resp.Config)
-	return cfg != "" && hasNonTemplateContent(cfg)
 }
 
 // hasNonTemplateContent 判断一份 xray config 是不是"用户有内容"的(而非空模板)。
@@ -318,41 +254,11 @@ func (h *RemoteManageHandler) HandleScanResult(serverID int64, payload WSScanRes
 		log.Printf("[Remote Manage] Auto-sync from scan_result for server %d: synced=%d (claimed=%d, created=%d), skipped=%d",
 			serverID, result.SyncedCount, result.ClaimedCount, result.CreatedCount, result.SkippedCount)
 	} else {
-		// xray 未运行，自动下发配置
-		server, err := h.repo.GetRemoteServer(ctx, serverID)
-		if err == nil && server != nil {
-			if !remoteInstallationAllowsAutoDeploy(ctx, h.repo, serverID, "Remote Manage") {
-				return
-			}
-			useStealSelf := server.Use443 && server.Domain != "" && h.stealSelfDeployer != nil
-			go func() {
-				deployCtx, deployCancel := context.WithTimeout(context.Background(), 60*time.Second)
-				defer deployCancel()
-				// 已有用户内容就不覆盖:偷自己 server 重启瞬间 xray 未就绪也会上报 XrayRunning=false,
-				// 之前只有 deployDefaultConfig 内部有 hasNonTemplateContent 保护、stealSelfDeployer 分支没有,
-				// 导致已部署的偷自己 server 每次重启都被模板覆盖 nginx/config。这里统一拦一道,两分支都保护。
-				if h.serverHasXrayContent(deployCtx, serverID) {
-					log.Printf("[Remote Manage] server %d xray 未运行但配置已有用户内容,跳过自动下发(避免覆盖 nginx/config)", serverID)
-					return
-				}
-				mutationErr := withRemoteInstallationSafeMutation(deployCtx, h.repo, serverID, "Remote Manage", func(actionCtx context.Context) error {
-					if useStealSelf {
-						return h.stealSelfDeployer(actionCtx, serverID)
-					}
-					h.deployDefaultConfig(actionCtx, serverID)
-					return nil
-				})
-				if mutationErr != nil {
-					if !errors.Is(mutationErr, storage.ErrRemoteInstallationActive) {
-						log.Printf("[Remote Manage] Auto-deploy config failed for server %d: %v", serverID, mutationErr)
-					}
-					return
-				}
-				if useStealSelf {
-					log.Printf("[Remote Manage] Auto-deployed steal-self config for server %d", serverID)
-				}
-			}()
-		}
+		// A scan is observability only. Xray may be deliberately stopped by an
+		// administrator, and a failed scan must never write a config or start it.
+		// Initial installation and explicit panel actions remain the only paths
+		// that deploy or start an Xray core.
+		log.Printf("[Remote Manage] Server %d reported Xray stopped; preserving administrator control", serverID)
 	}
 }
 

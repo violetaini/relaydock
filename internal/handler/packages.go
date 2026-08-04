@@ -449,11 +449,6 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 					return
 				}
 				if node.NodeType == "routed" {
-					if srv, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer); err == nil {
-						mu.Lock()
-						restartNeeded[srv.ID] = true
-						mu.Unlock()
-					}
 					item, err := collectRoutedBatchItem(ctx, h.remoteManage, h.repo, user, node.ID)
 					if err != nil {
 						log.Printf("[PackageUpdate] collect routed item user=%s node=%d failed: %v", user.Username, node.ID, err)
@@ -508,12 +503,15 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 					return
 				}
 				if node.NodeType == "routed" {
-					if srv, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer); err == nil {
-						mu.Lock()
-						restartNeeded[srv.ID] = true
-						mu.Unlock()
+					restart, err := removeUserFromRoutedNode(ctx, h.remoteManage, h.repo, user.Username, node.ID)
+					if restart {
+						if srv, lookupErr := h.repo.GetRemoteServerByName(ctx, node.OriginalServer); lookupErr == nil {
+							mu.Lock()
+							restartNeeded[srv.ID] = true
+							mu.Unlock()
+						}
 					}
-					if err := removeUserFromRoutedNode(ctx, h.remoteManage, h.repo, user.Username, node.ID); err != nil {
+					if err != nil {
 						log.Printf("[PackageUpdate] remove user %s from routed node %d failed: %v", user.Username, node.ID, err)
 					}
 					return
@@ -555,7 +553,12 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 		routeWg.Add(1)
 		go func(sid int64, list []routedBatchItem) {
 			defer routeWg.Done()
-			_ = applyRoutedBatchOrFallback(ctx, h.remoteManage, h.repo, sid, list, "PackageUpdate")
+			outcome, _ := applyRoutedBatchOrFallback(ctx, h.remoteManage, h.repo, sid, list, "PackageUpdate")
+			if outcome.NeedsRestart() {
+				mu.Lock()
+				restartNeeded[sid] = true
+				mu.Unlock()
+			}
 		}(serverID, items)
 	}
 	for serverID, items := range inboundBatch {
@@ -612,7 +615,8 @@ func NewPackageDeleteHandler(repo *storage.TrafficRepository, remoteManage *Remo
 func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher, username string) error {
 	var mu sync.Mutex
 	var mutationErrs []error
-	// 只 routed 路径(改 routing rules)需要重启;普通 inbound remove-client 由 agent 热更新。
+	// Routed rule removals are persisted with no_restart=true. Aggregate them
+	// here only when the Agent confirms a routing/runtime change.
 	restartNeeded := map[int64]bool{}
 
 	// inbound 移除 + routed 下线并发执行 — 每条目独立,失败只 log。
@@ -649,14 +653,17 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 		wg.Add(1)
 		go func(routedNodeID int64) {
 			defer wg.Done()
-			if node, err := repo.GetNodeByID(ctx, routedNodeID); err == nil && node.OriginalServer != "" {
-				if srv, err := repo.GetRemoteServerByName(ctx, node.OriginalServer); err == nil {
-					mu.Lock()
-					restartNeeded[srv.ID] = true
-					mu.Unlock()
+			restart, err := removeUserFromRoutedNode(ctx, remoteManage, repo, username, routedNodeID)
+			if restart {
+				if node, nodeErr := repo.GetNodeByID(ctx, routedNodeID); nodeErr == nil && node.OriginalServer != "" {
+					if srv, serverErr := repo.GetRemoteServerByName(ctx, node.OriginalServer); serverErr == nil {
+						mu.Lock()
+						restartNeeded[srv.ID] = true
+						mu.Unlock()
+					}
 				}
 			}
-			if err := removeUserFromRoutedNode(ctx, remoteManage, repo, username, routedNodeID); err != nil {
+			if err != nil {
 				log.Printf("[PackageUnbind] routed node %d 下线用户 %s 失败: %v", routedNodeID, username, err)
 				mu.Lock()
 				mutationErrs = append(mutationErrs, fmt.Errorf("routed node %d: %w", routedNodeID, err))
@@ -800,6 +807,7 @@ func (h *PackageUnassignHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var mutationErrs []error
+	restartNeeded := map[int64]bool{}
 	for _, cfg := range configs {
 		_, removeErr := removePackageUserInboundConfig(ctx, h.remoteManage, h.repo, cfg)
 		if removeErr != nil && !isInboundNotFoundErr(removeErr) {
@@ -820,11 +828,20 @@ func (h *PackageUnassignHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		if !sa.IsActive {
 			continue
 		}
-		if err := removeUserFromRoutedNode(ctx, h.remoteManage, h.repo, req.Username, sa.RoutedNodeID); err != nil {
-			log.Printf("[PackageUnassign] routed node %d 下线用户 %s 失败: %v", sa.RoutedNodeID, req.Username, err)
-			mutationErrs = append(mutationErrs, fmt.Errorf("routed node %d: %w", sa.RoutedNodeID, err))
+		restart, removeErr := removeUserFromRoutedNode(ctx, h.remoteManage, h.repo, req.Username, sa.RoutedNodeID)
+		if restart {
+			if node, nodeErr := h.repo.GetNodeByID(ctx, sa.RoutedNodeID); nodeErr == nil && node.OriginalServer != "" {
+				if server, serverErr := h.repo.GetRemoteServerByName(ctx, node.OriginalServer); serverErr == nil {
+					restartNeeded[server.ID] = true
+				}
+			}
+		}
+		if removeErr != nil {
+			log.Printf("[PackageUnassign] routed node %d 下线用户 %s 失败: %v", sa.RoutedNodeID, req.Username, removeErr)
+			mutationErrs = append(mutationErrs, fmt.Errorf("routed node %d: %w", sa.RoutedNodeID, removeErr))
 		}
 	}
+	restartXrayInParallel(ctx, h.remoteManage, restartNeeded, "PackageUnassign")
 	if joined := errors.Join(mutationErrs...); joined != nil {
 		status := http.StatusBadGateway
 		if errors.Is(joined, storage.ErrRemoteInstallationActive) {
@@ -1067,11 +1084,6 @@ func (h *PackageAssignHandler) AssignAndProvision(ctx context.Context, username 
 						return
 					}
 					if node.NodeType == "routed" {
-						if srv, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer); err == nil {
-							mu.Lock()
-							restartNeeded[srv.ID] = true
-							mu.Unlock()
-						}
 						item, err := collectRoutedBatchItem(ctx, h.remoteManage, h.repo, user, node.ID)
 						if err != nil {
 							log.Printf("[PackageAssign] routed node %d collect failed for user %s: %v", node.ID, username, err)
@@ -1128,7 +1140,12 @@ func (h *PackageAssignHandler) AssignAndProvision(ctx context.Context, username 
 				routeWg.Add(1)
 				go func(sid int64, list []routedBatchItem) {
 					defer routeWg.Done()
-					ws := applyRoutedBatchOrFallback(ctx, h.remoteManage, h.repo, sid, list, "PackageAssign")
+					outcome, ws := applyRoutedBatchOrFallback(ctx, h.remoteManage, h.repo, sid, list, "PackageAssign")
+					if outcome.NeedsRestart() {
+						mu.Lock()
+						restartNeeded[sid] = true
+						mu.Unlock()
+					}
 					if len(ws) > 0 {
 						mu.Lock()
 						warnings = append(warnings, ws...)
@@ -1344,9 +1361,10 @@ func (h *PackageAssignHandler) loadDefaultTemplate(ctx context.Context) (string,
 }
 
 // addUserToInbound 获取远程入站配置，添加用户凭据，然后重新提交
-// restartXrayInParallel 并发对多台服务器做 xray restart-with-recovery,等全部完成后返回。
-// 单台 restartXrayWithRecovery 至少 2s(verify wait),5 台串行 ≥10s;并发后整体只看最慢一台。
-// 失败只记日志,不打断 —— 调用方语义里"重启 best-effort",和原顺序版本一致。
+// restartXrayInParallel applies routing changes on already-running cores only.
+// Package reconciliation is background control-plane work; it must never
+// revive an Xray service the administrator intentionally stopped. A later
+// explicit start loads the durable routing configuration normally.
 func restartXrayInParallel(ctx context.Context, rm *RemoteManageHandler, serverIDs map[int64]bool, logPrefix string) {
 	if len(serverIDs) == 0 {
 		return
@@ -1356,6 +1374,15 @@ func restartXrayInParallel(ctx context.Context, rm *RemoteManageHandler, serverI
 		wg.Add(1)
 		go func(sid int64) {
 			defer wg.Done()
+			status, statusErr := rm.remoteXrayServiceStatus(ctx, sid)
+			if statusErr != nil {
+				log.Printf("[%s] skip Xray restart on server %d: unable to confirm running state: %v", logPrefix, sid, statusErr)
+				return
+			}
+			if !status.Running {
+				log.Printf("[%s] skip Xray restart on server %d: service is stopped by operator", logPrefix, sid)
+				return
+			}
 			if err := rm.restartXrayWithRecovery(ctx, sid, logPrefix); err != nil {
 				log.Printf("[%s] restart xray on server %d failed: %v", logPrefix, sid, err)
 			}
@@ -1552,25 +1579,30 @@ func applyPreparedInboundCredential(ctx context.Context, rm *RemoteManageHandler
 	if err != nil {
 		return fmt.Errorf("add-client: %w", err)
 	}
-	restart, err := validateAgentClientMutation(response)
+	runtimeDeferred, err := validateAgentClientMutation(response)
 	if err != nil {
 		return fmt.Errorf("add-client ACK: %w", err)
 	}
-	if restart {
-		if err := rm.restartXrayWithRecovery(ctx, serverID, "ManagedClientAdd"); err != nil {
-			return fmt.Errorf("apply persisted client to Xray: %w", err)
-		}
+	if runtimeDeferred {
+		// The Agent persisted the client but could not hot-replace the inbound.
+		// Do not revive an administrator-stopped core; the Agent retries on a
+		// later matching mutation or the operator's explicit Xray start.
+		log.Printf("[ManagedClientAdd] server=%d Agent deferred inbound runtime apply; Xray lifecycle left unchanged", serverID)
 	}
 
 	return nil
 }
 
-// validateAgentClientMutation turns the Agent's JSON response into an actual
-// application acknowledgement. Some Agent versions return HTTP 200 after the
-// config was persisted but the running Xray could not be updated. A no-op can
-// also be the retry of such a deferred mutation, so both cases require a
-// verified restart before the master marks access applied.
-func validateAgentClientMutation(body []byte) (bool, error) {
+type agentClientMutationOutcome struct {
+	RuntimeDeferred   bool
+	NoOp              bool
+	ExplicitUnchanged bool
+}
+
+// inspectAgentClientMutation separates a genuine runtime-apply failure from
+// an idempotent no-op. Neither condition grants the control plane permission
+// to start a stopped Xray process.
+func inspectAgentClientMutation(body []byte) (agentClientMutationOutcome, error) {
 	var response struct {
 		Success        bool   `json:"success"`
 		Message        string `json:"message"`
@@ -1578,15 +1610,27 @@ func validateAgentClientMutation(body []byte) (bool, error) {
 		Changed        *bool  `json:"changed"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
-		return false, fmt.Errorf("invalid JSON: %w", err)
+		return agentClientMutationOutcome{}, fmt.Errorf("invalid JSON: %w", err)
 	}
 	if !response.Success {
-		return false, errors.New("Agent did not acknowledge the client mutation")
+		return agentClientMutationOutcome{}, errors.New("Agent did not acknowledge the client mutation")
 	}
-	needsRestart := strings.TrimSpace(response.RuntimeWarning) != "" ||
-		strings.Contains(strings.ToLower(response.Message), "no-op") ||
-		(response.Changed != nil && !*response.Changed)
-	return needsRestart, nil
+	return agentClientMutationOutcome{
+		RuntimeDeferred:   strings.TrimSpace(response.RuntimeWarning) != "",
+		NoOp:              strings.Contains(strings.ToLower(response.Message), "no-op"),
+		ExplicitUnchanged: response.Changed != nil && !*response.Changed,
+	}, nil
+}
+
+// validateAgentClientMutation reports only whether the Agent deferred a live
+// inbound replacement. Callers may surface or log that condition, but must not
+// use it as a reason to start or restart Xray.
+func validateAgentClientMutation(body []byte) (bool, error) {
+	outcome, err := inspectAgentClientMutation(body)
+	if err != nil {
+		return false, err
+	}
+	return outcome.RuntimeDeferred, nil
 }
 
 // extractClientByEmail 在 inbound.settings 的 clients / users / accounts 数组里按 email 找现存 client,
@@ -1689,14 +1733,12 @@ func removeUserFromInbound(ctx context.Context, rm *RemoteManageHandler, cfg sto
 	if err != nil {
 		return fmt.Errorf("remove-client: %w", err)
 	}
-	restart, err := validateAgentClientMutation(response)
+	runtimeDeferred, err := validateAgentClientMutation(response)
 	if err != nil {
 		return fmt.Errorf("remove-client ACK: %w", err)
 	}
-	if restart {
-		if err := rm.restartXrayWithRecovery(ctx, cfg.ServerID, "ManagedClientRemove"); err != nil {
-			return fmt.Errorf("apply persisted client removal to Xray: %w", err)
-		}
+	if runtimeDeferred {
+		log.Printf("[ManagedClientRemove] server=%d Agent deferred inbound runtime apply; Xray lifecycle left unchanged", cfg.ServerID)
 	}
 	return nil
 }

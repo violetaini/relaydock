@@ -146,9 +146,9 @@ func (h *RemoteManageHandler) replaceInboundForSync(ctx context.Context, serverI
 	if err := validateManagedWireGuardMutationACK(response, mutationID); err != nil {
 		return fmt.Errorf("replace inbound ownership ACK: %w", err)
 	}
-	if err := applyAgentConfigMutationACK(ctx, h, serverID, "ManagedRealityCredentialRepair", response); err != nil {
-		return fmt.Errorf("replace inbound ACK: %w", err)
-	}
+	// ChildManageHandler applies an inbound replacement through Xray's runtime
+	// API before atomically persisting it. A full core restart would interrupt
+	// every unrelated proxy merely to change this one owned inbound.
 	return nil
 }
 

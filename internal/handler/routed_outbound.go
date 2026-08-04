@@ -463,11 +463,23 @@ func (h *RoutedOutboundHandler) peekInboundFirstClientFlow(ctx context.Context, 
 // mutateRoutingRuleUserByOutboundTag 在 routing.rules 里找 outboundTag 匹配的 rule,
 // 给它的 user[] 数组加/删一个 email,然后用 agent 的 `set` action 把整个 routing 推回去。
 // 用途:auto-detected routed 节点没有 marktag,agent 的 add_user_to_rule 需要 marktag,绕开它。
-// add=true 表示新增 email(去重 append);add=false 表示移除。
-func mutateRoutingRuleUserByOutboundTag(ctx context.Context, rm *RemoteManageHandler, serverID int64, outboundTag, userEmail string, add bool) error {
+// 返回值表示 routing 是否真的写入；调用方据此决定是否做唯一一次终态重启。
+func mutateRoutingRuleUserByOutboundTag(ctx context.Context, rm *RemoteManageHandler, serverID int64, outboundTag, userEmail string, add bool) (bool, error) {
+	return mutateRoutingRuleUser(ctx, rm, serverID, "outboundTag", outboundTag, userEmail, add)
+}
+
+// mutateRoutingRuleUserByMarktag is the ownership-preserving counterpart for
+// panel-created routed rules. Reading first makes a repeated unbind a true
+// no-op instead of rewriting the routing file and causing an unnecessary
+// process restart later in the package transaction.
+func mutateRoutingRuleUserByMarktag(ctx context.Context, rm *RemoteManageHandler, serverID int64, marktag, userEmail string, add bool) (bool, error) {
+	return mutateRoutingRuleUser(ctx, rm, serverID, "marktag", marktag, userEmail, add)
+}
+
+func mutateRoutingRuleUser(ctx context.Context, rm *RemoteManageHandler, serverID int64, selectorKey, selectorValue, userEmail string, add bool) (bool, error) {
 	leasedCtx, release, err := acquireRemoteMutationLease(ctx, rm, serverID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer release()
 	ctx = leasedCtx
@@ -478,20 +490,20 @@ func mutateRoutingRuleUserByOutboundTag(ctx context.Context, rm *RemoteManageHan
 
 	raw, err := rm.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/routing", nil)
 	if err != nil {
-		return fmt.Errorf("get routing: %w", err)
+		return false, fmt.Errorf("get routing: %w", err)
 	}
 	var resp struct {
 		Success bool                   `json:"success"`
 		Routing map[string]interface{} `json:"routing"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return fmt.Errorf("parse routing: %w", err)
+		return false, fmt.Errorf("parse routing: %w", err)
 	}
 	if !resp.Success {
-		return errors.New("Agent did not acknowledge routing snapshot")
+		return false, errors.New("Agent did not acknowledge routing snapshot")
 	}
 	if resp.Routing == nil {
-		return fmt.Errorf("no routing config")
+		return false, fmt.Errorf("no routing config")
 	}
 	rules, _ := resp.Routing["rules"].([]interface{})
 	matched := -1
@@ -500,20 +512,20 @@ func mutateRoutingRuleUserByOutboundTag(ctx context.Context, rm *RemoteManageHan
 		if rm == nil {
 			continue
 		}
-		if t, _ := rm["outboundTag"].(string); t == outboundTag {
+		if t, _ := rm[selectorKey].(string); t == selectorValue {
 			matched = i
 			break
 		}
 	}
 	if matched < 0 {
-		return fmt.Errorf("no routing rule with outboundTag=%q", outboundTag)
+		return false, fmt.Errorf("no routing rule with %s=%q", selectorKey, selectorValue)
 	}
 	rule := rules[matched].(map[string]interface{})
 	users, _ := rule["user"].([]interface{})
 	if add {
 		for _, u := range users {
 			if s, _ := u.(string); s == userEmail {
-				return rm.restartXrayWithRecovery(ctx, serverID, "RoutedRuleNoOp")
+				return false, nil
 			}
 		}
 		users = append(users, userEmail)
@@ -523,6 +535,9 @@ func mutateRoutingRuleUserByOutboundTag(ctx context.Context, rm *RemoteManageHan
 			if s, _ := u.(string); s != userEmail {
 				filtered = append(filtered, u)
 			}
+		}
+		if len(filtered) == len(users) {
+			return false, nil
 		}
 		users = filtered
 	}
@@ -539,12 +554,16 @@ func mutateRoutingRuleUserByOutboundTag(ctx context.Context, rm *RemoteManageHan
 	})
 	response, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", body)
 	if err != nil {
-		return fmt.Errorf("set routing: %w", err)
+		return false, fmt.Errorf("set routing: %w", err)
 	}
-	if err := applyAgentConfigMutationACK(ctx, rm, serverID, "RoutedRuleSet", response); err != nil {
-		return err
+	changed, err := inspectAgentConfigMutationChanged(response)
+	if err != nil {
+		return false, err
 	}
-	return rm.restartXrayWithRecovery(ctx, serverID, "RoutedRuleSet")
+	if !changed {
+		return false, nil
+	}
+	return true, nil
 }
 
 // peekInboundFirstClientFlow 给非 RoutedOutboundHandler 的调用方用(addUserToRoutedNode 直接拿 *RemoteManageHandler)。
@@ -673,7 +692,7 @@ func peekInboundClientByEmail(ctx context.Context, rm *RemoteManageHandler, serv
 
 // 给目标 inbound 加一个 client — 走 agent 原子 add-client,在 inboundsMu 锁内完成 read-modify-write。
 // 主控不再持有 inbound 快照,从根本上消除并发绑套餐丢 client 的问题。
-func addClientToInbound(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag string, client map[string]interface{}) error {
+func addClientToInboundDeferred(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag string, client map[string]interface{}) (agentClientMutationOutcome, error) {
 	body, _ := json.Marshal(map[string]interface{}{
 		"action": "add-client",
 		"tag":    inboundTag,
@@ -681,16 +700,22 @@ func addClientToInbound(ctx context.Context, rm *RemoteManageHandler, serverID i
 	})
 	response, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/inbounds", body)
 	if err != nil {
-		return fmt.Errorf("add-client: %w", err)
+		return agentClientMutationOutcome{}, fmt.Errorf("add-client: %w", err)
 	}
-	restart, err := validateAgentClientMutation(response)
+	outcome, err := inspectAgentClientMutation(response)
 	if err != nil {
-		return fmt.Errorf("add-client ACK: %w", err)
+		return agentClientMutationOutcome{}, fmt.Errorf("add-client ACK: %w", err)
 	}
-	if restart {
-		if err := rm.restartXrayWithRecovery(ctx, serverID, "RoutedClientAdd"); err != nil {
-			return fmt.Errorf("apply routed client to Xray: %w", err)
-		}
+	return outcome, nil
+}
+
+func addClientToInbound(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag string, client map[string]interface{}) error {
+	outcome, err := addClientToInboundDeferred(ctx, rm, serverID, inboundTag, client)
+	if err != nil {
+		return err
+	}
+	if outcome.RuntimeDeferred {
+		log.Printf("[RoutedClientAdd] server=%d Agent deferred inbound runtime apply; Xray lifecycle left unchanged", serverID)
 	}
 	return nil
 }
@@ -768,7 +793,7 @@ func addInboundSniffingExcludes(ctx context.Context, rm *RemoteManageHandler, se
 	return applyAgentConfigMutationACK(ctx, rm, serverID, "RoutedSniffingUpdate", response)
 }
 
-func applyAgentConfigMutationACK(ctx context.Context, rm *RemoteManageHandler, serverID int64, label string, body []byte) error {
+func inspectAgentConfigMutationACK(body []byte) (bool, error) {
 	var response struct {
 		Success        bool   `json:"success"`
 		Message        string `json:"message"`
@@ -777,26 +802,53 @@ func applyAgentConfigMutationACK(ctx context.Context, rm *RemoteManageHandler, s
 		Changed        *bool  `json:"changed"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
-		return fmt.Errorf("invalid Agent mutation ACK: %w", err)
+		return false, fmt.Errorf("invalid Agent mutation ACK: %w", err)
 	}
 	if !response.Success {
-		return errors.New("Agent did not acknowledge the configuration mutation")
+		return false, errors.New("Agent did not acknowledge the configuration mutation")
 	}
-	needsRestart := strings.TrimSpace(response.Warning) != "" ||
-		strings.TrimSpace(response.RuntimeWarning) != "" ||
-		strings.Contains(strings.ToLower(response.Message), "no-op") ||
-		(response.Changed != nil && !*response.Changed)
-	if needsRestart {
-		if err := rm.restartXrayWithRecovery(ctx, serverID, label); err != nil {
-			return fmt.Errorf("verify Agent configuration mutation: %w", err)
-		}
+	// A no-op and changed=false are confirmed idempotence, never a recovery
+	// signal. Runtime warnings are reported to callers, but lifecycle decisions
+	// remain explicit panel actions.
+	return strings.TrimSpace(response.Warning) != "" || strings.TrimSpace(response.RuntimeWarning) != "", nil
+}
+
+// inspectAgentConfigMutationChanged reads the optional mutation metadata used
+// by newer Agents while remaining compatible with the older successful
+// "Routing updated" response. A confirmed no-op cannot justify a core
+// restart, even when it is part of a package transaction.
+func inspectAgentConfigMutationChanged(body []byte) (bool, error) {
+	var response struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+		Changed *bool  `json:"changed"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return false, fmt.Errorf("invalid Agent mutation ACK: %w", err)
+	}
+	if !response.Success {
+		return false, errors.New("Agent did not acknowledge the configuration mutation")
+	}
+	if response.Changed != nil {
+		return *response.Changed, nil
+	}
+	return !strings.Contains(strings.ToLower(response.Message), "no-op"), nil
+}
+
+func applyAgentConfigMutationACK(ctx context.Context, rm *RemoteManageHandler, serverID int64, label string, body []byte) error {
+	deferred, err := inspectAgentConfigMutationACK(body)
+	if err != nil {
+		return err
+	}
+	if deferred {
+		log.Printf("[%s] server=%d Agent reported deferred configuration runtime apply; Xray lifecycle left unchanged", label, serverID)
 	}
 	return nil
 }
 
 // 从目标 inbound 移除一个 client(按 email 匹配)。
 // agent 的 matchClientCredential 在 id/password 等主键缺失时会回退到 email,所以这里只传 email 也能匹配。
-func removeClientFromInbound(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag, email string) error {
+func removeClientFromInboundDeferred(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag, email string) (agentClientMutationOutcome, error) {
 	body, _ := json.Marshal(map[string]interface{}{
 		"action": "remove-client",
 		"tag":    inboundTag,
@@ -804,16 +856,22 @@ func removeClientFromInbound(ctx context.Context, rm *RemoteManageHandler, serve
 	})
 	response, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/inbounds", body)
 	if err != nil {
-		return fmt.Errorf("remove-client: %w", err)
+		return agentClientMutationOutcome{}, fmt.Errorf("remove-client: %w", err)
 	}
-	restart, err := validateAgentClientMutation(response)
+	outcome, err := inspectAgentClientMutation(response)
 	if err != nil {
-		return fmt.Errorf("remove-client ACK: %w", err)
+		return agentClientMutationOutcome{}, fmt.Errorf("remove-client ACK: %w", err)
 	}
-	if restart {
-		if err := rm.restartXrayWithRecovery(ctx, serverID, "RoutedClientRemove"); err != nil {
-			return fmt.Errorf("apply routed client removal to Xray: %w", err)
-		}
+	return outcome, nil
+}
+
+func removeClientFromInbound(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag, email string) error {
+	outcome, err := removeClientFromInboundDeferred(ctx, rm, serverID, inboundTag, email)
+	if err != nil {
+		return err
+	}
+	if outcome.RuntimeDeferred {
+		log.Printf("[RoutedClientRemove] server=%d Agent deferred inbound runtime apply; Xray lifecycle left unchanged", serverID)
 	}
 	return nil
 }
@@ -1032,8 +1090,12 @@ func prepareRoutedNodeForUserLocked(ctx context.Context, rm *RemoteManageHandler
 	}); err != nil {
 		return nil, fmt.Errorf("reserve subaccount: %w", err)
 	}
-	if err := addClientToInbound(ctx, rm, info.ServerID, info.InboundTag, info.Credential); err != nil {
+	clientOutcome, err := addClientToInboundDeferred(ctx, rm, info.ServerID, info.InboundTag, info.Credential)
+	if err != nil {
 		return nil, fmt.Errorf("add client to inbound: %w", err)
+	}
+	if clientOutcome.RuntimeDeferred {
+		log.Printf("[RoutedClientAdd] server=%d Agent deferred runtime inbound replacement; preserving its retry path without restarting the core", info.ServerID)
 	}
 	if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
 		Username: info.Username, RoutedNodeID: info.RoutedNodeID,
@@ -1098,13 +1160,26 @@ func collectRoutedBatchItem(ctx context.Context, rm *RemoteManageHandler, repo *
 // ErrAgentBatchNotSupported 老 agent 没 /api/child/batch-apply 端点时返回,调用方应 fallback。
 var ErrAgentBatchNotSupported = errors.New("agent batch-apply endpoint not supported")
 
+// routedBatchOutcome records whether the Agent actually wrote routing. Xray
+// has no runtime API for rules, so this is the sole package-batch condition
+// that warrants one terminal restart. Inbound runtime warnings and no-ops are
+// deliberately not restart triggers here.
+type routedBatchOutcome struct {
+	RoutingChanged bool
+}
+
+func (outcome routedBatchOutcome) NeedsRestart() bool {
+	return outcome.RoutingChanged
+}
+
 // applyRoutedBatchOrFallback 同台 server 上的 routed 节点改动一次性发给 agent,
 // 老 agent 不支持就 fallback 到逐项 prepareRoutedNodeForUser + applyRoutingAdditionsBatch。
-// 返回收集到的人类可读 warning 列表(给前端 toast 用,空切片=全成功)。
+// 返回实际变更结果和人类可读 warning 列表(给前端 toast 用,空切片=全成功)。
 // label 仅用于日志(如 "PackageAssign" / "PackageUpdate")。
-func applyRoutedBatchOrFallback(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, serverID int64, items []routedBatchItem, label string) []string {
+func applyRoutedBatchOrFallback(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, serverID int64, items []routedBatchItem, label string) (routedBatchOutcome, []string) {
+	var outcome routedBatchOutcome
 	if len(items) == 0 {
-		return nil
+		return outcome, nil
 	}
 	usernames := make([]string, 0, len(items))
 	for _, item := range items {
@@ -1118,8 +1193,9 @@ func applyRoutedBatchOrFallback(ctx context.Context, rm *RemoteManageHandler, re
 		}
 		defer release()
 
-		err = applyRoutedBatchToAgentLocked(leasedCtx, rm, repo, serverID, items)
+		batchOutcome, err := applyRoutedBatchToAgentLocked(leasedCtx, rm, repo, serverID, items)
 		if err == nil {
+			outcome = batchOutcome
 			return nil
 		}
 		if !errors.Is(err, ErrAgentBatchNotSupported) {
@@ -1145,44 +1221,50 @@ func applyRoutedBatchOrFallback(ctx context.Context, rm *RemoteManageHandler, re
 			}
 		}
 		if len(routingAdds) > 0 {
-			if rerr := applyRoutingAdditionsBatch(leasedCtx, rm, serverID, routingAdds); rerr != nil {
+			if changed, rerr := applyRoutingAdditionsBatch(leasedCtx, rm, serverID, routingAdds); rerr != nil {
 				log.Printf("[%s] fallback routing batch server=%d failed: %v", label, serverID, rerr)
 				warnings = append(warnings, fmt.Sprintf("服务器 %d 路由规则批量更新失败", serverID))
+			} else {
+				outcome.RoutingChanged = changed
 			}
 		}
 		return nil
 	})
 	if leaseErr != nil {
 		log.Printf("[%s] server=%d mutation blocked: %v", label, serverID, leaseErr)
-		return []string{fmt.Sprintf("服务器 %d 正在安装或暂不可变更", serverID)}
+		return outcome, []string{fmt.Sprintf("服务器 %d 正在安装或暂不可变更", serverID)}
 	}
-	return warnings
+	return outcome, warnings
 }
 
 // applyRoutedBatchToAgent 把同台 server 上的 routed 节点批量改动(inbound add-client + routing add-user)
 // 一次 POST /api/child/batch-apply 提交。
-//   - 成功:批量 UpsertUserSubaccount 写 DB,返回 nil
+//   - 成功:批量 UpsertUserSubaccount 写 DB,返回实际 routing/runtime 结果
 //   - agent 不支持(404)→ 返回 ErrAgentBatchNotSupported,caller 走 prepareRoutedNodeForUser fallback
 //   - 其它失败 → 返回 wrapped error,DB 不写(下次重试幂等)
-func applyRoutedBatchToAgent(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, serverID int64, items []routedBatchItem) error {
+func applyRoutedBatchToAgent(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, serverID int64, items []routedBatchItem) (routedBatchOutcome, error) {
 	if len(items) == 0 {
-		return nil
+		return routedBatchOutcome{}, nil
 	}
 	usernames := make([]string, 0, len(items))
 	for _, item := range items {
 		usernames = append(usernames, item.Username)
 	}
-	return repo.WithUsersProvisioningLease(ctx, usernames, func() error {
+	var outcome routedBatchOutcome
+	err := repo.WithUsersProvisioningLease(ctx, usernames, func() error {
 		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
 		if err != nil {
 			return err
 		}
 		defer release()
-		return applyRoutedBatchToAgentLocked(leasedCtx, rm, repo, serverID, items)
+		outcome, err = applyRoutedBatchToAgentLocked(leasedCtx, rm, repo, serverID, items)
+		return err
 	})
+	return outcome, err
 }
 
-func applyRoutedBatchToAgentLocked(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, serverID int64, items []routedBatchItem) error {
+func applyRoutedBatchToAgentLocked(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, serverID int64, items []routedBatchItem) (routedBatchOutcome, error) {
+	var outcome routedBatchOutcome
 	// 同服务器 batch 写盘也要走 routingMutateLocks,跟 applyRoutingAdditionsBatch 串行,
 	// 避免 batch 与单点 routing mutate 并发改 routing 数组。
 	mu := acquireRoutingMutateLock(serverID)
@@ -1209,7 +1291,7 @@ func applyRoutedBatchToAgentLocked(ctx context.Context, rm *RemoteManageHandler,
 			Username: it.Username, RoutedNodeID: it.RoutedNodeID,
 			Email: it.UserEmail, CredentialJSON: it.CredentialJSON,
 		}); err != nil {
-			return fmt.Errorf("reserve routed subaccount user=%s node=%d: %w", it.Username, it.RoutedNodeID, err)
+			return outcome, fmt.Errorf("reserve routed subaccount user=%s node=%d: %w", it.Username, it.RoutedNodeID, err)
 		}
 		req.InboundClients = append(req.InboundClients, batchInboundClient{
 			Tag:    it.InboundTag,
@@ -1229,9 +1311,9 @@ func applyRoutedBatchToAgentLocked(ctx context.Context, rm *RemoteManageHandler,
 		msg := err.Error()
 		low := strings.ToLower(msg)
 		if strings.Contains(low, "404") || strings.Contains(low, "not found") || strings.Contains(low, "method not allowed") {
-			return ErrAgentBatchNotSupported
+			return outcome, ErrAgentBatchNotSupported
 		}
-		return fmt.Errorf("batch-apply server=%d: %w", serverID, err)
+		return outcome, fmt.Errorf("batch-apply server=%d: %w", serverID, err)
 	}
 
 	var resp struct {
@@ -1239,30 +1321,35 @@ func applyRoutedBatchToAgentLocked(ctx context.Context, rm *RemoteManageHandler,
 		InboundResults  []string `json:"inbound_results"`
 		RoutingResults  []string `json:"routing_results"`
 		RuntimeWarnings []string `json:"runtime_warnings"`
+		RoutingChanged  bool     `json:"routing_changed"`
 		Message         string   `json:"message"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return fmt.Errorf("parse batch-apply response: %w", err)
+		return outcome, fmt.Errorf("parse batch-apply response: %w", err)
 	}
 	if !resp.Success {
-		return fmt.Errorf("batch-apply rejected: %s", resp.Message)
+		return outcome, fmt.Errorf("batch-apply rejected: %s", resp.Message)
 	}
 	if len(resp.InboundResults) != len(items) || len(resp.RoutingResults) != len(items) {
-		return fmt.Errorf("batch-apply returned incomplete item results")
+		return outcome, fmt.Errorf("batch-apply returned incomplete item results")
 	}
-	needsRestart := len(resp.RuntimeWarnings) > 0
+	outcome.RoutingChanged = resp.RoutingChanged
 	for i := range items {
 		inboundNoOp, inboundErr := validateAgentBatchItemResult(resp.InboundResults[i])
 		routingNoOp, routingErr := validateAgentBatchItemResult(resp.RoutingResults[i])
 		if inboundErr != nil || routingErr != nil {
-			return fmt.Errorf("batch-apply item %d failed: inbound=%v routing=%v", i, inboundErr, routingErr)
+			return outcome, fmt.Errorf("batch-apply item %d failed: inbound=%v routing=%v", i, inboundErr, routingErr)
 		}
-		needsRestart = needsRestart || inboundNoOp || routingNoOp
+		// Older Agents that already expose batch-apply may not have emitted
+		// routing_changed yet. Their per-item "ok" still provides an exact
+		// compatibility signal; "ok (no-op)" deliberately does not.
+		if !routingNoOp {
+			outcome.RoutingChanged = true
+		}
+		_ = inboundNoOp
 	}
-	if needsRestart {
-		if err := rm.restartXrayWithRecovery(ctx, serverID, "RoutedBatchApply"); err != nil {
-			return fmt.Errorf("apply persisted routed batch to Xray: %w", err)
-		}
+	if len(resp.RuntimeWarnings) > 0 {
+		log.Printf("[RoutedBatchApply] server=%d Agent deferred an inbound runtime replacement; not restarting the core for an inbound-only warning", serverID)
 	}
 
 	// Every Agent operation is acknowledged before any local binding is saved.
@@ -1274,23 +1361,24 @@ func applyRoutedBatchToAgentLocked(ctx context.Context, rm *RemoteManageHandler,
 			CredentialJSON: it.CredentialJSON,
 			IsActive:       true,
 		}); err != nil {
-			return fmt.Errorf("save routed subaccount user=%s node=%d: %w", it.Username, it.RoutedNodeID, err)
+			return outcome, fmt.Errorf("save routed subaccount user=%s node=%d: %w", it.Username, it.RoutedNodeID, err)
 		}
 	}
-	return nil
+	return outcome, nil
 }
 
 // applyRoutingAdditionsBatch 把同台服务器多个 routing rule 改动一次 GET+SET 推回。
 // 调用方应该把 additions 按 ServerID 分组后,per-server 调一次本函数。
 // 失败时 routing 未更新,但 client 已在 inbound 里 + DB 有 subaccount 记录,
-// 重试本函数即可幂等补全(去重 append email)。
-func applyRoutingAdditionsBatch(ctx context.Context, rm *RemoteManageHandler, serverID int64, additions []routingRuleAddition) error {
+// 重试本函数即可幂等补全(去重 append email)。返回值表示 routing 是否真的改变；
+// 调用方决定何时做唯一一次必要的 Xray 重启。
+func applyRoutingAdditionsBatch(ctx context.Context, rm *RemoteManageHandler, serverID int64, additions []routingRuleAddition) (bool, error) {
 	if len(additions) == 0 {
-		return nil
+		return false, nil
 	}
 	leasedCtx, release, err := acquireRemoteMutationLease(ctx, rm, serverID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer release()
 	ctx = leasedCtx
@@ -1300,22 +1388,23 @@ func applyRoutingAdditionsBatch(ctx context.Context, rm *RemoteManageHandler, se
 
 	raw, err := rm.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/routing", nil)
 	if err != nil {
-		return fmt.Errorf("get routing: %w", err)
+		return false, fmt.Errorf("get routing: %w", err)
 	}
 	var resp struct {
 		Success bool                   `json:"success"`
 		Routing map[string]interface{} `json:"routing"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return fmt.Errorf("parse routing: %w", err)
+		return false, fmt.Errorf("parse routing: %w", err)
 	}
 	if !resp.Success {
-		return errors.New("Agent did not acknowledge routing snapshot")
+		return false, errors.New("Agent did not acknowledge routing snapshot")
 	}
 	if resp.Routing == nil {
-		return fmt.Errorf("no routing config")
+		return false, fmt.Errorf("no routing config")
 	}
 	rules, _ := resp.Routing["rules"].([]interface{})
+	changed := false
 
 	for _, a := range additions {
 		matched := -1
@@ -1337,7 +1426,7 @@ func applyRoutingAdditionsBatch(ctx context.Context, rm *RemoteManageHandler, se
 			}
 		}
 		if matched < 0 {
-			return fmt.Errorf("routing rule not found server=%d marktag=%q outboundTag=%q", serverID, a.Marktag, a.OutboundTag)
+			return false, fmt.Errorf("routing rule not found server=%d marktag=%q outboundTag=%q", serverID, a.Marktag, a.OutboundTag)
 		}
 		rule := rules[matched].(map[string]interface{})
 		users, _ := rule["user"].([]interface{})
@@ -1352,8 +1441,12 @@ func applyRoutingAdditionsBatch(ctx context.Context, rm *RemoteManageHandler, se
 		if !exists {
 			users = append(users, a.UserEmail)
 			rule["user"] = users
+			changed = true
 		}
 		rules[matched] = rule
+	}
+	if !changed {
+		return false, nil
 	}
 	resp.Routing["rules"] = rules
 
@@ -1364,12 +1457,16 @@ func applyRoutingAdditionsBatch(ctx context.Context, rm *RemoteManageHandler, se
 	})
 	response, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", body)
 	if err != nil {
-		return fmt.Errorf("set routing: %w", err)
+		return false, fmt.Errorf("set routing: %w", err)
 	}
-	if err := applyAgentConfigMutationACK(ctx, rm, serverID, "RoutedRulesSet", response); err != nil {
-		return err
+	ackChanged, err := inspectAgentConfigMutationChanged(response)
+	if err != nil {
+		return false, err
 	}
-	return rm.restartXrayWithRecovery(ctx, serverID, "RoutedRulesSet")
+	if !ackChanged {
+		return false, nil
+	}
+	return true, nil
 }
 
 // addUserToRoutedNode 是单节点版的包装,给非套餐路径(单用户加路由出站等)用,
@@ -1390,7 +1487,8 @@ func addUserToRoutedNode(ctx context.Context, rm *RemoteManageHandler, repo *sto
 		if err != nil || add == nil {
 			return err
 		}
-		if err := applyRoutingAdditionsBatch(leasedCtx, rm, add.ServerID, []routingRuleAddition{*add}); err != nil {
+		changed, err := applyRoutingAdditionsBatch(leasedCtx, rm, add.ServerID, []routingRuleAddition{*add})
+		if err != nil {
 			// Keep rollback inside the same lease so installation cannot snapshot
 			// the transient client/routing state.
 			routed, gerr := repo.GetRoutedNodeDetail(leasedCtx, routedNodeID)
@@ -1399,20 +1497,26 @@ func addUserToRoutedNode(ctx context.Context, rm *RemoteManageHandler, repo *sto
 			}
 			return err
 		}
+		if changed {
+			if err := rm.restartXrayWithRecovery(leasedCtx, add.ServerID, "RoutedRulesSet"); err != nil {
+				return fmt.Errorf("apply routed rule to Xray: %w", err)
+			}
+		}
 		return nil
 	})
 }
 
 // removeUserFromRoutedNode 把用户从 routing rule.user[] 移除 + 从 inbound 移除 client。
+// 返回值表示 routing 是否实际改变；运行时入站替换延后只记录日志，不重启核心。
 // is_active 置 0,credential 保留 — 下次绑定/续费可无缝恢复。
-func removeUserFromRoutedNode(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string, routedNodeID int64) error {
+func removeUserFromRoutedNode(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string, routedNodeID int64) (bool, error) {
 	routed, err := repo.GetRoutedNodeDetail(ctx, routedNodeID)
 	if err != nil {
-		return fmt.Errorf("get routed node %d: %w", routedNodeID, err)
+		return false, fmt.Errorf("get routed node %d: %w", routedNodeID, err)
 	}
 	servers, err := repo.ListRemoteServers(ctx)
 	if err != nil {
-		return fmt.Errorf("list servers: %w", err)
+		return false, fmt.Errorf("list servers: %w", err)
 	}
 	var serverID int64
 	for _, s := range servers {
@@ -1422,56 +1526,56 @@ func removeUserFromRoutedNode(ctx context.Context, rm *RemoteManageHandler, repo
 		}
 	}
 	if serverID == 0 {
-		return fmt.Errorf("server %s not found", routed.OriginalServer)
+		return false, fmt.Errorf("server %s not found", routed.OriginalServer)
 	}
 	leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer release()
 	ctx = leasedCtx
 
 	routed, err = repo.GetRoutedNodeDetail(ctx, routedNodeID)
 	if err != nil {
-		return fmt.Errorf("get routed node %d: %w", routedNodeID, err)
+		return false, fmt.Errorf("get routed node %d: %w", routedNodeID, err)
 	}
 	lockedServer, err := repo.GetRemoteServerByName(ctx, routed.OriginalServer)
 	if err != nil || lockedServer.ID != serverID {
-		return errors.New("routed node server changed while removing user; retry required")
+		return false, errors.New("routed node server changed while removing user; retry required")
 	}
 	sa, err := repo.GetUserSubaccount(ctx, routedNodeID, username)
 	if err != nil || sa == nil {
-		return nil // 没有子账号,无事可做
+		return false, nil // 没有子账号,无事可做
 	}
 
 	// 1. 从 rule.user[] 移除。远端未确认时保留 active 本地记录供重试。
+	routingChanged := false
 	if routed.RoutedRuleMarktag != "" {
-		body, _ := json.Marshal(map[string]interface{}{
-			"action":     "remove_user_from_rule",
-			"marktag":    routed.RoutedRuleMarktag,
-			"user_email": sa.Email,
-			"no_restart": true, // 主控 PackageUnbind 在末尾统一重启,见 packages.go restartXrayInParallel
-		})
-		response, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", body)
-		if err == nil {
-			err = applyAgentConfigMutationACK(ctx, rm, serverID, "RoutedUserRuleRemove", response)
-		}
+		routingChanged, err = mutateRoutingRuleUserByMarktag(ctx, rm, serverID, routed.RoutedRuleMarktag, sa.Email, false)
 		if err != nil {
-			return fmt.Errorf("remove user from routing rule: %w", err)
+			return false, fmt.Errorf("remove user from routing rule: %w", err)
 		}
 	} else if routed.RoutedOutboundTag != "" {
-		if err := mutateRoutingRuleUserByOutboundTag(ctx, rm, serverID, routed.RoutedOutboundTag, sa.Email, false); err != nil {
-			return fmt.Errorf("remove user from routing rule: %w", err)
+		routingChanged, err = mutateRoutingRuleUserByOutboundTag(ctx, rm, serverID, routed.RoutedOutboundTag, sa.Email, false)
+		if err != nil {
+			return false, fmt.Errorf("remove user from routing rule: %w", err)
 		}
 	}
 
 	// 2. 从 inbound 移除 client
-	if err := removeClientFromInbound(ctx, rm, serverID, routed.InboundTag, sa.Email); err != nil {
-		return err
+	clientOutcome, err := removeClientFromInboundDeferred(ctx, rm, serverID, routed.InboundTag, sa.Email)
+	if err != nil {
+		return false, err
+	}
+	if clientOutcome.RuntimeDeferred {
+		log.Printf("[RoutedClientRemove] server=%d Agent deferred runtime inbound replacement; preserving its retry path without restarting the core", serverID)
 	}
 
 	// 3. DB 置 is_active=0(凭据保留)
-	return repo.SetSubaccountActive(ctx, sa.ID, false)
+	if err := repo.SetSubaccountActive(ctx, sa.ID, false); err != nil {
+		return routingChanged, err
+	}
+	return routingChanged, nil
 }
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9-]{2,32}$`)

@@ -38,6 +38,37 @@ func certDeployPaths(domain, dir string) (certPath, keyPath string) {
 	return filepath.Join(dir, name+".pem"), filepath.Join(dir, name+".key")
 }
 
+// certificateReloadTarget normalizes the service selected by the administrator.
+// AutoDeploy controls when a certificate is copied, never which service should
+// be reloaded. Returning false protects legacy/incomplete records from an
+// unintended service reload.
+func certificateReloadTarget(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "nginx", "xray", "both":
+		return strings.ToLower(strings.TrimSpace(value)), true
+	default:
+		return "", false
+	}
+}
+
+// automaticCertificateReloadTarget keeps certificate material rotation
+// non-disruptive. Xray watches certificate files in the normal configuration,
+// so a renewal only replaces files. Nginx still needs a reload to observe its
+// configured files. A deliberately oneTimeLoading Xray waits for the next
+// explicit operator restart rather than interrupting proxy traffic.
+func automaticCertificateReloadTarget(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "nginx":
+		return "nginx", true
+	case "xray":
+		return "none", true
+	case "both":
+		return "nginx", true
+	default:
+		return "", false
+	}
+}
+
 type CertificateHandler struct {
 	repo               *storage.TrafficRepository
 	wsHandler          *RemoteWSHandler
@@ -1108,15 +1139,15 @@ func (h *CertificateHandler) HandleCertUpdate(serverID int64, payload WSCertUpda
 		// 部署到主服务器和所有远程服务器（如果配置）
 		cert, err := h.repo.GetCertificate(ctx, payload.CertID)
 		if err == nil && cert.DeployCertPath != "" && cert.DeployKeyPath != "" {
-			deployTarget := cert.DeployTarget
+			automaticTarget := cert.DeployTarget
 			if cert.AutoDeploy {
-				deployTarget = "both"
+				automaticTarget = "both"
 			}
-			if deployTarget != "" && deployTarget != "none" {
+			if deployTarget, shouldDeploy := automaticCertificateReloadTarget(automaticTarget); shouldDeploy {
 				if deployErr := h.deployLocal(payload.CertPEM, payload.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget); deployErr != nil {
 					log.Printf("[Certificate] Local deploy from cert_update failed: %v", deployErr)
 				}
-				h.deployToAllRemotes(cert.Domain, payload.CertPEM, payload.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget)
+				h.deployToAllRemotes(cert.Domain, payload.CertPEM, payload.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget, true)
 			}
 		}
 	} else {
@@ -1160,11 +1191,12 @@ func (h *CertificateHandler) buildCertRequest(ctx context.Context, cert *storage
 
 // 处理颁发后的证书部署 - 部署到主服务器和所有远程服务器。
 func (h *CertificateHandler) deployAfterIssue(cert *storage.Certificate, result *acme.CertResult) {
-	deployTarget := cert.DeployTarget
+	automaticTarget := cert.DeployTarget
 	if cert.AutoDeploy && cert.DeployCertPath != "" && cert.DeployKeyPath != "" {
-		deployTarget = "both"
+		automaticTarget = "both"
 	}
-	if deployTarget == "" || deployTarget == "none" {
+	deployTarget, shouldDeploy := automaticCertificateReloadTarget(automaticTarget)
+	if !shouldDeploy {
 		return
 	}
 	if cert.DeployCertPath == "" || cert.DeployKeyPath == "" {
@@ -1182,7 +1214,7 @@ func (h *CertificateHandler) deployAfterIssue(cert *storage.Certificate, result 
 	}
 
 	// 部署到所有远程服务器
-	h.deployToAllRemotes(cert.Domain, result.CertPEM, result.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget)
+	h.deployToAllRemotes(cert.Domain, result.CertPEM, result.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget, true)
 }
 
 func (h *CertificateHandler) checkMasterCertReady(cert *storage.Certificate) {
@@ -1218,13 +1250,18 @@ func (h *CertificateHandler) deployRemoteCertificate(cert *storage.Certificate, 
 		return
 	}
 
+	reloadTarget, shouldDeploy := automaticCertificateReloadTarget(cert.DeployTarget)
+	if !shouldDeploy {
+		return
+	}
 	payload := WSCertDeployPayload{
-		Domain:   cert.Domain,
-		CertPEM:  certPEM,
-		KeyPEM:   keyPEM,
-		CertPath: filepath.Join(filepath.Dir(cert.DeployCertPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployCertPath)),
-		KeyPath:  filepath.Join(filepath.Dir(cert.DeployKeyPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployKeyPath)),
-		Reload:   cert.DeployTarget,
+		Domain:    cert.Domain,
+		CertPEM:   certPEM,
+		KeyPEM:    keyPEM,
+		CertPath:  filepath.Join(filepath.Dir(cert.DeployCertPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployCertPath)),
+		KeyPath:   filepath.Join(filepath.Dir(cert.DeployKeyPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployKeyPath)),
+		Reload:    reloadTarget,
+		Automatic: true,
 	}
 
 	h.deployToRemoteServer(server, payload)
@@ -1296,12 +1333,13 @@ func (h *CertificateHandler) deployCertToServerSyncLeasedWithReload(ctx context.
 		return "", "", fmt.Errorf("unsupported managed Xray certificate reload target %q", reloadTarget)
 	}
 	payload := WSCertDeployPayload{
-		Domain:   cert.Domain,
-		CertPEM:  cert.CertPEM,
-		KeyPEM:   cert.KeyPEM,
-		CertPath: certPath,
-		KeyPath:  keyPath,
-		Reload:   reloadTarget,
+		Domain:    cert.Domain,
+		CertPEM:   cert.CertPEM,
+		KeyPEM:    cert.KeyPEM,
+		CertPath:  certPath,
+		KeyPath:   keyPath,
+		Reload:    reloadTarget,
+		Automatic: true,
 	}
 
 	// Use the request/response management path whenever available. It selects WS
@@ -1333,7 +1371,7 @@ func (h *CertificateHandler) deployCertToServerSyncLeasedWithReload(ctx context.
 }
 
 // 将证书部署到所有连接的远程服务器。
-func (h *CertificateHandler) deployToAllRemotes(domain, certPEM, keyPEM, certPath, keyPath, reloadTarget string) {
+func (h *CertificateHandler) deployToAllRemotes(domain, certPEM, keyPEM, certPath, keyPath, reloadTarget string, automatic bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -1343,12 +1381,13 @@ func (h *CertificateHandler) deployToAllRemotes(domain, certPEM, keyPEM, certPat
 	}
 
 	payload := WSCertDeployPayload{
-		Domain:   domain,
-		CertPEM:  certPEM,
-		KeyPEM:   keyPEM,
-		CertPath: filepath.Join(filepath.Dir(certPath), certDeployFilename(domain)+filepath.Ext(certPath)),
-		KeyPath:  filepath.Join(filepath.Dir(keyPath), certDeployFilename(domain)+filepath.Ext(keyPath)),
-		Reload:   reloadTarget,
+		Domain:    domain,
+		CertPEM:   certPEM,
+		KeyPEM:    keyPEM,
+		CertPath:  filepath.Join(filepath.Dir(certPath), certDeployFilename(domain)+filepath.Ext(certPath)),
+		KeyPath:   filepath.Join(filepath.Dir(keyPath), certDeployFilename(domain)+filepath.Ext(keyPath)),
+		Reload:    reloadTarget,
+		Automatic: automatic,
 	}
 
 	for i := range servers {
@@ -1466,7 +1505,7 @@ func (h *CertificateHandler) DeployCertificate(w http.ResponseWriter, r *http.Re
 	}
 
 	// 部署到所有远程服务器
-	h.deployToAllRemotes(cert.Domain, cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget)
+	h.deployToAllRemotes(cert.Domain, cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget, false)
 
 	respondJSON(w, http.StatusOK, map[string]any{"success": true, "message": "证书已部署到主服务器，远程服务器部署已提交"})
 }
@@ -1488,20 +1527,28 @@ func (h *CertificateHandler) DeployAutoDeployCertificates(serverID int64) {
 		return
 	}
 
+	attempted := 0
 	for _, cert := range certs {
-		payload := WSCertDeployPayload{
-			Domain:   cert.Domain,
-			CertPEM:  cert.CertPEM,
-			KeyPEM:   cert.KeyPEM,
-			CertPath: filepath.Join(filepath.Dir(cert.DeployCertPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployCertPath)),
-			KeyPath:  filepath.Join(filepath.Dir(cert.DeployKeyPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployKeyPath)),
-			Reload:   "both",
+		reloadTarget, shouldDeploy := automaticCertificateReloadTarget("both")
+		if !shouldDeploy || strings.TrimSpace(cert.DeployCertPath) == "" || strings.TrimSpace(cert.DeployKeyPath) == "" {
+			log.Printf("[Certificate] Skip auto-deploy %s: no valid deployment target or paths", cert.Domain)
+			continue
 		}
+		payload := WSCertDeployPayload{
+			Domain:    cert.Domain,
+			CertPEM:   cert.CertPEM,
+			KeyPEM:    cert.KeyPEM,
+			CertPath:  filepath.Join(filepath.Dir(cert.DeployCertPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployCertPath)),
+			KeyPath:   filepath.Join(filepath.Dir(cert.DeployKeyPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployKeyPath)),
+			Reload:    reloadTarget,
+			Automatic: true,
+		}
+		attempted++
 		if err := h.deployToRemoteServerSync(ctx, server, payload); err != nil {
 			log.Printf("[Certificate] Auto-deploy %s to server %s failed: %v", cert.Domain, server.Name, err)
 		}
 	}
-	log.Printf("[Certificate] Completed auto-deploy of %d cert(s) to server %s", len(certs), server.Name)
+	log.Printf("[Certificate] Completed auto-deploy of %d cert(s) to server %s", attempted, server.Name)
 }
 
 // --- DNS 提供商 API 处理程序 ---

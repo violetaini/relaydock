@@ -282,34 +282,34 @@ func mergeAgentOnlyInboundsOutbounds(baseCfgJSON, agentCfgJSON string) (string, 
 	return string(merged), added
 }
 
-// CorrectXrayModeDrift 校正 embedded→external 漂移(agent WS auth 成功后由 RemoteWSHandler 异步触发)。
-// agentMode = agent 随 auth 上报的当前实际 xray_mode。
-//
-// 只处理"DB=embedded 但 agent=external"这一个安全方向:这里下发
-// switch-xray-mode(embedded) 让 agent 回到数据库记录的运行模式。
-// 反向(DB=external → 切 embedded 或 agent=embedded → 切 external)
-// 都不自动,避免把好端端的 external 服务器搞挂。agent 收到后改 config.yaml + 自重启,重连即 embedded。
+// CorrectXrayModeDrift detects an Agent-reported Xray mode mismatch after
+// authentication. Mode changes alter the running topology and can interrupt
+// proxy traffic, so reconnects never correct them automatically. Administrators
+// must make an explicit mode change through the panel.
 func (h *RemoteManageHandler) CorrectXrayModeDrift(ctx context.Context, serverID int64, agentMode string) {
-	if strings.TrimSpace(agentMode) != "external" {
+	if h == nil || h.repo == nil {
 		return
 	}
-	if !remoteInstallationAllowsAutoDeploy(ctx, h.repo, serverID, "Xray mode drift") {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reportedMode := strings.ToLower(strings.TrimSpace(agentMode))
+	if reportedMode != "embedded" && reportedMode != "external" {
 		return
 	}
 	server, err := h.repo.GetRemoteServer(ctx, serverID)
-	if err != nil || server == nil || server.XrayMode != "embedded" {
+	if err != nil || server == nil {
+		if err != nil {
+			log.Printf("[XrayModeDrift] server=%d could not read expected mode: %v", serverID, err)
+		}
 		return
 	}
-	log.Printf("[XrayModeDrift] server=%d DB=embedded but agent=external → auto-switch agent back to embedded", serverID)
-	fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	body, _ := json.Marshal(map[string]string{"xray_mode": "embedded"})
-	if perr := withRemoteInstallationSafeMutation(fctx, h.repo, serverID, "Xray mode drift", func(actionCtx context.Context) error {
-		_, err := h.forwardToRemoteServer(actionCtx, serverID, "POST", "/api/child/agent/switch-xray-mode", body)
-		return err
-	}); perr != nil {
-		log.Printf("[XrayModeDrift] server=%d auto-switch to embedded failed: %v", serverID, perr)
+	expectedMode := strings.ToLower(strings.TrimSpace(server.XrayMode))
+	if expectedMode == "" {
+		expectedMode = "external"
+	}
+	if expectedMode == reportedMode {
 		return
 	}
-	log.Printf("[XrayModeDrift] server=%d switch-xray-mode(embedded) sent; agent will restart into embedded", serverID)
+	log.Printf("[XrayModeDrift] server=%d expected=%s reported=%s; leaving Agent mode unchanged until an administrator explicitly changes it", serverID, expectedMode, reportedMode)
 }

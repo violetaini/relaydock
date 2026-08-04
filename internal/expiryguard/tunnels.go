@@ -506,9 +506,10 @@ func (g *Guard) applyTunnelInbound(ctx context.Context, resource TunnelResource)
 		return err
 	}
 	if deferred {
-		if err := g.restartXray(ctx); err != nil {
-			return err
-		}
+		// The desired inbound is durable, but its live replacement was deferred.
+		// Keep the tunnel in its retryable state; never start an Xray process the
+		// operator intentionally stopped just to complete a background sync.
+		return errors.New("Agent deferred tunnel runtime apply without restarting Xray")
 	}
 	inbounds, err := g.listAgentInbounds(ctx)
 	if err != nil {
@@ -539,17 +540,10 @@ func (g *Guard) removeTunnelInbound(ctx context.Context, resource TunnelResource
 	if _, exists := observeInbound(inbounds, resource.Tag); !exists {
 		return nil
 	}
-	if err := g.restartXray(ctx); err != nil {
-		return err
-	}
-	inbounds, err = g.listAgentInbounds(ctx)
-	if err != nil {
-		return err
-	}
-	if _, exists := observeInbound(inbounds, resource.Tag); exists {
-		return errors.New("tunnel inbound remains after Agent removal and Xray restart")
-	}
-	return nil
+	// The durable removal already succeeded. A stale runtime inbound must wait
+	// for a user-controlled Xray restart rather than being used to revive a
+	// manually stopped service from the expiry/tunnel guard.
+	return errors.New("tunnel inbound remains in runtime after durable removal; waiting for explicit Xray start")
 }
 
 func (g *Guard) nftAvailable(ctx context.Context) bool {

@@ -812,6 +812,11 @@ func (h *RemoteTrafficHandler) SetProbeMetricsStore(store *ProbeMetricsStore) {
 // RemoteTrafficRequest 表示来自远程服务器的流量报告
 type RemoteTrafficRequest struct {
 	Stats *traffic.XrayStats `json:"stats,omitempty"`
+	// AgentVersion and Capabilities are supplied by current HTTP-mode Agents.
+	// They let the control plane apply feature-gated response configuration
+	// without guessing from a version string. Older Agents omit both fields.
+	AgentVersion string            `json:"agent_version,omitempty"`
+	Capabilities AgentCapabilities `json:"capabilities,omitempty"`
 	// System 系统级网卡累计 RX/TX(来自 agent /proc/net/dev),用于 server.traffic_source='system' 路径。
 	// nil = 老 agent 不支持上报,server 视图自动回退 xray 数据源。
 	System *RemoteSystemTraffic `json:"system,omitempty"`
@@ -881,10 +886,12 @@ func (h *RemoteTrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	if req.Stats == nil && req.System == nil && req.Sysmetrics == nil {
-		h.writeJSON(w, http.StatusOK, map[string]interface{}{
-			"success": true,
-			"message": "No stats to process",
+		respData, _ := json.Marshal(map[string]interface{}{
+			"success":        true,
+			"message":        "No stats to process",
+			"config_updates": agentRuntimeConfigUpdates(ctx, h.repo, remoteServer.ID, req.Capabilities),
 		})
+		writeHTTPCryptoResponse(w, crypto.Session, respData)
 		return
 	}
 
@@ -931,13 +938,7 @@ func (h *RemoteTrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	// 在 traffic 上报响应里捎带最新的 config 更新(HTTP-mode agent 没有持久连接,
 	// 走 traffic POST 的 response 把变化推回去,agent 收到后调 handleConfigUpdate 应用)。
-	configUpdates := map[string]string{}
-	if val, _ := h.repo.GetSystemSetting(ctx, "dashboard_refresh_interval_ms"); val != "" {
-		configUpdates["traffic_report_interval_ms"] = val
-	}
-	for key, value := range ProbeConfigUpdates(ctx, h.repo, serverID) {
-		configUpdates[key] = value
-	}
+	configUpdates := agentRuntimeConfigUpdates(ctx, h.repo, serverID, req.Capabilities)
 	respData, _ := json.Marshal(map[string]interface{}{
 		"success":        true,
 		"message":        "Traffic data received",

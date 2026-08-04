@@ -152,36 +152,20 @@ func (h *CertificateHandler) managedXrayCertificateUsesOneTimeLoading(ctx contex
 	return found && reference.keyPath == keyPath && reference.oneTimeLoading
 }
 
-// managedXrayCertificateReloadTarget keeps the normal renewal path strictly
+// managedXrayCertificateReloadTarget keeps every certificate content update
 // non-disruptive. A user can explicitly set oneTimeLoading, which disables
-// Xray's file watcher; in that exceptional case an active Xray needs one
-// controlled restart to load the replacement. A stopped or unreachable Xray
-// is never started for a certificate update: it will read the new files when
-// the user starts it later.
+// Xray's file watcher; that setting means the replacement waits for the next
+// explicit operator restart rather than interrupting proxy traffic.
 func (h *CertificateHandler) managedXrayCertificateReloadTarget(ctx context.Context, server *storage.RemoteServer, cert *storage.Certificate) string {
-	if server == nil || !h.managedXrayCertificateUsesOneTimeLoading(ctx, server.ID, cert) {
-		return "none"
+	if server != nil && h.managedXrayCertificateUsesOneTimeLoading(ctx, server.ID, cert) {
+		log.Printf("[Certificate] %s on server %d uses oneTimeLoading; certificate files replaced and will load on the next explicit Xray restart", cert.Domain, server.ID)
 	}
-	if h.remoteManage == nil {
-		log.Printf("[Certificate] %s on server %d uses oneTimeLoading; leaving files pending because live Xray status is unavailable", cert.Domain, server.ID)
-		return "none"
-	}
-	status, err := h.remoteManage.remoteXrayServiceStatus(ctx, server.ID)
-	if err != nil || status == nil || !status.Running {
-		if err != nil {
-			log.Printf("[Certificate] %s on server %d uses oneTimeLoading; leaving files pending because Xray status is unavailable: %v", cert.Domain, server.ID, err)
-		} else {
-			log.Printf("[Certificate] %s on server %d uses oneTimeLoading while Xray is stopped; new files will load on the next user start", cert.Domain, server.ID)
-		}
-		return "none"
-	}
-	return "xray"
+	return "none"
 }
 
 // restoreManagedXrayCertFiles puts the previous PEM pair back at the same
 // panel-managed paths. Xray keeps serving the currently loaded pair while its
-// file watcher observes the replacement. The caller may request the one
-// exceptional oneTimeLoading recovery restart described above.
+// file watcher observes the replacement. The rollback is file-only too.
 func (h *CertificateHandler) restoreManagedXrayCertFiles(ctx context.Context, server *storage.RemoteServer, previous *storage.Certificate, reloadTarget string) error {
 	if previous == nil || previous.CertPEM == "" || previous.KeyPEM == "" {
 		return fmt.Errorf("previous certificate material is unavailable")

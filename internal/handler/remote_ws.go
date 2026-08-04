@@ -77,9 +77,8 @@ type WSAuthPayload struct {
 	// 不再反向 HTTP 拉 /api/child/system/info —— 端口隐身(HidePortOnWS)关闭入站后仍可拿到。
 	// 老 agent 不发该字段 = 空串 → fallback 反向 HTTP(向后兼容)。
 	AgentVersion string `json:"agent_version,omitempty"`
-	// XrayMode agent 当前实际运行模式(embedded/external),随 auth 上报。master 据此校正
-	// "embedded→external 漂移":DB 记 embedded 但 agent 卡 external 时自动下发切回 embedded
-	// 老 agent 不发 = 空串 → 跳过校正。
+	// XrayMode agent 当前实际运行模式(embedded/external),随 auth 上报。master 仅据此
+	// 记录模式漂移，不会自动切换 Agent 的运行拓扑。老 agent 不发 = 空串 → 跳过检测。
 	XrayMode string `json:"xray_mode,omitempty"`
 }
 
@@ -106,6 +105,11 @@ type AgentCapabilities struct {
 	AgentUninstallV2 bool `json:"agent_uninstall_v2,omitempty"`
 	// XrayVersionSelectV1 表示外置 Xray 安装接口接受经过主控白名单校验的目标版本。
 	XrayVersionSelectV1 bool `json:"xray_version_select_v1,omitempty"`
+	// XrayAuthorizationV2 means xray_authorized only reconciles RelayDock-owned
+	// inbounds through the runtime API. Older Agents used this key to start or
+	// stop the whole core, so the control plane must never send it without this
+	// explicit contract.
+	XrayAuthorizationV2 bool `json:"xray_authorization_v2,omitempty"`
 }
 
 // MissingManagedNodeCapabilities returns the safety contracts an Agent must
@@ -222,12 +226,13 @@ type WSCertRequestPayload struct {
 
 // WSCertDeployPayload 表示证书部署负载（Master -> Agent）
 type WSCertDeployPayload struct {
-	Domain   string `json:"domain"`
-	CertPEM  string `json:"cert_pem"`
-	KeyPEM   string `json:"key_pem"`
-	CertPath string `json:"cert_path"`
-	KeyPath  string `json:"key_path"`
-	Reload   string `json:"reload"` // nginx、xray、两者、无
+	Domain    string `json:"domain"`
+	CertPEM   string `json:"cert_pem"`
+	KeyPEM    string `json:"key_pem"`
+	CertPath  string `json:"cert_path"`
+	KeyPath   string `json:"key_path"`
+	Reload    string `json:"reload"`              // nginx、xray、两者、无
+	Automatic bool   `json:"automatic,omitempty"` // 续签/同步：不得重启 Xray
 }
 
 // WSCertUpdatePayload 表示证书结果负载（Agent -> Master）
@@ -358,8 +363,8 @@ type RemoteWSHandler struct {
 	// xrayConfigSyncCallback 在 auth 成功后异步触发(args: serverID + 上次 server.status),
 	// 实现见 RemoteManageHandler.SyncXrayConfigOnReconnect — 跨 handler 用 callback 注入避免循环依赖。
 	xrayConfigSyncCallback func(ctx context.Context, serverID int64, prevStatus string)
-	// xrayModeCorrectCallback 在 auth 成功后异步触发,校正 embedded→external 漂移(agent 上报的实际 mode)。
-	// 实现见 RemoteManageHandler.CorrectXrayModeDrift。老 agent 不上报 mode → agentMode 空 → 跳过。
+	// xrayModeCorrectCallback 在 auth 成功后异步触发，记录 xray_mode 漂移(agent 上报的实际 mode)。
+	// 实现见 RemoteManageHandler.CorrectXrayModeDrift。它不会自动切换运行模式。
 	xrayModeCorrectCallback func(ctx context.Context, serverID int64, agentMode string)
 	// authFailIPs 记录最近 auth 失败的 IP,用于"狂连"场景的 backoff:
 	//   - 同 IP 在 cooldown 内的连接直接拒绝 upgrade(节省 CPU 与日志)
@@ -439,7 +444,7 @@ func (h *RemoteWSHandler) SetXrayConfigSyncCallback(cb func(ctx context.Context,
 	h.xrayConfigSyncCallback = cb
 }
 
-// SetXrayModeCorrectCallback 注册 agent WS auth 成功后的 xray_mode 漂移校正回调。
+// SetXrayModeCorrectCallback 注册 agent WS auth 成功后的 xray_mode 漂移检测回调。
 func (h *RemoteWSHandler) SetXrayModeCorrectCallback(cb func(ctx context.Context, serverID int64, agentMode string)) {
 	h.xrayModeCorrectCallback = cb
 }
@@ -1119,24 +1124,12 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 		h.SendCapabilities(wsConn)
 	}
 
-	// 连接/重连时把当前「上报间隔」(dashboard_refresh_interval_ms) 下发给该 agent,
-	// 使其立即采用配置值。否则 agent 在 admin 没改动过该设置的情况下会一直用自己的默认值
-	// (老 agent 默认 60s)——BroadcastConfigUpdate 只在 admin 主动改动时触发,
-	// 覆盖不到"新连接/重连采用现有配置"这一场景。
-	if h.repo != nil {
-		if val, _ := h.repo.GetSystemSetting(context.Background(), "dashboard_refresh_interval_ms"); val != "" {
-			go func(c *RemoteWSConnection, v string) {
-				payload, _ := json.Marshal(map[string]string{"traffic_report_interval_ms": v})
-				c.mu.Lock()
-				defer c.mu.Unlock()
-				_ = h.sendEncryptedMessage(c, WSMessage{Type: WSMsgTypeConfigUpdate, Payload: payload})
-			}(wsConn, val)
-		}
-	}
-	// Host-health collection is per server, so it cannot use the global
-	// BroadcastConfigUpdate helper. Push it on every authenticated connection;
-	// HTTP-mode Agents receive the same values in traffic replies.
-	go h.PushProbeConfigToAgent(context.Background(), server.ID)
+	// Connections and reconnects receive one complete runtime policy update:
+	// report interval, host-health collection, and the Xray authorization bit.
+	// A safe Agent also receives xray_authorized to clear a persisted false
+	// value without waiting for a traffic report; legacy Agents receive only
+	// non-lifecycle configuration.
+	go h.PushAgentRuntimeConfigToAgent(context.Background(), server.ID)
 
 	// embedded 模式：认证成功后推送限速配置。
 	if server.XrayMode == "embedded" && h.limiterPusher != nil {
@@ -1154,11 +1147,10 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 		})
 	}
 
-	// embedded 漂移校正:agent 随 auth 上报当前实际 xray_mode,与 DB 不一致时自动下发切回 embedded。
+	// Agent 随 auth 上报当前实际 xray_mode。漂移只记录供管理员排查，绝不自动改变
+	// embedded/external 拓扑，避免一次重连意外中断代理。
 	if h.xrayModeCorrectCallback != nil && authPayload.XrayMode != "" {
-		h.scheduleInstallationSafeAutoAction(server.ID, "Xray mode drift", func(ctx context.Context) {
-			h.xrayModeCorrectCallback(ctx, server.ID, authPayload.XrayMode)
-		})
+		go h.xrayModeCorrectCallback(context.Background(), server.ID, authPayload.XrayMode)
 	}
 
 	// 在第一次连接时自动部署窃取配置（服务器处于挂起状态）
@@ -1476,15 +1468,26 @@ func (h *RemoteWSHandler) SendConfigUpdate(serverID int64, updates map[string]st
 	})
 }
 
-// PushProbeConfigToAgent sends the explicit system-metric collection policy
-// to one authenticated Agent.  It is a no-op for offline servers.
-func (h *RemoteWSHandler) PushProbeConfigToAgent(ctx context.Context, serverID int64) {
+// PushAgentRuntimeConfigToAgent sends the complete Agent runtime policy to one
+// authenticated Agent. It is a no-op for offline servers.
+func (h *RemoteWSHandler) PushAgentRuntimeConfigToAgent(ctx context.Context, serverID int64) {
 	if h == nil || h.repo == nil {
 		return
 	}
-	if err := h.SendConfigUpdate(serverID, ProbeConfigUpdates(ctx, h.repo, serverID)); err != nil {
-		log.Printf("[Remote WS] push probe configuration to server %d: %v", serverID, err)
+	var capabilities AgentCapabilities
+	if conn, ok := h.GetConnectionByServerID(serverID); ok {
+		capabilities = conn.Capabilities
 	}
+	if err := h.SendConfigUpdate(serverID, agentRuntimeConfigUpdates(ctx, h.repo, serverID, capabilities)); err != nil {
+		log.Printf("[Remote WS] push runtime configuration to server %d: %v", serverID, err)
+	}
+}
+
+// PushProbeConfigToAgent is retained for callers that refresh probe settings.
+// The message intentionally carries the full runtime policy so a probe refresh
+// cannot leave an old authorization value behind.
+func (h *RemoteWSHandler) PushProbeConfigToAgent(ctx context.Context, serverID int64) {
+	h.PushAgentRuntimeConfigToAgent(ctx, serverID)
 }
 
 // PushProbeConfigToAll refreshes host-health collection for every connected

@@ -707,6 +707,7 @@ func main() {
 	mux.Handle("/api/admin/remote/xray/config", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleXrayConfig)))
 	mux.Handle("/api/admin/remote/xray/test-config", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleXrayTestConfig)))
 	mux.Handle("/api/admin/remote/xray/config/files", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleXrayConfigFiles)))
+	mux.Handle("/api/admin/remote/xray/reality-compatibility", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleManagedRealityCompatibility)))
 	mux.Handle("/api/admin/remote/nginx/install", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxInstall)))
 	mux.Handle("/api/admin/remote/nginx/remove", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxRemove)))
 	// Cloudflare WARP — 每个 agent 各自注册 + 注入 warp-v4 / warp-v6 双 outbound
