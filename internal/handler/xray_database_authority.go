@@ -752,6 +752,21 @@ func (h *RemoteManageHandler) reconcileDatabaseOwnedInboundsLeased(
 		if !completeDatabaseDesiredInbound(row.InboundTag, inbound) {
 			return result, fmt.Errorf("database-authorized inbound %s has no complete desired definition", row.InboundTag)
 		}
+		// Database-owned Reality listeners must not depend on Xray's implicit
+		// minimum-client default. Persist the compatibility floor before the hot
+		// runtime comparison so the Agent and every future snapshot converge from
+		// the same durable intent without requiring an operator action.
+		if applyManagedRealityCompatibilityToInbound(inbound) {
+			compatibleJSON, marshalErr := json.Marshal(inbound)
+			if marshalErr != nil {
+				return result, fmt.Errorf("encode compatible desired inbound %s: %w", row.InboundTag, marshalErr)
+			}
+			if _, persistErr := h.repo.UpsertActiveDesiredInbound(
+				ctx, serverID, row.InboundTag, row.MutationID, compatibleJSON,
+			); persistErr != nil {
+				return result, fmt.Errorf("persist compatible desired inbound %s: %w", row.InboundTag, persistErr)
+			}
+		}
 		desired[row.InboundTag] = inbound
 		mutations[row.InboundTag] = strings.TrimSpace(row.MutationID)
 	}

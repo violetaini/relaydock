@@ -102,6 +102,7 @@ func reconcileManagedRealityInbound(inbound map[string]interface{}, node *storag
 	}
 	settings["clients"] = append([]interface{}{newOwner}, remaining...)
 	candidate["settings"] = settings
+	applyManagedRealityCompatibilityToInbound(candidate)
 	return candidate, !reflect.DeepEqual(candidate, inbound), true, nil
 }
 

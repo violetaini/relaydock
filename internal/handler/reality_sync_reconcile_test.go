@@ -267,7 +267,7 @@ func TestReconcileManagedRealityInboundRestoresPublishedClient(t *testing.T) {
 	}
 }
 
-func TestReconcileManagedRealityInboundDoesNotAddCompatibilityMinimumDuringBackgroundSync(t *testing.T) {
+func TestReconcileManagedRealityInboundAddsCompatibilityMinimumDuringBackgroundSync(t *testing.T) {
 	node := realitySyncStoredNode()
 	admin := map[string]interface{}{
 		"id":    realitySyncStoredUUID,
@@ -275,16 +275,16 @@ func TestReconcileManagedRealityInboundDoesNotAddCompatibilityMinimumDuringBackg
 		"flow":  "xtls-rprx-vision",
 	}
 
-	t.Run("missing value is left alone", func(t *testing.T) {
+	t.Run("missing value receives managed default", func(t *testing.T) {
 		inbound := realitySyncInbound([]interface{}{admin})
 		reconciled, changed, managed, err := reconcileManagedRealityInbound(inbound, &node, "admin")
-		if err != nil || !managed || changed {
-			t.Fatalf("managed=%v changed=%v err=%v, want no background compatibility rewrite", managed, changed, err)
+		if err != nil || !managed || !changed {
+			t.Fatalf("managed=%v changed=%v err=%v, want automatic compatibility rewrite", managed, changed, err)
 		}
 		stream := reconciled["streamSettings"].(map[string]interface{})
 		reality := stream["realitySettings"].(map[string]interface{})
-		if _, exists := reality["minClientVer"]; exists {
-			t.Fatalf("background sync unexpectedly added minClientVer: %#v", reality["minClientVer"])
+		if got := reality["minClientVer"]; got != managedRealityMinClientVersion {
+			t.Fatalf("background sync minClientVer=%#v, want %q", got, managedRealityMinClientVersion)
 		}
 	})
 

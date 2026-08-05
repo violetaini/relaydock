@@ -137,6 +137,19 @@ func databaseAuthorityInbound(tag string, port int, mutationID string) map[strin
 	return inbound
 }
 
+func databaseAuthorityRealityInbound(tag string, port int, mutationID string, minClientVer interface{}) map[string]interface{} {
+	inbound := databaseAuthorityInbound(tag, port, mutationID)
+	realitySettings := map[string]interface{}{}
+	if minClientVer != nil {
+		realitySettings["minClientVer"] = minClientVer
+	}
+	inbound["streamSettings"] = map[string]interface{}{
+		"security":        "reality",
+		"realitySettings": realitySettings,
+	}
+	return inbound
+}
+
 func seedDatabaseAuthorityDesired(t *testing.T, repo *storage.TrafficRepository, serverID int64, inbound map[string]interface{}, mutationID string) {
 	t.Helper()
 	raw, err := json.Marshal(observedInboundConfig(inbound))
@@ -331,6 +344,92 @@ func TestDatabaseInboundReconcileRestoresDesiredAndEnforcesMutationFence(t *test
 				t.Fatalf("restored inbound = %#v, want %#v", gotInbound, desired)
 			}
 		})
+	}
+}
+
+func TestDatabaseInboundReconcileAutomaticallyPersistsRealityCompatibility(t *testing.T) {
+	desired := databaseAuthorityRealityInbound("database-reality", 8443, "", nil)
+	observed := databaseAuthorityRealityInbound("database-reality", 8443, "database-generation", nil)
+	agentState := newDatabaseAuthorityAgent(observed)
+	agent := httptest.NewServer(agentState)
+	defer agent.Close()
+	repo, server := newDatabaseAuthorityHandlerRepo(t, agent.URL)
+	seedDatabaseAuthorityDesired(t, repo, server.ID, desired, "database-generation")
+	seedDatabaseAuthoritySnapshot(t, repo, server.ID, desired)
+
+	handler := NewRemoteManageHandler(repo, nil)
+	result, err := handler.reconcileDatabaseOwnedInboundsLeased(context.Background(), server.ID, "")
+	if err != nil {
+		t.Fatalf("reconcile database inbounds: %v", err)
+	}
+	if result != (databaseInboundReconcileResult{Updated: 1}) {
+		t.Fatalf("reconcile result = %+v, want one hot update", result)
+	}
+	mutations := agentState.mutationSnapshot()
+	if len(mutations) != 1 || wireGuardStringValue(mutations[0]["action"]) != "add" {
+		t.Fatalf("Agent mutations = %#v, want one inbound hot replacement", mutations)
+	}
+	replacement, _ := mutations[0]["inbound"].(map[string]interface{})
+	if got := managedRealityCompatibilityMinClientVer(t, replacement); got != managedRealityMinClientVersion {
+		t.Fatalf("replacement minClientVer = %#v, want %q", got, managedRealityMinClientVersion)
+	}
+
+	stored, err := repo.GetDesiredInbound(context.Background(), server.ID, "database-reality")
+	if err != nil || stored == nil {
+		t.Fatalf("stored desired inbound = %+v, err=%v", stored, err)
+	}
+	storedInbound, err := decodeDesiredInbound(stored.InboundJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := managedRealityCompatibilityMinClientVer(t, storedInbound); got != managedRealityMinClientVersion {
+		t.Fatalf("stored minClientVer = %#v, want %q", got, managedRealityMinClientVersion)
+	}
+
+	// The persisted default and hot replacement make subsequent scans a no-op.
+	second, err := handler.reconcileDatabaseOwnedInboundsLeased(context.Background(), server.ID, "")
+	if err != nil {
+		t.Fatalf("second reconcile database inbounds: %v", err)
+	}
+	if second != (databaseInboundReconcileResult{}) || len(agentState.mutationSnapshot()) != 1 {
+		t.Fatalf("second reconcile = %+v, mutations=%#v", second, agentState.mutationSnapshot())
+	}
+	agentState.mu.Lock()
+	serviceControls := agentState.serviceControls
+	rawConfigWrites := agentState.rawConfigWrites
+	agentState.mu.Unlock()
+	if serviceControls != 0 || rawConfigWrites != 0 {
+		t.Fatalf("compatibility reconcile restarted or rewrote Xray: controls=%d raw_writes=%d", serviceControls, rawConfigWrites)
+	}
+}
+
+func TestDatabaseInboundReconcilePreservesExplicitRealityCompatibility(t *testing.T) {
+	desired := databaseAuthorityRealityInbound("database-reality", 8443, "", "2.0.0")
+	observed := databaseAuthorityRealityInbound("database-reality", 8443, "database-generation", "2.0.0")
+	agentState := newDatabaseAuthorityAgent(observed)
+	agent := httptest.NewServer(agentState)
+	defer agent.Close()
+	repo, server := newDatabaseAuthorityHandlerRepo(t, agent.URL)
+	seedDatabaseAuthorityDesired(t, repo, server.ID, desired, "database-generation")
+	seedDatabaseAuthoritySnapshot(t, repo, server.ID, desired)
+
+	result, err := NewRemoteManageHandler(repo, nil).reconcileDatabaseOwnedInboundsLeased(context.Background(), server.ID, "")
+	if err != nil {
+		t.Fatalf("reconcile database inbounds: %v", err)
+	}
+	if result != (databaseInboundReconcileResult{}) || len(agentState.mutationSnapshot()) != 0 {
+		t.Fatalf("explicit compatibility was overwritten: result=%+v mutations=%#v", result, agentState.mutationSnapshot())
+	}
+	stored, err := repo.GetDesiredInbound(context.Background(), server.ID, "database-reality")
+	if err != nil || stored == nil {
+		t.Fatalf("stored desired inbound = %+v, err=%v", stored, err)
+	}
+	storedInbound, err := decodeDesiredInbound(stored.InboundJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := managedRealityCompatibilityMinClientVer(t, storedInbound); got != "2.0.0" {
+		t.Fatalf("stored explicit minClientVer = %#v, want 2.0.0", got)
 	}
 }
 
