@@ -174,6 +174,12 @@ func main() {
 		logger.Error("WireGuard 节点私钥加密初始化失败", "error", err)
 		os.Exit(1)
 	}
+	if inserted, err := repo.CompleteDeferredDesiredInboundBackfill(context.Background()); err != nil {
+		logger.Error("数据库入站延迟迁移失败", "error", err)
+		os.Exit(1)
+	} else if inserted > 0 {
+		logger.Info("数据库入站延迟迁移完成", "count", inserted)
+	}
 	logger.Info("主控加密公钥已加载", "public_key", masterIdentity.PublicKeyBase64())
 
 	cryptoConfig := handler.NewCryptoConfig(masterIdentity, securechan.NewSessionCache(1*time.Hour))

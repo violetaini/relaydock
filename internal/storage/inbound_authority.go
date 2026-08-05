@@ -239,6 +239,59 @@ func (r *TrafficRepository) BackfillAuthorizedDesiredInbounds(ctx context.Contex
 	return count, nil
 }
 
+// CompleteDeferredDesiredInboundBackfill reruns the latest durable snapshots
+// after node-secret encryption is available. Startup migration cannot decrypt
+// an existing WireGuard node identity yet, so it deliberately defers those
+// listeners instead of trusting plaintext from a snapshot.
+func (r *TrafficRepository) CompleteDeferredDesiredInboundBackfill(ctx context.Context) (int, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("traffic repository not initialized")
+	}
+	type currentSnapshot struct {
+		serverID int64
+		config   string
+	}
+	rows, err := r.db.QueryContext(ctx, `
+SELECT s.server_id, s.config_json
+FROM server_xray_config_snapshots s
+JOIN (
+    SELECT server_id, MAX(id) AS id
+    FROM server_xray_config_snapshots
+    WHERE status = 'current'
+    GROUP BY server_id
+) latest ON latest.id = s.id
+ORDER BY s.server_id`)
+	if err != nil {
+		return 0, fmt.Errorf("list current snapshots for deferred desired inbound backfill: %w", err)
+	}
+	snapshots := make([]currentSnapshot, 0)
+	for rows.Next() {
+		var snapshot currentSnapshot
+		if err := rows.Scan(&snapshot.serverID, &snapshot.config); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("scan current snapshot for deferred desired inbound backfill: %w", err)
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("iterate current snapshots for deferred desired inbound backfill: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("close current snapshots for deferred desired inbound backfill: %w", err)
+	}
+
+	total := 0
+	for _, snapshot := range snapshots {
+		inserted, err := r.BackfillAuthorizedDesiredInbounds(ctx, snapshot.serverID, snapshot.config)
+		if err != nil {
+			return total, fmt.Errorf("complete deferred desired inbound backfill for server %d: %w", snapshot.serverID, err)
+		}
+		total += inserted
+	}
+	return total, nil
+}
+
 func backfillAuthorizedDesiredInbounds(
 	ctx context.Context,
 	store desiredInboundStore,

@@ -466,9 +466,15 @@ func TestDesiredInboundBackfillRebuildsWireGuardPeersFromDatabaseMetadata(t *tes
 	if pending, err := repo.GetDesiredInbound(ctx, server.ID, tag); err != nil || pending != nil {
 		t.Fatalf("startup backfill persisted unverified WireGuard desired inbound=%+v err=%v", pending, err)
 	}
-	inserted, err := repo.BackfillAuthorizedDesiredInbounds(ctx, server.ID, string(config))
+	if _, err := repo.UpsertCurrentXraySnapshot(ctx, server.ID, string(config), XraySnapshotSourceMasterWrite); err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := repo.CompleteDeferredDesiredInboundBackfill(ctx)
 	if err != nil || inserted != 1 {
-		t.Fatalf("backfill inserted=%d err=%v", inserted, err)
+		t.Fatalf("deferred backfill inserted=%d err=%v", inserted, err)
+	}
+	if inserted, err := repo.CompleteDeferredDesiredInboundBackfill(ctx); err != nil || inserted != 0 {
+		t.Fatalf("idempotent deferred backfill inserted=%d err=%v", inserted, err)
 	}
 	desired, err := repo.GetDesiredInbound(ctx, server.ID, tag)
 	if err != nil || desired == nil {

@@ -1752,8 +1752,11 @@ func (h *RemoteWSHandler) handleScanResult(wsConn *RemoteWSConnection, payload j
 	log.Printf("[Remote WS] Received scan_result from %s: xray_running=%v, inbounds=%d",
 		wsConn.ServerName, scanPayload.XrayRunning, len(scanPayload.Inbounds))
 
-	if scanResultHandler != nil {
-		scanResultHandler(wsConn.ServerID, scanPayload)
+	if handler := scanResultHandler; handler != nil {
+		// The handler may reconcile Xray through WS RPC. Running it on this read
+		// loop would prevent the loop from receiving the corresponding RPC reply
+		// and deadlock the reconciliation until its context expires.
+		go handler(wsConn.ServerID, scanPayload)
 	}
 }
 

@@ -19,13 +19,17 @@ import (
 type databaseAuthorityAgent struct {
 	mu              sync.Mutex
 	inbounds        map[string]map[string]interface{}
+	configOmitTags  map[string]bool
 	mutations       []map[string]interface{}
 	serviceControls int
 	rawConfigWrites int
 }
 
 func newDatabaseAuthorityAgent(inbounds ...map[string]interface{}) *databaseAuthorityAgent {
-	agent := &databaseAuthorityAgent{inbounds: make(map[string]map[string]interface{}, len(inbounds))}
+	agent := &databaseAuthorityAgent{
+		inbounds:       make(map[string]map[string]interface{}, len(inbounds)),
+		configOmitTags: make(map[string]bool),
+	}
 	for _, inbound := range inbounds {
 		if inbound == nil {
 			continue
@@ -49,7 +53,10 @@ func (a *databaseAuthorityAgent) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "inbounds": inbounds})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/child/xray/config":
 		inbounds := make([]map[string]interface{}, 0, len(a.inbounds))
-		for _, inbound := range a.inbounds {
+		for tag, inbound := range a.inbounds {
+			if a.configOmitTags[tag] {
+				continue
+			}
 			inbounds = append(inbounds, observedInboundConfig(inbound))
 		}
 		config, _ := json.Marshal(map[string]interface{}{
@@ -223,6 +230,42 @@ func TestDatabaseInboundReconcileBackfillsAuthorizedLiveInboundBeforeRemovingGho
 	desired, err := repo.GetDesiredInbound(context.Background(), server.ID, "legacy-bound")
 	if err != nil || desired == nil || !strings.HasPrefix(desired.MutationID, "database-migration:") {
 		t.Fatalf("backfilled desired = %+v, err=%v", desired, err)
+	}
+}
+
+func TestDatabaseInboundReconcileUsesAuthorizedInventoryWhenBaseConfigOmitsConfdirInbound(t *testing.T) {
+	bound := databaseAuthorityInbound("legacy-confdir", 8443, "old-agent-generation")
+	bound["_source"] = "confdir"
+	ghost := databaseAuthorityInbound("agent-ghost", 9443, "agent-generation")
+	agentState := newDatabaseAuthorityAgent(bound, ghost)
+	agentState.configOmitTags["legacy-confdir"] = true
+	agent := httptest.NewServer(agentState)
+	defer agent.Close()
+	repo, server := newDatabaseAuthorityHandlerRepo(t, agent.URL)
+	if _, err := repo.CreateNode(context.Background(), storage.Node{
+		Username: "admin", RawURL: "vless://fixture@example.test:443", NodeName: "Legacy confdir",
+		Protocol: "vless", Enabled: true, OriginalServer: server.Name, InboundTag: "legacy-confdir",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := NewRemoteManageHandler(repo, nil).reconcileDatabaseOwnedInboundsLeased(context.Background(), server.ID, "")
+	if err != nil {
+		t.Fatalf("reconcile database inbounds: %v", err)
+	}
+	if result.Removed != 1 || result.Restored != 0 || result.Updated != 0 {
+		t.Fatalf("reconcile result = %+v", result)
+	}
+	desired, err := repo.GetDesiredInbound(context.Background(), server.ID, "legacy-confdir")
+	if err != nil || desired == nil {
+		t.Fatalf("backfilled desired = %+v, err=%v", desired, err)
+	}
+	if strings.Contains(string(desired.InboundJSON), "_source") || strings.Contains(string(desired.InboundJSON), "_mutation_id") {
+		t.Fatalf("Agent observation metadata leaked into desired inbound: %s", desired.InboundJSON)
+	}
+	mutations := agentState.mutationSnapshot()
+	if len(mutations) != 1 || wireGuardStringValue(mutations[0]["tag"]) != "agent-ghost" {
+		t.Fatalf("Agent mutations = %#v", mutations)
 	}
 }
 

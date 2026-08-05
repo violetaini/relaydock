@@ -103,6 +103,45 @@ func observedInboundConfig(inbound map[string]interface{}) map[string]interface{
 	return cleaned
 }
 
+func supplementAuthorizedObservedInbounds(
+	baseConfig string,
+	observed map[string]map[string]interface{},
+	authorizedTags []string,
+) (string, error) {
+	config, err := xrayConfigObject(baseConfig)
+	if err != nil {
+		return "", err
+	}
+	rawInbounds, exists := config["inbounds"]
+	if exists && rawInbounds != nil {
+		if _, ok := rawInbounds.([]interface{}); !ok {
+			return "", errors.New("Xray config inbounds must be an array")
+		}
+	}
+	inbounds, _ := rawInbounds.([]interface{})
+	existing, err := xrayConfigInbounds(baseConfig)
+	if err != nil {
+		return "", err
+	}
+	for _, tag := range authorizedTags {
+		if existing[tag] != nil {
+			continue
+		}
+		candidate := observedInboundConfig(observed[tag])
+		if !completeDatabaseDesiredInbound(tag, candidate) {
+			continue
+		}
+		inbounds = append(inbounds, candidate)
+		existing[tag] = candidate
+	}
+	config["inbounds"] = inbounds
+	normalized, err := json.Marshal(config)
+	if err != nil {
+		return "", fmt.Errorf("encode supplemented Xray config: %w", err)
+	}
+	return string(normalized), nil
+}
+
 // rebuildDatabaseAuthorizedInboundClients adds dynamic credentials to the
 // durable base listener definitions. The base definitions may contain their
 // creation-time owner credential; every subsequently provisioned credential
@@ -683,12 +722,16 @@ func (h *RemoteManageHandler) reconcileDatabaseOwnedInboundsLeased(
 	if strings.TrimSpace(baseConfig) == "" {
 		return result, errors.New("Agent returned an empty complete Xray config")
 	}
-	if _, err := h.repo.BackfillAuthorizedDesiredInbounds(ctx, serverID, baseConfig); err != nil {
-		return result, fmt.Errorf("backfill database-authorized inbounds: %w", err)
-	}
 	authorizedTags, err := h.repo.ListAuthorizedInboundTags(ctx, serverID)
 	if err != nil {
 		return result, fmt.Errorf("list database-authorized inbound tags: %w", err)
+	}
+	baseConfig, err = supplementAuthorizedObservedInbounds(baseConfig, observed, authorizedTags)
+	if err != nil {
+		return result, fmt.Errorf("supplement database-authorized inbounds from Agent inventory: %w", err)
+	}
+	if _, err := h.repo.BackfillAuthorizedDesiredInbounds(ctx, serverID, baseConfig); err != nil {
+		return result, fmt.Errorf("backfill database-authorized inbounds: %w", err)
 	}
 	rows, err := h.repo.ListActiveDesiredInbounds(ctx, serverID)
 	if err != nil {

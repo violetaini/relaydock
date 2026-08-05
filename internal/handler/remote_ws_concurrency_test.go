@@ -29,6 +29,53 @@ func TestSendEncryptedMessageSerializesConcurrentWriters(t *testing.T) {
 	}
 }
 
+func TestHandleScanResultDoesNotBlockWebSocketReader(t *testing.T) {
+	previous := scanResultHandler
+	defer func() { scanResultHandler = previous }()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	scanResultHandler = func(serverID int64, payload WSScanResultPayload) {
+		defer close(done)
+		if serverID != 42 {
+			t.Errorf("server id = %d, want 42", serverID)
+		}
+		close(started)
+		<-release
+	}
+	payload, err := json.Marshal(WSScanResultPayload{XrayRunning: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		(&RemoteWSHandler{}).handleScanResult(&RemoteWSConnection{ServerID: 42, ServerName: "edge"}, payload)
+		close(returned)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("scan-result callback did not start")
+	}
+	select {
+	case <-returned:
+		close(release)
+	case <-time.After(100 * time.Millisecond):
+		close(release)
+		<-returned
+		t.Fatal("scan-result callback blocked the WebSocket read loop")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scan-result callback did not finish")
+	}
+}
+
 func testConcurrentRemoteWSSends(t *testing.T, encrypted bool) {
 	t.Helper()
 
