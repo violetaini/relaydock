@@ -3873,6 +3873,105 @@ func extractOutboundTarget(ob map[string]any) (string, int) {
 
 // ================== X 射线路由管理 ==================
 
+func isRoutingRuleHotAction(action string) bool {
+	switch action {
+	case "add_rule_hot", "replace_rule_hot", "remove_rule_hot", "move_rule_hot":
+		return true
+	default:
+		return false
+	}
+}
+
+func routingRemoteHTTPFailure(err error) (status int, body []byte, message string, ok bool) {
+	var statusErr *remoteHTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.Status, statusErr.Body, statusErr.Error(), true
+	}
+	var wsStatusErr *HTTPLikeError
+	if !errors.As(err, &wsStatusErr) {
+		return 0, nil, "", false
+	}
+	normalized := remoteHTTPStatusErrorFromBody(wsStatusErr.Status, wsStatusErr.Body)
+	if errors.As(normalized, &statusErr) {
+		return statusErr.Status, statusErr.Body, statusErr.Error(), true
+	}
+	return wsStatusErr.Status, wsStatusErr.Body, wsStatusErr.Error(), true
+}
+
+func isUnsupportedRoutingRuleHotAction(err error) bool {
+	status, body, message, ok := routingRemoteHTTPFailure(err)
+	if !ok || status != http.StatusBadRequest {
+		return false
+	}
+	message = strings.ToLower(strings.TrimSpace(message + " " + string(body)))
+	return strings.Contains(message, "invalid action") || strings.Contains(message, "set_hot required")
+}
+
+func remoteWriteRoutingMutationError(w http.ResponseWriter, err error) {
+	status, _, message, ok := routingRemoteHTTPFailure(err)
+	if ok && status >= 400 && status < 500 {
+		remoteWriteError(w, status, message)
+		return
+	}
+	remoteWriteForwardError(w, err)
+}
+
+func routingMutationStatusError(status int, message string) error {
+	body, _ := json.Marshal(map[string]interface{}{
+		"success": false,
+		"error":   message,
+		"message": message,
+	})
+	return &remoteHTTPStatusError{Status: status, Body: body, Message: message}
+}
+
+func (h *RemoteManageHandler) performRemoteRoutingRuleHotAction(ctx context.Context, serverID int64, body []byte, request ChildRoutingRequest) ([]byte, error) {
+	action := strings.ToLower(strings.TrimSpace(request.Action))
+	if !isRoutingRuleHotAction(action) {
+		return nil, routingMutationStatusError(http.StatusBadRequest, "invalid routing rule action")
+	}
+	leasedCtx, release, err := acquireRemoteMutationLease(ctx, h, serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	lock := acquireRoutingMutateLock(serverID)
+	defer lock.Unlock()
+
+	// New Agents perform the mutation and expected_rule comparison under their
+	// local Xray config lock. This owner-side routing lock also orders the atomic
+	// request with legacy GET + set_hot transactions and Reality route sync.
+	result, err := h.forwardToRemoteServer(suppressDatabaseInboundPostWrite(leasedCtx), serverID, http.MethodPost, "/api/child/routing", body)
+	if err == nil {
+		return result, nil
+	}
+	if !isUnsupportedRoutingRuleHotAction(err) {
+		return nil, err
+	}
+
+	// Legacy Agents only understand set_hot. The owner performs this fallback so
+	// federated consumers cannot race an owner-side routing transaction.
+	routing, err := fetchRoutedRoutingSnapshot(leasedCtx, h, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read current routing: %w", err)
+	}
+	candidate, err := mutateRoutingRules(routing, action, request)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errRoutingRuleChanged) {
+			status = http.StatusConflict
+		}
+		return nil, routingMutationStatusError(status, err.Error())
+	}
+	if err := setRoutedRoutingHot(leasedCtx, h, serverID, candidate); err != nil {
+		return nil, fmt.Errorf("failed to hot-apply routing: %w", err)
+	}
+	return json.Marshal(map[string]interface{}{
+		"success": true,
+		"message": "Routing rule updated and persisted without restarting Xray.",
+	})
+}
+
 // 代理将管理请求路由到远程服务器
 func (h *RemoteManageHandler) HandleRouting(w http.ResponseWriter, r *http.Request) {
 	serverID := r.URL.Query().Get("server_id")
@@ -3892,6 +3991,23 @@ func (h *RemoteManageHandler) HandleRouting(w http.ResponseWriter, r *http.Reque
 		body, err = io.ReadAll(r.Body)
 		if err != nil {
 			remoteWriteError(w, http.StatusBadRequest, "failed to read body")
+			return
+		}
+		var request ChildRoutingRequest
+		if err := json.Unmarshal(body, &request); err != nil {
+			remoteWriteError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		action := strings.ToLower(strings.TrimSpace(request.Action))
+		if isRoutingRuleHotAction(action) {
+			result, routeErr := h.performRemoteRoutingRuleHotAction(r.Context(), id, body, request)
+			if routeErr != nil {
+				remoteWriteRoutingMutationError(w, routeErr)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(result)
 			return
 		}
 	}
@@ -6409,6 +6525,14 @@ func (h *RemoteManageHandler) cleanupTunnelRouteForReality(ctx context.Context, 
 	if !databaseTunnelTakeoverEnabled(server) {
 		return nil
 	}
+	leasedCtx, release, err := acquireRemoteMutationLease(ctx, h, serverID)
+	if err != nil {
+		return fmt.Errorf("锁定 Reality 路由同步: %w", err)
+	}
+	defer release()
+	ctx = leasedCtx
+	routingLock := acquireRoutingMutateLock(serverID)
+	defer routingLock.Unlock()
 
 	inventory, err := h.fetchAgentInboundInventory(ctx, serverID)
 	if err != nil {
@@ -6691,6 +6815,14 @@ func (h *RemoteManageHandler) restoreTunnelRouteForReality(ctx context.Context, 
 	if !databaseTunnelTakeoverEnabled(server) {
 		return nil
 	}
+	leasedCtx, release, err := acquireRemoteMutationLease(ctx, h, serverID)
+	if err != nil {
+		return fmt.Errorf("锁定 Reality 路由恢复: %w", err)
+	}
+	defer release()
+	ctx = leasedCtx
+	routingLock := acquireRoutingMutateLock(serverID)
+	defer routingLock.Unlock()
 	inventory, err := h.fetchAgentInboundInventory(ctx, serverID)
 	if err != nil {
 		return fmt.Errorf("读取 Agent 入站: %w", err)

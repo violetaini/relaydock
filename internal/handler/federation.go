@@ -79,6 +79,24 @@ func (h *FederationHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func writeFederationManagePayload(w http.ResponseWriter, session *securechan.Session, status int, payload []byte) {
+	if session != nil {
+		enc, err := session.Encrypt(payload)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("encrypt federation response"))
+			return
+		}
+		w.Header().Set("X-Encrypted", "1")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(status)
+		_, _ = w.Write(enc)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(payload)
+}
+
 // handleManage 转发一条 agent 管理命令(消费方指定 method/path/body,path 限定 /api/child/)。
 // 在 HTTPS 之上叠加令牌揭示的 ECDH 端到端加密:支持密钥交换、加密请求、明文降级三种形态。
 func (h *FederationHandler) handleManage(w http.ResponseWriter, r *http.Request, serverID int64) {
@@ -127,22 +145,29 @@ func (h *FederationHandler) handleManage(w http.ResponseWriter, r *http.Request,
 		body = b
 	}
 
-	result, ferr := h.remoteManage.ForwardToAgent(r.Context(), serverID, req.Method, req.Path, body)
+	var result []byte
+	var ferr error
+	cleanPath := strings.TrimSuffix(strings.SplitN(req.Path, "?", 2)[0], "/")
+	var routingRequest ChildRoutingRequest
+	if req.Method == http.MethodPost && cleanPath == "/api/child/routing" &&
+		json.Unmarshal(body, &routingRequest) == nil && isRoutingRuleHotAction(strings.ToLower(strings.TrimSpace(routingRequest.Action))) {
+		result, ferr = h.remoteManage.performRemoteRoutingRuleHotAction(r.Context(), serverID, body, routingRequest)
+	} else {
+		result, ferr = h.remoteManage.ForwardToAgent(r.Context(), serverID, req.Method, req.Path, body)
+	}
 	if ferr != nil {
+		status, responseBody, message, ok := routingRemoteHTTPFailure(ferr)
+		if ok && status >= 400 && status < 500 {
+			if len(responseBody) == 0 {
+				responseBody, _ = json.Marshal(map[string]interface{}{"success": false, "error": message, "message": message})
+			}
+			writeFederationManagePayload(w, session, status, responseBody)
+			return
+		}
 		writeError(w, http.StatusBadGateway, ferr)
 		return
 	}
-	if session != nil {
-		if enc, eerr := session.Encrypt(result); eerr == nil {
-			w.Header().Set("X-Encrypted", "1")
-			w.Header().Set("Content-Type", "application/octet-stream")
-			_, _ = w.Write(enc)
-			return
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(result)
+	writeFederationManagePayload(w, session, http.StatusOK, result)
 }
 
 // fedToken 取分享令牌(与 authShare 一致),用作会话缓存键。

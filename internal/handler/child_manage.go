@@ -2992,11 +2992,144 @@ type ChildRoutingRequest struct {
 	Action  string                 `json:"action"` // “获取”、“设置”、“添加规则”、“删除规则”
 	Routing map[string]interface{} `json:"routing,omitempty"`
 	Rule    map[string]interface{} `json:"rule,omitempty"`
-	Index   int                    `json:"index,omitempty"`
+	// ExpectedRule is an optimistic concurrency guard for index-based mutations.
+	// When present, the current rule at the requested index must still match it.
+	ExpectedRule map[string]interface{} `json:"expected_rule,omitempty"`
+	Index        *int                   `json:"index,omitempty"`
+	From         *int                   `json:"from,omitempty"`
+	To           *int                   `json:"to,omitempty"`
 	// 负载均衡 leastPing/leastLoad 的 xray 顶层观测站(balancers 随 Routing 透传)。
 	// RawMessage 三态:缺失=不变;JSON null=清除;对象=写入。
 	Observatory      json.RawMessage `json:"observatory,omitempty"`
 	BurstObservatory json.RawMessage `json:"burstObservatory,omitempty"`
+}
+
+var errRoutingRuleChanged = errors.New("routing rule changed; refresh and retry")
+
+func cloneRoutingConfig(routing map[string]interface{}) (map[string]interface{}, error) {
+	if routing == nil {
+		return map[string]interface{}{}, nil
+	}
+	raw, err := json.Marshal(routing)
+	if err != nil {
+		return nil, fmt.Errorf("marshal routing config clone: %w", err)
+	}
+	var cloned map[string]interface{}
+	if err := json.Unmarshal(raw, &cloned); err != nil {
+		return nil, fmt.Errorf("decode routing config clone: %w", err)
+	}
+	if cloned == nil {
+		cloned = map[string]interface{}{}
+	}
+	return cloned, nil
+}
+
+func mutateRoutingRules(routing map[string]interface{}, action string, req ChildRoutingRequest) (map[string]interface{}, error) {
+	candidate, err := cloneRoutingConfig(routing)
+	if err != nil {
+		return nil, err
+	}
+
+	var rules []interface{}
+	if rawRules, exists := candidate["rules"]; exists && rawRules != nil {
+		var ok bool
+		rules, ok = rawRules.([]interface{})
+		if !ok {
+			return nil, errors.New("routing rules must be an array")
+		}
+	}
+
+	cloneRule := func() (map[string]interface{}, error) {
+		if req.Rule == nil {
+			return nil, errors.New("rule is required")
+		}
+		return cloneRoutingConfig(req.Rule)
+	}
+	checkExpectedRule := func(index int) error {
+		if req.ExpectedRule == nil {
+			return nil
+		}
+		expected, err := json.Marshal(req.ExpectedRule)
+		if err != nil {
+			return fmt.Errorf("marshal expected rule: %w", err)
+		}
+		current, err := json.Marshal(rules[index])
+		if err != nil {
+			return fmt.Errorf("marshal current rule: %w", err)
+		}
+		if !bytes.Equal(expected, current) {
+			return errRoutingRuleChanged
+		}
+		return nil
+	}
+
+	switch action {
+	case "add_rule", "add_rule_hot":
+		rule, err := cloneRule()
+		if err != nil {
+			return nil, err
+		}
+		updated := make([]interface{}, 0, len(rules)+1)
+		updated = append(updated, rules...)
+		updated = append(updated, rule)
+		candidate["rules"] = updated
+
+	case "replace_rule_hot":
+		if req.Index == nil || *req.Index < 0 || *req.Index >= len(rules) {
+			return nil, errors.New("invalid rule index")
+		}
+		if err := checkExpectedRule(*req.Index); err != nil {
+			return nil, err
+		}
+		rule, err := cloneRule()
+		if err != nil {
+			return nil, err
+		}
+		updated := append([]interface{}(nil), rules...)
+		updated[*req.Index] = rule
+		candidate["rules"] = updated
+
+	case "remove_rule", "remove_rule_hot":
+		if req.Index == nil || *req.Index < 0 || *req.Index >= len(rules) {
+			return nil, errors.New("invalid rule index")
+		}
+		if err := checkExpectedRule(*req.Index); err != nil {
+			return nil, err
+		}
+		updated := make([]interface{}, 0, len(rules)-1)
+		updated = append(updated, rules[:*req.Index]...)
+		updated = append(updated, rules[*req.Index+1:]...)
+		candidate["rules"] = updated
+
+	case "move_rule_hot":
+		if req.From == nil || req.To == nil {
+			return nil, errors.New("from and to indexes are required")
+		}
+		from, to := *req.From, *req.To
+		if from < 0 || from >= len(rules) || to < 0 || to >= len(rules) {
+			return nil, errors.New("invalid rule index")
+		}
+		if err := checkExpectedRule(from); err != nil {
+			return nil, err
+		}
+		updated := append([]interface{}(nil), rules...)
+		if from != to {
+			moved := updated[from]
+			withoutMoved := make([]interface{}, 0, len(updated)-1)
+			withoutMoved = append(withoutMoved, updated[:from]...)
+			withoutMoved = append(withoutMoved, updated[from+1:]...)
+			updated = make([]interface{}, 0, len(rules))
+			updated = append(updated, withoutMoved[:to]...)
+			updated = append(updated, moved)
+			updated = append(updated, withoutMoved[to:]...)
+		}
+		candidate["rules"] = updated
+
+	default:
+		return nil, errors.New("invalid routing rule action")
+	}
+
+	return candidate, nil
 }
 
 // applyObservatory 按 RawMessage 三态把顶层 observatory/burstObservatory 写入/删除/保持。
@@ -3036,6 +3169,47 @@ func applyRoutingRulesHot(ctx context.Context, routingClient routercommand.Routi
 		ShouldAppend: false,
 	}); err != nil {
 		return fmt.Errorf("replace runtime routing rules: %w", err)
+	}
+	return nil
+}
+
+type routingHotUpdateError struct {
+	phase         string
+	err           error
+	rollbackErr   error
+	renameApplied bool
+}
+
+func (err *routingHotUpdateError) Error() string {
+	if err.rollbackErr != nil {
+		return fmt.Sprintf("%s routing update: %v; runtime rollback failed: %v", err.phase, err.err, err.rollbackErr)
+	}
+	return fmt.Sprintf("%s routing update: %v", err.phase, err.err)
+}
+
+func (err *routingHotUpdateError) Unwrap() error { return err.err }
+
+func performRoutingHotUpdate(
+	candidate map[string]interface{},
+	previous map[string]interface{},
+	apply func(map[string]interface{}) error,
+	persist func() error,
+) error {
+	if err := apply(candidate); err != nil {
+		// Xray's rule replacement clears the active rule set before rebuilding it.
+		// A failed AddRule call can therefore leave runtime routing empty or only
+		// partially rebuilt, so restore the last persisted generation here too.
+		rollbackErr := apply(previous)
+		return &routingHotUpdateError{phase: "apply", err: err, rollbackErr: rollbackErr}
+	}
+	if err := persist(); err != nil {
+		if atomicRenameWasApplied(err) {
+			// The complete candidate file is already visible. Keep runtime on the
+			// same generation instead of creating a disk/runtime split.
+			return &routingHotUpdateError{phase: "persist", err: err, renameApplied: true}
+		}
+		rollbackErr := apply(previous)
+		return &routingHotUpdateError{phase: "persist", err: err, rollbackErr: rollbackErr}
 	}
 	return nil
 }
@@ -3118,11 +3292,14 @@ func (h *ChildManageHandler) manageRouting(w http.ResponseWriter, r *http.Reques
 		childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to parse config: %v", err))
 		return
 	}
-	originalRouting, _ := config["routing"].(map[string]interface{})
-	if originalRouting == nil {
-		originalRouting = map[string]interface{}{}
+	currentRouting, _ := config["routing"].(map[string]interface{})
+	originalRouting, err := cloneRoutingConfig(currentRouting)
+	if err != nil {
+		childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to snapshot routing config: %v", err))
+		return
 	}
-	hotReplace := action == "set_hot"
+	hotReplace := action == "set_hot" || strings.HasSuffix(action, "_rule_hot")
+	var candidateRouting map[string]interface{}
 
 	switch action {
 	case "set", "set_hot":
@@ -3134,45 +3311,36 @@ func (h *ChildManageHandler) manageRouting(w http.ResponseWriter, r *http.Reques
 			childWriteError(w, http.StatusBadRequest, "set_hot only replaces routing rules")
 			return
 		}
-		config["routing"] = req.Routing
+		candidateRouting, err = cloneRoutingConfig(req.Routing)
+		if err != nil {
+			childWriteError(w, http.StatusBadRequest, fmt.Sprintf("Invalid routing config: %v", err))
+			return
+		}
 		if !hotReplace {
 			applyObservatory(config, "observatory", req.Observatory)
 			applyObservatory(config, "burstObservatory", req.BurstObservatory)
 		}
 
-	case "add_rule":
-		if req.Rule == nil {
-			childWriteError(w, http.StatusBadRequest, "Rule is required")
+	case "add_rule", "add_rule_hot", "replace_rule_hot", "remove_rule", "remove_rule_hot", "move_rule_hot":
+		if hotReplace && (len(req.Observatory) != 0 || len(req.BurstObservatory) != 0) {
+			childWriteError(w, http.StatusBadRequest, "Hot rule actions do not change observatory config")
 			return
 		}
-		routing, _ := config["routing"].(map[string]interface{})
-		if routing == nil {
-			routing = map[string]interface{}{}
-		}
-		rules, _ := routing["rules"].([]interface{})
-		rules = append(rules, req.Rule)
-		routing["rules"] = rules
-		config["routing"] = routing
-
-	case "remove_rule":
-		routing, _ := config["routing"].(map[string]interface{})
-		if routing == nil {
-			childWriteError(w, http.StatusBadRequest, "No routing config found")
+		candidateRouting, err = mutateRoutingRules(currentRouting, action, req)
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, errRoutingRuleChanged) {
+				status = http.StatusConflict
+			}
+			childWriteError(w, status, err.Error())
 			return
 		}
-		rules, _ := routing["rules"].([]interface{})
-		if req.Index < 0 || req.Index >= len(rules) {
-			childWriteError(w, http.StatusBadRequest, "Invalid rule index")
-			return
-		}
-		rules = append(rules[:req.Index], rules[req.Index+1:]...)
-		routing["rules"] = rules
-		config["routing"] = routing
 
 	default:
 		childWriteError(w, http.StatusBadRequest, "Invalid action")
 		return
 	}
+	config["routing"] = candidateRouting
 
 	if hotReplace {
 		apiPort := h.findXrayAPIPort()
@@ -3180,25 +3348,45 @@ func (h *ChildManageHandler) manageRouting(w http.ResponseWriter, r *http.Reques
 			childWriteError(w, http.StatusInternalServerError, "Xray API not available")
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-		clients, err := client.New(ctx, "127.0.0.1", uint16(apiPort))
+		dialCtx, cancelDial := context.WithTimeout(r.Context(), 10*time.Second)
+		clients, err := client.New(dialCtx, "127.0.0.1", uint16(apiPort))
+		cancelDial()
 		if err != nil {
 			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to connect to Xray routing API: %v", err))
 			return
 		}
 		defer clients.Connection.Close()
-		if err := applyRoutingRulesHot(ctx, clients.Routing, req.Routing); err != nil {
-			childWriteError(w, http.StatusConflict, fmt.Sprintf("Failed to hot-apply routing rules (upgrade the Xray core if AddRule is unavailable): %v", err))
-			return
-		}
-		if err := writeJSONFileAtomic(configPath, config); err != nil {
-			rollbackErr := applyRoutingRulesHot(ctx, clients.Routing, originalRouting)
-			if rollbackErr != nil {
-				childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist routing config: %v; runtime rollback failed: %v", err, rollbackErr))
+		err = performRoutingHotUpdate(
+			candidateRouting,
+			originalRouting,
+			func(routing map[string]interface{}) error {
+				// Give candidate and rollback calls independent windows. In particular,
+				// a timed-out candidate must not make the rollback context unusable.
+				applyCtx, cancelApply := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancelApply()
+				return applyRoutingRulesHot(applyCtx, clients.Routing, routing)
+			},
+			func() error { return writeJSONFileAtomic(configPath, config) },
+		)
+		if err != nil {
+			var transactionErr *routingHotUpdateError
+			if !errors.As(err, &transactionErr) {
+				childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update routing: %v", err))
 				return
 			}
-			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist routing config: %v; runtime rules restored", err))
+			if transactionErr.renameApplied {
+				childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Routing rules were applied and the new config is visible, but directory durability could not be confirmed: %v", transactionErr.err))
+				return
+			}
+			if transactionErr.rollbackErr != nil {
+				childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to %s routing config: %v; runtime rollback failed: %v", transactionErr.phase, transactionErr.err, transactionErr.rollbackErr))
+				return
+			}
+			if transactionErr.phase == "apply" {
+				childWriteError(w, http.StatusConflict, fmt.Sprintf("Failed to hot-apply routing rules; runtime rules restored (upgrade the Xray core if AddRule is unavailable): %v", transactionErr.err))
+				return
+			}
+			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist routing config: %v; runtime rules restored", transactionErr.err))
 			return
 		}
 		childWriteJSON(w, http.StatusOK, map[string]interface{}{
