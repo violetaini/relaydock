@@ -1,12 +1,17 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/storage"
 )
@@ -28,14 +33,98 @@ func createManagedSecurityTestUser(t *testing.T, repo *storage.TrafficRepository
 	}
 }
 
-func TestPrepareImportedNodeOrdinaryUserCannotClaimManagedInbound(t *testing.T) {
-	h := &nodesHandler{}
-	node := storage.Node{OriginalServer: "managed-server", InboundTag: "vless-in"}
+func TestPrepareImportedNodeNeverClaimsManagedInbound(t *testing.T) {
+	for _, isAdmin := range []bool{false, true} {
+		h := &nodesHandler{}
+		chainID := int64(19)
+		node := storage.Node{
+			OriginalServer:    "managed-server",
+			InboundTag:        "vless-in",
+			InboundMutationID: "owned-generation",
+			ChainProxyNodeID:  &chainID,
+		}
 
-	h.prepareImportedNode(context.Background(), &node, false)
+		h.prepareImportedNode(context.Background(), &node, isAdmin)
 
-	if node.OriginalServer != "" || node.InboundTag != "" {
-		t.Fatalf("ordinary import retained managed association: server=%q tag=%q", node.OriginalServer, node.InboundTag)
+		if node.OriginalServer != "" || node.InboundTag != "" || node.InboundMutationID != "" || node.ChainProxyNodeID != nil {
+			t.Fatalf("admin=%v import retained managed association: %#v", isAdmin, node)
+		}
+	}
+}
+
+func TestValidateDatabaseManagedForwardNodeRejectsImportedInventory(t *testing.T) {
+	ctx := context.Background()
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "admin", storage.RoleAdmin)
+	imported, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "imported", Protocol: "vless",
+		ClashConfig: `{"name":"imported","type":"vless","server":"198.51.100.2","port":443}`, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create imported node: %v", err)
+	}
+	managed, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "managed", Protocol: "vless",
+		OriginalServer: "edge-1", InboundTag: "vless-in",
+		ClashConfig: `{"name":"managed","type":"vless","server":"203.0.113.2","port":443}`, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create managed node: %v", err)
+	}
+	handler := NewRemoteManageHandler(repo, nil)
+
+	if err := handler.validateDatabaseManagedForwardNode(ctx, map[string]interface{}{"forward_node_id": float64(imported.ID)}); err == nil {
+		t.Fatal("imported subscription node was accepted as a server forwarding source")
+	}
+	if err := handler.validateDatabaseManagedForwardNode(ctx, map[string]interface{}{"forward_node_id": float64(managed.ID)}); err != nil {
+		t.Fatalf("database-managed source was rejected: %v", err)
+	}
+	if err := handler.validateDatabaseManagedForwardNode(ctx, map[string]interface{}{}); err != nil {
+		t.Fatalf("request without forwarding source was rejected: %v", err)
+	}
+}
+
+func TestImportedNodeCannotGainRelayAndManagedEndpointEditKeepsOwnership(t *testing.T) {
+	ctx := context.Background()
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "admin", storage.RoleAdmin)
+	imported, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "imported", Protocol: "vless",
+		ClashConfig: `{"name":"imported","type":"vless","server":"198.51.100.2","port":443}`, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create imported node: %v", err)
+	}
+	handler := &nodesHandler{repo: repo, yamlSyncManager: NewYAMLSyncManager(t.TempDir(), repo)}
+	relayRequest := httptest.NewRequest(http.MethodPut, "/api/admin/nodes/1/relay", bytes.NewBufferString(`{"relay_server":"relay.example.test","relay_port":443}`))
+	relayRequest = relayRequest.WithContext(auth.ContextWithUsername(relayRequest.Context(), "admin"))
+	relayResponse := httptest.NewRecorder()
+	handler.handleSetRelay(relayResponse, relayRequest, fmt.Sprint(imported.ID))
+	if relayResponse.Code != http.StatusBadRequest || !strings.Contains(relayResponse.Body.String(), "不能设置中转") {
+		t.Fatalf("imported relay response=%d %s", relayResponse.Code, relayResponse.Body.String())
+	}
+
+	managed, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "managed", Protocol: "vless",
+		OriginalServer: "edge-1", InboundTag: "vless-in",
+		ClashConfig: `{"name":"managed","type":"vless","server":"edge.example.test","port":443}`, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("create managed node: %v", err)
+	}
+	serverRequest := httptest.NewRequest(http.MethodPut, "/api/admin/nodes/2/server", bytes.NewBufferString(`{"server":"203.0.113.77"}`))
+	serverRequest = serverRequest.WithContext(auth.ContextWithUsername(serverRequest.Context(), "admin"))
+	serverResponse := httptest.NewRecorder()
+	handler.handleUpdateServer(serverResponse, serverRequest, fmt.Sprint(managed.ID))
+	if serverResponse.Code != http.StatusOK {
+		t.Fatalf("managed endpoint update=%d %s", serverResponse.Code, serverResponse.Body.String())
+	}
+	updated, err := repo.GetNodeByID(ctx, managed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.OriginalServer != "edge-1" || updated.InboundTag != "vless-in" {
+		t.Fatalf("managed ownership drifted after endpoint edit: %#v", updated)
 	}
 }
 

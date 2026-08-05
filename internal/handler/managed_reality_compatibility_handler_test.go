@@ -23,11 +23,12 @@ func managedRealityCompatibilityTestInbound(tag, mutationID string, fenceKnown b
 		realitySettings["minClientVer"] = minClientVer
 	}
 	return map[string]interface{}{
-		"tag":                     tag,
-		"protocol":                "vless",
-		"_mutation_fence_known":   fenceKnown,
-		"_mutation_id":            mutationID,
-		"settings":                map[string]interface{}{"clients": []interface{}{}},
+		"tag":                   tag,
+		"protocol":              "vless",
+		"port":                  2443,
+		"_mutation_fence_known": fenceKnown,
+		"_mutation_id":          mutationID,
+		"settings":              map[string]interface{}{"clients": []interface{}{}},
 		"streamSettings": map[string]interface{}{
 			"security":        "reality",
 			"realitySettings": realitySettings,
@@ -66,7 +67,7 @@ func TestManagedRealityCompatibilityHotReplacesOwnedRealityOnly(t *testing.T) {
 				"mutation_owners": map[string]string{
 					"panel-reality-missing": "panel-generation-missing",
 					"panel-reality-blank":   "panel-generation-blank",
-					"user-reality":           "user-generation",
+					"user-reality":          "user-generation",
 				},
 				"inbounds": []map[string]interface{}{ownedMissing, ownedBlank, unowned},
 			})
@@ -156,10 +157,10 @@ func TestManagedRealityCompatibilityHotReplacesOwnedRealityOnly(t *testing.T) {
 
 func TestManagedRealityCompatibilitySkipsWithoutAuthoritativeOwnership(t *testing.T) {
 	for _, test := range []struct {
-		name                  string
-		inventoryFenceKnown   bool
-		inboundFenceKnown     bool
-		storedOwnership       string
+		name                string
+		inventoryFenceKnown bool
+		inboundFenceKnown   bool
+		storedOwnership     string
 	}{
 		{
 			name:                "Agent does not support the mutation fence",

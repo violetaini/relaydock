@@ -108,6 +108,15 @@ func (h *FederationHandler) handleManage(w http.ResponseWriter, r *http.Request,
 	if req.Method == "" {
 		req.Method = http.MethodGet
 	}
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		cleanPath := strings.TrimSuffix(strings.SplitN(req.Path, "?", 2)[0], "/")
+		if cleanPath == "/api/child/xray/config" ||
+			cleanPath == "/api/child/xray/config/files" ||
+			strings.HasPrefix(cleanPath, "/api/child/xray/config-files") {
+			writeError(w, http.StatusForbidden, errors.New("federated raw Xray config writes are disabled; use owner-side managed operations"))
+			return
+		}
+	}
 	var body []byte
 	if req.BodyB64 != "" {
 		b, derr := base64.StdEncoding.DecodeString(req.BodyB64)

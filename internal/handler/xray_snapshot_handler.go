@@ -182,20 +182,10 @@ func (h *XraySnapshotHandler) handleRecoveryApply(w http.ResponseWriter, r *http
 	})
 }
 
-// handleRecoveryAccept: 用户在 UI 选"接受 agent 当前配置" → 把 pending 升级为 current,旧 current 置 old。
-// 不调 agent — agent 端配置本来就是 pending 的内容。
+// Agent state is observation only. Keeping the old endpoint as an explicit
+// rejection prevents stale clients from silently promoting an Agent snapshot.
 func (h *XraySnapshotHandler) handleRecoveryAccept(w http.ResponseWriter, r *http.Request) {
-	serverID, err := parseServerIDQuery(r)
-	if err != nil {
-		writeBadRequest(w, err.Error())
-		return
-	}
-	if aerr := h.repo.AcceptPendingXrayRecovery(r.Context(), serverID); aerr != nil {
-		writeJSONError(w, http.StatusBadRequest, aerr.Error())
-		return
-	}
-	log.Printf("[XraySnapshot] server=%d recovery-accept ok", serverID)
-	respondJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	writeJSONError(w, http.StatusGone, "Agent 配置不能成为入站权威；请恢复数据库配置或从节点管理重新创建")
 }
 
 func (h *XraySnapshotHandler) handleList(w http.ResponseWriter, r *http.Request) {
@@ -276,11 +266,15 @@ func (h *XraySnapshotHandler) handleRestore(w http.ResponseWriter, r *http.Reque
 // 否则用户在 UI 看到"恢复成功"但 agent 实际还在跑旧配置 — 跟其他下发路径(deploy_tunnel
 // / deploy_fallback / remote_reality_domains)的"PUT + restartXrayWithRecovery"约定一致。
 func (h *XraySnapshotHandler) applyConfigToAgent(r *http.Request, serverID int64, configJSON string) error {
-	ctx, release, err := h.repo.AcquireRemoteServerMutationLease(r.Context(), serverID)
+	ctx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(r.Context(), serverID)
 	if err != nil {
 		return err
 	}
 	defer release()
+	configJSON, err = h.remoteManage.canonicalizeDatabaseInbounds(ctx, serverID, configJSON)
+	if err != nil {
+		return fmt.Errorf("sanitize database-authoritative inbounds: %w", err)
+	}
 
 	// 1) agent test-config 验证
 	testBody, _ := json.Marshal(map[string]string{"config": configJSON})

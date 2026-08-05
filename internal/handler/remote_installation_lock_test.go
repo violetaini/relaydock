@@ -643,23 +643,40 @@ func TestPrepareRemoteInstallationDefersStealSelfUntilExternalXrayExists(t *test
 	}
 }
 
-func TestSnapshotSyncRechecksLockAfterRemoteRead(t *testing.T) {
-	configRequested := make(chan struct{}, 1)
-	releaseConfig := make(chan struct{})
+func TestReconnectReconcileHoldsMutationLeaseAndRejectsAgentOnlyInbound(t *testing.T) {
+	inventoryRequested := make(chan struct{}, 1)
+	releaseInventory := make(chan struct{})
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/child/xray/config" || r.Method != http.MethodGet {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/child/inbounds":
+			inventoryRequested <- struct{}{}
+			<-releaseInventory
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"inbounds": []map[string]any{{
+					"tag": "temporary", "protocol": "vless", "port": 2443,
+					"_mutation_id": "agent-only-generation",
+				}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
+			var request map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&request)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true, "mutation_id": request["mutation_id"],
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/child/xray/config":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true, "config": `{"inbounds":[{"tag":"temporary","protocol":"vless","port":2443}]}`,
+			})
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		configRequested <- struct{}{}
-		<-releaseConfig
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"success": true,
-			"config":  `{"inbounds":[{"tag":"temporary","protocol":"vless"}]}`,
-		})
 	}))
 	defer agent.Close()
-	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
+	// This test covers reconciliation lease ordering, not 443 takeover. Keeping
+	// takeover disabled avoids intentionally authorizing a tunnel-in definition
+	// that this minimal Agent fixture does not provide.
+	repo, server := newRemoteInstallationHandlerRepoWithSteal(t, testServerPort(t, agent.URL), false)
 	handler := NewRemoteManageHandler(repo, nil)
 	done := make(chan struct{})
 	go func() {
@@ -667,46 +684,63 @@ func TestSnapshotSyncRechecksLockAfterRemoteRead(t *testing.T) {
 		close(done)
 	}()
 	select {
-	case <-configRequested:
+	case <-inventoryRequested:
 	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot sync did not fetch remote config")
+		t.Fatal("reconnect reconcile did not read Agent inventory")
 	}
-	if err := repo.BeginRemoteServerInstallation(context.Background(), server.ID, "snapshot-install", time.Now().Add(time.Minute)); err != nil {
-		t.Fatal(err)
+	installationDone := make(chan error, 1)
+	go func() {
+		installationDone <- repo.BeginRemoteServerInstallation(context.Background(), server.ID, "snapshot-install", time.Now().Add(time.Minute))
+	}()
+	select {
+	case err := <-installationDone:
+		t.Fatalf("installation bypassed active reconcile lease: %v", err)
+	case <-time.After(100 * time.Millisecond):
 	}
-	close(releaseConfig)
+	close(releaseInventory)
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot sync did not return")
+		t.Fatal("reconnect reconcile did not return")
+	}
+	select {
+	case err := <-installationDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("installation did not acquire lease after reconcile")
 	}
 	snapshot, err := repo.GetCurrentXraySnapshot(context.Background(), server.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot != nil {
-		t.Fatalf("installation-time config was snapshotted: %+v", snapshot)
+	if snapshot == nil || strings.Contains(snapshot.ConfigJSON, "temporary") {
+		t.Fatalf("Agent-only inbound entered canonical snapshot: %+v", snapshot)
 	}
 }
 
-func TestSnapshotRestoreRechecksLockImmediatelyBeforePut(t *testing.T) {
-	testRequested := make(chan struct{}, 1)
-	releaseTest := make(chan struct{})
-	configPut := make(chan struct{}, 1)
+func TestExplicitReconnectRecoveryRestoresAndActivatesDatabaseSnapshot(t *testing.T) {
+	configPutRequested := make(chan string, 1)
+	releaseConfigPut := make(chan struct{})
+	restartRequested := make(chan string, 1)
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/api/child/xray/config":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"success": true,
-				"config":  `{"inbounds":[],"outbounds":[]}`,
-			})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/xray/test-config":
-			testRequested <- struct{}{}
-			<-releaseTest
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/xray/config":
-			configPut <- struct{}{}
+			var request struct {
+				Config string `json:"config"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&request)
+			configPutRequested <- request.Config
+			<-releaseConfigPut
 			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		case r.URL.Path == "/api/child/services/control":
+			restartRequested <- r.URL.Path
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/child/services/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{"xray": map[string]any{"running": true}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -714,8 +748,11 @@ func TestSnapshotRestoreRechecksLockImmediatelyBeforePut(t *testing.T) {
 	defer agent.Close()
 	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
 	if _, err := repo.UpsertCurrentXraySnapshot(context.Background(), server.ID,
-		`{"inbounds":[{"tag":"stable","protocol":"vless"}],"outbounds":[]}`,
+		`{"inbounds":[{"tag":"stable","listen":"0.0.0.0","port":2443,"protocol":"vless","settings":{"clients":[]}}],"outbounds":[{"tag":"database-out","protocol":"freedom"}],"routing":{"rules":[]}}`,
 		storage.XraySnapshotSourceMasterWrite); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpsertActiveDesiredInbound(context.Background(), server.ID, "stable", "database-generation", json.RawMessage(`{"tag":"stable","listen":"0.0.0.0","port":2443,"protocol":"vless","settings":{"clients":[]}}`)); err != nil {
 		t.Fatal(err)
 	}
 	handler := NewRemoteManageHandler(repo, nil)
@@ -725,27 +762,48 @@ func TestSnapshotRestoreRechecksLockImmediatelyBeforePut(t *testing.T) {
 		handler.SyncXrayConfigOnReconnect(context.Background(), server.ID, storage.RemoteServerStatusOffline)
 		close(done)
 	}()
+	var restoredConfig string
 	select {
-	case <-testRequested:
+	case restoredConfig = <-configPutRequested:
 	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot restore did not validate config")
+		t.Fatal("explicit reconnect recovery did not write the database snapshot")
 	}
-	if err := repo.BeginRemoteServerInstallation(context.Background(), server.ID, "restore-install", time.Now().Add(time.Minute)); err != nil {
-		t.Fatal(err)
+	if !strings.Contains(restoredConfig, `"tag":"stable"`) || !strings.Contains(restoredConfig, `"tag":"database-out"`) {
+		t.Fatalf("restored config did not preserve database inbounds/outbounds: %s", restoredConfig)
 	}
-	close(releaseTest)
+	installationDone := make(chan error, 1)
+	go func() {
+		installationDone <- repo.BeginRemoteServerInstallation(context.Background(), server.ID, "restore-install", time.Now().Add(time.Minute))
+	}()
+	select {
+	case err := <-installationDone:
+		t.Fatalf("installation bypassed hot-reconcile lease: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseConfigPut)
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot restore did not return")
+		t.Fatal("reconnect hot reconcile did not return")
 	}
 	select {
-	case <-configPut:
-		t.Fatal("installation acquired during config test did not block restore PUT")
-	default:
+	case err := <-installationDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("installation did not acquire lease after hot reconcile")
 	}
-	if !handler.consumeExpectRecovery(server.ID) {
-		t.Fatal("blocked restore lost the pending recovery intent")
+	select {
+	case path := <-restartRequested:
+		if path != "/api/child/services/control" {
+			t.Fatalf("explicit recovery used unexpected restart path %s", path)
+		}
+	default:
+		t.Fatal("explicit recovery wrote the file without activating it")
+	}
+	if handler.consumeExpectRecovery(server.ID) {
+		t.Fatal("successful explicit recovery intent survived reconnect")
 	}
 }
 

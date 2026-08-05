@@ -547,6 +547,12 @@ func TestAcquireRemoteServerMutationLeaseIsReentrantAndReleaseIsIdempotent(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
+	if held, exclusive := repo.RemoteServerMutationLeaseState(leasedCtx, server.ID); !held || exclusive {
+		t.Fatalf("shared lease state=(held=%v exclusive=%v)", held, exclusive)
+	}
+	if held, exclusive := repo.RemoteServerMutationLeaseState(ctx, server.ID); held || exclusive {
+		t.Fatalf("unleased context state=(held=%v exclusive=%v)", held, exclusive)
+	}
 	nestedCtx, nestedRelease, err := repo.AcquireRemoteServerMutationLease(leasedCtx, server.ID)
 	if err != nil {
 		t.Fatalf("nested AcquireRemoteServerMutationLease: %v", err)
@@ -583,6 +589,9 @@ func TestAcquireRemoteServerExclusiveMutationLeaseSerializesOrdinaryMutations(t 
 	leasedCtx, release, err := repo.AcquireRemoteServerExclusiveMutationLease(ctx, server.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if held, exclusive := repo.RemoteServerMutationLeaseState(leasedCtx, server.ID); !held || !exclusive {
+		t.Fatalf("exclusive lease state=(held=%v exclusive=%v)", held, exclusive)
 	}
 	defer release()
 

@@ -377,41 +377,21 @@ func (h *nodesHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// claimNodeIfHostMatchesServer associates an imported node with a managed
-// server when its origin host matches that server.
-func (h *nodesHandler) claimNodeIfHostMatchesServer(ctx context.Context, node *storage.Node) {
-	if h.remoteManage == nil || node == nil {
-		return
-	}
-	// 优先 ClashConfig(从 yaml 转过来的标准结构,server 字段稳定),fallback ParsedConfig。
-	configJSON := node.ClashConfig
-	if strings.TrimSpace(configJSON) == "" {
-		configJSON = node.ParsedConfig
-	}
-	srv, err := h.remoteManage.MatchRemoteServerByNodeHost(ctx, configJSON, node.RelayOrigServer)
-	if err != nil || srv == nil {
-		return
-	}
-	node.OriginalServer = srv.Name
-	if strings.TrimSpace(node.Tag) == "" {
-		node.Tag = fmt.Sprintf("远程:%s", srv.Name)
-	}
-}
-
 // prepareImportedNode enforces the trust boundary between ordinary imports and
-// nodes managed by an Agent. Only administrators may associate an imported
-// node with a managed server/inbound; ordinary users always create external
-// nodes, even when their payload or proxy host resembles a managed server.
-func (h *nodesHandler) prepareImportedNode(ctx context.Context, node *storage.Node, isAdmin bool) {
+// nodes managed by an Agent. Imports are subscription inventory only: matching
+// a managed server's hostname never grants ownership of an Xray inbound.
+func (h *nodesHandler) prepareImportedNode(_ context.Context, node *storage.Node, _ bool) {
 	if node == nil {
 		return
 	}
-	if !isAdmin {
-		node.OriginalServer = ""
-		node.InboundTag = ""
-		return
-	}
-	h.claimNodeIfHostMatchesServer(ctx, node)
+	node.OriginalServer = ""
+	node.InboundTag = ""
+	node.InboundMutationID = ""
+	node.ChainProxyNodeID = nil
+}
+
+func isDatabaseManagedNode(node *storage.Node) bool {
+	return node != nil && strings.TrimSpace(node.OriginalServer) != "" && strings.TrimSpace(node.InboundTag) != ""
 }
 
 // buildUserCredMapForCreator 给某个用户构造 (server_name, inbound_tag) → credential_json 映射,
@@ -622,13 +602,9 @@ func (h *nodesHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 		ChainProxyNodeID: req.ChainProxyNodeID,
 	}
 
-	// Only administrators may turn an import into a managed node.
+	// Manual creation is import-only. Server ownership is established only by
+	// the managed-node transaction after an Agent ACK.
 	h.prepareImportedNode(r.Context(), &node, userIsAdmin(r.Context(), h.repo, username))
-
-	// 中转:clash/parsed 的 server/port 换成中转地址,原服务器地址/端口记到 relay_orig_*。
-	if rs := strings.TrimSpace(req.RelayServer); rs != "" {
-		applyRelayToNode(&node, rs, req.RelayPort)
-	}
 
 	created, err := h.repo.CreateNode(r.Context(), node)
 	if err != nil {
@@ -666,7 +642,6 @@ func (h *nodesHandler) handleBatchCreate(w http.ResponseWriter, r *http.Request)
 	}
 
 	nodes := make([]storage.Node, 0, len(req.Nodes))
-	relayReqs := make([]nodeRequest, 0, len(req.Nodes)) // 与 nodes 对齐,保留每个节点的中转意图
 	for _, n := range req.Nodes {
 		// 允许 Clash 订阅节点没有 RawURL，但必须有 NodeName 和 ClashConfig
 		if n.NodeName == "" || n.ClashConfig == "" {
@@ -683,7 +658,6 @@ func (h *nodesHandler) handleBatchCreate(w http.ResponseWriter, r *http.Request)
 			Tag:          n.Tag,
 			InboundTag:   n.InboundTag,
 		})
-		relayReqs = append(relayReqs, n)
 	}
 
 	if len(nodes) == 0 {
@@ -691,18 +665,11 @@ func (h *nodesHandler) handleBatchCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Only administrators may turn an import into a managed node. In particular,
-	// ordinary users cannot smuggle inbound_tag through the batch endpoint.
+	// Batch creation is also import-only; no caller may smuggle a server binding
+	// or inbound tag through subscription inventory.
 	isAdmin := userIsAdmin(r.Context(), h.repo, username)
 	for i := range nodes {
 		h.prepareImportedNode(r.Context(), &nodes[i], isAdmin)
-	}
-
-	// 给填了中转的节点挂中转(与单个创建/编辑端点同一份 applyRelayToNode 逻辑)。
-	for i := range nodes {
-		if rs := strings.TrimSpace(relayReqs[i].RelayServer); rs != "" {
-			applyRelayToNode(&nodes[i], rs, relayReqs[i].RelayPort)
-		}
 	}
 
 	created, err := h.repo.BatchCreateNodes(r.Context(), nodes)
@@ -749,6 +716,21 @@ func (h *nodesHandler) handleUpdate(w http.ResponseWriter, r *http.Request, idSe
 		return
 	}
 	req.parseChainProxyNodeID()
+	if isAdmin && req.hasChainProxyNodeID() && req.ChainProxyNodeID != nil {
+		if !isDatabaseManagedNode(&existing) {
+			writeBadRequest(w, "导入节点只用于订阅、测速和用户分配，不能设置链式代理")
+			return
+		}
+		target, targetErr := h.repo.GetNodeByID(r.Context(), *req.ChainProxyNodeID)
+		if targetErr != nil {
+			writeBadRequest(w, "链式代理目标节点不存在")
+			return
+		}
+		if !isDatabaseManagedNode(&target) {
+			writeBadRequest(w, "导入节点不能作为链式代理目标")
+			return
+		}
+	}
 
 	// 普通用户:只能改自己节点的「名称」。归属已由 fetchNodeForAccess 限制为本人节点(套餐/admin
 	// 节点取不到 → 404)。强制只保留 NodeName、其余字段沿用原节点,防止越权改配置/协议/标签/启用状态。
@@ -921,16 +903,14 @@ func (h *nodesHandler) handleUpdateServer(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// server 字段变了 → OriginalServer 必须重新校验:
-	//   - 新 server 命中某 remote_server.{IP,Domain,PullAddress} → OS = 该 server.Name
-	//   - 不命中任何 remote_server → 清空 OS(避免「VICTORIA 伪装节点残留 OS=GoMami」这种识别错位)
-	// 这里复用 MatchRemoteServerByNodeHost 同一份匹配规则。
-	if h.remoteManage != nil {
-		if srv, _ := h.remoteManage.MatchRemoteServerByNodeHost(r.Context(), existing.ClashConfig, existing.RelayOrigServer); srv != nil {
-			existing.OriginalServer = srv.Name
-		} else {
-			existing.OriginalServer = ""
-		}
+	// OriginalServer is lifecycle ownership, not a guess derived from the
+	// client-facing endpoint. Managed nodes keep their server binding when an
+	// administrator resolves a hostname, configures a relay, or edits the
+	// advertised address. Imported inventory can never gain that binding here.
+	if !isDatabaseManagedNode(&existing) {
+		existing.OriginalServer = ""
+		existing.InboundTag = ""
+		existing.InboundMutationID = ""
 	}
 
 	updated, err := h.repo.UpdateNode(r.Context(), existing)
@@ -1118,6 +1098,10 @@ func (h *nodesHandler) handleSetRelay(w http.ResponseWriter, r *http.Request, id
 			status = http.StatusNotFound
 		}
 		writeError(w, status, err)
+		return
+	}
+	if !isDatabaseManagedNode(&existing) {
+		writeBadRequest(w, "导入节点只用于订阅、测速和用户分配，不能设置中转")
 		return
 	}
 	var req struct {
@@ -1868,7 +1852,7 @@ func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inbo
 	lock := wssServerLock(server.ID)
 	lock.Lock()
 	defer lock.Unlock()
-	realityDomains, removedInboundWasWSS, stateErr := h.remoteManage.getInboundRemovalSyncState(ctx, server.ID, inboundTag)
+	removalState, stateErr := h.remoteManage.inspectInboundRemovalSyncState(ctx, server.ID, inboundTag)
 	if stateErr != nil {
 		log.Printf("[Nodes] Failed to snapshot remote inbound %s on server %s before deletion: %v", inboundTag, serverName, stateErr)
 	}
@@ -1911,12 +1895,12 @@ func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inbo
 		// disturb unrelated nginx sites when the removed inbound was plain WS.
 		return nil
 	}
-	if len(realityDomains) > 0 {
-		if err := h.remoteManage.restoreTunnelRouteForReality(ctx, server.ID, realityDomains); err != nil {
+	if len(removalState.realityDomains) > 0 || removalState.realityPort > 0 {
+		if err := h.remoteManage.restoreTunnelRouteForReality(ctx, server.ID, removalState.realityDomains, removalState.realityPort); err != nil {
 			log.Printf("[Nodes] Restore Reality route after delete inbound %s on server=%d failed: %v", inboundTag, server.ID, err)
 		}
 	}
-	if removedInboundWasWSS {
+	if removalState.wasWSS {
 		if err := h.remoteManage.SyncWSSNginx(ctx, server.ID); err != nil {
 			log.Printf("[Nodes] SyncWSSNginx after delete inbound %s on server=%d failed: %v", inboundTag, server.ID, err)
 		}

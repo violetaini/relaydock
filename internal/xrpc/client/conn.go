@@ -6,6 +6,7 @@ import (
 
 	loggerpb "github.com/xtls/xray-core/app/log/command"
 	handlerpb "github.com/xtls/xray-core/app/proxyman/command"
+	routerpb "github.com/xtls/xray-core/app/router/command"
 	statspb "github.com/xtls/xray-core/app/stats/command"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -17,6 +18,7 @@ type Clients struct {
 	Handler    handlerpb.HandlerServiceClient
 	Logger     loggerpb.LoggerServiceClient
 	Stats      statspb.StatsServiceClient
+	Routing    routerpb.RoutingServiceClient
 }
 
 // 针对正在运行的 Xray API 端点建立不安全（明文）连接。
@@ -37,5 +39,6 @@ func New(ctx context.Context, addr string, port uint16, dialOpts ...grpc.DialOpt
 		Handler:    handlerpb.NewHandlerServiceClient(conn),
 		Logger:     loggerpb.NewLoggerServiceClient(conn),
 		Stats:      statspb.NewStatsServiceClient(conn),
+		Routing:    routerpb.NewRoutingServiceClient(conn),
 	}, nil
 }

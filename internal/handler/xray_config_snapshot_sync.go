@@ -3,6 +3,8 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -29,120 +31,97 @@ func (h *RemoteManageHandler) consumeExpectRecovery(serverID int64) bool {
 	return exists
 }
 
-// SyncXrayConfigOnReconnect 在 agent WS 重连成功后由 RemoteWSHandler 异步触发。
-//
-// 行为:拉 agent 当前 xray config.json,与主控 current snapshot 比对,按 prevStatus 分流:
-//   - prevStatus == "offline":写 pending_recovery,不动 current(VPS 跑路换机场景 — 等用户决策)
-//   - 其它(首次连接 / connected 期 reconnect):UpsertCurrent
-//     (用户 SSH 修复坏配置后重启 agent 的场景 — 自动接受 agent 现状)
-//
-// 拉失败 / 解析失败:静默跳过,等下次 reconnect 再来 — agent 端 xray 还没装 / 没启动很正常。
+// SyncXrayConfigOnReconnect treats Agent state as observation only. Reconnects
+// converge hot-add/remove capable inbounds to the durable database intent and
+// never promote Agent-only listeners into snapshots or nodes.
 func (h *RemoteManageHandler) SyncXrayConfigOnReconnect(ctx context.Context, serverID int64, prevStatus string) {
 	fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if !remoteInstallationAllowsAutoDeploy(fctx, h.repo, serverID, "Xray snapshot sync") {
 		return
 	}
-
-	raw, err := h.forwardToRemoteServer(fctx, serverID, "GET", "/api/child/xray/config", nil)
+	expectRecovery := strings.EqualFold(strings.TrimSpace(prevStatus), storage.RemoteServerStatusOffline) && h.consumeExpectRecovery(serverID)
+	leasedCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(fctx, serverID)
 	if err != nil {
-		// xray 未安装 / 配置文件不存在 → agent 返回 404,这里也 silent skip
-		log.Printf("[XraySync] server=%d fetch agent xray config skipped: %v", serverID, err)
+		log.Printf("[XrayAuthority] reconnect server=%d lease failed: %v", serverID, err)
 		return
 	}
-
-	var resp struct {
-		Success bool   `json:"success"`
-		Path    string `json:"path"`
-		Config  string `json:"config"`
-	}
-	if jerr := json.Unmarshal(raw, &resp); jerr != nil || !resp.Success || strings.TrimSpace(resp.Config) == "" {
-		log.Printf("[XraySync] server=%d parse agent xray config skipped: jerr=%v success=%v", serverID, jerr, resp.Success)
-		return
-	}
-	// The install lock may have been acquired while the remote GET was in
-	// flight. Never snapshot or restore a transient config that may roll back.
-	if !remoteInstallationAllowsAutoDeploy(fctx, h.repo, serverID, "Xray snapshot sync") {
-		return
-	}
-
-	if strings.EqualFold(strings.TrimSpace(prevStatus), "offline") {
-		// 用户在 UI 点过恢复 Popover → 直接下发 current,不走 pending_recovery 等待决策。
-		// 典型场景:VPS 跑路换机,新 agent 装好后连上来,主控自动把 last snapshot 覆盖过去。
-		if h.consumeExpectRecovery(serverID) {
-			current, cerr := h.repo.GetCurrentXraySnapshot(fctx, serverID)
-			if cerr != nil || current == nil {
-				log.Printf("[XraySync] server=%d expect_recovery set but no current snapshot: %v", serverID, cerr)
-				return
-			}
-			// 恢复前 merge:把 agent 实配(resp.Config)里 current 落后缺失的 inbound/outbound 并回来,
-			// 避免用落后 snapshot 全量覆盖抹掉 federation 对方新加的入站("共享入站一觉醒来消失")。
-			cfgToApply, mergedN := mergeAgentOnlyInboundsOutbounds(current.ConfigJSON, resp.Config)
-			if mergedN > 0 {
-				log.Printf("[XraySync] server=%d expect_recovery: merged %d agent-only inbound/outbound into snapshot before restore", serverID, mergedN)
-			}
-			// test → PUT
-			testBody, _ := json.Marshal(map[string]string{"config": cfgToApply})
-			if raw, terr := h.forwardToRemoteServer(fctx, serverID, "POST", "/api/child/xray/test-config", testBody); terr == nil {
-				var tr struct {
-					Ok    bool   `json:"ok"`
-					Error string `json:"error"`
-				}
-				_ = json.Unmarshal(raw, &tr)
-				if !tr.Ok {
-					log.Printf("[XraySync] server=%d expect_recovery: snapshot failed test on new agent: %s", serverID, tr.Error)
-					return
-				}
-			}
-			putBody, _ := json.Marshal(map[string]interface{}{"config": cfgToApply, "force": true})
-			if perr := withRemoteInstallationSafeMutation(fctx, h.repo, serverID, "Xray snapshot restore", func(actionCtx context.Context) error {
-				_, err := h.forwardToRemoteServer(actionCtx, serverID, "POST", "/api/child/xray/config", putBody)
-				return err
-			}); perr != nil {
-				// consumeExpectRecovery ran before the remote validation. Preserve the
-				// user's recovery intent so a post-finalize reconnect/trigger can retry.
-				h.SetExpectRecovery(serverID)
-				log.Printf("[XraySync] server=%d expect_recovery PUT failed: %v", serverID, perr)
-				return
-			}
-			log.Printf("[XraySync] server=%d expect_recovery: auto-restored current snapshot (hash=%s)", serverID, shortHash(current.ConfigHash))
+	defer release()
+	if expectRecovery {
+		if err := h.restoreDatabaseXraySnapshotLeased(leasedCtx, serverID); err != nil {
+			// The flag is transient, but a failed restore must remain retryable on
+			// the next reconnect instead of silently degrading to inbound-only sync.
+			h.SetExpectRecovery(serverID)
+			log.Printf("[XrayAuthority] explicit recovery server=%d failed: %v", serverID, err)
 			return
 		}
-
-		var wrote bool
-		werr := withRemoteInstallationSafeMutation(fctx, h.repo, serverID, "Xray pending recovery", func(actionCtx context.Context) error {
-			var err error
-			wrote, err = h.repo.WritePendingXrayRecovery(actionCtx, serverID, resp.Config, storage.XraySnapshotSourceAgentReport)
-			return err
-		})
-		if werr != nil {
-			log.Printf("[XraySync] server=%d write pending recovery failed: %v", serverID, werr)
-			return
-		}
-		if wrote {
-			log.Printf("[XraySync] server=%d offline→online with config drift — pending_recovery written, awaiting user decision", serverID)
-		} else {
-			log.Printf("[XraySync] server=%d offline→online but config matches current — no pending needed", serverID)
-		}
+		log.Printf("[XrayAuthority] explicit recovery server=%d restored the database snapshot", serverID)
 		return
 	}
+	result, reconcileErr := h.reconcileDatabaseOwnedInboundsLeased(leasedCtx, serverID, "")
+	h.logDatabaseInboundReconcile(serverID, "reconnect", result, reconcileErr)
+}
 
-	var snap *storage.ServerXrayConfigSnapshot
-	werr := withRemoteInstallationSafeMutation(fctx, h.repo, serverID, "Xray snapshot upsert", func(actionCtx context.Context) error {
-		var err error
-		snap, err = h.repo.UpsertCurrentXraySnapshot(actionCtx, serverID, resp.Config, storage.XraySnapshotSourceAgentReport)
-		if err == nil && h.inboundCache != nil {
-			h.inboundCache.SyncFromConfig(serverID, resp.Config)
-		}
+// restoreDatabaseXraySnapshotLeased is reserved for the explicit disaster-
+// recovery workflow. Normal reconnects use hot inbound reconciliation and do
+// not write the full config. The caller must hold the server mutation lease.
+func (h *RemoteManageHandler) restoreDatabaseXraySnapshotLeased(ctx context.Context, serverID int64) error {
+	current, err := h.repo.GetCurrentXraySnapshot(ctx, serverID)
+	if err != nil {
+		return fmt.Errorf("load current Xray snapshot: %w", err)
+	}
+	if current == nil || strings.TrimSpace(current.ConfigJSON) == "" {
+		return errors.New("no database Xray snapshot is available")
+	}
+	configJSON, err := h.canonicalizeDatabaseInbounds(ctx, serverID, current.ConfigJSON)
+	if err != nil {
+		return fmt.Errorf("canonicalize database inbounds: %w", err)
+	}
+
+	testBody, err := json.Marshal(map[string]string{"config": configJSON})
+	if err != nil {
 		return err
-	})
-	if werr != nil {
-		log.Printf("[XraySync] server=%d upsert current failed: %v", serverID, werr)
-		return
 	}
-	if snap != nil && snap.ConfigHash != "" {
-		log.Printf("[XraySync] server=%d current snapshot synced (hash=%s)", serverID, shortHash(snap.ConfigHash))
+	raw, err := h.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/xray/test-config", testBody)
+	if err != nil {
+		return fmt.Errorf("test database Xray snapshot: %w", err)
 	}
+	var tested struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &tested); err != nil {
+		return fmt.Errorf("decode Xray snapshot test: %w", err)
+	}
+	if !tested.OK {
+		message := strings.TrimSpace(tested.Error)
+		if message == "" {
+			message = "Agent rejected the database Xray snapshot"
+		}
+		return errors.New(message)
+	}
+
+	putBody, err := json.Marshal(map[string]interface{}{"config": configJSON, "force": true})
+	if err != nil {
+		return err
+	}
+	if _, err := h.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/xray/config", putBody); err != nil {
+		return fmt.Errorf("restore database Xray snapshot: %w", err)
+	}
+	// The Agent config endpoint only persists the file. Disaster recovery must
+	// not report success until the running process has loaded and passed the
+	// normal restart health check. This restart is limited to the explicit
+	// recovery action; ordinary inbound reconciliation remains hot.
+	if err := h.restartXrayWithRecovery(ctx, serverID, "XrayDatabaseRecovery"); err != nil {
+		return fmt.Errorf("activate restored database Xray snapshot: %w", err)
+	}
+	if _, err := h.repo.UpsertCurrentXraySnapshot(ctx, serverID, configJSON, storage.XraySnapshotSourceMasterWrite); err != nil {
+		return fmt.Errorf("persist restored Xray snapshot: %w", err)
+	}
+	if h.inboundCache != nil {
+		h.inboundCache.SyncFromConfig(serverID, configJSON)
+	}
+	return h.repo.DiscardPendingXrayRecovery(ctx, serverID)
 }
 
 func shortHash(h string) string {
@@ -167,7 +146,7 @@ var xrayMutatingPathPrefixes = []string{
 	"/api/child/routing",
 	"/api/child/batch-apply",
 	"/api/child/xray/config",
-	"/api/child/xray/config-files",
+	"/api/child/xray/config/files",
 	"/api/child/xray/system-config",
 	"/api/child/external-xray/takeover",
 }
@@ -188,42 +167,60 @@ func shouldRefreshXraySnapshotAfter(method, path string) bool {
 	return false
 }
 
-// refreshXraySnapshot 异步拉一次 agent 当前 xray config 并 upsert 到 current snapshot,
-// 由 forwardToRemoteServer defer hook 在 master 写操作成功后触发。
-//
-// 注意:本函数内部也调 forwardToRemoteServer GET,GET 不触发递归 refresh(shouldRefreshXraySnapshotAfter 返回 false)。
-func (h *RemoteManageHandler) refreshXraySnapshot(serverID int64) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func agentMutationAcknowledged(path string, requestBody, raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var response struct {
+		Success *bool `json:"success"`
+		OK      *bool `json:"ok"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return false
+	}
+	acknowledged := response.OK != nil && *response.OK
+	if response.Success != nil {
+		acknowledged = *response.Success
+	}
+	if !acknowledged {
+		return false
+	}
+	cleanPath := strings.TrimSuffix(strings.SplitN(path, "?", 2)[0], "/")
+	if cleanPath != "/api/child/inbounds" {
+		return true
+	}
+	var request struct {
+		MutationID string `json:"mutation_id"`
+	}
+	var inboundResponse struct {
+		MutationID string `json:"mutation_id"`
+		Superseded bool   `json:"superseded"`
+	}
+	if err := json.Unmarshal(requestBody, &request); err != nil || json.Unmarshal(raw, &inboundResponse) != nil {
+		return false
+	}
+	if inboundResponse.Superseded {
+		return false
+	}
+	return strings.TrimSpace(request.MutationID) == "" ||
+		strings.TrimSpace(request.MutationID) == strings.TrimSpace(inboundResponse.MutationID)
+}
+
+// refreshXraySnapshot is intentionally a database-authority reconcile. A
+// successful Agent write may trigger it, but the Agent response is never
+// promoted to desired state.
+func (h *RemoteManageHandler) refreshXraySnapshot(ctx context.Context, serverID int64) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	raw, err := h.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/xray/config", nil)
+	leasedCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(ctx, serverID)
 	if err != nil {
-		log.Printf("[XraySync] refresh after master write skipped for server=%d: %v", serverID, err)
+		log.Printf("[XrayAuthority] post-write server=%d lease failed: %v", serverID, err)
 		return
 	}
-	var resp struct {
-		Success bool   `json:"success"`
-		Config  string `json:"config"`
-	}
-	if jerr := json.Unmarshal(raw, &resp); jerr != nil || !resp.Success || strings.TrimSpace(resp.Config) == "" {
-		log.Printf("[XraySync] refresh parse skipped for server=%d: jerr=%v success=%v", serverID, jerr, resp.Success)
-		return
-	}
-	var snap *storage.ServerXrayConfigSnapshot
-	werr := withRemoteInstallationSafeMutation(ctx, h.repo, serverID, "Xray snapshot refresh", func(actionCtx context.Context) error {
-		var err error
-		snap, err = h.repo.UpsertCurrentXraySnapshot(actionCtx, serverID, resp.Config, storage.XraySnapshotSourceMasterWrite)
-		if err == nil && h.inboundCache != nil {
-			h.inboundCache.SyncFromConfig(serverID, resp.Config)
-		}
-		return err
-	})
-	if werr != nil {
-		log.Printf("[XraySync] refresh upsert failed for server=%d: %v", serverID, werr)
-		return
-	}
-	if snap != nil && snap.ConfigHash != "" {
-		log.Printf("[XraySync] refresh after master write ok server=%d (hash=%s)", serverID, shortHash(snap.ConfigHash))
-	}
+	defer release()
+	leasedCtx = suppressDatabaseInboundPostWrite(leasedCtx)
+	result, reconcileErr := h.reconcileDatabaseOwnedInboundsLeased(leasedCtx, serverID, "")
+	h.logDatabaseInboundReconcile(serverID, "post_write", result, reconcileErr)
 }
 
 // mergeAgentOnlyInboundsOutbounds 在 baseCfg(要下发的 snapshot)基础上,把 agentCfg(agent 当前实配)里

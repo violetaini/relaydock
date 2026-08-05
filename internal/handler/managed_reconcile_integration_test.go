@@ -95,8 +95,8 @@ func (a *managedFakeAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = w.Write([]byte(`{"success":true}`))
 	case r.Method == http.MethodGet && r.URL.Path == "/api/child/xray/config":
-		// A successful inbound mutation schedules a background snapshot refresh.
-		// No config is needed for this test; signaling lets it finish before cleanup.
+		// A shared managed-client transaction must not try to upgrade itself into
+		// a full database-authority reconcile.
 		_, _ = w.Write([]byte(`{"success":false}`))
 		select {
 		case a.snapshotHit <- struct{}{}:
@@ -267,8 +267,8 @@ func TestManagedReconcileProvisionsLimiterBeforeExpiringClient(t *testing.T) {
 
 	select {
 	case <-fakeAgent.snapshotHit:
-	case <-time.After(time.Second):
-		t.Fatal("background xray snapshot refresh did not finish")
+		t.Fatal("managed client transaction triggered a redundant full Xray authority scan")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

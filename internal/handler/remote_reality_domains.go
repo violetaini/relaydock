@@ -272,7 +272,7 @@ func (h *RemoteManageHandler) HandleSetupSSL(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	ctx, release, err := h.repo.AcquireRemoteServerMutationLease(r.Context(), id)
+	ctx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(r.Context(), id)
 	if err != nil {
 		remoteWriteForwardError(w, err)
 		return
@@ -470,9 +470,12 @@ func (h *RemoteManageHandler) HandleDeployStealSelfConfig(w http.ResponseWriter,
 // 历史 BUG:之前 if/else 只识别 fallback,其它(含 default、空)统统走 tunnel,
 // 用户选了"默认"部署模式但 deployStealSelf 实际下发的是 tunnel 配置。
 func (h *RemoteManageHandler) DeployStealSelfConfig(ctx context.Context, serverID int64) error {
-	return h.repo.WithRemoteServerMutationLease(ctx, serverID, func(leasedCtx context.Context) error {
-		return h.deployStealSelfConfigLeased(leasedCtx, serverID)
-	})
+	leasedCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return h.deployStealSelfConfigLeased(leasedCtx, serverID)
 }
 
 func (h *RemoteManageHandler) deployStealSelfConfigLeased(ctx context.Context, serverID int64) error {

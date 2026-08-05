@@ -8,7 +8,7 @@ import (
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
-func TestInboundEventDoesNotClaimOrdinaryUserNode(t *testing.T) {
+func TestInboundEventNeverClaimsImportedNodes(t *testing.T) {
 	ctx := context.Background()
 	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
 	if err != nil {
@@ -41,13 +41,12 @@ func TestInboundEventDoesNotClaimOrdinaryUserNode(t *testing.T) {
 		t.Fatalf("create unknown owner node: %v", err)
 	}
 
-	listener := NewNodeSyncListener(repo, nil)
-	matched, err := listener.tryClaimExternalNode(ctx, server, InboundEvent{Tag: "vless-in", Protocol: "vless", Port: 443}, config)
-	if err != nil {
-		t.Fatalf("claim external node: %v", err)
-	}
-	if !matched {
-		t.Fatal("expected the administrator node to be claimed")
+	listener := NewNodeSyncListener(repo, func(_ int64, _ map[string]any) (string, error) { return config, nil })
+	if err := listener.Handle(InboundEvent{
+		Type: EventInboundAdded, ServerID: server.ID, Tag: "vless-in", MutationID: "managed-generation",
+		Protocol: "vless", Port: 443, Inbound: map[string]any{"tag": "vless-in", "protocol": "vless", "port": 443},
+	}); err != nil {
+		t.Fatalf("handle inbound event: %v", err)
 	}
 	gotAdmin, err := repo.GetNodeByID(ctx, adminNode.ID)
 	if err != nil {
@@ -57,8 +56,8 @@ func TestInboundEventDoesNotClaimOrdinaryUserNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read user node: %v", err)
 	}
-	if gotAdmin.OriginalServer != server.Name || gotAdmin.InboundTag != "vless-in" {
-		t.Fatalf("admin node was not claimed: %#v", gotAdmin)
+	if gotAdmin.OriginalServer != "" || gotAdmin.InboundTag != "" {
+		t.Fatalf("administrator import was claimed: %#v", gotAdmin)
 	}
 	if gotUser.OriginalServer != "" || gotUser.InboundTag != "" {
 		t.Fatalf("ordinary user node was claimed: %#v", gotUser)

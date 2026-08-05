@@ -20,6 +20,8 @@ import (
 	"github.com/violetaini/relaydock/internal/xrpc/client"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
+	routercommand "github.com/xtls/xray-core/app/router/command"
+	xserial "github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -3012,6 +3014,32 @@ func applyObservatory(config map[string]interface{}, key string, raw json.RawMes
 	}
 }
 
+func applyRoutingRulesHot(ctx context.Context, routingClient routercommand.RoutingServiceClient, routing map[string]interface{}) error {
+	raw, err := json.Marshal(routing)
+	if err != nil {
+		return fmt.Errorf("marshal routing config: %w", err)
+	}
+	var routingConfig conf.RouterConfig
+	if err := json.Unmarshal(raw, &routingConfig); err != nil {
+		return fmt.Errorf("decode routing config: %w", err)
+	}
+	built, err := routingConfig.Build()
+	if err != nil {
+		return fmt.Errorf("build routing config: %w", err)
+	}
+	message := xserial.ToTypedMessage(built)
+	if message == nil {
+		return errors.New("build routing typed message")
+	}
+	if _, err := routingClient.AddRule(ctx, &routercommand.AddRuleRequest{
+		Config:       message,
+		ShouldAppend: false,
+	}); err != nil {
+		return fmt.Errorf("replace runtime routing rules: %w", err)
+	}
+	return nil
+}
+
 // 处理子服务器的路由管理
 func (h *ChildManageHandler) HandleRouting(w http.ResponseWriter, r *http.Request) {
 	if !h.authenticate(r) {
@@ -3090,16 +3118,27 @@ func (h *ChildManageHandler) manageRouting(w http.ResponseWriter, r *http.Reques
 		childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to parse config: %v", err))
 		return
 	}
+	originalRouting, _ := config["routing"].(map[string]interface{})
+	if originalRouting == nil {
+		originalRouting = map[string]interface{}{}
+	}
+	hotReplace := action == "set_hot"
 
 	switch action {
-	case "set":
+	case "set", "set_hot":
 		if req.Routing == nil {
 			childWriteError(w, http.StatusBadRequest, "Routing config is required")
 			return
 		}
+		if hotReplace && (len(req.Observatory) != 0 || len(req.BurstObservatory) != 0) {
+			childWriteError(w, http.StatusBadRequest, "set_hot only replaces routing rules")
+			return
+		}
 		config["routing"] = req.Routing
-		applyObservatory(config, "observatory", req.Observatory)
-		applyObservatory(config, "burstObservatory", req.BurstObservatory)
+		if !hotReplace {
+			applyObservatory(config, "observatory", req.Observatory)
+			applyObservatory(config, "burstObservatory", req.BurstObservatory)
+		}
 
 	case "add_rule":
 		if req.Rule == nil {
@@ -3132,6 +3171,40 @@ func (h *ChildManageHandler) manageRouting(w http.ResponseWriter, r *http.Reques
 
 	default:
 		childWriteError(w, http.StatusBadRequest, "Invalid action")
+		return
+	}
+
+	if hotReplace {
+		apiPort := h.findXrayAPIPort()
+		if apiPort == 0 {
+			childWriteError(w, http.StatusInternalServerError, "Xray API not available")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		clients, err := client.New(ctx, "127.0.0.1", uint16(apiPort))
+		if err != nil {
+			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to connect to Xray routing API: %v", err))
+			return
+		}
+		defer clients.Connection.Close()
+		if err := applyRoutingRulesHot(ctx, clients.Routing, req.Routing); err != nil {
+			childWriteError(w, http.StatusConflict, fmt.Sprintf("Failed to hot-apply routing rules (upgrade the Xray core if AddRule is unavailable): %v", err))
+			return
+		}
+		if err := writeJSONFileAtomic(configPath, config); err != nil {
+			rollbackErr := applyRoutingRulesHot(ctx, clients.Routing, originalRouting)
+			if rollbackErr != nil {
+				childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist routing config: %v; runtime rollback failed: %v", err, rollbackErr))
+				return
+			}
+			childWriteError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to persist routing config: %v; runtime rules restored", err))
+			return
+		}
+		childWriteJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Routing updated in runtime and persisted without restarting Xray.",
+		})
 		return
 	}
 

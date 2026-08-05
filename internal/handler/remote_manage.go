@@ -30,20 +30,21 @@ import (
 
 // RemoteManageHandler 处理需要转发到子服务器的管理请求
 type RemoteManageHandler struct {
-	repo              *storage.TrafficRepository
-	wsHandler         *RemoteWSHandler
-	httpClient        *http.Client
-	certHandler       *CertificateHandler
-	crypto            *CryptoConfig
-	pullSessions      sync.Map // serverID (int64) → *securechan.Session
-	fedSessions       sync.Map // serverID (int64) → *securechan.Session (联邦:消费方↔拥有方)
-	stealSelfDeployer func(ctx context.Context, serverID int64) error
-	inboundCache      *InboundCache // 从 xray config snapshot 派生,套餐绑/换绑 cred 计算用,setter 注入
-	xrayVersionsMu    sync.Mutex
-	xrayVersions      []XrayCoreVersion
-	xrayVersionsAt    time.Time
-	xrayVersionsErr   string
-	xrayVersionsFetch chan struct{}
+	repo                *storage.TrafficRepository
+	wsHandler           *RemoteWSHandler
+	httpClient          *http.Client
+	certHandler         *CertificateHandler
+	crypto              *CryptoConfig
+	pullSessions        sync.Map // serverID (int64) → *securechan.Session
+	fedSessions         sync.Map // serverID (int64) → *securechan.Session (联邦:消费方↔拥有方)
+	stealSelfDeployer   func(ctx context.Context, serverID int64) error
+	inboundCache        *InboundCache // 从 xray config snapshot 派生,套餐绑/换绑 cred 计算用,setter 注入
+	xrayVersionsMu      sync.Mutex
+	xrayVersions        []XrayCoreVersion
+	xrayVersionsAt      time.Time
+	xrayVersionsErr     string
+	xrayVersionsFetch   chan struct{}
+	publishInboundEvent func(event.InboundEvent) error
 }
 
 const (
@@ -74,8 +75,9 @@ func (h *RemoteManageHandler) SetInboundCache(c *InboundCache) {
 // 创建一个新的远程管理处理程序
 func NewRemoteManageHandler(repo *storage.TrafficRepository, wsHandler *RemoteWSHandler) *RemoteManageHandler {
 	return &RemoteManageHandler{
-		repo:      repo,
-		wsHandler: wsHandler,
+		repo:                repo,
+		wsHandler:           wsHandler,
+		publishInboundEvent: event.GetBus().Publish,
 		httpClient: &http.Client{
 			// Per-operation contexts still enforce the shorter default/WARP
 			// deadlines; the client ceiling must allow a full line speed test.
@@ -211,7 +213,7 @@ func (h *RemoteManageHandler) handleConnLimitKickDelta(ctx context.Context, serv
 
 // 处理通过 WebSocket 从代理收到的扫描结果。
 func (h *RemoteManageHandler) HandleScanResult(serverID int64, payload WSScanResultPayload) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	leasedCtx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(ctx, serverID)
 	if err != nil {
@@ -241,18 +243,10 @@ func (h *RemoteManageHandler) HandleScanResult(serverID int64, payload WSScanRes
 	}
 
 	if payload.XrayRunning {
-		// Installation may be observing a temporary Xray config that will be
-		// rolled back. Do not create/claim database nodes from that transient
-		// state. The shared lease covers every remote/DB mutation in auto-sync.
-		var result SyncInboundsToNodesResponse
-		if err := withRemoteInstallationSafeMutation(ctx, h.repo, serverID, "Remote Manage inbound sync", func(actionCtx context.Context) error {
-			result = h.syncInboundsToNodesInternal(actionCtx, serverID)
-			return nil
-		}); err != nil {
-			return
-		}
-		log.Printf("[Remote Manage] Auto-sync from scan_result for server %d: synced=%d (claimed=%d, created=%d), skipped=%d",
-			serverID, result.SyncedCount, result.ClaimedCount, result.CreatedCount, result.SkippedCount)
+		// Agent inventory is observation only. Database-owned nodes drive the
+		// desired inbound set; runtime-only listeners are removed, never imported.
+		result, reconcileErr := h.reconcileDatabaseOwnedInboundsLeased(ctx, serverID, "")
+		h.logDatabaseInboundReconcile(serverID, "scan_result", result, reconcileErr)
 	} else {
 		// A scan is observability only. Xray may be deliberately stopped by an
 		// administrator, and a failed scan must never write a config or start it.
@@ -295,6 +289,47 @@ func remoteWriteForwardError(w http.ResponseWriter, err error) {
 	remoteWriteError(w, status, err.Error())
 }
 
+// remoteHTTPStatusError means the peer returned a complete HTTP response. For
+// inbound mutations this is a definitive rejection, unlike a timeout, broken
+// connection, unreadable body, or decrypt failure where the Agent may already
+// have applied the request.
+type remoteHTTPStatusError struct {
+	Status  int
+	Body    []byte
+	Message string
+}
+
+func (e *remoteHTTPStatusError) Error() string {
+	if e == nil {
+		return "remote server rejected request"
+	}
+	if message := strings.TrimSpace(e.Message); message != "" {
+		return message
+	}
+	return fmt.Sprintf("remote server returned status %d: %s", e.Status, string(e.Body))
+}
+
+func remoteHTTPStatusErrorFromBody(status int, body []byte) error {
+	message := ""
+	var response map[string]interface{}
+	if json.Unmarshal(body, &response) == nil {
+		message = strings.TrimSpace(wireGuardStringValue(response["error"]))
+		if message == "" {
+			message = strings.TrimSpace(wireGuardStringValue(response["message"]))
+		}
+	}
+	return &remoteHTTPStatusError{Status: status, Body: append([]byte(nil), body...), Message: message}
+}
+
+func isDefinitiveInboundMutationRejection(err error) bool {
+	var statusErr *remoteHTTPStatusError
+	if errors.As(err, &statusErr) {
+		return true
+	}
+	var wsStatusErr *HTTPLikeError
+	return errors.As(err, &wsStatusErr)
+}
+
 // remoteWritePartialError 表示远程多步操作的主动作已经生效，但后置同步未完成。
 // 用 409 保证 CDN 不替换 body，并让客户端明确知道不应把该请求当成全部成功。
 func remoteWritePartialError(w http.ResponseWriter, message string, mutationIDs ...string) {
@@ -309,6 +344,22 @@ func remoteWritePartialError(w http.ResponseWriter, message string, mutationIDs 
 		if mutationID := strings.TrimSpace(mutationIDs[0]); mutationID != "" {
 			payload["mutation_id"] = mutationID
 		}
+	}
+	remoteWriteJSON(w, http.StatusConflict, payload)
+}
+
+func remoteWriteUncertainMutationError(w http.ResponseWriter, message, mutationID string) {
+	payload := map[string]any{
+		"success":           false,
+		"partial":           true,
+		"uncertain":         true,
+		"reconcile_pending": true,
+		"error":             message,
+		"message":           message,
+		"status":            http.StatusBadGateway,
+	}
+	if mutationID = strings.TrimSpace(mutationID); mutationID != "" {
+		payload["mutation_id"] = mutationID
 	}
 	remoteWriteJSON(w, http.StatusConflict, payload)
 }
@@ -541,6 +592,31 @@ func (h *RemoteManageHandler) HandleXrayConfig(w http.ResponseWriter, r *http.Re
 		body, err = io.ReadAll(r.Body)
 		if err != nil {
 			remoteWriteError(w, http.StatusBadRequest, "failed to read body")
+			return
+		}
+		var request map[string]interface{}
+		if err := json.Unmarshal(body, &request); err != nil {
+			remoteWriteError(w, http.StatusBadRequest, "invalid Xray config request")
+			return
+		}
+		configJSON := strings.TrimSpace(wireGuardStringValue(request["config"]))
+		canonical, canonicalErr := h.canonicalizeDatabaseInbounds(r.Context(), id, configJSON)
+		if canonicalErr != nil {
+			remoteWriteError(w, http.StatusConflict, "无法校验数据库入站配置: "+canonicalErr.Error())
+			return
+		}
+		requestedInbounds, _ := xrayConfigInbounds(configJSON)
+		canonicalInbounds, _ := xrayConfigInbounds(canonical)
+		requestedJSON, _ := json.Marshal(requestedInbounds)
+		canonicalJSON, _ := json.Marshal(canonicalInbounds)
+		if string(requestedJSON) != string(canonicalJSON) {
+			remoteWriteError(w, http.StatusConflict, "代理入站由节点管理维护；原始 Xray 配置只能修改出站、路由和其他非入站设置")
+			return
+		}
+		request["config"] = canonical
+		body, err = json.Marshal(request)
+		if err != nil {
+			remoteWriteError(w, http.StatusBadRequest, "failed to normalize Xray config request")
 			return
 		}
 	}
@@ -1591,6 +1667,32 @@ func (h *RemoteManageHandler) forwardToRemoteServer(ctx context.Context, serverI
 		response, forwardErr = h.forwardToRemoteServerLeased(leasedCtx, serverID, method, path, body)
 		return forwardErr
 	})
+	// Reconcile in the request lifecycle, after the ordinary mutation lease has
+	// been released. This avoids detached goroutines outliving tests/shutdown and
+	// lets an exclusive outer operation reuse its lease. Authority-generated hot
+	// mutations suppress this hook to prevent recursive reconciliation.
+	if err == nil && shouldRefreshXraySnapshotAfter(method, path) &&
+		!databaseInboundPostWriteSuppressed(ctx) && agentMutationAcknowledged(path, body, response) {
+		// The owning control plane performs authority reconciliation for shared
+		// servers. Running the consumer's database intent against the same Agent
+		// would otherwise delete the owner's listeners.
+		if _, fedErr := h.repo.GetFederatedServer(ctx, serverID); errors.Is(fedErr, storage.ErrFederatedServerNotFound) {
+			held, exclusive := h.repo.RemoteServerMutationLeaseState(ctx, serverID)
+			switch {
+			case exclusive:
+				result, reconcileErr := h.reconcileDatabaseOwnedInboundsLeased(suppressDatabaseInboundPostWrite(ctx), serverID, "")
+				h.logDatabaseInboundReconcile(serverID, "post_write", result, reconcileErr)
+			case held:
+				// Client and package transactions already hold a shared lease and
+				// update their database intent before the Agent mutation. A full
+				// authority pass cannot upgrade that lease and is redundant here.
+			default:
+				h.refreshXraySnapshot(ctx, serverID)
+			}
+		} else if fedErr != nil {
+			log.Printf("[XrayAuthority] post-write server=%d ownership check skipped: %v", serverID, fedErr)
+		}
+	}
 	return response, err
 }
 
@@ -1599,14 +1701,6 @@ func isLineSpeedtestRun(method, path string) bool {
 }
 
 func (h *RemoteManageHandler) forwardToRemoteServerLeased(ctx context.Context, serverID int64, method, path string, body []byte) (respBody []byte, err error) {
-	// 写操作成功 + path 命中 xray 配置修改清单 → 异步 refresh snapshot
-	// (用 defer + named return 统一处理所有 return 分支,无需在每个 return 点重复)
-	defer func() {
-		if err == nil && shouldRefreshXraySnapshotAfter(method, path) {
-			go h.refreshXraySnapshot(serverID)
-		}
-	}()
-
 	// 联邦(分享)服务器:不直连 agent,改走拥有方主控的 /api/federation/manage。
 	// Only the explicit not-found sentinel may fall back to a direct Agent call;
 	// treating a database read failure as a local server can bypass the owner
@@ -1617,6 +1711,19 @@ func (h *RemoteManageHandler) forwardToRemoteServerLeased(ctx context.Context, s
 		return h.doFederationRequest(transportCtx, fed, method, path, body)
 	} else if !errors.Is(ferr, storage.ErrFederatedServerNotFound) {
 		return nil, fmt.Errorf("resolve federated server: %w", ferr)
+	}
+	cleanPath := strings.TrimSuffix(strings.SplitN(path, "?", 2)[0], "/")
+	if (method == http.MethodPost || method == http.MethodPut) && cleanPath == "/api/child/xray/config" {
+		body, err = h.canonicalizeDatabaseXrayConfigRequest(ctx, serverID, body)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalize database-authoritative Xray config: %w", err)
+		}
+	}
+	if method == http.MethodPost && cleanPath == "/api/child/inbounds" && !databaseInboundIntentAlreadyStaged(ctx) {
+		body, err = h.stageDatabaseInboundMutation(ctx, serverID, body)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// WS-first:agent 上报 capabilities.rpc=true 且 WS 当前已连接 → 走反向 RPC,
@@ -1820,13 +1927,7 @@ func (h *RemoteManageHandler) doPlainFederationRequest(ctx context.Context, fed 
 }
 
 func federationErrorFromBody(status int, body []byte) error {
-	var er map[string]any
-	if json.Unmarshal(body, &er) == nil {
-		if msg, ok := er["error"].(string); ok {
-			return fmt.Errorf("%s", msg)
-		}
-	}
-	return fmt.Errorf("federation returned status %d: %s", status, string(body))
+	return remoteHTTPStatusErrorFromBody(status, body)
 }
 
 func (h *RemoteManageHandler) doPlainPullRequest(ctx context.Context, method, childURL, token string, body []byte) ([]byte, error) {
@@ -1856,13 +1957,7 @@ func (h *RemoteManageHandler) doPlainPullRequest(ctx context.Context, method, ch
 	}
 
 	if resp.StatusCode >= 400 {
-		var errResp map[string]interface{}
-		if json.Unmarshal(respBody, &errResp) == nil {
-			if msg, ok := errResp["error"].(string); ok {
-				return nil, fmt.Errorf("%s", msg)
-			}
-		}
-		return nil, fmt.Errorf("remote server returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, remoteHTTPStatusErrorFromBody(resp.StatusCode, respBody)
 	}
 
 	return respBody, nil
@@ -1903,13 +1998,7 @@ func (h *RemoteManageHandler) doPullKeyExchange(ctx context.Context, serverID in
 	}
 
 	if resp.StatusCode >= 400 {
-		var errResp map[string]interface{}
-		if json.Unmarshal(respBody, &errResp) == nil {
-			if msg, ok := errResp["error"].(string); ok {
-				return nil, fmt.Errorf("%s", msg)
-			}
-		}
-		return nil, fmt.Errorf("remote server returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, remoteHTTPStatusErrorFromBody(resp.StatusCode, respBody)
 	}
 
 	if kxResp := resp.Header.Get("X-Key-Exchange"); kxResp != "" {
@@ -1976,13 +2065,7 @@ func (h *RemoteManageHandler) doEncryptedPullRequest(ctx context.Context, method
 	}
 
 	if resp.StatusCode >= 400 {
-		var errResp map[string]interface{}
-		if json.Unmarshal(respBody, &errResp) == nil {
-			if msg, ok := errResp["error"].(string); ok {
-				return nil, fmt.Errorf("%s", msg)
-			}
-		}
-		return nil, fmt.Errorf("remote server returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, remoteHTTPStatusErrorFromBody(resp.StatusCode, respBody)
 	}
 
 	return respBody, nil
@@ -1990,6 +2073,14 @@ func (h *RemoteManageHandler) doEncryptedPullRequest(ctx context.Context, method
 
 // 处理远程服务器上的 xray 配置文件的列表和管理
 func (h *RemoteManageHandler) HandleXrayConfigFiles(w http.ResponseWriter, r *http.Request) {
+	// Inbound authority lives in the control-plane database. Allowing the raw
+	// file editor to write config.json (or another included JSON fragment) would
+	// bypass the same validation enforced by HandleXrayConfig.
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		remoteWriteError(w, http.StatusGone, "Xray 配置文件写入已停用；请使用节点管理和受控配置接口")
+		return
+	}
+
 	serverID := r.URL.Query().Get("server_id")
 	if serverID == "" {
 		remoteWriteError(w, http.StatusBadRequest, "server_id required")
@@ -2008,16 +2099,7 @@ func (h *RemoteManageHandler) HandleXrayConfigFiles(w http.ResponseWriter, r *ht
 		query = "?file=" + file
 	}
 
-	var body []byte
-	if r.Method == http.MethodPut || r.Method == http.MethodPost {
-		body, err = io.ReadAll(r.Body)
-		if err != nil {
-			remoteWriteError(w, http.StatusBadRequest, "failed to read body")
-			return
-		}
-	}
-
-	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/xray/config/files"+query, body)
+	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/xray/config/files"+query, nil)
 	if err != nil {
 		remoteWriteForwardError(w, err)
 		return
@@ -2477,7 +2559,6 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	// 用户卡片在前端已锁死,但后端必须独立校验,防止普通用户绕过前端直接构造请求把别人的 uuid/email 塞进节点。
 	// 管理员是节点管理者,可添加任意 client(任意 uuid/email),不受此限制。
 	// 注:套餐分配用户走的是 addUserToInbound → forwardToRemoteServer,不经过本 HTTP handler,不受影响。
-	var reservedInboundTag string
 	var reservedMutationID string
 	if r.Method == http.MethodPost && inboundReq != nil {
 		action, _ := inboundReq["action"].(string)
@@ -2536,16 +2617,21 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 
 	// 删除 reality 入站前，先保存其 serverNames 以便后续恢复路由
 	var preDeleteRealityDomains []string
+	var preDeleteRealityPort int
 	var removedInboundWasWSS bool
 	if r.Method == http.MethodPost && inboundReq != nil {
 		action, _ := inboundReq["action"].(string)
 		if strings.ToLower(action) == "remove" {
 			if tag, _ := inboundReq["tag"].(string); tag != "" {
-				preDeleteRealityDomains, removedInboundWasWSS, err = h.getInboundRemovalSyncState(operationCtx, id, tag)
+				var removalState inboundRemovalSyncState
+				removalState, err = h.inspectInboundRemovalSyncState(operationCtx, id, tag)
 				if err != nil {
 					remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("删除前读取入站后置同步信息失败: %v", err))
 					return
 				}
+				preDeleteRealityDomains = removalState.realityDomains
+				preDeleteRealityPort = removalState.realityPort
+				removedInboundWasWSS = removalState.wasWSS
 			}
 		}
 	}
@@ -2645,6 +2731,21 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 			}
 		}
 	}
+	if r.Method == http.MethodPost && inboundReq != nil {
+		if err := h.validateDatabaseManagedForwardNode(operationCtx, inboundReq); err != nil {
+			remoteWriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+	}
+
+	var desiredMutationSnapshot *inboundDesiredMutationSnapshot
+	if r.Method == http.MethodPost && inboundReq != nil {
+		desiredMutationSnapshot, err = h.captureInboundDesiredMutationSnapshot(operationCtx, id, inboundReq)
+		if err != nil {
+			remoteWriteError(w, http.StatusInternalServerError, "无法保存入站变更前状态: "+err.Error())
+			return
+		}
+	}
 
 	if r.Method == http.MethodPost && inboundReq != nil {
 		action := strings.ToLower(strings.TrimSpace(wireGuardStringValue(inboundReq["action"])))
@@ -2662,22 +2763,28 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 				remoteWriteError(w, http.StatusInternalServerError, "无法预存远端入站所有权: "+err.Error())
 				return
 			}
-			reservedInboundTag = tag
 			reservedMutationID = mutationID
 		}
 	}
 
 	result, err := h.forwardToRemoteServer(operationCtx, id, r.Method, "/api/child/inbounds", body)
 	if err != nil {
-		// If the Agent is still reachable, its authenticated fence inventory is
-		// authoritative and can restore a previous owner after a confirmed rollback.
-		// A timeout or disconnect keeps the pre-reserved new owner conservatively.
-		if reservedInboundTag != "" && reservedMutationID != "" {
-			if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, reservedInboundTag); reconcileErr != nil {
-				log.Printf("[Remote Manage] Retaining uncertain inbound ownership %d/%s (%s): %v", id, reservedInboundTag, reservedMutationID, reconcileErr)
+		if isDefinitiveInboundMutationRejection(err) {
+			if rollbackErr := h.restoreInboundDesiredMutationSnapshot(operationCtx, id, desiredMutationSnapshot); rollbackErr != nil {
+				remoteWritePartialError(w, "Agent 已明确拒绝入站变更，但数据库意图回滚失败，需等待对账: "+rollbackErr.Error(), reservedMutationID)
+				return
 			}
+			remoteWriteForwardError(w, err)
+			return
 		}
-		remoteWriteForwardError(w, err)
+		// No complete Agent response means the write may already have committed.
+		// Keep the staged desired generation and ownership; reconciliation can then
+		// inspect the authenticated Agent fence without hiding a possibly live inlet.
+		mutationID := ""
+		if desiredMutationSnapshot != nil {
+			mutationID = desiredMutationSnapshot.mutationID
+		}
+		remoteWriteUncertainMutationError(w, "入站变更结果不确定，已保留数据库意图并等待自动对账: "+err.Error(), mutationID)
 		return
 	}
 
@@ -2694,22 +2801,20 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		// 检查远程服务器响应是否成功
 		var resp map[string]interface{}
 		if decodeErr := json.Unmarshal(result, &resp); decodeErr != nil {
-			if reservedInboundTag != "" && reservedMutationID != "" {
-				if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, reservedInboundTag); reconcileErr != nil {
-					remoteWriteError(w, http.StatusBadGateway, "Agent 返回无法解析，且无法确认当前入站所有权: "+reconcileErr.Error())
-					return
-				}
-			}
-			remoteWriteError(w, http.StatusBadGateway, "Agent 返回了无法解析的入站变更结果")
+			mutationID := strings.TrimSpace(wireGuardStringValue(inboundReq["mutation_id"]))
+			remoteWriteUncertainMutationError(w, "Agent 返回了无法解析的入站变更结果，已保留数据库意图并等待自动对账", mutationID)
 			return
 		}
 		success, successPresent := resp["success"].(bool)
-		if !successPresent || !success {
-			if reservedInboundTag != "" && reservedMutationID != "" {
-				if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, reservedInboundTag); reconcileErr != nil {
-					remoteWriteError(w, http.StatusBadGateway, "Agent 未确认入站变更，且无法恢复当前入站所有权: "+reconcileErr.Error())
-					return
-				}
+		if !successPresent {
+			mutationID := strings.TrimSpace(wireGuardStringValue(inboundReq["mutation_id"]))
+			remoteWriteUncertainMutationError(w, "Agent 未返回明确的入站变更状态，已保留数据库意图并等待自动对账", mutationID)
+			return
+		}
+		if !success {
+			if rollbackErr := h.restoreInboundDesiredMutationSnapshot(operationCtx, id, desiredMutationSnapshot); rollbackErr != nil {
+				remoteWritePartialError(w, "Agent 已拒绝入站变更，但数据库意图回滚失败，需等待对账: "+rollbackErr.Error(), reservedMutationID)
+				return
 			}
 			message := strings.TrimSpace(wireGuardStringValue(resp["error"]))
 			if message == "" {
@@ -2724,25 +2829,24 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		{
 			mutationID := strings.TrimSpace(wireGuardStringValue(inboundReq["mutation_id"]))
 			if mutationID != "" && strings.TrimSpace(wireGuardStringValue(resp["mutation_id"])) != mutationID {
-				if reservedInboundTag != "" && reservedMutationID != "" {
-					if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, reservedInboundTag); reconcileErr != nil {
-						remoteWriteError(w, http.StatusBadGateway, "Agent 未回显匹配的 mutation_id，且无法确认当前入站所有权: "+reconcileErr.Error())
-						return
-					}
+				if rollbackErr := h.restoreInboundDesiredMutationSnapshot(operationCtx, id, desiredMutationSnapshot); rollbackErr != nil {
+					remoteWritePartialError(w, "Agent 未回显匹配的 mutation_id，且数据库意图回滚失败: "+rollbackErr.Error(), mutationID)
+					return
 				}
 				remoteWriteError(w, http.StatusBadGateway, "Agent 未回显匹配的 mutation_id，远端变更结果无法确认")
 				return
 			}
 			superseded, _ := resp["superseded"].(bool)
 			if (actionLower == "" || actionLower == "add") && superseded {
-				if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, reservedInboundTag); reconcileErr != nil {
-					remoteWriteError(w, http.StatusConflict, "该入站创建已被更新代次取代，且刷新当前所有权失败: "+reconcileErr.Error())
+				if rollbackErr := h.restoreInboundDesiredMutationSnapshot(operationCtx, id, desiredMutationSnapshot); rollbackErr != nil {
+					remoteWritePartialError(w, "该入站创建已被更新代次取代，且数据库意图回滚失败: "+rollbackErr.Error(), mutationID)
 					return
 				}
 				remoteWriteError(w, http.StatusConflict, "该入站创建已被更新代次取代")
 				return
 			}
 			var postSyncErrors []string
+			managedWSSAdd := false
 			if actionLower == "remove" && superseded {
 				if tag := strings.TrimSpace(wireGuardStringValue(inboundReq["tag"])); tag != "" {
 					if reconcileErr := h.reconcileRemoteInboundOwnershipFromAgent(operationCtx, id, tag); reconcileErr != nil {
@@ -2752,7 +2856,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 			}
 			if actionLower == "" || actionLower == "add" {
 				var pendingWSSEvent *event.InboundEvent
-				// 添加入站：先处理 reality 相关配置（更新 tunnel-in port + 清理域名路由）
+				managedWSSAdd = isWSSInboundReq(inboundReq)
 				if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok {
 					tag, _ := inbound["tag"].(string)
 					protocol, _ := inbound["protocol"].(string)
@@ -2765,10 +2869,6 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 					case "v4", "v6", "both":
 					default:
 						ipVersion = "" // 非法值降级为默认 v4
-					}
-
-					if err := h.cleanupTunnelRouteForReality(operationCtx, id, inbound); err != nil {
-						postSyncErrors = append(postSyncErrors, "Reality 路由同步失败: "+err.Error())
 					}
 
 					// 转换为 map[string]any
@@ -2805,28 +2905,31 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 							postSyncErrors = append(postSyncErrors, "WireGuard 管理记录同步失败: "+resourceErr.Error())
 						}
 					}
-					if isWSSInboundReq(inboundReq) {
+					if managedWSSAdd {
 						pendingWSSEvent = &inboundEvent
 					} else {
-						if publishErr := event.GetBus().Publish(inboundEvent); publishErr != nil {
+						if publishErr := h.publishManagedInboundEvent(inboundEvent); publishErr != nil {
 							postSyncErrors = append(postSyncErrors, "节点同步失败: "+publishErr.Error())
 						}
 					}
 				}
 				// 受管 WS 入站添加成功 → 在同一租约内聚合渲染并等待 Agent ACK。
-				if isWSSInboundReq(inboundReq) {
+				if managedWSSAdd {
 					if err := h.SyncWSSNginx(operationCtx, id); err != nil {
-						inbound, _ := inboundReq["inbound"].(map[string]interface{})
-						tag, _ := inbound["tag"].(string)
-						rollbackErr := h.rollbackWSSInboundAdd(operationCtx, id, tag, mutationID)
-						if rollbackErr == nil {
-							remoteWriteError(w, http.StatusBadGateway, "WSS nginx 同步失败，刚创建的入站已自动回滚: "+err.Error())
-							return
-						}
-						postSyncErrors = append(postSyncErrors, "WSS nginx 同步失败: "+err.Error()+"；自动回滚失败: "+rollbackErr.Error())
+						postSyncErrors = append(postSyncErrors, "WSS nginx 同步失败: "+err.Error())
 					} else if pendingWSSEvent != nil {
-						if publishErr := event.GetBus().Publish(*pendingWSSEvent); publishErr != nil {
+						if publishErr := h.publishManagedInboundEvent(*pendingWSSEvent); publishErr != nil {
 							postSyncErrors = append(postSyncErrors, "节点同步失败: "+publishErr.Error())
+						}
+					}
+				}
+				// Reality/tunnel route changes are the final post-sync step. If an
+				// earlier database write failed, compensate before touching shared 443
+				// routing. The helper itself applies tunnel and routing transactionally.
+				if len(postSyncErrors) == 0 {
+					if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok {
+						if err := h.cleanupTunnelRouteForReality(operationCtx, id, inbound); err != nil {
+							postSyncErrors = append(postSyncErrors, "Reality 路由同步失败: "+err.Error())
 						}
 					}
 				}
@@ -2848,8 +2951,8 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 					}
 				}
 				// 恢复被 reality 接管的域名到 tunnel-in→nginx 路由
-				if len(preDeleteRealityDomains) > 0 {
-					if err := h.restoreTunnelRouteForReality(operationCtx, id, preDeleteRealityDomains); err != nil {
+				if len(preDeleteRealityDomains) > 0 || preDeleteRealityPort > 0 {
+					if err := h.restoreTunnelRouteForReality(operationCtx, id, preDeleteRealityDomains, preDeleteRealityPort); err != nil {
 						postSyncErrors = append(postSyncErrors, "Reality 路由恢复失败: "+err.Error())
 					}
 				}
@@ -2860,6 +2963,14 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 				}
 			}
 			if len(postSyncErrors) > 0 {
+				if actionLower == "" || actionLower == "add" {
+					if rollbackErr := h.compensateAcknowledgedInboundAdd(operationCtx, id, desiredMutationSnapshot, managedWSSAdd); rollbackErr == nil {
+						remoteWriteError(w, http.StatusBadGateway, "入站后置同步失败，远端入站和本地记录已自动回滚: "+strings.Join(postSyncErrors, "; "))
+						return
+					} else {
+						postSyncErrors = append(postSyncErrors, "自动回滚失败: "+rollbackErr.Error())
+					}
+				}
 				remoteWritePartialError(w, "入站主动作已生效，但后置同步未完成: "+strings.Join(postSyncErrors, "; "), mutationID)
 				return
 			}
@@ -2869,6 +2980,45 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(result)
+}
+
+// validateDatabaseManagedForwardNode keeps imported subscription inventory out
+// of server-side Xray lifecycle. An imported node can be shared and rendered in
+// subscriptions, but only a node already bound to a database-owned inbound may
+// be selected as the source for a managed forwarding listener.
+func (h *RemoteManageHandler) validateDatabaseManagedForwardNode(ctx context.Context, request map[string]interface{}) error {
+	raw, exists := request["forward_node_id"]
+	if !exists || raw == nil {
+		return nil
+	}
+	var nodeID int64
+	switch value := raw.(type) {
+	case float64:
+		nodeID = int64(value)
+		if value != float64(nodeID) {
+			return errors.New("转发源节点 ID 无效")
+		}
+	case int64:
+		nodeID = value
+	case int:
+		nodeID = int64(value)
+	default:
+		return errors.New("转发源节点 ID 无效")
+	}
+	if nodeID <= 0 {
+		return nil
+	}
+	node, err := h.repo.GetNodeByID(ctx, nodeID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNodeNotFound) {
+			return errors.New("转发源节点不存在")
+		}
+		return fmt.Errorf("读取转发源节点失败: %w", err)
+	}
+	if !isDatabaseManagedNode(&node) {
+		return errors.New("导入节点只能用于订阅和用户分配，不能创建服务器入站")
+	}
+	return nil
 }
 
 // applyManagedInboundSniffing enforces the server-side product default for
@@ -2959,6 +3109,139 @@ func applyManagedRealityCompatibilityToInbound(inbound map[string]interface{}) b
 	return true
 }
 
+type inboundDesiredMutationSnapshot struct {
+	action            string
+	tag               string
+	mutationID        string
+	stagedState       string
+	previousDesired   *storage.DesiredInbound
+	previousOwnership string
+}
+
+func (h *RemoteManageHandler) captureInboundDesiredMutationSnapshot(
+	ctx context.Context,
+	serverID int64,
+	request map[string]interface{},
+) (*inboundDesiredMutationSnapshot, error) {
+	action := strings.ToLower(strings.TrimSpace(wireGuardStringValue(request["action"])))
+	if action == "" {
+		action = "add"
+	}
+	var tag, state string
+	switch action {
+	case "add":
+		inbound, _ := request["inbound"].(map[string]interface{})
+		tag = strings.TrimSpace(wireGuardStringValue(inbound["tag"]))
+		state = storage.DesiredInboundStateActive
+	case "remove":
+		tag = strings.TrimSpace(wireGuardStringValue(request["tag"]))
+		state = storage.DesiredInboundStateDeleted
+	default:
+		return nil, nil
+	}
+	if tag == "" || tag == "api" {
+		return nil, nil
+	}
+	previous, err := h.repo.GetDesiredInbound(ctx, serverID, tag)
+	if err != nil {
+		return nil, fmt.Errorf("capture desired inbound before mutation: %w", err)
+	}
+	if previous != nil {
+		copyValue := *previous
+		copyValue.InboundJSON = append(json.RawMessage(nil), previous.InboundJSON...)
+		previous = &copyValue
+	}
+	owner, err := h.repo.GetRemoteInboundOwnership(ctx, serverID, tag)
+	if err != nil {
+		return nil, fmt.Errorf("capture inbound ownership before mutation: %w", err)
+	}
+	return &inboundDesiredMutationSnapshot{
+		action: action, tag: tag,
+		mutationID:        strings.TrimSpace(wireGuardStringValue(request["mutation_id"])),
+		stagedState:       state,
+		previousDesired:   previous,
+		previousOwnership: owner,
+	}, nil
+}
+
+func (h *RemoteManageHandler) restoreInboundDesiredMutationSnapshot(
+	ctx context.Context,
+	serverID int64,
+	snapshot *inboundDesiredMutationSnapshot,
+) error {
+	if snapshot == nil {
+		return nil
+	}
+	restored, err := h.repo.RestoreDesiredInboundIfMutation(
+		ctx, serverID, snapshot.tag, snapshot.mutationID, snapshot.stagedState, snapshot.previousDesired,
+	)
+	if err != nil {
+		return err
+	}
+	if !restored {
+		return storage.ErrDesiredInboundMutationChanged
+	}
+	if snapshot.action != "add" || snapshot.mutationID == "" {
+		return nil
+	}
+	restored, err = h.repo.RestoreRemoteInboundOwnershipIfMutation(
+		ctx, serverID, snapshot.tag, snapshot.mutationID, snapshot.previousOwnership,
+	)
+	if err != nil {
+		return err
+	}
+	if !restored {
+		return errors.New("inbound ownership mutation changed during rollback")
+	}
+	return nil
+}
+
+func (h *RemoteManageHandler) publishManagedInboundEvent(inboundEvent event.InboundEvent) error {
+	if h.publishInboundEvent != nil {
+		return h.publishInboundEvent(inboundEvent)
+	}
+	return event.GetBus().Publish(inboundEvent)
+}
+
+func (h *RemoteManageHandler) compensateAcknowledgedInboundAdd(
+	ctx context.Context,
+	serverID int64,
+	snapshot *inboundDesiredMutationSnapshot,
+	managedWSS bool,
+) error {
+	if snapshot == nil || snapshot.action != "add" {
+		return errors.New("missing acknowledged inbound rollback snapshot")
+	}
+	if err := h.rollbackWSSInboundAdd(ctx, serverID, snapshot.tag, snapshot.mutationID); err != nil {
+		// The remove result is uncertain. Keep desired state and ownership so the
+		// normal database reconciler can converge without hiding a live inbound.
+		return fmt.Errorf("热删除远端入站失败，已保留待对账状态: %w", err)
+	}
+
+	var cleanupErrors []error
+	if err := h.restoreInboundDesiredMutationSnapshot(ctx, serverID, snapshot); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("恢复数据库入站意图: %w", err))
+	}
+	if _, err := h.repo.DeleteManagedInboundResourceByServerTagMutation(
+		ctx, serverID, snapshot.tag, snapshot.mutationID,
+	); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("清理受管入站资源: %w", err))
+	}
+	if server, err := h.repo.GetRemoteServer(ctx, serverID); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("读取节点所属服务器: %w", err))
+	} else if _, err := h.repo.DeleteNodesByInboundTagMutation(
+		ctx, server.Name, snapshot.tag, snapshot.mutationID,
+	); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("清理节点记录: %w", err))
+	}
+	if managedWSS {
+		if err := h.SyncWSSNginx(ctx, serverID); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("清理 WSS nginx 配置: %w", err))
+		}
+	}
+	return errors.Join(cleanupErrors...)
+}
+
 func (h *RemoteManageHandler) reconcileRemoteInboundOwnershipFromAgent(ctx context.Context, serverID int64, tag string) error {
 	tag = strings.TrimSpace(tag)
 	if tag == "" {
@@ -2994,6 +3277,9 @@ func (h *RemoteManageHandler) rollbackWSSInboundAdd(ctx context.Context, serverI
 	if err != nil {
 		return err
 	}
+	// Compensation removes an already staged generation. Staging a tombstone
+	// here would make the rollback itself become the new durable intent.
+	ctx = context.WithValue(ctx, databaseInboundIntentAlreadyStagedKey{}, true)
 	result, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/inbounds", body)
 	if err != nil {
 		return err
@@ -3127,14 +3413,6 @@ func (h *RemoteManageHandler) HandleCreateManagedNode(w http.ResponseWriter, r *
 	}
 
 	node, found, lookupErr := h.findManagedNode(r.Context(), server.Name, tag)
-	if lookupErr == nil && !found {
-		syncResult := h.syncInboundsToNodes(r.Context(), serverID, "", false)
-		node, found, err = h.findManagedNode(r.Context(), server.Name, tag)
-		lookupErr = err
-		if lookupErr == nil && !found && len(syncResult.Errors) > 0 {
-			lookupErr = fmt.Errorf("%s", strings.Join(syncResult.Errors, "; "))
-		}
-	}
 	if lookupErr == nil && !found {
 		lookupErr = errors.New("入站已创建，但节点同步未生成记录")
 	}
@@ -3684,22 +3962,18 @@ func (h *RemoteManageHandler) HandleScan(w http.ResponseWriter, r *http.Request)
 			}
 		}
 
-		// 如果 Xray 正在运行，则将入站同步到节点表
+		// Xray 正在运行时，以数据库记录覆盖远端入站。扫描结果绝不
+		// 反向创建、认领或更新订阅节点。
 		if scanResult.XrayRunning {
-			syncResult := h.syncInboundsToNodesInternal(r.Context(), id)
-			log.Printf("[Remote Manage] Sync inbounds result for server %d: synced=%d (claimed=%d, created=%d), skipped=%d, tags=%v",
-				id, syncResult.SyncedCount, syncResult.ClaimedCount, syncResult.CreatedCount, syncResult.SkippedCount, syncResult.SyncedTags)
-
-			// 将同步结果合并到响应中
+			reconcileResult, reconcileErr := h.reconcileDatabaseOwnedInboundsLeased(r.Context(), id, "")
+			h.logDatabaseInboundReconcile(id, "manual_scan", reconcileResult, reconcileErr)
 			var response map[string]interface{}
 			if err := json.Unmarshal(result, &response); err == nil {
-				response["synced_count"] = syncResult.SyncedCount
-				response["claimed_count"] = syncResult.ClaimedCount
-				response["created_count"] = syncResult.CreatedCount
-				response["skipped_count"] = syncResult.SkippedCount
-				response["synced_tags"] = syncResult.SyncedTags
-				if len(syncResult.Errors) > 0 {
-					response["sync_errors"] = syncResult.Errors
+				response["removed_unmanaged_inbounds"] = reconcileResult.Removed
+				response["restored_managed_inbounds"] = reconcileResult.Restored
+				response["updated_managed_inbounds"] = reconcileResult.Updated
+				if reconcileErr != nil {
+					response["reconcile_error"] = reconcileErr.Error()
 				}
 				result, _ = json.Marshal(response)
 			}
@@ -4822,31 +5096,7 @@ func (h *RemoteManageHandler) HandleSyncInboundsToNodes(w http.ResponseWriter, r
 		return
 	}
 
-	serverID := r.URL.Query().Get("server_id")
-	if serverID == "" {
-		remoteWriteError(w, http.StatusBadRequest, "server_id required")
-		return
-	}
-
-	id, err := strconv.ParseInt(serverID, 10, 64)
-	if err != nil {
-		remoteWriteError(w, http.StatusBadRequest, "invalid server_id")
-		return
-	}
-
-	// 解析请求体(server_host + force_override 都是可选)
-	var req SyncInboundsToNodesRequest
-	if r.ContentLength > 0 {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			remoteWriteError(w, http.StatusBadRequest, "invalid request body")
-			return
-		}
-	}
-
-	response := h.syncInboundsToNodes(r.Context(), id, req.ServerHost, req.ForceOverride)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	remoteWriteError(w, http.StatusGone, "入站反向同步已停用；请从节点管理创建服务器节点，导入节点仅用于订阅与用户分配")
 }
 
 // chooseClashServerHost 给一台 remote server 选合适的 clash_config.server 值。
@@ -5871,7 +6121,7 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	ctx, release, err := h.repo.AcquireRemoteServerMutationLease(r.Context(), req.ServerID)
+	ctx, release, err := h.repo.AcquireRemoteServerExclusiveMutationLease(r.Context(), req.ServerID)
 	if err != nil {
 		remoteWriteForwardError(w, err)
 		return
@@ -6010,9 +6260,13 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 }
 
 func (h *RemoteManageHandler) addWebsiteTunnelConfig(config map[string]any, domain string) {
+	h.addWebsiteTunnelConfigChanged(config, domain)
+}
+
+func (h *RemoteManageHandler) addWebsiteTunnelConfigChanged(config map[string]any, domain string) bool {
 	routing, _ := config["routing"].(map[string]any)
 	if routing == nil {
-		return
+		return false
 	}
 	rules, _ := routing["rules"].([]any)
 
@@ -6038,12 +6292,12 @@ func (h *RemoteManageHandler) addWebsiteTunnelConfig(config map[string]any, doma
 		}
 		domains, _ := r["domain"].([]any)
 		for _, d := range domains {
-			if s, _ := d.(string); s == domain {
-				return
+			if s, _ := d.(string); strings.EqualFold(strings.TrimSpace(s), strings.TrimSpace(domain)) {
+				return false
 			}
 		}
 		r["domain"] = append(domains, domain)
-		return
+		return true
 	}
 
 	newRule := map[string]any{
@@ -6053,6 +6307,7 @@ func (h *RemoteManageHandler) addWebsiteTunnelConfig(config map[string]any, doma
 	}
 	rules = append([]any{newRule}, rules...)
 	routing["rules"] = rules
+	return true
 }
 
 func (h *RemoteManageHandler) removeDomainsFromTunnelNginxRoute(config map[string]any, domainsToRemove []string) bool {
@@ -6064,7 +6319,12 @@ func (h *RemoteManageHandler) removeDomainsFromTunnelNginxRoute(config map[strin
 
 	removeSet := make(map[string]struct{})
 	for _, d := range domainsToRemove {
-		removeSet[strings.ToLower(d)] = struct{}{}
+		if domain := strings.ToLower(strings.TrimSpace(d)); domain != "" {
+			removeSet[domain] = struct{}{}
+		}
+	}
+	if len(removeSet) == 0 {
+		return false
 	}
 
 	for i, rule := range rules {
@@ -6090,12 +6350,18 @@ func (h *RemoteManageHandler) removeDomainsFromTunnelNginxRoute(config map[strin
 
 		domains, _ := r["domain"].([]any)
 		var remaining []any
+		removed := false
 		for _, d := range domains {
 			if s, _ := d.(string); s != "" {
-				if _, found := removeSet[strings.ToLower(s)]; !found {
+				if _, found := removeSet[strings.ToLower(strings.TrimSpace(s))]; !found {
 					remaining = append(remaining, d)
+				} else {
+					removed = true
 				}
 			}
+		}
+		if !removed {
+			return false
 		}
 
 		if len(remaining) == 0 {
@@ -6136,117 +6402,228 @@ func (h *RemoteManageHandler) cleanupTunnelRouteForReality(ctx context.Context, 
 		return nil
 	}
 
-	inboundPort := 0
-	if p, ok := inbound["port"].(float64); ok {
-		inboundPort = int(p)
-	}
-	inboundTag, _ := inbound["tag"].(string)
-
-	xrayResp, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/xray/config", nil)
+	server, err := h.repo.GetRemoteServer(ctx, serverID)
 	if err != nil {
-		return fmt.Errorf("读取 xray 配置: %w", err)
+		return fmt.Errorf("读取服务器接管状态: %w", err)
 	}
-	var configResp struct {
-		Config string `json:"config"`
-	}
-	if err := json.Unmarshal(xrayResp, &configResp); err != nil {
-		return fmt.Errorf("解析 xray 响应: %w", err)
-	}
-	var xrayConfig map[string]any
-	if err := json.Unmarshal([]byte(configResp.Config), &xrayConfig); err != nil {
-		return fmt.Errorf("解析 xray 配置: %w", err)
-	}
-
-	configChanged := false
-
-	// 如果是第一个 reality 入站，更新 tunnel-in 的 settings.port
-	if inboundPort > 0 && h.isFirstRealityInbound(xrayConfig, inboundTag) {
-		if h.updateTunnelInPortInConfig(xrayConfig, inboundPort) {
-			configChanged = true
-			log.Printf("[HandleInbounds] Updated tunnel-in settings.port to %d for first reality inbound on server %d", inboundPort, serverID)
-		}
-	}
-
-	// 从 tunnel-in→nginx 路由中移除 reality serverNames
-	if h.removeDomainsFromTunnelNginxRoute(xrayConfig, domains) {
-		configChanged = true
-	}
-
-	if !configChanged {
+	if !databaseTunnelTakeoverEnabled(server) {
 		return nil
 	}
 
-	updatedConfig, err := json.MarshalIndent(xrayConfig, "", "    ")
+	inventory, err := h.fetchAgentInboundInventory(ctx, serverID)
 	if err != nil {
-		return fmt.Errorf("序列化 xray 配置: %w", err)
+		return fmt.Errorf("读取 Agent 入站: %w", err)
 	}
-	configPayload, err := json.Marshal(map[string]string{"config": string(updatedConfig)})
+	tunnelInbound := findRealitySyncInbound(inventory.Inbounds, "tunnel-in")
+	if tunnelInbound == nil {
+		return errors.New("已启用 tunnel 接管，但 Agent 中不存在 tunnel-in")
+	}
+
+	routing, err := h.fetchRealitySyncRouting(ctx, serverID)
 	if err != nil {
-		return fmt.Errorf("序列化 xray 请求: %w", err)
-	}
-	if _, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/xray/config", configPayload); err != nil {
-		return fmt.Errorf("写入 Reality 路由配置: %w", err)
-	}
-	if err := h.restartXrayWithRecovery(ctx, serverID, "RealityRouteUpdate"); err != nil {
 		return err
 	}
-	log.Printf("[HandleInbounds] Reality cleanup done on server %d: domains=%v", serverID, domains)
+	originalRouting := cloneRealityHotSyncMap(routing)
+	if originalRouting == nil {
+		return errors.New("无法保存 Reality 路由回滚状态")
+	}
+	routingConfig := map[string]any{"routing": routing}
+	routingChanged := h.removeDomainsFromTunnelNginxRoute(routingConfig, domains)
+
+	inboundTag := strings.TrimSpace(wireGuardStringValue(inbound["tag"]))
+	inboundPortValue, hasInboundPort := wireGuardNumericValue(inbound["port"])
+	inboundPort := int(inboundPortValue)
+	tunnelChanged := false
+	var originalTunnel map[string]interface{}
+	mutationID := ""
+	if hasInboundPort && inboundPort > 0 && isFirstRealityInboundInventory(inventory.Inbounds, inboundTag) {
+		updatedTunnel := cloneRealityHotSyncMap(tunnelInbound)
+		originalTunnel = cloneRealityHotSyncMap(tunnelInbound)
+		if updatedTunnel == nil || originalTunnel == nil {
+			return errors.New("无法保存 tunnel-in 热替换状态")
+		}
+		settings, _ := updatedTunnel["settings"].(map[string]interface{})
+		if settings == nil {
+			settings = map[string]interface{}{}
+			updatedTunnel["settings"] = settings
+		}
+		currentPort, currentPortOK := wireGuardNumericValue(settings["port"])
+		if !currentPortOK || int(currentPort) != inboundPort {
+			settings["port"] = inboundPort
+			mutationID = strings.TrimSpace(wireGuardStringValue(tunnelInbound["_mutation_id"]))
+			if mutationID == "" {
+				mutationID, err = h.repo.FindInboundMutationID(ctx, serverID, "tunnel-in")
+				if err != nil {
+					return fmt.Errorf("读取 tunnel-in 所有权: %w", err)
+				}
+			}
+			if mutationID == "" {
+				return errors.New("tunnel-in 缺少 mutation_id，拒绝无所有权热替换")
+			}
+			hotCtx := suppressDatabaseInboundPostWrite(ctx)
+			if replaceErr := h.replaceInboundForSync(hotCtx, serverID, updatedTunnel, mutationID); replaceErr != nil {
+				rollbackErr := h.replaceInboundForSync(hotCtx, serverID, originalTunnel, mutationID)
+				return errors.Join(
+					fmt.Errorf("热替换 tunnel-in: %w", replaceErr),
+					wrapRealitySyncRollbackError("恢复 tunnel-in", rollbackErr),
+				)
+			}
+			tunnelChanged = true
+		}
+	}
+
+	if routingChanged {
+		if routeErr := h.setRealitySyncRoutingHot(ctx, serverID, routing); routeErr != nil {
+			routeRollbackErr := h.setRealitySyncRoutingHot(ctx, serverID, originalRouting)
+			var tunnelRollbackErr error
+			if tunnelChanged {
+				tunnelRollbackErr = h.replaceInboundForSync(suppressDatabaseInboundPostWrite(ctx), serverID, originalTunnel, mutationID)
+			}
+			return errors.Join(
+				fmt.Errorf("热更新 Reality 路由: %w", routeErr),
+				wrapRealitySyncRollbackError("恢复路由", routeRollbackErr),
+				wrapRealitySyncRollbackError("恢复 tunnel-in", tunnelRollbackErr),
+			)
+		}
+	}
+	if tunnelChanged || routingChanged {
+		log.Printf("[HandleInbounds] Reality hot sync done on server %d: tunnel_changed=%t routing_changed=%t domains=%v", serverID, tunnelChanged, routingChanged, domains)
+	}
 	return nil
 }
 
-// isFirstRealityInbound 检查当前配置中是否已有其他 reality 入站（排除 currentTag）
-func (h *RemoteManageHandler) isFirstRealityInbound(xrayConfig map[string]any, currentTag string) bool {
-	inbounds, _ := xrayConfig["inbounds"].([]any)
-	for _, ib := range inbounds {
-		ibMap, _ := ib.(map[string]any)
-		if ibMap == nil {
+func cloneRealityHotSyncMap(value map[string]interface{}) map[string]interface{} {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var cloned map[string]interface{}
+	if json.Unmarshal(raw, &cloned) != nil {
+		return nil
+	}
+	return cloned
+}
+
+func findRealitySyncInbound(inbounds []map[string]interface{}, tag string) map[string]interface{} {
+	for _, inbound := range inbounds {
+		if strings.TrimSpace(wireGuardStringValue(inbound["tag"])) == strings.TrimSpace(tag) {
+			return inbound
+		}
+	}
+	return nil
+}
+
+func isFirstRealityInboundInventory(inbounds []map[string]interface{}, currentTag string) bool {
+	for _, inbound := range inbounds {
+		tag := strings.TrimSpace(wireGuardStringValue(inbound["tag"]))
+		if tag == "" || tag == strings.TrimSpace(currentTag) {
 			continue
 		}
-		tag, _ := ibMap["tag"].(string)
-		if tag == currentTag || tag == "" {
+		if status := strings.TrimSpace(wireGuardStringValue(inbound["_runtime_status"])); status == "not_running" {
 			continue
 		}
-		ss, _ := ibMap["streamSettings"].(map[string]any)
-		if ss == nil {
-			continue
-		}
-		if sec, _ := ss["security"].(string); sec == "reality" {
+		streamSettings, _ := inbound["streamSettings"].(map[string]interface{})
+		port, validPort := wireGuardNumericValue(inbound["port"])
+		if validPort && port >= 1 && port <= 65535 &&
+			strings.EqualFold(strings.TrimSpace(wireGuardStringValue(streamSettings["security"])), "reality") {
 			return false
 		}
 	}
 	return true
 }
 
-// updateTunnelInPortInConfig 修改 xray 配置中 tunnel-in 的 settings.port
-func (h *RemoteManageHandler) updateTunnelInPortInConfig(xrayConfig map[string]any, port int) bool {
-	inbounds, _ := xrayConfig["inbounds"].([]any)
-	for _, ib := range inbounds {
-		ibMap, _ := ib.(map[string]any)
-		if ibMap == nil {
-			continue
-		}
-		tag, _ := ibMap["tag"].(string)
-		if tag != "tunnel-in" {
-			continue
-		}
-		settings, _ := ibMap["settings"].(map[string]any)
-		if settings == nil {
-			settings = map[string]any{}
-			ibMap["settings"] = settings
-		}
-		settings["port"] = port
-		return true
+func wrapRealitySyncRollbackError(operation string, err error) error {
+	if err == nil {
+		return nil
 	}
-	return false
+	return fmt.Errorf("%s失败: %w", operation, err)
 }
 
-// getInboundRemovalSyncState 在删除前一次读取目标 inbound，同时保存 Reality 路由恢复
-// 所需的 serverNames 以及 WSS nginx 清理标志。该读取失败时必须在主删除前终止，
-// 否则删除成功后已无法可靠重建后置状态。
+func (h *RemoteManageHandler) fetchRealitySyncRouting(ctx context.Context, serverID int64) (map[string]interface{}, error) {
+	raw, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/routing", nil)
+	if err != nil {
+		return nil, fmt.Errorf("读取 Agent 路由: %w", err)
+	}
+	var response struct {
+		Success *bool                  `json:"success"`
+		Routing map[string]interface{} `json:"routing"`
+		Error   string                 `json:"error"`
+		Message string                 `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, fmt.Errorf("解析 Agent 路由: %w", err)
+	}
+	if response.Success == nil || !*response.Success {
+		message := strings.TrimSpace(response.Error)
+		if message == "" {
+			message = strings.TrimSpace(response.Message)
+		}
+		if message == "" {
+			message = "Agent 未返回路由"
+		}
+		return nil, errors.New(message)
+	}
+	if response.Routing == nil {
+		response.Routing = map[string]interface{}{}
+	}
+	return response.Routing, nil
+}
+
+func (h *RemoteManageHandler) setRealitySyncRoutingHot(ctx context.Context, serverID int64, routing map[string]interface{}) error {
+	payload, err := json.Marshal(map[string]interface{}{
+		"action":  "set_hot",
+		"routing": routing,
+	})
+	if err != nil {
+		return fmt.Errorf("序列化热路由请求: %w", err)
+	}
+	raw, err := h.forwardToRemoteServer(suppressDatabaseInboundPostWrite(ctx), serverID, http.MethodPost, "/api/child/routing", payload)
+	if err != nil {
+		return err
+	}
+	var response struct {
+		Success *bool  `json:"success"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return fmt.Errorf("解析热路由响应: %w", err)
+	}
+	if response.Success != nil && *response.Success {
+		return nil
+	}
+	message := strings.TrimSpace(response.Error)
+	if message == "" {
+		message = strings.TrimSpace(response.Message)
+	}
+	if message == "" {
+		message = "Agent 未确认热路由更新"
+	}
+	return errors.New(message)
+}
+
+type inboundRemovalSyncState struct {
+	realityDomains []string
+	realityPort    int
+	wasWSS         bool
+}
+
+// getInboundRemovalSyncState preserves the legacy compact result used by WSS
+// callers. Reality deletion paths use inspectInboundRemovalSyncState so they
+// can also retarget tunnel-in away from the port that is about to disappear.
 func (h *RemoteManageHandler) getInboundRemovalSyncState(ctx context.Context, serverID int64, tag string) ([]string, bool, error) {
+	state, err := h.inspectInboundRemovalSyncState(ctx, serverID, tag)
+	return state.realityDomains, state.wasWSS, err
+}
+
+// inspectInboundRemovalSyncState snapshots all post-delete facts before the
+// Agent removes the target. Once the inbound is gone its Reality port and SNI
+// set cannot be reconstructed from runtime inventory.
+func (h *RemoteManageHandler) inspectInboundRemovalSyncState(ctx context.Context, serverID int64, tag string) (inboundRemovalSyncState, error) {
+	var state inboundRemovalSyncState
 	resp, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/inbounds", nil)
 	if err != nil {
-		return nil, false, err
+		return state, err
 	}
 	var inboundsResp struct {
 		Success  *bool                    `json:"success"`
@@ -6255,7 +6632,7 @@ func (h *RemoteManageHandler) getInboundRemovalSyncState(ctx context.Context, se
 		Message  string                   `json:"message"`
 	}
 	if err := json.Unmarshal(resp, &inboundsResp); err != nil {
-		return nil, false, err
+		return state, err
 	}
 	if inboundsResp.Success != nil && !*inboundsResp.Success {
 		message := strings.TrimSpace(inboundsResp.Error)
@@ -6265,74 +6642,201 @@ func (h *RemoteManageHandler) getInboundRemovalSyncState(ctx context.Context, se
 		if message == "" {
 			message = "Agent rejected inbounds query"
 		}
-		return nil, false, errors.New(message)
+		return state, errors.New(message)
 	}
 	for _, inb := range inboundsResp.Inbounds {
 		inbTag, _ := inb["tag"].(string)
 		if inbTag != tag {
 			continue
 		}
-		wasWSS := isNginxManagedWSSInbound(inb)
+		state.wasWSS = isNginxManagedWSSInbound(inb)
 		ss, _ := inb["streamSettings"].(map[string]interface{})
 		if ss == nil {
-			return nil, wasWSS, nil
+			return state, nil
 		}
 		if sec, _ := ss["security"].(string); sec != "reality" {
-			return nil, wasWSS, nil
+			return state, nil
+		}
+		if port, ok := wireGuardNumericValue(inb["port"]); ok && port >= 1 && port <= 65535 {
+			state.realityPort = int(port)
 		}
 		rs, _ := ss["realitySettings"].(map[string]interface{})
 		if rs == nil {
-			return nil, wasWSS, nil
+			return state, nil
 		}
 		sns, _ := rs["serverNames"].([]interface{})
-		var domains []string
 		for _, sn := range sns {
 			if s, _ := sn.(string); s != "" {
-				domains = append(domains, s)
+				state.realityDomains = append(state.realityDomains, s)
 			}
 		}
-		return domains, wasWSS, nil
+		return state, nil
 	}
-	return nil, false, nil
+	return state, nil
 }
 
 // restoreTunnelRouteForReality 删除 reality 入站后，将其 serverNames 恢复到 tunnel-in→nginx 路由。
-func (h *RemoteManageHandler) restoreTunnelRouteForReality(ctx context.Context, serverID int64, domains []string) error {
-	xrayResp, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/xray/config", nil)
+func (h *RemoteManageHandler) restoreTunnelRouteForReality(ctx context.Context, serverID int64, domains []string, removedRealityPorts ...int) error {
+	removedRealityPort := 0
+	if len(removedRealityPorts) > 0 {
+		removedRealityPort = removedRealityPorts[0]
+	}
+	if len(domains) == 0 && removedRealityPort <= 0 {
+		return nil
+	}
+	server, err := h.repo.GetRemoteServer(ctx, serverID)
 	if err != nil {
-		return fmt.Errorf("读取 xray 配置: %w", err)
+		return fmt.Errorf("读取服务器接管状态: %w", err)
 	}
-	var configResp struct {
-		Config string `json:"config"`
+	if !databaseTunnelTakeoverEnabled(server) {
+		return nil
 	}
-	if err := json.Unmarshal(xrayResp, &configResp); err != nil {
-		return fmt.Errorf("解析 xray 响应: %w", err)
+	inventory, err := h.fetchAgentInboundInventory(ctx, serverID)
+	if err != nil {
+		return fmt.Errorf("读取 Agent 入站: %w", err)
 	}
-	var xrayConfig map[string]any
-	if err := json.Unmarshal([]byte(configResp.Config), &xrayConfig); err != nil {
-		return fmt.Errorf("解析 xray 配置: %w", err)
+	tunnelInbound := findRealitySyncInbound(inventory.Inbounds, "tunnel-in")
+	if tunnelInbound == nil {
+		return nil
 	}
 
-	for _, domain := range domains {
-		h.addWebsiteTunnelConfig(xrayConfig, domain)
+	var routing, originalRouting map[string]interface{}
+	routingChanged := false
+	if len(domains) > 0 {
+		routing, err = h.fetchRealitySyncRouting(ctx, serverID)
+		if err != nil {
+			return err
+		}
+		originalRouting = cloneRealityHotSyncMap(routing)
+		if originalRouting == nil {
+			return errors.New("无法保存 Reality 路由回滚状态")
+		}
+		routingConfig := map[string]any{"routing": routing}
+		for _, domain := range domains {
+			domain = strings.TrimSpace(domain)
+			if domain != "" && h.addWebsiteTunnelConfigChanged(routingConfig, domain) {
+				routingChanged = true
+			}
+		}
 	}
 
-	updatedConfig, err := json.MarshalIndent(xrayConfig, "", "    ")
-	if err != nil {
-		return fmt.Errorf("序列化 xray 配置: %w", err)
+	tunnelChanged := false
+	var originalTunnel map[string]interface{}
+	mutationID := ""
+	currentTarget, currentTargetOK := realityTunnelTargetPort(tunnelInbound)
+	if removedRealityPort > 0 && currentTargetOK && currentTarget == removedRealityPort {
+		nextPort, nextErr := h.nextDatabaseRealityInboundPort(ctx, serverID, inventory.Inbounds, removedRealityPort)
+		if nextErr != nil {
+			return nextErr
+		}
+		if nextPort > 0 {
+			originalTunnel = cloneRealityHotSyncMap(tunnelInbound)
+			updatedTunnel := cloneRealityHotSyncMap(tunnelInbound)
+			if originalTunnel == nil || updatedTunnel == nil {
+				return errors.New("无法保存 tunnel-in 热切换状态")
+			}
+			settings, _ := updatedTunnel["settings"].(map[string]interface{})
+			if settings == nil {
+				settings = map[string]interface{}{}
+				updatedTunnel["settings"] = settings
+			}
+			settings["port"] = nextPort
+			mutationID = strings.TrimSpace(wireGuardStringValue(tunnelInbound["_mutation_id"]))
+			if mutationID == "" {
+				mutationID, err = h.repo.FindInboundMutationID(ctx, serverID, "tunnel-in")
+				if err != nil {
+					return fmt.Errorf("读取 tunnel-in 所有权: %w", err)
+				}
+			}
+			if mutationID == "" {
+				return errors.New("tunnel-in 缺少 mutation_id，拒绝无所有权热切换")
+			}
+			hotCtx := suppressDatabaseInboundPostWrite(ctx)
+			if replaceErr := h.replaceInboundForSync(hotCtx, serverID, updatedTunnel, mutationID); replaceErr != nil {
+				rollbackErr := h.replaceInboundForSync(hotCtx, serverID, originalTunnel, mutationID)
+				return errors.Join(
+					fmt.Errorf("删除 Reality 后热切换 tunnel-in: %w", replaceErr),
+					wrapRealitySyncRollbackError("恢复 tunnel-in", rollbackErr),
+				)
+			}
+			tunnelChanged = true
+		}
 	}
-	configPayload, err := json.Marshal(map[string]string{"config": string(updatedConfig)})
-	if err != nil {
-		return fmt.Errorf("序列化 xray 请求: %w", err)
+	if routingChanged {
+		if routeErr := h.setRealitySyncRoutingHot(ctx, serverID, routing); routeErr != nil {
+			routeRollbackErr := h.setRealitySyncRoutingHot(ctx, serverID, originalRouting)
+			var tunnelRollbackErr error
+			if tunnelChanged {
+				tunnelRollbackErr = h.replaceInboundForSync(suppressDatabaseInboundPostWrite(ctx), serverID, originalTunnel, mutationID)
+			}
+			return errors.Join(
+				fmt.Errorf("热恢复域名 %v 到 tunnel 路由: %w", domains, routeErr),
+				wrapRealitySyncRollbackError("恢复路由", routeRollbackErr),
+				wrapRealitySyncRollbackError("恢复 tunnel-in", tunnelRollbackErr),
+			)
+		}
 	}
-	if _, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/xray/config", configPayload); err != nil {
-		return fmt.Errorf("恢复域名 %v 到 tunnel 路由: %w", domains, err)
+	if tunnelChanged || routingChanged {
+		log.Printf("[HandleInbounds] Reality delete hot sync done on server %d: tunnel_changed=%t routing_changed=%t domains=%v", serverID, tunnelChanged, routingChanged, domains)
 	}
-	if err := h.restartXrayWithRecovery(ctx, serverID, "RealityRouteRestore"); err != nil {
-		return err
-	}
-	log.Printf("[HandleInbounds] Restored reality serverNames %v to tunnel-in→nginx route on server %d", domains, serverID)
 	return nil
+}
+
+func realityTunnelTargetPort(tunnelInbound map[string]interface{}) (int, bool) {
+	settings, _ := tunnelInbound["settings"].(map[string]interface{})
+	port, ok := wireGuardNumericValue(settings["port"])
+	if !ok || port < 1 || port > 65535 {
+		return 0, false
+	}
+	return int(port), true
+}
+
+func (h *RemoteManageHandler) nextDatabaseRealityInboundPort(
+	ctx context.Context,
+	serverID int64,
+	inbounds []map[string]interface{},
+	removedPort int,
+) (int, error) {
+	rows, err := h.repo.ListActiveDesiredInbounds(ctx, serverID)
+	if err != nil {
+		return 0, fmt.Errorf("读取剩余数据库入站: %w", err)
+	}
+	desiredRealityPorts := make(map[string]int)
+	for _, row := range rows {
+		inbound, decodeErr := decodeDesiredInbound(row.InboundJSON)
+		if decodeErr != nil {
+			return 0, fmt.Errorf("解析剩余数据库入站 %s: %w", row.InboundTag, decodeErr)
+		}
+		streamSettings, _ := inbound["streamSettings"].(map[string]interface{})
+		if !strings.EqualFold(strings.TrimSpace(wireGuardStringValue(streamSettings["security"])), "reality") {
+			continue
+		}
+		port, ok := wireGuardNumericValue(inbound["port"])
+		if !ok || port < 1 || port > 65535 || int(port) == removedPort {
+			continue
+		}
+		desiredRealityPorts[strings.TrimSpace(row.InboundTag)] = int(port)
+	}
+	for _, inbound := range inbounds {
+		tag := strings.TrimSpace(wireGuardStringValue(inbound["tag"]))
+		desiredPort, databaseOwned := desiredRealityPorts[tag]
+		if !databaseOwned {
+			continue
+		}
+		if status := strings.TrimSpace(wireGuardStringValue(inbound["_runtime_status"])); status == "not_running" {
+			continue
+		}
+		streamSettings, _ := inbound["streamSettings"].(map[string]interface{})
+		if !strings.EqualFold(strings.TrimSpace(wireGuardStringValue(streamSettings["security"])), "reality") {
+			continue
+		}
+		port, ok := wireGuardNumericValue(inbound["port"])
+		if !ok || port < 1 || port > 65535 || int(port) != desiredPort {
+			continue
+		}
+		return int(port), nil
+	}
+	return 0, nil
 }
 
 func (h *RemoteManageHandler) addWebsiteFallbackConfig(config map[string]any, domain string) {

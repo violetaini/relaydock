@@ -167,15 +167,6 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 		return reconcileErr
 	}
 
-	// Only an inbound with no existing managed node may claim a legacy external
-	// node. Otherwise a same-coordinate external row could short-circuit the
-	// replacement above and leave the actual managed node stale.
-	if matched, claimErr := l.tryClaimExternalNode(ctx, server, event, clashConfig); matched {
-		return claimErr
-	} else if claimErr != nil {
-		return claimErr
-	}
-
 	var createErrors []error
 	for _, p := range plans {
 		// 真重复(同 server-host + protocol + port)才 skip —— 带上 host,避免「both」时 v4/v6 同 proto+port 互相误杀
@@ -540,101 +531,15 @@ func isTunnelProtocol(protocol string) bool {
 	}
 }
 
-// protocolEquivalent 判断 clash type 与 xray protocol 是否同一种协议。
-// clash 用 `type: ss`,xray 用 `protocol: shadowsocks`,其他名字一致。
 func protocolEquivalent(clashType, xrayProtocol string) bool {
-	a := strings.ToLower(strings.TrimSpace(clashType))
-	b := strings.ToLower(strings.TrimSpace(xrayProtocol))
-	if a == b {
-		return true
-	}
-	norm := func(s string) string {
-		if s == "ss" {
+	normalize := func(value string) string {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "ss" {
 			return "shadowsocks"
 		}
-		return s
+		return value
 	}
-	return norm(a) == norm(b)
-}
-
-// tryClaimExternalNode 扫所有"外部节点"(original_server=” 且 inbound_tag=”),
-// 看是否有节点的 clash_config 指向 (server 的 IP/Domain/PullAddress 之一) + 同 port + 同 protocol,
-// 命中即把该节点 UPDATE 为受管节点(填上 original_server + inbound_tag),返回 true。
-// 这避免迁移场景下:relaydock 原有节点 + agent 扫描新创建节点 → 重复 2 条节点的问题。
-func (l *NodeSyncListener) tryClaimExternalNode(ctx context.Context, server *storage.RemoteServer, event InboundEvent, agentClashConfig string) (bool, error) {
-	// 候选地址:能让外部节点 server 字段命中该 remote_server 的所有可能形式
-	candidates := map[string]bool{}
-	for _, a := range []string{server.IPAddress, server.Domain, server.PullAddress} {
-		if strings.TrimSpace(a) != "" {
-			candidates[a] = true
-		}
-	}
-	if len(candidates) == 0 {
-		return false, nil
-	}
-
-	allNodes, err := l.repo.ListAllNodes(ctx)
-	if err != nil {
-		log.Printf("[NodeSync] tryClaimExternalNode: list all nodes failed: %v", err)
-		return false, fmt.Errorf("读取可认领节点失败: %w", err)
-	}
-	for _, n := range allNodes {
-		// Agent events must never claim an ordinary user's imported node, even
-		// when its host/port/protocol happen to match this managed server. Missing
-		// owner records also fail closed instead of inheriting legacy admin trust.
-		owner, ownerErr := l.repo.GetUser(ctx, n.Username)
-		if ownerErr != nil || owner.Role != storage.RoleAdmin {
-			continue
-		}
-		// 只看"外部节点":没关联 server / inbound,且不是 routed 子节点
-		if strings.TrimSpace(n.OriginalServer) != "" || strings.TrimSpace(n.InboundTag) != "" {
-			continue
-		}
-		if n.NodeType == "routed" {
-			continue
-		}
-		var cfg map[string]any
-		if err := json.Unmarshal([]byte(n.ClashConfig), &cfg); err != nil {
-			continue
-		}
-		srv, _ := cfg["server"].(string)
-		if !candidates[srv] {
-			continue
-		}
-		var port int
-		switch p := cfg["port"].(type) {
-		case float64:
-			port = int(p)
-		case int:
-			port = p
-		}
-		if port != event.Port {
-			continue
-		}
-		proto, _ := cfg["type"].(string)
-		if !protocolEquivalent(proto, event.Protocol) {
-			continue
-		}
-
-		// 命中:更新该节点
-		log.Printf("[NodeSync] Claim external node id=%d name=%q for %s/%s:%d", n.ID, n.NodeName, server.Name, event.Protocol, event.Port)
-		// 用 agent 转出来的 clash_config 替换,但保留原节点名(用户可能改过中文名)
-		var newCfg map[string]any
-		if err := json.Unmarshal([]byte(agentClashConfig), &newCfg); err == nil {
-			if name, _ := cfg["name"].(string); name != "" {
-				newCfg["name"] = name
-			}
-			if updated, err := json.Marshal(newCfg); err == nil {
-				agentClashConfig = string(updated)
-			}
-		}
-		if err := l.repo.ClaimExternalNode(ctx, n.ID, server.Name, event.Tag, event.MutationID, fmt.Sprintf("远程:%s", server.Name), agentClashConfig); err != nil {
-			log.Printf("[NodeSync] ClaimExternalNode failed: %v", err)
-			return false, fmt.Errorf("认领外部节点 %d 失败: %w", n.ID, err)
-		}
-		return true, nil
-	}
-	return false, nil
+	return normalize(clashType) == normalize(xrayProtocol)
 }
 
 func (l *NodeSyncListener) handleRemoved(ctx context.Context, event InboundEvent) error {

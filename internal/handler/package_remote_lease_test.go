@@ -141,18 +141,6 @@ func TestInboundBatchRuntimeWarningDoesNotRestartXray(t *testing.T) {
 	}
 }
 
-func TestPackageRestartSkipsStoppedXray(t *testing.T) {
-	stopped := false
-	agent := &packageLeaseAgent{xrayRunning: &stopped}
-	_, server, remote := newPackageLeaseFixture(t, agent)
-
-	restartXrayInParallel(context.Background(), remote, map[int64]bool{server.ID: true}, "PackageStoppedTest")
-
-	if got := agent.serviceControls.Load(); got != 0 {
-		t.Fatalf("stopped package server made %d Xray control request(s)", got)
-	}
-}
-
 func TestPackageInboundUnbindActiveInstallationKeepsRemoteAndDatabaseState(t *testing.T) {
 	agent := &packageLeaseAgent{}
 	repo, server, remote := newPackageLeaseFixture(t, agent)

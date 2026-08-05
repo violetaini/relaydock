@@ -246,6 +246,7 @@ func TestHandleInboundsHoldsLeaseThroughWSSPostSync(t *testing.T) {
 
 func TestHandleInboundsRollsBackWSSWhenPostSyncFails(t *testing.T) {
 	var added atomic.Bool
+	var nginxSyncs atomic.Int64
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -269,7 +270,11 @@ func TestHandleInboundsRollsBackWSSWhenPostSyncFails(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/cert/deploy":
 			_, _ = w.Write([]byte(`{"success":true}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/nginx/setup-ssl":
-			http.Error(w, "nginx reload rejected", http.StatusInternalServerError)
+			if nginxSyncs.Add(1) == 1 {
+				http.Error(w, "nginx reload rejected", http.StatusInternalServerError)
+			} else {
+				_, _ = w.Write([]byte(`{"success":true}`))
+			}
 		case r.Method == http.MethodGet && r.URL.Path == "/api/child/xray/config":
 			_, _ = w.Write([]byte(`{"success":true,"config":"{}"}`))
 		default:
@@ -298,6 +303,9 @@ func TestHandleInboundsRollsBackWSSWhenPostSyncFails(t *testing.T) {
 	}
 	if added.Load() {
 		t.Fatal("WSS inbound remained after nginx post-sync failed")
+	}
+	if nginxSyncs.Load() < 2 {
+		t.Fatalf("nginx cleanup was not attempted after rollback: calls=%d", nginxSyncs.Load())
 	}
 }
 

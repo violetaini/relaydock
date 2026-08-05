@@ -926,7 +926,7 @@ func TestManagedWireGuardInventorySyncBackfillsWithoutCreatingNode(t *testing.T)
 	}
 }
 
-func TestManagedWireGuardInventorySyncPreservesLegacyOwnershipAndRechecksPeer(t *testing.T) {
+func TestManagedWireGuardScanReappliesDatabaseOwnershipWithoutRecheckingPeer(t *testing.T) {
 	handler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
 	createResponse := httptest.NewRecorder()
 	handler.HandleManagedInboundResources(createResponse, managedWireGuardRequest(t, http.MethodPost,
@@ -961,10 +961,7 @@ func TestManagedWireGuardInventorySyncPreservesLegacyOwnershipAndRechecksPeer(t 
 	agent.mu.Lock()
 	agent.ownerMutationID = ""
 	agent.mu.Unlock()
-	result := handler.syncInboundsToNodesInternal(context.Background(), server.ID)
-	if !result.Success || len(result.Errors) != 0 {
-		t.Fatalf("sync result=%+v", result)
-	}
+	handler.HandleScanResult(server.ID, WSScanResultPayload{XrayRunning: true, XrayVersion: "test"})
 	owner, err = repo.GetRemoteInboundOwnership(context.Background(), server.ID, node.InboundTag)
 	if err != nil || owner != node.InboundMutationID {
 		t.Fatalf("legacy sync cleared ownership=%q node=%q err=%v", owner, node.InboundMutationID, err)
@@ -974,11 +971,11 @@ func TestManagedWireGuardInventorySyncPreservesLegacyOwnershipAndRechecksPeer(t 
 		t.Fatalf("legacy sync changed node ownership: node=%+v err=%v", nodeAfter, err)
 	}
 	peer, err = repo.GetWireGuardProbePeer(context.Background(), created.Resource.ID)
-	if err != nil || peer.State != storage.WireGuardProbePeerStatePending {
-		t.Fatalf("legacy sync did not require Agent recheck: peer=%+v err=%v", peer, err)
+	if err != nil || peer.State != storage.WireGuardProbePeerStateActive {
+		t.Fatalf("database-authority scan changed probe peer: peer=%+v err=%v", peer, err)
 	}
-	if actions := agent.actionSnapshot(); len(actions) != 1 || actions[0] != "add" {
-		t.Fatalf("inventory sync unexpectedly mutated Agent: %v", actions)
+	if actions := agent.actionSnapshot(); len(actions) != 2 || actions[0] != "add" || actions[1] != "add" {
+		t.Fatalf("scan did not reapply the database mutation owner: %v", actions)
 	}
 }
 
@@ -1049,6 +1046,13 @@ func TestStaleOrdinaryNodeCleanupCannotDeleteNewSameTagGeneration(t *testing.T) 
 	}
 	resource.MutationID = newMutationID
 	if _, err := repo.UpsertManagedInboundResource(context.Background(), *resource); err != nil {
+		t.Fatal(err)
+	}
+	desired, err := repo.GetDesiredInbound(context.Background(), server.ID, staleNode.InboundTag)
+	if err != nil || desired == nil {
+		t.Fatalf("read desired inbound: desired=%+v err=%v", desired, err)
+	}
+	if _, err := repo.UpsertActiveDesiredInbound(context.Background(), server.ID, staleNode.InboundTag, newMutationID, desired.InboundJSON); err != nil {
 		t.Fatal(err)
 	}
 	agent.mu.Lock()

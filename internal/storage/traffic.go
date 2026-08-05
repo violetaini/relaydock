@@ -2964,6 +2964,9 @@ CREATE TABLE IF NOT EXISTS user_traffic_threshold_notified (
 	if err := r.migrateRemoteInboundOwnership(); err != nil {
 		return err
 	}
+	if err := r.migrateRemoteInboundDesired(); err != nil {
+		return err
+	}
 	if err := r.migrateForwarding(); err != nil {
 		return err
 	}
@@ -10567,6 +10570,22 @@ type remoteServerMutationLeaseContext struct {
 	heldServerIDs      map[int64]struct{}
 	exclusiveServerIDs map[int64]struct{}
 	bypassServerIDs    map[int64]struct{}
+}
+
+// RemoteServerMutationLeaseState reports whether ctx already carries this
+// repository's lease for serverID. Callers use it to avoid trying to upgrade a
+// shared lease in the same call stack, which RWMutex cannot do safely.
+func (r *TrafficRepository) RemoteServerMutationLeaseState(ctx context.Context, serverID int64) (held, exclusive bool) {
+	if r == nil || ctx == nil || serverID <= 0 {
+		return false, false
+	}
+	state, _ := ctx.Value(remoteServerMutationLeaseContextKey{}).(remoteServerMutationLeaseContext)
+	if state.repo != r {
+		return false, false
+	}
+	_, held = state.heldServerIDs[serverID]
+	_, exclusive = state.exclusiveServerIDs[serverID]
+	return held, exclusive
 }
 
 // RemoteServerMutationLeaseBypassContext marks an explicit installation

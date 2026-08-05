@@ -469,8 +469,8 @@ func TestHandleInboundsLeavesDirectWebSocketConfigurationIntact(t *testing.T) {
 	if got := ws["path"]; got != "/plain" {
 		t.Fatalf("path = %v, want /plain", got)
 	}
-	if got := inboundGets.Load(); got != 0 {
-		t.Fatalf("plain WS triggered %d WSS allocation/aggregation reads", got)
+	if got := inboundGets.Load(); got != 1 {
+		t.Fatalf("plain WS made %d inbound reads, want one database-authority reconciliation read", got)
 	}
 	if got := nginxWrites.Load(); got != 0 {
 		t.Fatalf("plain WS triggered %d nginx writes", got)
