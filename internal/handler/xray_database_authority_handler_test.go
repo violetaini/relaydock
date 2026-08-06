@@ -117,7 +117,7 @@ func newDatabaseAuthorityHandlerRepo(t *testing.T, agentURL string) (*storage.Tr
 		Status:         storage.RemoteServerStatusConnected,
 		ConnectionMode: storage.ConnectionModePush,
 		IPAddress:      "127.0.0.1",
-		ListenPort:     tunnelChainAgentPort(t, agentURL),
+		ListenPort:     remoteAgentTestPort(t, agentURL),
 		XrayMode:       "embedded",
 	}
 	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {

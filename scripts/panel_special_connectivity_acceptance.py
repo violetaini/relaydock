@@ -52,17 +52,8 @@ def wireguard_tag(run_id: str) -> str:
     return f"accept-{run_id}-wireguard"
 
 
-def chain_label(run_id: str) -> str:
-    readable = re.sub(r"[^a-z0-9-]", "", run_id.lower()).strip("-")[:16] or "run"
-    digest = hashlib.sha256(run_id.encode("ascii")).hexdigest()[:8]
-    label = f"accept-{readable}-{digest}"
-    if not re.fullmatch(r"[a-z0-9-]{2,32}", label):
-        raise PanelAcceptanceError("could not derive a safe AnyDoor label")
-    return label
-
-
-def chain_tag(label: str, index: int) -> str:
-    return f"tunnel-{label}-h{index}"
+def anydoor_tag(run_id: str) -> str:
+    return f"accept-{run_id}-anydoor"
 
 
 def require_wireguard_tag(tag: str, expected: str) -> None:
@@ -70,8 +61,8 @@ def require_wireguard_tag(tag: str, expected: str) -> None:
         raise PanelAcceptanceError("refusing WireGuard cleanup outside this run")
 
 
-def require_chain_tag(tag: str, label: str, index: int) -> None:
-    if not re.fullmatch(r"accept-[a-z0-9-]{2,25}", label) or tag != chain_tag(label, index):
+def require_anydoor_tag(tag: str, expected: str) -> None:
+    if tag != expected or not re.fullmatch(r"accept-[a-z0-9-]+-anydoor", tag):
         raise PanelAcceptanceError("refusing AnyDoor cleanup outside this run")
 
 
@@ -131,6 +122,13 @@ def matching_wireguard_nodes(api: PanelAPI, _server_id: int, tag: str) -> list[d
             continue
         matches.append(node)
     return matches
+
+
+def matching_anydoor_nodes(api: PanelAPI, tag: str) -> list[dict[str, object]]:
+    return [
+        node for node in normal_nodes(api)
+        if node_field(node, "inbound_tag", "InboundTag") == tag
+    ]
 
 
 def parse_metadata(value: object) -> dict[str, object]:
@@ -640,113 +638,170 @@ def probe_udp_echo(host: str, port: int, timeout: float) -> None:
     raise PanelAcceptanceError("UDP echo through AnyDoor failed") from last_error
 
 
-def build_chain_request(label: str, server_ids: list[int], port: int, target_host: str) -> dict[str, object]:
+def build_anydoor_request(
+    tag: str,
+    forward_node_id: int,
+    listen_port: int,
+    target_host: str,
+    target_port: int,
+) -> dict[str, object]:
     return {
-        "label": label,
-        "server_ids": server_ids,
-        "entry_port": port,
-        "target_address": target_host.strip(),
-        "target_port": port,
+        "action": "add",
+        "node_name": "Acceptance AnyDoor",
+        "forward_node_id": forward_node_id,
+        "inbound": {
+            "tag": tag,
+            "listen": "0.0.0.0",
+            "protocol": "tunnel",
+            "port": listen_port,
+            "settings": {
+                "address": target_host.strip(),
+                "port": target_port,
+                "network": "tcp,udp",
+            },
+        },
     }
 
 
-def validate_chain_response(
+def validate_anydoor_response(
     api: PanelAPI,
     response: object,
-    label: str,
-    server_ids: list[int],
-    port: int,
+    server_id: int,
+    tag: str,
+    listen_port: int,
     target_host: str,
-) -> str:
+    target_port: int,
+) -> tuple[int, str]:
     if not isinstance(response, dict) or response.get("success") is not True:
-        raise PanelAcceptanceError("AnyDoor chain create response did not confirm success")
-    if response.get("label") != label or int(response.get("entry_port", 0)) != port:
-        raise PanelAcceptanceError("AnyDoor chain response label or shared port does not match")
-    hops = response.get("hops")
-    if not isinstance(hops, list) or len(hops) != len(server_ids):
-        raise PanelAcceptanceError("AnyDoor chain response has an unexpected hop count")
-    for index, server_id in enumerate(server_ids):
-        hop = hops[index]
-        expected_tag = chain_tag(label, index)
-        if not isinstance(hop, dict):
-            raise PanelAcceptanceError("AnyDoor chain response contains an invalid hop")
-        if int(hop.get("server_id", 0)) != server_id or hop.get("tag") != expected_tag:
-            raise PanelAcceptanceError("AnyDoor chain response hop identity does not match")
-        if int(hop.get("listen_port", 0)) != port:
-            raise PanelAcceptanceError("AnyDoor chain did not use one shared port on every server")
-        if index == len(server_ids) - 1:
-            if hop.get("target_address") != target_host or int(hop.get("target_port", 0)) != port:
-                raise PanelAcceptanceError("AnyDoor final hop does not use the same target port")
-        inbound = remote_inbound(api, server_id, expected_tag)
-        settings = inbound.get("settings") if isinstance(inbound, dict) else None
-        network = str(settings.get("network", "")) if isinstance(settings, dict) else ""
-        networks = {item.strip() for item in network.split(",") if item.strip()}
-        if (
-            not isinstance(inbound, dict)
-            or str(inbound.get("protocol", "")).lower() != "tunnel"
-            or int(inbound.get("port", 0)) != port
-            or networks != {"tcp", "udp"}
-        ):
-            raise PanelAcceptanceError(f"AnyDoor Agent readback for hop {index + 1} is incomplete")
-    entry_host = str(response.get("entry_host", "")).strip()
-    if not entry_host:
-        raise PanelAcceptanceError("AnyDoor response has no reachable entry host")
-    return entry_host
+        raise PanelAcceptanceError("AnyDoor managed-node create response did not confirm success")
+    response_node = response.get("node")
+    if not isinstance(response_node, dict) or node_field(response_node, "inbound_tag", "InboundTag") != tag:
+        raise PanelAcceptanceError("AnyDoor create response did not include the managed clone")
+    try:
+        node_id = int(response.get("node_id") or node_field(response_node, "id", "ID") or 0)
+    except (TypeError, ValueError) as reason:
+        raise PanelAcceptanceError("AnyDoor managed clone ID is invalid") from reason
+    if node_id <= 0:
+        raise PanelAcceptanceError("AnyDoor managed clone ID is invalid")
+
+    matches = matching_anydoor_nodes(api, tag)
+    if len(matches) != 1 or int(node_field(matches[0], "id", "ID") or 0) != node_id:
+        raise PanelAcceptanceError("AnyDoor clone is not visible in the normal node list")
+    raw_proxy = node_field(matches[0], "clash_config", "ClashConfig")
+    try:
+        proxy = dict(raw_proxy) if isinstance(raw_proxy, dict) else json.loads(str(raw_proxy or ""))
+    except (TypeError, ValueError, json.JSONDecodeError) as reason:
+        raise PanelAcceptanceError("AnyDoor clone has no usable Clash configuration") from reason
+    entry_host = str(proxy.get("server", "")).strip()
+    if not entry_host or int(proxy.get("port", 0)) != listen_port:
+        raise PanelAcceptanceError("AnyDoor clone does not contain the requested entry endpoint")
+
+    inbound = remote_inbound(api, server_id, tag)
+    settings = inbound.get("settings") if isinstance(inbound, dict) else None
+    network = str(settings.get("network", "")) if isinstance(settings, dict) else ""
+    networks = {item.strip().lower() for item in network.split(",") if item.strip()}
+    if (
+        not isinstance(inbound, dict)
+        or str(inbound.get("protocol", "")).strip().lower() not in {"tunnel", "dokodemo-door"}
+        or int(inbound.get("port", 0)) != listen_port
+        or not isinstance(settings, dict)
+        or str(settings.get("address", "")).strip() != target_host
+        or int(settings.get("port", 0)) != target_port
+        or networks != {"tcp", "udp"}
+    ):
+        raise PanelAcceptanceError("AnyDoor Agent readback does not match the managed-node request")
+    return node_id, entry_host
 
 
-def cleanup_chain(api: PanelAPI, server_ids: list[int], label: str) -> None:
-    failures: list[str] = []
-    for index in reversed(range(len(server_ids))):
-        tag = chain_tag(label, index)
-        require_chain_tag(tag, label, index)
+def cleanup_anydoor(
+    api: PanelAPI,
+    server_id: int,
+    tag: str,
+    expected_tag: str,
+    expected_node_id: int = 0,
+) -> None:
+    require_anydoor_tag(tag, expected_tag)
+    nodes = matching_anydoor_nodes(api, tag)
+    if len(nodes) > 1:
+        raise PanelAcceptanceError("refusing cleanup because duplicate AnyDoor clones exist")
+    lifecycle_error = ""
+    if nodes:
         try:
-            if remote_inbound(api, server_ids[index], tag) is not None:
-                remove_raw_inbound(api, server_ids[index], tag)
-            if remote_inbound(api, server_ids[index], tag) is not None:
-                raise PanelAcceptanceError("tag remains after removal")
-        except Exception as reason:
-            failures.append(f"server {server_ids[index]} tag {tag}: {reason}")
-    if failures:
-        raise PanelAcceptanceError("; ".join(failures))
+            node_id = int(node_field(nodes[0], "id", "ID") or 0)
+        except (TypeError, ValueError) as reason:
+            raise PanelAcceptanceError("AnyDoor cleanup node ID is invalid") from reason
+        if node_id <= 0 or (expected_node_id > 0 and node_id != expected_node_id):
+            raise PanelAcceptanceError("refusing AnyDoor cleanup because the managed clone ID does not match")
+        response = api.request("DELETE", f"/api/admin/nodes/{node_id}")
+        if not isinstance(response, dict) or response.get("status") != "deleted":
+            raise PanelAcceptanceError("normal AnyDoor node deletion was not confirmed")
+        if matching_anydoor_nodes(api, tag) or remote_inbound(api, server_id, tag) is not None:
+            lifecycle_error = "normal AnyDoor node deletion did not remove its managed inbound lifecycle"
+    if remote_inbound(api, server_id, tag) is not None:
+        remove_raw_inbound(api, server_id, tag)
+    if matching_anydoor_nodes(api, tag) or remote_inbound(api, server_id, tag) is not None:
+        raise PanelAcceptanceError("AnyDoor cleanup verification failed")
+    if lifecycle_error:
+        raise PanelAcceptanceError(lifecycle_error)
 
 
 def run_anydoor(args: argparse.Namespace, api: PanelAPI, run_id: str) -> None:
-    label = chain_label(run_id)
-    planned = [(server_id, chain_tag(label, index)) for index, server_id in enumerate(args.chain_server_id)]
-    for server_id, tag in planned:
-        if remote_inbound(api, server_id, tag) is not None:
-            raise PanelAcceptanceError(f"refusing to reuse existing AnyDoor tag {tag}")
+    tag = anydoor_tag(run_id)
+    if remote_inbound(api, args.anydoor_server_id, tag) is not None:
+        raise PanelAcceptanceError(f"refusing to reuse existing AnyDoor tag {tag}")
+    if matching_anydoor_nodes(api, tag):
+        raise PanelAcceptanceError(f"refusing to reuse existing AnyDoor clone {tag}")
 
     echo: EchoProbe | None = None
-    port = args.anydoor_port
+    target_port = args.target_port
     if args.serve_echo:
-        echo = EchoProbe(args.echo_bind_host, port)
-        port = echo.port
+        echo = EchoProbe(args.echo_bind_host, target_port)
+        target_port = echo.port
         echo.start()
-    elif port == 0:
-        raise PanelAcceptanceError("external AnyDoor echo requires an explicit --anydoor-port")
+    elif target_port == 0:
+        raise PanelAcceptanceError("external AnyDoor echo requires an explicit --target-port")
 
     target_host = args.target_host.strip()
-    request = build_chain_request(label, args.chain_server_id, port, target_host)
+    request = build_anydoor_request(
+        tag,
+        args.anydoor_forward_node_id,
+        args.anydoor_port,
+        target_host,
+        target_port,
+    )
     attempted = False
+    node_id = 0
     primary_error: Exception | None = None
     try:
         attempted = True
-        response = api.request("POST", "/api/admin/tunnel-chains", request)
-        entry_host = validate_chain_response(
-            api, response, label, args.chain_server_id, port, target_host,
+        response = api.request(
+            "POST",
+            f"/api/admin/managed-nodes/create?server_id={args.anydoor_server_id}",
+            request,
         )
-        probe_tcp_echo(entry_host, port, args.timeout)
-        probe_udp_echo(entry_host, port, args.timeout)
-        print(f"PASS anydoor: {len(args.chain_server_id)} managed hops and target use port {port}; TCP/UDP echo verified")
+        node_id, entry_host = validate_anydoor_response(
+            api,
+            response,
+            args.anydoor_server_id,
+            tag,
+            args.anydoor_port,
+            target_host,
+            target_port,
+        )
+        probe_tcp_echo(entry_host, args.anydoor_port, args.timeout)
+        probe_udp_echo(entry_host, args.anydoor_port, args.timeout)
+        print(
+            f"PASS anydoor: managed clone {node_id}, one TCP/UDP listener on server "
+            f"{args.anydoor_server_id}, Agent readback and echo verified"
+        )
     except Exception as reason:
         primary_error = reason
         raise
     finally:
         if attempted:
             try:
-                cleanup_chain(api, args.chain_server_id, label)
-                print("CLEAN anydoor: every disposable hop removed in reverse order")
+                cleanup_anydoor(api, args.anydoor_server_id, tag, tag, node_id)
+                print("CLEAN anydoor: disposable managed clone and inbound removed")
             except Exception as cleanup_error:
                 if primary_error is None:
                     raise PanelAcceptanceError("AnyDoor cleanup failed: " + str(cleanup_error)) from cleanup_error
@@ -761,9 +816,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--case", action="append", choices=CASES, default=[])
     result.add_argument("--wireguard-server-id", type=int, default=1)
     result.add_argument("--wireguard-port", type=int, default=51920)
-    result.add_argument("--chain-server-id", action="append", type=int, default=[])
-    result.add_argument("--anydoor-port", type=int, default=0)
+    result.add_argument("--anydoor-server-id", type=int, default=1)
+    result.add_argument("--anydoor-forward-node-id", type=int, default=0)
+    result.add_argument("--anydoor-port", type=int, default=2033)
     result.add_argument("--target-host", default="")
+    result.add_argument("--target-port", type=int, default=0)
     result.add_argument("--serve-echo", action="store_true")
     result.add_argument("--echo-bind-host", default="0.0.0.0")
     result.add_argument("--dns-server", default="1.1.1.1")
@@ -793,16 +850,18 @@ def validate_args(args: argparse.Namespace, cases: list[str]) -> None:
         except ValueError as reason:
             raise PanelAcceptanceError("--dns-server must be an IP literal") from reason
     if "anydoor" in cases:
-        if len(args.chain_server_id) < 2 or len(set(args.chain_server_id)) != len(args.chain_server_id):
-            raise PanelAcceptanceError("AnyDoor requires at least two distinct --chain-server-id values")
-        if any(server_id <= 0 for server_id in args.chain_server_id):
-            raise PanelAcceptanceError("AnyDoor server IDs must be positive")
+        if args.anydoor_server_id <= 0:
+            raise PanelAcceptanceError("AnyDoor server ID must be positive")
+        if args.anydoor_forward_node_id <= 0:
+            raise PanelAcceptanceError("AnyDoor requires a positive --anydoor-forward-node-id")
         if not args.target_host.strip():
             raise PanelAcceptanceError("AnyDoor requires --target-host for the TCP/UDP echo server")
-        if args.anydoor_port != 0 and not 1024 <= args.anydoor_port <= 65535:
-            raise PanelAcceptanceError("--anydoor-port must be 0 or 1024-65535")
-        if not args.serve_echo and args.anydoor_port == 0:
-            raise PanelAcceptanceError("external AnyDoor echo requires an explicit --anydoor-port")
+        if not 1024 <= args.anydoor_port <= 65535:
+            raise PanelAcceptanceError("--anydoor-port must be 1024-65535")
+        if args.target_port != 0 and not 1 <= args.target_port <= 65535:
+            raise PanelAcceptanceError("--target-port must be 0 or 1-65535")
+        if not args.serve_echo and args.target_port == 0:
+            raise PanelAcceptanceError("external AnyDoor echo requires an explicit --target-port")
     if args.expected_exit_ip:
         try:
             ipaddress.ip_address(args.expected_exit_ip)

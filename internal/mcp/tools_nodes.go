@@ -8,7 +8,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// registerNodeTools 节点域 MCP 工具(list / get / create / update / delete / batch_delete / speedtest / tcping / tunnel_list)。
+// registerNodeTools 节点域 MCP 工具(list / get / create / update / delete / batch_delete / speedtest / tcping)。
 func registerNodeTools(s *server.MCPServer, b *bridge) {
 	// 只读
 	s.AddTool(readTool("node_list", "列出所有代理节点(协议、名称、服务器地址、入站标签等)。"),
@@ -25,11 +25,6 @@ func registerNodeTools(s *server.MCPServer, b *bridge) {
 				return mcpgo.NewToolResultError("id 必填"), nil
 			}
 			return b.get(ctx, "/api/admin/nodes/"+pathEscape(id))
-		})
-
-	s.AddTool(readTool("tunnel_list", "列出所有 tunnel(dokodemo 转发)入站,跨所有远程/分享服务器。"),
-		func(ctx context.Context, _ mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-			return b.get(ctx, "/api/admin/tunnels")
 		})
 
 	s.AddTool(readTool("node_tcping", "使用主控本机 Mihomo 测试指定节点的真实协议链路，结果包含协议建链和 HTTPS 探测往返耗时。",

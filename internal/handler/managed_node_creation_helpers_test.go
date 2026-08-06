@@ -191,11 +191,11 @@ func TestCreateManagedNodeRollsBackWarningResponse(t *testing.T) {
 	}))
 	defer agent.Close()
 
-	repo := newTunnelChainTestRepo(t)
+	repo := newRemoteHandlerTestRepo(t)
 	if err := repo.CreateUser(context.Background(), "admin", "admin@example.test", "Admin", "test-hash", storage.RoleAdmin, ""); err != nil {
 		t.Fatalf("create admin: %v", err)
 	}
-	server := createTunnelChainRemoteServer(t, repo, "managed-warning-edge", agent.URL)
+	server := createRemoteHandlerTestServer(t, repo, "managed-warning-edge", agent.URL)
 	if _, err := repo.UpdateRemoteServerXrayStatus(context.Background(), server.ID, true, "test"); err != nil {
 		t.Fatalf("mark Xray running: %v", err)
 	}

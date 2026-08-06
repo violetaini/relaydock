@@ -39,11 +39,13 @@ class CleanupAPI:
             self.nodes = [item for item in self.nodes if item["id"] != node_id]
             for node in matching:
                 tag = str(node["inbound_tag"])
-                for resource in [item for item in self.resources if item["inbound_tag"] == tag]:
-                    server_id = int(resource["server_id"])
+                for server_id in list(self.inbounds):
                     self.inbounds[server_id] = [
                         item for item in self.inbounds.get(server_id, []) if item.get("tag") != tag
                     ]
+                for resource in [item for item in self.resources if item["inbound_tag"] == tag]:
+                    server_id = int(resource["server_id"])
+                    self.inbounds.setdefault(server_id, [])
                 self.resources = [item for item in self.resources if item["inbound_tag"] != tag]
             return {"status": "deleted"}
         if method == "DELETE" and path.startswith("/api/admin/managed-inbound-resources/"):
@@ -77,11 +79,33 @@ class BrokenNodeCleanupAPI(CleanupAPI):
         return super().request(method, path, body)
 
 
+class AnyDoorRunAPI(CleanupAPI):
+    def request(self, method: str, path: str, body: object | None = None) -> object:
+        if method == "POST" and path.startswith("/api/admin/managed-nodes/create?server_id="):
+            self.requests.append((method, path, body))
+            server_id = int(path.rsplit("=", 1)[1])
+            assert isinstance(body, dict) and isinstance(body.get("inbound"), dict)
+            inbound = dict(body["inbound"])
+            tag = str(inbound["tag"])
+            node = {
+                "id": 21,
+                "inbound_tag": tag,
+                "protocol": "vless",
+                "clash_config": {
+                    "type": "vless",
+                    "server": "entry.example.test",
+                    "port": inbound["port"],
+                },
+            }
+            self.nodes = [node]
+            self.inbounds[server_id] = [inbound]
+            return {"success": True, "node_id": 21, "node": node}
+        return super().request(method, path, body)
+
+
 class PanelSpecialAcceptanceTest(unittest.TestCase):
-    def test_chain_label_is_valid_for_long_run_id(self) -> None:
-        label = special.chain_label("a" * 40)
-        self.assertRegex(label, r"^[a-z0-9-]{2,32}$")
-        self.assertLessEqual(len(label), 32)
+    def test_anydoor_tag_uses_the_run_owned_namespace(self) -> None:
+        self.assertEqual("accept-unit01-anydoor", special.anydoor_tag("unit01"))
 
     def test_wireguard_request_separates_client_private_key_from_agent_inbound(self) -> None:
         client_private = "C" * 43 + "="
@@ -127,11 +151,21 @@ class PanelSpecialAcceptanceTest(unittest.TestCase):
         assert isinstance(udp_settings, dict)
         self.assertEqual("udp", udp_settings["network"])
 
-    def test_chain_request_uses_same_port_everywhere(self) -> None:
-        request = special.build_chain_request("accept-unit01-abcd1234", [1, 2], 2033, "192.0.2.10")
-        self.assertEqual(2033, request["entry_port"])
-        self.assertEqual(2033, request["target_port"])
-        self.assertEqual([1, 2], request["server_ids"])
+    def test_anydoor_request_uses_the_managed_node_transaction(self) -> None:
+        request = special.build_anydoor_request(
+            "accept-unit01-anydoor", 17, 2033, "192.0.2.10", 2044,
+        )
+        self.assertEqual("add", request["action"])
+        self.assertEqual(17, request["forward_node_id"])
+        inbound = request["inbound"]
+        assert isinstance(inbound, dict)
+        self.assertEqual("accept-unit01-anydoor", inbound["tag"])
+        self.assertEqual("tunnel", inbound["protocol"])
+        self.assertEqual(2033, inbound["port"])
+        self.assertEqual(
+            {"address": "192.0.2.10", "port": 2044, "network": "tcp,udp"},
+            inbound["settings"],
+        )
 
     def test_wireguard_response_requires_normal_node_and_subscription_share(self) -> None:
         api = CleanupAPI()
@@ -250,26 +284,78 @@ class PanelSpecialAcceptanceTest(unittest.TestCase):
             special.cleanup_wireguard(api, 1, "production-wireguard", "accept-unit01-wireguard")
         self.assertEqual([], api.requests)
 
-    def test_chain_cleanup_is_reverse_order_and_exact(self) -> None:
+    def test_anydoor_response_requires_normal_clone_and_agent_readback(self) -> None:
         api = CleanupAPI()
-        label = "accept-unit01-abcd1234"
-        api.inbounds = {
-            1: [{"tag": special.chain_tag(label, 0)}],
-            2: [{"tag": special.chain_tag(label, 1)}],
+        tag = "accept-unit01-anydoor"
+        node = {
+            "id": 21,
+            "inbound_tag": tag,
+            "protocol": "vless",
+            "clash_config": {"type": "vless", "server": "entry.example.test", "port": 2033},
         }
-        special.cleanup_chain(api, [1, 2], label)
-        removals = [request for request in api.requests if request[0] == "POST"]
-        self.assertEqual(2, len(removals))
-        self.assertIn("server_id=2", removals[0][1])
-        assert isinstance(removals[0][2], dict)
-        self.assertEqual(special.chain_tag(label, 1), removals[0][2]["tag"])
-        self.assertIn("server_id=1", removals[1][1])
+        api.nodes = [node]
+        api.inbounds[3] = [{
+            "tag": tag,
+            "protocol": "tunnel",
+            "port": 2033,
+            "settings": {"address": "192.0.2.10", "port": 2044, "network": "tcp,udp"},
+        }]
+        result = special.validate_anydoor_response(
+            api, {"success": True, "node_id": 21, "node": node},
+            3, tag, 2033, "192.0.2.10", 2044,
+        )
+        self.assertEqual((21, "entry.example.test"), result)
 
-    def test_chain_cleanup_refuses_unowned_label_without_requests(self) -> None:
+    def test_anydoor_cleanup_uses_the_normal_node_lifecycle(self) -> None:
+        api = CleanupAPI()
+        tag = "accept-unit01-anydoor"
+        api.nodes = [{"id": 21, "inbound_tag": tag, "protocol": "vless"}]
+        api.inbounds[3] = [{"tag": tag, "protocol": "tunnel", "port": 2033}]
+        special.cleanup_anydoor(api, 3, tag, tag, 21)
+        self.assertIn(("DELETE", "/api/admin/nodes/21", None), api.requests)
+        self.assertFalse(any(request[0] == "POST" for request in api.requests))
+        self.assertEqual([], api.nodes)
+        self.assertEqual([], api.inbounds[3])
+
+    def test_anydoor_cleanup_reports_a_broken_node_lifecycle_after_fallback(self) -> None:
+        api = BrokenNodeCleanupAPI()
+        tag = "accept-unit01-anydoor"
+        api.nodes = [{"id": 21, "inbound_tag": tag, "protocol": "vless"}]
+        api.inbounds[3] = [{"tag": tag, "protocol": "tunnel", "port": 2033}]
+        with self.assertRaisesRegex(special.PanelAcceptanceError, "normal AnyDoor node deletion"):
+            special.cleanup_anydoor(api, 3, tag, tag, 21)
+        self.assertEqual([], api.nodes)
+        self.assertEqual([], api.inbounds[3])
+
+    def test_anydoor_cleanup_refuses_unowned_tag_without_requests(self) -> None:
         api = CleanupAPI()
         with self.assertRaises(special.PanelAcceptanceError):
-            special.cleanup_chain(api, [1, 2], "production")
+            special.cleanup_anydoor(api, 3, "production-anydoor", "accept-unit01-anydoor")
         self.assertEqual([], api.requests)
+
+    def test_anydoor_run_uses_current_managed_node_endpoint_and_cleans_up(self) -> None:
+        api = AnyDoorRunAPI()
+        args = special.parser().parse_args([
+            "--base-url", "https://panel.example",
+            "--case", "anydoor",
+            "--anydoor-server-id", "3",
+            "--anydoor-forward-node-id", "17",
+            "--anydoor-port", "2033",
+            "--target-host", "192.0.2.10",
+            "--target-port", "2044",
+        ])
+        original_tcp, original_udp = special.probe_tcp_echo, special.probe_udp_echo
+        special.probe_tcp_echo = lambda *_args: None
+        special.probe_udp_echo = lambda *_args: None
+        try:
+            special.run_anydoor(args, api, "unit01")
+        finally:
+            special.probe_tcp_echo, special.probe_udp_echo = original_tcp, original_udp
+        creates = [request for request in api.requests if request[0] == "POST" and "managed-nodes/create" in request[1]]
+        self.assertEqual(1, len(creates))
+        self.assertEqual("/api/admin/managed-nodes/create?server_id=3", creates[0][1])
+        self.assertEqual([], api.nodes)
+        self.assertEqual([], api.inbounds[3])
 
     def test_echo_probe_handles_tcp_and_udp(self) -> None:
         echo = special.EchoProbe("127.0.0.1", 0)
@@ -297,8 +383,8 @@ class PanelSpecialAcceptanceTest(unittest.TestCase):
         args = special.parser().parse_args([
             "--base-url", "https://panel.example",
             "--case", "anydoor",
-            "--chain-server-id", "1",
-            "--chain-server-id", "2",
+            "--anydoor-server-id", "1",
+            "--anydoor-forward-node-id", "17",
             "--target-host", "192.0.2.10",
         ])
         with self.assertRaises(special.PanelAcceptanceError):

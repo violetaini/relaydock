@@ -655,10 +655,6 @@ func main() {
 	mux.Handle("/api/admin/speedtest/", auth.RequireAdmin(tokenStore, userRepo, speedTestHandler))
 	lineSpeedTestHandler := handler.NewLineSpeedTestHandler(repo, remoteManageHandler)
 	mux.Handle("/api/admin/line-speedtest/", auth.RequireAdmin(tokenStore, userRepo, lineSpeedTestHandler))
-	// Tunnel(dokodemo 转发入站)聚合管理:跨所有远程/分享服务器列出 protocol==tunnel 入站,供节点管理「Tunnel 管理」弹窗使用
-	mux.Handle("/api/admin/tunnels", auth.RequireAdmin(tokenStore, userRepo, handler.NewTunnelsHandler(repo, remoteManageHandler)))
-	// 链式端口转发编排:选有序多台服务器建 N 条首尾相接的单跳 tunnel。
-	mux.Handle("/api/admin/tunnel-chains", auth.RequireAdmin(tokenStore, userRepo, handler.NewTunnelChainHandler(repo, remoteManageHandler)))
 	// 联邦入口(分享令牌鉴权,供其他主控间接管理被分享服务器)
 	federationHandler := handler.NewFederationHandler(repo, remoteManageHandler, capabilityManager)
 	mux.Handle("/api/federation/manage", federationHandler)

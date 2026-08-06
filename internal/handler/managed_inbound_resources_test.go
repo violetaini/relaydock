@@ -230,7 +230,7 @@ func newManagedInboundHandlerTest(t *testing.T, initialInbound map[string]interf
 	agentState := &managedWireGuardAgent{inbound: cloneManagedWireGuardInbound(initialInbound)}
 	agent := httptest.NewServer(agentState)
 	t.Cleanup(agent.Close)
-	server := createTunnelChainRemoteServer(t, repo, "managed-wireguard-edge", agent.URL)
+	server := createRemoteHandlerTestServer(t, repo, "managed-wireguard-edge", agent.URL)
 	return NewRemoteManageHandler(repo, nil), repo, server, agentState, dbPath
 }
 

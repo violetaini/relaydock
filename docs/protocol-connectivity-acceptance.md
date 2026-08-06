@@ -186,9 +186,9 @@ it never writes `allowInsecure` into the server inbound.
 
 ### Guarded WireGuard and AnyDoor runner
 
-`scripts/panel_special_connectivity_acceptance.py` covers the two resources
-that do not use the standard managed-node lifecycle. It is also a dry run
-unless `--execute` is supplied, and cleanup cannot be disabled.
+`scripts/panel_special_connectivity_acceptance.py` covers WireGuard's dedicated
+credential-safe creation path and the managed-node AnyDoor transaction. It is
+also a dry run unless `--execute` is supplied, and cleanup cannot be disabled.
 
 - WireGuard is created through
   `/api/admin/managed-inbound-resources/wireguard`. The authenticated request
@@ -201,10 +201,14 @@ unless `--execute` is supplied, and cleanup cannot be disabled.
   inner UDP DNS connectivity. Cleanup uses the ordinary node deletion API and
   confirms that the node, compatibility resource, and remote inbound all
   disappear. The resource API is used only to clean a half-completed create.
-- AnyDoor is created through `/api/admin/tunnel-chains`. Every managed hop and
-  the final echo target use one explicit numeric port. The runner requires both
-  a TCP nonce echo and a UDP nonce echo, removes hop tags in reverse order, and
-  confirms every tag is absent.
+- AnyDoor is created through
+  `/api/admin/managed-nodes/create?server_id=<entry-server>` with an existing
+  database-managed source node in `forward_node_id`. The runner verifies the
+  returned ordinary clone, the single TCP+UDP Agent listener and its exact
+  target, then requires both a TCP nonce echo and a UDP nonce echo. Cleanup
+  deletes the ordinary clone and confirms that both the clone and remote
+  inbound disappear; a raw exact-tag removal is only a leak-prevention fallback
+  and is still reported as a lifecycle regression.
 
 The WireGuard create body uses this contract (placeholder values shown):
 
@@ -247,11 +251,13 @@ and downloadable `.conf` from `client`, encrypts the sensitive node fields at
 rest, and decrypts them only for an authorized node, subscription or share
 response.
 
-Run the AnyDoor phase on the third host that will act as C, or point it at an
+Run the AnyDoor phase beside a reachable echo target, or point it at an
 equivalent external TCP/UDP echo process. `--serve-echo` opens a temporary,
 non-amplifying echo listener locally; `--target-host` must be the address by
-which the last managed server can reach that host. The host and cloud firewall
-must already allow the selected TCP and UDP port. The runner never changes a
+which the selected entry server can reach that host. `--anydoor-forward-node-id`
+must name an existing database-managed node because the product transaction
+creates an ordinary clone tied to that node. The host and cloud firewall must
+already allow the selected target TCP and UDP port. The runner never changes a
 firewall itself.
 
 ```sh
@@ -260,15 +266,15 @@ export ARCWAY_ACCEPTANCE_XRAY_BIN=/path/to/xray
 python3 scripts/panel_special_connectivity_acceptance.py \
   --base-url https://panel.example \
   --wireguard-server-id 1 \
-  --chain-server-id 1 \
-  --chain-server-id 2 \
+  --anydoor-server-id 1 \
+  --anydoor-forward-node-id 17 \
   --anydoor-port 2033 \
   --target-host 192.0.2.10 \
   --serve-echo \
   --expected-exit-ip 192.0.2.20
 ```
 
-Review the dry-run summary, then append `--execute`. For a disposable random
-same-port check instead of port 2033, omit `--anydoor-port` while using
-`--serve-echo`; the local echo listener selects a free port and the chain API
-requires that exact port to be free on every managed hop.
+Review the dry-run summary, then append `--execute`. With `--serve-echo`, omit
+`--target-port` to let the local echo listener select a free target port. The
+AnyDoor entry listener remains `--anydoor-port` (2033 by default), and that TCP
+and UDP port must be free on the selected entry server.

@@ -363,7 +363,7 @@ func TestSyncInboundsReconcilesOnlyMatchingPhysicalRealityNode(t *testing.T) {
 			agentState := &realitySyncAgent{inbounds: []map[string]interface{}{realitySyncInbound(test.liveClients)}}
 			agent := httptest.NewServer(agentState)
 			t.Cleanup(agent.Close)
-			server := createTunnelChainRemoteServer(t, repo, "edge-reality", agent.URL)
+			server := createRemoteHandlerTestServer(t, repo, "edge-reality", agent.URL)
 
 			physicalTemplate := realitySyncStoredNode()
 			physical, err := repo.CreateNode(ctx, physicalTemplate)

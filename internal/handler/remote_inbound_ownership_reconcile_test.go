@@ -39,11 +39,11 @@ func TestHandleInboundsRestoresOwnerAfterRejectedOrMismatchedAdd(t *testing.T) {
 			}))
 			defer agent.Close()
 
-			repo := newTunnelChainTestRepo(t)
+			repo := newRemoteHandlerTestRepo(t)
 			if err := repo.CreateUser(context.Background(), "admin", "admin@example.test", "Admin", "hash", storage.RoleAdmin, ""); err != nil {
 				t.Fatal(err)
 			}
-			server := createTunnelChainRemoteServer(t, repo, "owner-reconcile-edge", agent.URL)
+			server := createRemoteHandlerTestServer(t, repo, "owner-reconcile-edge", agent.URL)
 			if err := repo.SetRemoteInboundOwnership(context.Background(), server.ID, "same-tag", "old-generation"); err != nil {
 				t.Fatal(err)
 			}
