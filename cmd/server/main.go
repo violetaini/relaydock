@@ -36,6 +36,7 @@ import (
 	"github.com/violetaini/relaydock/internal/securechan"
 	"github.com/violetaini/relaydock/internal/speedtest"
 	"github.com/violetaini/relaydock/internal/storage"
+	inttgbot "github.com/violetaini/relaydock/internal/tgbot"
 	"github.com/violetaini/relaydock/internal/traffic"
 	"github.com/violetaini/relaydock/internal/version"
 	"github.com/violetaini/relaydock/internal/web"
@@ -296,8 +297,7 @@ func main() {
 		NotifyDeviceLimitExceeded: systemConfig.NotifyDeviceLimitExceeded,
 	})
 
-	// TG bot 已拆为独立项目,通过 /api/admin/tgbot/* HTTP 调主控。
-	// 主控仅保留 admin REST handler + 邀请码 web UI + storage 字段 + notify 裸 HTTP 通知。
+	// Telegram Bot 和 Mini App 通过这组内部 API 复用现有用户、套餐和节点逻辑。
 	tgbotAPIHandler := handler.NewTGBotAPIHandler(repo)
 
 	// 从远程拉取配置
@@ -365,6 +365,7 @@ func main() {
 	//   - invites CRUD(admin web UI 用)
 	//   - bind/unbind/user-by-tg/user-summary/user-subscriptions/user-nodes(独立 TG bot 用)
 	mux.Handle("/api/admin/tgbot/", auth.RequireAdmin(tokenStore, userRepo, tgbotAPIHandler))
+	mux.Handle("/api/admin/announcements", auth.RequireAdmin(tokenStore, userRepo, handler.NewAnnouncementAdminHandler(repo)))
 	mux.Handle("/api/admin/users", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserListHandler(repo)))
 	userCreateHandler := handler.NewUserCreateHandler(repo)
 	mux.Handle("/api/admin/users/create", auth.RequireAdmin(tokenStore, userRepo, userCreateHandler))
@@ -892,6 +893,10 @@ func main() {
 	if theme, _ := repo.GetSystemSetting(context.Background(), handler.DefaultThemeKey); theme != "" {
 		web.SetDefaultTheme(theme)
 	}
+	tgBotManager := inttgbot.NewManager(repo, tokenStore, mux)
+	mux.Handle("/api/admin/system-settings/tgbot", auth.RequireAdmin(tokenStore, userRepo, handler.NewTGBotSettingsHandler(tgBotManager)))
+	mux.HandleFunc("/tg-app", tgBotManager.ServeWebApp)
+	mux.HandleFunc("/api/tg-webapp/", tgBotManager.ServeWebApp)
 	// 自定义安全阈值(登录/暴力防护/订阅频率)— 写入后 handler 内部热更新 3 个 limiter 单例,无需重启
 	mux.Handle("/api/admin/security-settings", auth.RequireAdmin(tokenStore, userRepo, handler.NewSecuritySettingsHandler(repo)))
 	// Turnstile 配置自测:前端 widget 验完拿 token,后端用 DB 已存 secret 调 cloudflare siteverify,
@@ -905,6 +910,11 @@ func main() {
 			systemSettingsHandler.GetMasterURL(w, r)
 		case http.MethodPut:
 			systemSettingsHandler.SetMasterURL(w, r)
+			go func() {
+				if err := tgBotManager.Restart(context.Background()); err != nil {
+					logger.Error("主控地址变更后重启 Telegram Bot 失败", "error", err.Error())
+				}
+			}()
 		default:
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
@@ -1288,6 +1298,10 @@ func main() {
 	}
 
 	collectorCtx, stopCollector := context.WithCancel(context.Background())
+	if err := tgBotManager.Restart(collectorCtx); err != nil {
+		logger.Error("内置 Telegram Bot 启动失败", "error", err.Error())
+	}
+	defer tgBotManager.Stop()
 
 	trafficCollector.OnServerOffline = handler.SendServerOfflineNotification
 	// 启动 Xray 流量收集器（每 1 分钟）

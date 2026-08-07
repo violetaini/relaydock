@@ -95,6 +95,8 @@ func (h *TGBotAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 邀请码 CRUD
 	case path == "invites" && r.Method == http.MethodGet:
 		h.listInvites(w, r)
+	case path == "invites/lookup" && r.Method == http.MethodGet:
+		h.lookupInvite(w, r)
 	case path == "invites" && r.Method == http.MethodPost:
 		h.createInvite(w, r)
 	case path == "invites/revoke" && r.Method == http.MethodPost:
@@ -126,6 +128,14 @@ func (h *TGBotAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.redeem(w, r)
 	case path == "admin-subview" && r.Method == http.MethodGet:
 		h.adminSubview(w, r)
+	case path == "announcements/pending" && r.Method == http.MethodGet:
+		h.announcementsPending(w, r)
+	case path == "announcements/delivered" && r.Method == http.MethodPost:
+		h.announcementDelivered(w, r)
+	case path == "announcements/active" && r.Method == http.MethodGet:
+		h.announcementsActive(w, r)
+	case path == "announcements" && r.Method == http.MethodPost:
+		h.postAnnouncement(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -178,6 +188,27 @@ func (h *TGBotAPIHandler) listInvites(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toInviteOut(ic))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "items": out})
+}
+
+// lookupInvite returns one exact code without the recency limit used by the
+// administration list. This keeps old Telegram deep links usable while the
+// endpoint remains behind the existing administrator authentication boundary.
+func (h *TGBotAPIHandler) lookupInvite(w http.ResponseWriter, r *http.Request) {
+	code := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("code")))
+	if code == "" || len(code) > 128 {
+		writeJSONError(w, http.StatusBadRequest, "code 必填且不能超过 128 字节")
+		return
+	}
+	ic, ok := h.repo.GetInviteCode(r.Context(), code)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "found": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"found":   true,
+		"item":    toInviteOut(ic),
+	})
 }
 
 func (h *TGBotAPIHandler) createInvite(w http.ResponseWriter, r *http.Request) {

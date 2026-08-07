@@ -125,6 +125,37 @@ type NotifyTarget struct {
 	PackageEndDate *time.Time
 }
 
+// TGPackageUser is eligible for account-wide Telegram announcements.
+type TGPackageUser struct {
+	Username   string
+	TelegramID int64
+	PackageID  int64
+}
+
+// ListActivePackageTGUsers returns bound users whose package is still active.
+func (r *TrafficRepository) ListActivePackageTGUsers(ctx context.Context) ([]TGPackageUser, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT username, telegram_id, COALESCE(package_id, 0) FROM users
+		  WHERE telegram_id IS NOT NULL AND telegram_id != 0
+		    AND is_active = 1
+		    AND package_id IS NOT NULL AND package_id > 0
+		    AND (package_end_date IS NULL OR package_end_date > CURRENT_TIMESTAMP)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	users := make([]TGPackageUser, 0)
+	for rows.Next() {
+		var user TGPackageUser
+		if err := rows.Scan(&user.Username, &user.TelegramID, &user.PackageID); err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	return users, rows.Err()
+}
+
 // SetTGNotify 按 tg_id 开关用户通知。未绑(影响 0 行)返回错误。
 func (r *TrafficRepository) SetTGNotify(ctx context.Context, tgID int64, enabled bool) error {
 	if tgID == 0 {

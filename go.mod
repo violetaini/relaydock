@@ -9,6 +9,7 @@ require (
 	github.com/go-acme/alidns-20150109/v4 v4.7.0
 	github.com/go-acme/lego/v4 v4.35.2
 	github.com/go-acme/tencentclouddnspod v1.3.24
+	github.com/go-telegram/bot v1.21.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/mark3labs/mcp-go v0.54.0

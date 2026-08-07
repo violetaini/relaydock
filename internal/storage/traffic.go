@@ -2945,6 +2945,37 @@ CREATE TABLE IF NOT EXISTS user_traffic_threshold_notified (
 		return fmt.Errorf("migrate user_traffic_threshold_notified: %w", err)
 	}
 
+	const announcementSchema = `
+CREATE TABLE IF NOT EXISTS announcements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL DEFAULT 'general',
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    node_id INTEGER NOT NULL DEFAULT 0,
+    via_bot INTEGER NOT NULL DEFAULT 1,
+    via_miniapp INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP,
+    bot_delivered_at TIMESTAMP
+);
+`
+	if _, err := r.db.Exec(announcementSchema); err != nil {
+		return fmt.Errorf("migrate announcements: %w", err)
+	}
+	// Older announcement tables predate node targeting and bot delivery state.
+	// CREATE TABLE IF NOT EXISTS does not add columns to those installations, so
+	// repair them before creating an index or issuing the new SELECT statements.
+	if err := r.ensureTableColumn("announcements", "node_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate announcements node_id: %w", err)
+	}
+	if err := r.ensureTableColumn("announcements", "bot_delivered_at", "TIMESTAMP"); err != nil {
+		return fmt.Errorf("migrate announcements bot_delivered_at: %w", err)
+	}
+	if _, err := r.db.Exec(`CREATE INDEX IF NOT EXISTS idx_announcements_active
+		ON announcements(via_bot, via_miniapp, bot_delivered_at, expires_at, created_at)`); err != nil {
+		return fmt.Errorf("migrate announcements index: %w", err)
+	}
+
 	// 服务器分享(联邦)相关表:必须在迁移阶段建好,因为 ListRemoteServers 会 EXISTS 查询 federated_servers。
 	if err := r.ensureSharedServersTable(context.Background()); err != nil {
 		return fmt.Errorf("migrate shared_servers: %w", err)

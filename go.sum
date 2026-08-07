@@ -91,6 +91,8 @@ github.com/go-acme/lego/v4 v4.35.2 h1:uVQg+KC/yj9R2g7Q9W5wDqhvQvxV5SMu5eqFVoN5xZ
 github.com/go-acme/lego/v4 v4.35.2/go.mod h1:pX2jN5n8OphMGY1IaMjYm5DAEzguBaKRt8AvJAgJXpc=
 github.com/go-acme/tencentclouddnspod v1.3.24 h1:uCSiOW1EJttcnOON+MVVyVDJguFL/Q4NIGkq1CrT9p8=
 github.com/go-acme/tencentclouddnspod v1.3.24/go.mod h1:RKcB2wSoZncjBA0OEFj59s1ko1XDy+ZsAtk+9uMxUF0=
+github.com/go-telegram/bot v1.21.0 h1:Va/PbGc2vBDdv57GCUEEVV6ROlHWiC6SklJY9Hvhzps=
+github.com/go-telegram/bot v1.21.0/go.mod h1:i2TRs7fXWIeaceF3z7KzsMt/he0TwkVC680mvdTFYeM=
 github.com/go-jose/go-jose/v4 v4.1.4 h1:moDMcTHmvE6Groj34emNPLs/qtYXRVcd6S7NHbHz3kA=
 github.com/go-jose/go-jose/v4 v4.1.4/go.mod h1:x4oUasVrzR7071A4TnHLGSPpNOm2a21K9Kf04k1rs08=
 github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
