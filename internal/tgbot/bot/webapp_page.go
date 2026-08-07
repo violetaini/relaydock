@@ -9,7 +9,7 @@ import (
 )
 
 // webAppPage 返回 Mini App 单页(自包含,引 Telegram WebApp SDK)。
-// __DEVPREVIEW__ 注入:仅 webapp_dev_preview=true 时允许从 ?initData= 读取(本地预览),生产为 false。
+// __DEVPREVIEW__ 注入:仅 webapp_dev_preview=true 且请求来自 loopback 时使用本地预览哨兵,生产为 false。
 // __THEME__ 注入:跟随主控「默认主题」,anime 时给 <html> 加 theme-anime 类(首屏即生效,无闪烁)。
 func (s *Service) webAppPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -234,7 +234,7 @@ function renderRegister(){
  var h='<div class="card"><div class="title">注册并绑定账号</div>';
  h+='<div class="muted" style="margin-bottom:10px">输入兑换码、设置用户名和密码,注册成功后自动绑定当前 Telegram。</div>';
  h+='<input id="r-code" class="inp" placeholder="兑换码" autocapitalize="characters">';
- h+='<input id="r-user" class="inp" placeholder="用户名(3-20 位,字母数字 _ -)">';
+ h+='<input id="r-user" class="inp" placeholder="用户名(3-20 位,字母、数字或短横线)">';
  h+='<input id="r-pwd" class="inp" type="password" placeholder="密码(6-64 位)">';
  h+='<div id="r-msg" class="warn" style="font-size:13px;min-height:18px;margin:4px 0"></div>';
  h+='<button class="btn" style="width:100%;padding:11px" onclick="__register(this)">注册并绑定</button>';
@@ -270,7 +270,7 @@ function __register(btn){
  var pwd=(document.getElementById("r-pwd").value||"");
  var msg=document.getElementById("r-msg");
  if(!code||!user||!pwd){msg.textContent="请填写邀请码、用户名和密码";return;}
- if(!/^[a-zA-Z0-9_-]{3,20}$/.test(user)){msg.textContent="用户名格式不对(3-20 位 字母数字 _ -)";return;}
+ if(!/^[a-zA-Z0-9-]{3,20}$/.test(user)){msg.textContent="用户名格式不对(3-20 位,仅字母、数字或短横线,不含下划线)";return;}
  if(pwd.length<6){msg.textContent="密码至少 6 位";return;}
  msg.textContent="";btn.disabled=true;btn.textContent="提交中...";
  fetch("/api/tg-webapp/register",{method:"POST",headers:{"Content-Type":"application/json","X-Telegram-Init-Data":window.__init},
@@ -593,9 +593,9 @@ function load(){
  setScheme();
  if(tg&&tg.onEvent)tg.onEvent("themeChanged",setScheme);
  var initData=(tg&&tg.initData)?tg.initData:"";
- // 本地浏览器预览(webapp_dev_preview=true):无真实 initData 时,优先用 ?initData= 传入的真实签名串,
- // 否则退化为哨兵值 "__devpreview__",后端以第一个 admin_tg_id 身份放行,免 Telegram 直接开发调试。
- if(!initData&&__DEVPREVIEW__){initData=new URLSearchParams(location.search).get("initData")||"__devpreview__";}
+ // 本地浏览器预览(webapp_dev_preview=true):使用固定哨兵值,后端仅对 loopback
+ // 请求放行并映射到第一个 admin_tg_id。签名 initData 永不进入 URL 或访问日志。
+ if(!initData&&__DEVPREVIEW__){initData="__devpreview__";}
  if(!initData){document.getElementById("notice").classList.remove("hide");return;}
  window.__init=initData;
  if(tg){tg.ready();tg.expand();}

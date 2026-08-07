@@ -60,9 +60,53 @@ func (r *TrafficRepository) MarkAnnouncementBotDelivered(ctx context.Context, id
 	return err
 }
 
-func (r *TrafficRepository) DeleteAnnouncement(ctx context.Context, id int64) error {
-	_, err := r.db.ExecContext(ctx, `DELETE FROM announcements WHERE id = ?`, id)
+// ListAnnouncementBotDeliveredRecipients returns recipients whose complete
+// Telegram message has already been accepted by the Bot API. The composite
+// primary key makes this durable state idempotent across poller restarts.
+func (r *TrafficRepository) ListAnnouncementBotDeliveredRecipients(ctx context.Context, id int64) (map[int64]struct{}, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT telegram_id FROM announcement_bot_deliveries WHERE announcement_id = ?`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	delivered := make(map[int64]struct{})
+	for rows.Next() {
+		var telegramID int64
+		if err := rows.Scan(&telegramID); err != nil {
+			return nil, err
+		}
+		delivered[telegramID] = struct{}{}
+	}
+	return delivered, rows.Err()
+}
+
+// MarkAnnouncementBotRecipientDelivered records one successful recipient. It
+// is intentionally idempotent so a response retry cannot create duplicates.
+func (r *TrafficRepository) MarkAnnouncementBotRecipientDelivered(ctx context.Context, id, telegramID int64) error {
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO announcement_bot_deliveries (announcement_id, telegram_id)
+		 VALUES (?, ?)
+		 ON CONFLICT(announcement_id, telegram_id) DO NOTHING`,
+		id, telegramID)
 	return err
+}
+
+func (r *TrafficRepository) DeleteAnnouncement(ctx context.Context, id int64) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM announcement_bot_deliveries WHERE announcement_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM announcements WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *TrafficRepository) queryAnnouncements(ctx context.Context, query string, args ...any) ([]Announcement, error) {

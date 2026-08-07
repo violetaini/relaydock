@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-telegram/bot"
@@ -34,25 +33,26 @@ type regSession struct {
 }
 
 var (
-	regSessions = sync.Map{} // tg_id (int64) → *regSession
-	usernameRe  = regexp.MustCompile(`^[a-zA-Z0-9_-]{3,20}$`)
-	emailRe     = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
+	usernameRe = regexp.MustCompile(`^[a-zA-Z0-9-]{3,20}$`)
+	emailRe    = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
 )
 
 // startRegistration 在 kind='new' 邀请码 + tg 未绑 + 可用 校验后调用。
 func (s *Service) startRegistration(ctx context.Context, b *bot.Bot, chatID, tgID int64, ic *mmwxclient.Invite) {
-	regSessions.Store(tgID, &regSession{
+	s.regSessionsMu.Lock()
+	s.regSessions.Store(tgID, &regSession{
 		code:      ic.Code,
 		step:      stepWaitingUsername,
 		expiresAt: time.Now().Add(regSessionTTL),
 	})
+	s.regSessionsMu.Unlock()
 	pkgLine := ""
 	if ic.PackageID != nil {
 		pkgLine = fmt.Sprintf("\n(注册后自动绑套餐 #%d)", *ic.PackageID)
 	}
 	_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: chatID,
-		Text:   fmt.Sprintf("邀请码有效,开始注册。%s\n\n请发送用户名(3-20 字符,字母数字 _ -):", pkgLine),
+		Text:   fmt.Sprintf("邀请码有效,开始注册。%s\n\n请发送用户名(3-20 字符,字母、数字或短横线,不含下划线):", pkgLine),
 	})
 }
 
@@ -64,15 +64,17 @@ func (s *Service) continueRegistration(ctx context.Context, b *bot.Bot, update *
 	tgID := update.Message.From.ID
 	chatID := update.Message.Chat.ID
 	text := strings.TrimSpace(update.Message.Text)
+	s.regSessionsMu.Lock()
+	defer s.regSessionsMu.Unlock()
 
-	raw, ok := regSessions.Load(tgID)
+	raw, ok := s.regSessions.Load(tgID)
 	if !ok {
 		return false
 	}
 	sess := raw.(*regSession)
 
 	if time.Now().After(sess.expiresAt) {
-		regSessions.Delete(tgID)
+		s.regSessions.Delete(tgID)
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID,
 			Text:   "注册对话已超时,请重新 /start <code>。",
@@ -80,7 +82,7 @@ func (s *Service) continueRegistration(ctx context.Context, b *bot.Bot, update *
 		return true
 	}
 	if strings.EqualFold(text, "/cancel") || strings.EqualFold(text, "取消") {
-		regSessions.Delete(tgID)
+		s.regSessions.Delete(tgID)
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "已取消注册。"})
 		return true
 	}
@@ -90,7 +92,7 @@ func (s *Service) continueRegistration(ctx context.Context, b *bot.Bot, update *
 		if !usernameRe.MatchString(text) {
 			_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
 				ChatID: chatID,
-				Text:   "用户名格式不对(3-20 字符,字母数字 _ -)。请重发或 /cancel:",
+				Text:   "用户名格式不对(3-20 字符,仅字母、数字或短横线,不含下划线)。请重发或 /cancel:",
 			})
 			return true
 		}
@@ -122,7 +124,7 @@ func (s *Service) continueRegistration(ctx context.Context, b *bot.Bot, update *
 func (s *Service) finishRegistration(ctx context.Context, b *bot.Bot,
 	chatID, tgID int64, tgHandle string, sess *regSession, email string) {
 
-	defer regSessions.Delete(tgID)
+	defer s.regSessions.Delete(tgID)
 
 	resp, err := s.client.Bind(ctx, mmwxclient.BindRequest{
 		Code:           sess.code,

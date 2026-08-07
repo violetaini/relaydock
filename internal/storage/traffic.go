@@ -2971,6 +2971,18 @@ CREATE TABLE IF NOT EXISTS announcements (
 	if err := r.ensureTableColumn("announcements", "bot_delivered_at", "TIMESTAMP"); err != nil {
 		return fmt.Errorf("migrate announcements bot_delivered_at: %w", err)
 	}
+	const announcementBotDeliverySchema = `
+CREATE TABLE IF NOT EXISTS announcement_bot_deliveries (
+    announcement_id INTEGER NOT NULL,
+    telegram_id INTEGER NOT NULL,
+    delivered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (announcement_id, telegram_id),
+    FOREIGN KEY (announcement_id) REFERENCES announcements(id) ON DELETE CASCADE
+);
+`
+	if _, err := r.db.Exec(announcementBotDeliverySchema); err != nil {
+		return fmt.Errorf("migrate announcement_bot_deliveries: %w", err)
+	}
 	if _, err := r.db.Exec(`CREATE INDEX IF NOT EXISTS idx_announcements_active
 		ON announcements(via_bot, via_miniapp, bot_delivered_at, expires_at, created_at)`); err != nil {
 		return fmt.Errorf("migrate announcements index: %w", err)

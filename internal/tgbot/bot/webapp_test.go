@@ -85,6 +85,33 @@ func TestValidateInitDataRejectsDuplicateHash(t *testing.T) {
 	}
 }
 
+func TestWebAppMeRejectsInitDataInQueryString(t *testing.T) {
+	data := signedTestInitData(t, testUnixSeconds(time.Now()))
+	service := &Service{cfg: config.Config{TGBotToken: testBotToken}}
+	r := httptest.NewRequest(http.MethodGet, "/api/tg-webapp/me?initData="+url.QueryEscape(data), nil)
+	recorder := httptest.NewRecorder()
+
+	service.webAppMe(recorder, r)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+	if strings.Contains(webAppHTML, "URLSearchParams(location.search)") {
+		t.Fatal("Mini App still imports signed initData from the URL")
+	}
+}
+
+func TestRegistrationUsernameRuleMatchesMaster(t *testing.T) {
+	if usernameRe.MatchString("user_name") {
+		t.Fatal("Bot accepted an underscore that the master rejects")
+	}
+	if !usernameRe.MatchString("user-name") {
+		t.Fatal("Bot rejected a valid master username")
+	}
+	if strings.Contains(webAppHTML, "a-zA-Z0-9_-") {
+		t.Fatal("Mini App still accepts underscores in usernames")
+	}
+}
+
 func TestDevPreviewRequiresLoopbackPeerAndHost(t *testing.T) {
 	service := &Service{cfg: config.Config{
 		TGBotToken:       testBotToken,

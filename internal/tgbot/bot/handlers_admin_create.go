@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-telegram/bot"
@@ -25,8 +24,6 @@ import (
 //	iv:x                取消
 //
 // 仅 kind=bind 需要文字输入(用户名),用下面这个带 TTL 的 session。
-var adminInviteSessions = sync.Map{} // tgID(int64) → *inviteCreateSession
-
 type inviteCreateSession struct {
 	expiresAt time.Time
 }
@@ -93,8 +90,10 @@ func (s *Service) handleInviteCallback(ctx context.Context, b *bot.Bot, update *
 		case "new":
 			s.showPackageButtons(ctx, b, chatID, msgID)
 		case "bind":
-			adminInviteSessions.Store(cq.From.ID, &inviteCreateSession{expiresAt: time.Now().Add(10 * time.Minute)})
-			s.editText(ctx, b, chatID, msgID, "请发送要绑定的已有账号用户名(3-20 字符,字母数字 _ -),或发送 /cancel 取消:")
+			s.adminInviteSessionsMu.Lock()
+			s.adminInviteSessions.Store(cq.From.ID, &inviteCreateSession{expiresAt: time.Now().Add(10 * time.Minute)})
+			s.adminInviteSessionsMu.Unlock()
+			s.editText(ctx, b, chatID, msgID, "请发送要绑定的已有账号完整用户名,或发送 /cancel 取消:")
 		}
 
 	case "p":
@@ -189,33 +188,35 @@ func (s *Service) continueInviteCreate(ctx context.Context, b *bot.Bot, update *
 	}
 	tgID := update.Message.From.ID
 	chatID := update.Message.Chat.ID
+	s.adminInviteSessionsMu.Lock()
+	defer s.adminInviteSessionsMu.Unlock()
 
-	raw, ok := adminInviteSessions.Load(tgID)
+	raw, ok := s.adminInviteSessions.Load(tgID)
 	if !ok {
 		return false
 	}
 	sess := raw.(*inviteCreateSession)
 	if time.Now().After(sess.expiresAt) {
-		adminInviteSessions.Delete(tgID)
+		s.adminInviteSessions.Delete(tgID)
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "创建对话已超时,请重新 /admin_invite create。"})
 		return true
 	}
 
 	text := strings.TrimSpace(update.Message.Text)
 	if strings.EqualFold(text, "/cancel") || strings.EqualFold(text, "取消") {
-		adminInviteSessions.Delete(tgID)
+		s.adminInviteSessions.Delete(tgID)
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "已取消创建邀请码。"})
 		return true
 	}
-	if !usernameRe.MatchString(text) {
+	if text == "" || len(text) > 128 {
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID,
-			Text:   "用户名格式不对(3-20 字符,字母数字 _ -)。请重发或 /cancel:",
+			Text:   "用户名格式不对。请发送完整用户名或 /cancel:",
 		})
 		return true
 	}
 
-	defer adminInviteSessions.Delete(tgID)
+	defer s.adminInviteSessions.Delete(tgID)
 	code, err := s.client.CreateInvite(ctx, mmwxclient.CreateInviteRequest{
 		Kind: "bind", BindUsername: text, MaxUses: 1,
 	})

@@ -60,6 +60,12 @@ func TestAnnouncementMigrationRepairsLegacySchema(t *testing.T) {
 	if !columns["node_id"] || !columns["bot_delivered_at"] {
 		t.Fatalf("repaired columns = %v", columns)
 	}
+	var deliveryTable string
+	if err := repo.db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'announcement_bot_deliveries'`,
+	).Scan(&deliveryTable); err != nil {
+		t.Fatalf("delivery table migration: %v", err)
+	}
 
 	id, err := repo.CreateAnnouncement(context.Background(), Announcement{
 		Type: "general", Body: "maintenance", ViaBot: true, ViaMiniapp: true,
@@ -73,5 +79,69 @@ func TestAnnouncementMigrationRepairsLegacySchema(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].ID != id || items[0].NodeID != 0 {
 		t.Fatalf("pending announcements = %+v", items)
+	}
+}
+
+func TestAnnouncementBotRecipientDeliveryIsDurableAndIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recipient-delivery.db")
+	repo, err := NewTrafficRepository(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	id, err := repo.CreateAnnouncement(ctx, Announcement{
+		Type: "general", Body: "maintenance", ViaBot: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := repo.MarkAnnouncementBotRecipientDelivered(ctx, id, 1001); err != nil {
+			t.Fatalf("mark recipient attempt %d: %v", i+1, err)
+		}
+	}
+	if err := repo.MarkAnnouncementBotRecipientDelivered(ctx, id, 1002); err != nil {
+		t.Fatal(err)
+	}
+
+	delivered, err := repo.ListAnnouncementBotDeliveredRecipients(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(delivered) != 2 {
+		t.Fatalf("delivered recipients = %v, want 2 unique rows", delivered)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, err = NewTrafficRepository(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	delivered, err = repo.ListAnnouncementBotDeliveredRecipients(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := delivered[1001]; !ok {
+		t.Fatalf("recipient delivery did not survive reopen: %v", delivered)
+	}
+	if _, ok := delivered[1002]; !ok {
+		t.Fatalf("recipient delivery did not survive reopen: %v", delivered)
+	}
+
+	if err := repo.DeleteAnnouncement(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := repo.db.QueryRow(
+		`SELECT COUNT(*) FROM announcement_bot_deliveries WHERE announcement_id = ?`, id,
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("delivery rows after announcement delete = %d", count)
 	}
 }

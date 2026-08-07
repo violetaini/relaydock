@@ -200,9 +200,6 @@ func remoteIP(remoteAddr string) net.IP {
 // webAppMe 校验 initData → 反查账号 → 聚合账号/流量/节点/订阅。
 func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 	initData := r.Header.Get("X-Telegram-Init-Data")
-	if initData == "" {
-		initData = r.URL.Query().Get("initData")
-	}
 	tgID, handle, err := s.validateRequestInitData(r, initData)
 	if err != nil {
 		writeJSONResp(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
@@ -569,7 +566,7 @@ func (s *Service) webAppAdminInvites(w http.ResponseWriter, r *http.Request) {
 		"packages":        pkgs,
 		"redeem_template": tpl,
 		"master_url":      s.cfg.PublicBaseURL,
-		"bot_url":         s.botURL(),
+		"bot_url":         s.BotURL(),
 	})
 }
 

@@ -26,6 +26,11 @@ type Service struct {
 	webHandler  http.Handler
 	botUsername string // 由 getMe 获取,用于兑换码文案的 {机器人地址} = https://t.me/<botUsername>
 
+	regSessionsMu         sync.Mutex
+	regSessions           sync.Map
+	adminInviteSessionsMu sync.Mutex
+	adminInviteSessions   sync.Map
+
 	// Mini App 主题跟随主控「默认主题」的 60s 缓存(见 cachedDefaultTheme)
 	themeMu  sync.Mutex
 	themeVal string
@@ -37,19 +42,14 @@ type Service struct {
 	brandExp time.Time
 }
 
-// botURL 返回机器人的 t.me 链接;拿不到 username 时返回空串。
-func (s *Service) botURL() string {
-	if s.botUsername == "" {
-		return ""
-	}
-	return "https://t.me/" + s.botUsername
-}
-
 // BotURL 返回 getMe 探测到的机器人公开地址。
 func (s *Service) BotURL() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.botURL()
+	if s.botUsername == "" {
+		return ""
+	}
+	return "https://t.me/" + s.botUsername
 }
 
 func New(cfg config.Config, client *mmwxclient.Client) *Service {
@@ -62,7 +62,12 @@ func (s *Service) Start(parent context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	b, err := bot.New(s.cfg.TGBotToken, bot.WithDefaultHandler(s.defaultHandler))
+	b, err := bot.New(
+		s.cfg.TGBotToken,
+		bot.WithDefaultHandler(s.defaultHandler),
+		bot.WithSkipGetMe(),
+		bot.WithNotAsyncHandlers(),
+	)
 	if err != nil {
 		return errors.New("Telegram Bot 配置无效")
 	}
@@ -82,14 +87,22 @@ func (s *Service) Start(parent context.Context) error {
 		return errors.New("Telegram Bot getMe 未返回用户名")
 	}
 	ctx, cancel := context.WithCancel(parent)
+	setupCtx, setupCancel := context.WithTimeout(ctx, 10*time.Second)
+	if err := s.setMyCommands(setupCtx, b); err != nil {
+		setupCancel()
+		cancel()
+		return errors.New("Telegram Bot 命令菜单配置失败")
+	}
+	if err := s.setMenuButton(setupCtx, b); err != nil {
+		setupCancel()
+		cancel()
+		return errors.New("Telegram Mini App 菜单配置失败")
+	}
+	setupCancel()
+
 	s.b = b
 	s.cancel = cancel
 	s.botUsername = me.Username
-
-	setupCtx, setupCancel := context.WithTimeout(ctx, 10*time.Second)
-	s.setMyCommands(setupCtx, b)
-	s.setMenuButton(setupCtx, b)
-	setupCancel()
 
 	pollDone := make(chan struct{})
 	s.pollDone = pollDone
@@ -105,17 +118,18 @@ func (s *Service) Start(parent context.Context) error {
 }
 
 // setMenuButton 把主控内置的 Mini App 地址设为聊天菜单按钮。
-func (s *Service) setMenuButton(ctx context.Context, b *bot.Bot) {
+func (s *Service) setMenuButton(ctx context.Context, b *bot.Bot) error {
 	if s.cfg.WebAppURL == "" {
-		return
+		return nil
 	}
-	_, _ = b.SetChatMenuButton(ctx, &bot.SetChatMenuButtonParams{
+	_, err := b.SetChatMenuButton(ctx, &bot.SetChatMenuButtonParams{
 		MenuButton: &models.MenuButtonWebApp{
 			Type:   models.MenuButtonTypeWebApp,
 			Text:   "📊 我的面板",
 			WebApp: models.WebAppInfo{URL: s.cfg.WebAppURL},
 		},
 	})
+	return err
 }
 
 func (s *Service) Stop() {

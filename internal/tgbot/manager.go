@@ -163,19 +163,12 @@ func (m *Manager) restartLocked(parent context.Context) error {
 }
 
 func (m *Manager) startService(parent context.Context, s Settings) (*bot.Service, context.CancelFunc, string, error) {
-	adminUsername := ""
-	users, err := m.repo.ListUsers(parent, 1000)
+	adminUsername, err := m.repo.FindActiveAdminUsername(parent)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	for _, user := range users {
-		if user.Role == storage.RoleAdmin {
-			adminUsername = user.Username
-			break
-		}
-	}
 	if adminUsername == "" {
-		return nil, nil, "", errors.New("未找到管理员账号")
+		return nil, nil, "", errors.New("未找到已启用的管理员账号")
 	}
 	token, _, err := m.tokens.IssueWithTTL(adminUsername, 365*24*time.Hour)
 	if err != nil {
@@ -201,7 +194,7 @@ func (m *Manager) startService(parent context.Context, s Settings) (*bot.Service
 		return nil, nil, "", err
 	}
 	botURL := service.BotURL()
-	stop := func() { service.Stop(); m.tokens.Revoke(token) }
+	stop := func() { cancel(); service.Stop(); m.tokens.Revoke(token) }
 	return service, stop, botURL, nil
 }
 

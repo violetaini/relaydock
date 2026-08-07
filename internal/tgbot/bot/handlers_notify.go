@@ -151,37 +151,85 @@ func (s *Service) broadcastPendingAnnouncements(ctx context.Context, b *bot.Bot)
 		log.Printf("[announce] 拉取待推送公告失败: %v", err)
 		return
 	}
+	broadcastAnnouncements(ctx, items,
+		func(ctx context.Context, telegramID int64, text string) error {
+			_, err := b.SendMessage(ctx, &bot.SendMessageParams{ChatID: telegramID, Text: text})
+			return err
+		},
+		s.client.MarkAnnouncementRecipientDelivered,
+		s.client.MarkAnnouncementDelivered,
+	)
+}
+
+type announcementSendFunc func(context.Context, int64, string) error
+type announcementRecipientDeliveredFunc func(context.Context, int64, int64) error
+type announcementDeliveredFunc func(context.Context, int64) error
+
+func broadcastAnnouncements(
+	ctx context.Context,
+	items []mmwxclient.Announcement,
+	send announcementSendFunc,
+	markRecipientDelivered announcementRecipientDeliveredFunc,
+	markDelivered announcementDeliveredFunc,
+) {
 	for _, a := range items {
+		if ctx.Err() != nil {
+			return
+		}
 		parts := splitTelegramMessage(formatAnnouncement(a.Title, a.Body), telegramMessageMaxRunes)
 		sent := 0
-		allSent := true
+		hadFailure := false
 		for _, tgID := range a.Recipients { // 收件人已由主控按「有套餐 + 节点归属」定向筛好
+			if ctx.Err() != nil {
+				return
+			}
 			if tgID == 0 {
 				continue
 			}
+			recipientSent := true
 			for _, part := range parts {
-				if _, err := b.SendMessage(ctx, &bot.SendMessageParams{ChatID: tgID, Text: part}); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := send(ctx, tgID, part); err != nil {
+					if ctx.Err() != nil {
+						return
+					}
 					log.Printf("[announce] 公告 #%d 向 TG %d 推送失败: %v", a.ID, tgID, err)
-					allSent = false
+					recipientSent = false
+					hadFailure = true
 					break
 				}
 			}
-			if !allSent {
-				break
+			if !recipientSent {
+				continue
+			}
+			if err := markRecipientDelivered(ctx, a.ID, tgID); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[announce] 回填公告 %d 收件人 TG %d 投递状态失败: %v", a.ID, tgID, err)
+				hadFailure = true
+				continue
 			}
 			sent++
 			if !waitForContext(ctx, 50*time.Millisecond) { // 限速 ~20 msg/s,避免 Telegram 429
 				return
 			}
 		}
-		if !allSent {
-			// 保留 pending 状态,让瞬时 Telegram 故障在下一轮重试。
-			return
+		if hadFailure {
+			// 每个成功收件人均已独立记账；失败收件人留在下一轮 pending
+			// 中，但不能阻塞同批次后面的公告。
+			continue
 		}
-		// 仅全部收件人发送成功后回填,避免把未投递公告永久吞掉。
-		if err := s.client.MarkAnnouncementDelivered(ctx, a.ID); err != nil {
+		// 所有当前待投递收件人均完成后回填整条公告；若回填失败，
+		// 下一轮 pending 会返回空收件人，不会重发已记账的用户。
+		if err := markDelivered(ctx, a.ID); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("[announce] 回填公告 %d 投递状态失败: %v", a.ID, err)
-			return
+			continue
 		}
 		log.Printf("[announce] 公告 #%d 已推送 %d 个用户", a.ID, sent)
 	}

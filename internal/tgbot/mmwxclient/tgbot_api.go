@@ -454,7 +454,14 @@ func (c *Client) PendingAnnouncements(ctx context.Context) ([]Announcement, erro
 	return out.Announcements, nil
 }
 
-// MarkAnnouncementDelivered 标记公告已由 bot 推送(避免重复发)。
+// MarkAnnouncementRecipientDelivered 持久化单个收件人的成功投递，确保其他
+// 收件人失败或 Bot 重启时不会向已成功的用户重复发送。
+func (c *Client) MarkAnnouncementRecipientDelivered(ctx context.Context, id, telegramID int64) error {
+	return c.post(ctx, "/api/admin/tgbot/announcements/delivered",
+		map[string]any{"id": id, "telegram_id": telegramID}, nil)
+}
+
+// MarkAnnouncementDelivered 标记整条公告的 Bot 广播已经收尾。
 func (c *Client) MarkAnnouncementDelivered(ctx context.Context, id int64) error {
 	return c.post(ctx, "/api/admin/tgbot/announcements/delivered", map[string]any{"id": id}, nil)
 }

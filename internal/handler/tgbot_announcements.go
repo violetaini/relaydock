@@ -34,8 +34,16 @@ func (h *TGBotAPIHandler) announcementsPending(w http.ResponseWriter, r *http.Re
 	}
 	packageNodes := make(map[int64]map[int64]struct{})
 	for _, item := range items {
+		delivered, err := h.repo.ListAnnouncementBotDeliveredRecipients(ctx, item.ID)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		recipients := make([]int64, 0, len(users))
 		for _, user := range users {
+			if _, ok := delivered[user.TelegramID]; ok {
+				continue
+			}
 			if item.NodeID != 0 {
 				nodes, ok := packageNodes[user.PackageID]
 				if !ok {
@@ -62,13 +70,22 @@ func (h *TGBotAPIHandler) announcementsPending(w http.ResponseWriter, r *http.Re
 
 func (h *TGBotAPIHandler) announcementDelivered(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		ID int64 `json:"id"`
+		ID         int64 `json:"id"`
+		TelegramID int64 `json:"telegram_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.ID <= 0 {
 		writeJSONError(w, http.StatusBadRequest, "invalid id")
 		return
 	}
-	if err := h.repo.MarkAnnouncementBotDelivered(r.Context(), request.ID); err != nil {
+	var err error
+	if request.TelegramID != 0 {
+		err = h.repo.MarkAnnouncementBotRecipientDelivered(r.Context(), request.ID, request.TelegramID)
+	} else {
+		// Keep accepting the original announcement-only request so an older
+		// in-process bot can finish work during an atomic binary rollout.
+		err = h.repo.MarkAnnouncementBotDelivered(r.Context(), request.ID)
+	}
+	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

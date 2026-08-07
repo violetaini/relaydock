@@ -1298,9 +1298,6 @@ func main() {
 	}
 
 	collectorCtx, stopCollector := context.WithCancel(context.Background())
-	if err := tgBotManager.Restart(collectorCtx); err != nil {
-		logger.Error("内置 Telegram Bot 启动失败", "error", err.Error())
-	}
 	defer tgBotManager.Stop()
 
 	trafficCollector.OnServerOffline = handler.SendServerOfflineNotification
@@ -1429,6 +1426,11 @@ func main() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("HTTP服务器运行失败", "error", err)
 			os.Exit(1)
+		}
+	}()
+	go func() {
+		if err := tgBotManager.Restart(collectorCtx); err != nil {
+			logger.Error("内置 Telegram Bot 启动失败", "error", err.Error())
 		}
 	}()
 

@@ -28,7 +28,7 @@ func registerCommands(b *bot.Bot, s *Service) {
 
 // setMyCommands 注册 Telegram 命令菜单(输入 / 时弹出提示)。
 // 默认作用域给所有用户看普通命令;管理员的私聊额外追加 admin 命令。
-func (s *Service) setMyCommands(ctx context.Context, b *bot.Bot) {
+func (s *Service) setMyCommands(ctx context.Context, b *bot.Bot) error {
 	userCmds := []models.BotCommand{
 		{Command: "start", Description: "用邀请码注册或绑定账号"},
 		{Command: "me", Description: "我的账号信息"},
@@ -39,10 +39,12 @@ func (s *Service) setMyCommands(ctx context.Context, b *bot.Bot) {
 		{Command: "unbind", Description: "解绑 TG"},
 		{Command: "help", Description: "帮助"},
 	}
-	_, _ = b.SetMyCommands(ctx, &bot.SetMyCommandsParams{
+	if _, err := b.SetMyCommands(ctx, &bot.SetMyCommandsParams{
 		Commands: userCmds,
 		Scope:    &models.BotCommandScopeDefault{},
-	})
+	}); err != nil {
+		return err
+	}
 
 	adminCmds := append(append([]models.BotCommand{}, userCmds...),
 		models.BotCommand{Command: "admin_invite", Description: "邀请码 list/create/revoke"},
@@ -50,11 +52,14 @@ func (s *Service) setMyCommands(ctx context.Context, b *bot.Bot) {
 		models.BotCommand{Command: "announce", Description: "发布公告(广播给所有用户)"},
 	)
 	for _, id := range s.cfg.AdminTGIDs {
-		_, _ = b.SetMyCommands(ctx, &bot.SetMyCommandsParams{
+		if _, err := b.SetMyCommands(ctx, &bot.SetMyCommandsParams{
 			Commands: adminCmds,
 			Scope:    &models.BotCommandScopeChat{ChatID: id},
-		})
+		}); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // defaultHandler 处理未注册的消息(多步对话状态机入口)。
