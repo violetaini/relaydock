@@ -1195,7 +1195,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     token TEXT PRIMARY KEY,
     username TEXT NOT NULL,
     expires_at TIMESTAMP NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    auth_epoch INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions(username);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
@@ -1203,6 +1204,15 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
 
 	if _, err := r.db.Exec(sessionSchema); err != nil {
 		return fmt.Errorf("migrate sessions: %w", err)
+	}
+	if err := r.ensureTableColumn("sessions", "auth_epoch", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return fmt.Errorf("migrate sessions.auth_epoch: %w", err)
+	}
+	// Sessions created before credential/session revocation was made atomic may
+	// survive a password change. Epoch 1 is also the column default so a brief
+	// rollback to an older binary cannot mint sessions that a later upgrade trusts.
+	if _, err := r.db.Exec(`DELETE FROM sessions WHERE auth_epoch < ?`, currentAuthSessionEpoch); err != nil {
+		return fmt.Errorf("revoke legacy sessions: %w", err)
 	}
 
 	const userSchema = `
@@ -5896,6 +5906,8 @@ type Session struct {
 	CreatedAt time.Time
 }
 
+const currentAuthSessionEpoch = 2
+
 // 将新会话保存到数据库。
 func (r *TrafficRepository) CreateSession(ctx context.Context, token, username string, expiresAt time.Time) error {
 	if r == nil || r.db == nil {
@@ -5911,11 +5923,11 @@ func (r *TrafficRepository) CreateSession(ctx context.Context, token, username s
 		return errors.New("username is required")
 	}
 
-	const stmt = `INSERT INTO sessions (token, username, expires_at)
-		SELECT ?, ?, ? WHERE EXISTS (
+	const stmt = `INSERT INTO sessions (token, username, expires_at, auth_epoch)
+		SELECT ?, ?, ?, ? WHERE EXISTS (
 			SELECT 1 FROM users WHERE username = ? AND is_active = 1
 		)`
-	result, err := r.db.ExecContext(ctx, stmt, token, username, expiresAt, username)
+	result, err := r.db.ExecContext(ctx, stmt, token, username, expiresAt, currentAuthSessionEpoch, username)
 	if err != nil {
 		return fmt.Errorf("create session: %w", err)
 	}
@@ -6020,8 +6032,9 @@ func (r *TrafficRepository) LoadSessions(ctx context.Context) ([]Session, error)
 		return nil, errors.New("traffic repository not initialized")
 	}
 
-	const stmt = `SELECT token, username, expires_at, created_at FROM sessions WHERE expires_at > datetime('now') ORDER BY created_at ASC`
-	rows, err := r.db.QueryContext(ctx, stmt)
+	const stmt = `SELECT token, username, expires_at, created_at FROM sessions
+		WHERE expires_at > datetime('now') AND auth_epoch = ? ORDER BY created_at ASC`
+	rows, err := r.db.QueryContext(ctx, stmt, currentAuthSessionEpoch)
 	if err != nil {
 		return nil, fmt.Errorf("load sessions: %w", err)
 	}
