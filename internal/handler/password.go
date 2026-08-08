@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/storage"
 )
 
 type changePasswordRequest struct {
@@ -14,8 +15,8 @@ type changePasswordRequest struct {
 	NewPassword     string `json:"new_password"`
 }
 
-func NewPasswordHandler(manager *auth.Manager) http.Handler {
-	if manager == nil {
+func NewPasswordHandler(manager *auth.Manager, tokens *auth.TokenStore, repo *storage.TrafficRepository, twoFactorStore *auth.TwoFactorPendingStore) http.Handler {
+	if manager == nil || tokens == nil || repo == nil {
 		panic("password handler requires manager")
 	}
 
@@ -50,11 +51,15 @@ func NewPasswordHandler(manager *auth.Manager) http.Handler {
 		}
 
 		// 使用当前密码进行身份验证并更新为新密码
-		if err := manager.ChangePassword(r.Context(), username, current, newPassword); err != nil {
+		if err := manager.ChangePasswordAndRun(r.Context(), username, current, newPassword, func() {
+			tokens.RevokeUser(username)
+			if twoFactorStore != nil {
+				twoFactorStore.RevokeUser(username)
+			}
+		}); err != nil {
 			writeError(w, http.StatusBadRequest, errors.New("current password is incorrect or update failed"))
 			return
 		}
-
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "password_updated"})

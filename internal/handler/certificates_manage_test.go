@@ -140,7 +140,7 @@ func TestUpdateDNSProviderPreservesStoredCredentialsForEmptyObject(t *testing.T)
 	handler := NewCertificateHandler(repo, nil)
 	body := []byte(`{"name":"Cloudflare new name","provider_type":"cloudflare","credentials":"{}"}`)
 	request := httptest.NewRequest(http.MethodPut, "/api/admin/dns-providers/"+strconv.FormatInt(provider.ID, 10), bytes.NewReader(body))
-	request = request.WithContext(auth.ContextWithUsername(request.Context(), "api-token-admin"))
+	request = request.WithContext(auth.ContextWithGlobalAPIToken(request.Context()))
 	response := httptest.NewRecorder()
 	handler.UpdateDNSProvider(response, request)
 	if response.Code != http.StatusOK {
@@ -178,7 +178,7 @@ func TestUpdateCertificateRejectsIssuedDomainMetadataChange(t *testing.T) {
 
 	body := []byte(`{"domain":"other.example.com","email":"admin@example.com","provider":"letsencrypt","challenge_mode":"standalone","deploy_target":"none"}`)
 	request := httptest.NewRequest(http.MethodPut, "/api/admin/certificates/"+strconv.FormatInt(cert.ID, 10), bytes.NewReader(body))
-	request = request.WithContext(auth.ContextWithUsername(request.Context(), "api-token-admin"))
+	request = request.WithContext(auth.ContextWithGlobalAPIToken(request.Context()))
 	response := httptest.NewRecorder()
 	NewCertificateHandler(repo, nil).GetCertificate(response, request)
 	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "不能修改域名") {
@@ -223,7 +223,7 @@ func TestUpdateFailedCertificateChangesDNSProviderForRetry(t *testing.T) {
 
 	body := []byte(`{"domain":"retry.example.com","email":"admin@example.com","provider":"letsencrypt","challenge_mode":"dns","dns_provider_id":` + strconv.FormatInt(second.ID, 10) + `,"deploy_target":"none","auto_renew":true}`)
 	request := httptest.NewRequest(http.MethodPut, "/api/admin/certificates/"+strconv.FormatInt(cert.ID, 10), bytes.NewReader(body))
-	request = request.WithContext(auth.ContextWithUsername(request.Context(), "api-token-admin"))
+	request = request.WithContext(auth.ContextWithGlobalAPIToken(request.Context()))
 	response := httptest.NewRecorder()
 	NewCertificateHandler(repo, nil).GetCertificate(response, request)
 	if response.Code != http.StatusOK {
@@ -260,7 +260,7 @@ func TestUpdateManualWildcardCertificateDeploymentWithoutEmail(t *testing.T) {
 
 	body := []byte(`{"domain":"*.manual.example.com","email":"","provider":"manual","challenge_mode":"manual","deploy_target":"nginx","deploy_cert_path":"/etc/nginx/manual.pem","deploy_key_path":"/etc/nginx/manual.key","auto_deploy":true}`)
 	request := httptest.NewRequest(http.MethodPut, "/api/admin/certificates/"+strconv.FormatInt(cert.ID, 10), bytes.NewReader(body))
-	request = request.WithContext(auth.ContextWithUsername(request.Context(), "api-token-admin"))
+	request = request.WithContext(auth.ContextWithGlobalAPIToken(request.Context()))
 	response := httptest.NewRecorder()
 	NewCertificateHandler(repo, nil).GetCertificate(response, request)
 	if response.Code != http.StatusOK {

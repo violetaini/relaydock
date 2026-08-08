@@ -876,6 +876,12 @@ func (h *subscribeFilesHandler) handleDelete(w http.ResponseWriter, r *http.Requ
 }
 
 func (h *subscribeFilesHandler) handleReorder(w http.ResponseWriter, r *http.Request) {
+	username := auth.UsernameFromContext(r.Context())
+	if !userIsAdmin(r.Context(), h.repo, username) {
+		writeError(w, http.StatusForbidden, errors.New("只有管理员可以调整全局订阅排序"))
+		return
+	}
+
 	var req struct {
 		IDs []int64 `json:"ids"`
 	}
@@ -1693,6 +1699,12 @@ func (h *subscribeFilesHandler) initializeCustomRuleApplications(ctx context.Con
 // handleGetSubscriptionUsers GET /api/admin/subscribe-files/{id}/users
 // 返回该订阅文件分配给哪些用户 + 各自的 user_short_code / custom_user_short_code。
 func (h *subscribeFilesHandler) handleGetSubscriptionUsers(w http.ResponseWriter, r *http.Request, idStr string) {
+	username := auth.UsernameFromContext(r.Context())
+	if !userIsAdmin(r.Context(), h.repo, username) {
+		writeError(w, http.StatusForbidden, errors.New("只有管理员可以查看订阅用户"))
+		return
+	}
+
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		writeBadRequest(w, "invalid subscription file ID")

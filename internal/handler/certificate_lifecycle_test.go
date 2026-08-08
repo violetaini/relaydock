@@ -158,7 +158,7 @@ func TestRenewCertificateRejectsDuplicateOperation(t *testing.T) {
 	defer h.finishRenewal(cert.ID)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/certificates/renew", bytes.NewBufferString(`{"id":`+itoa64(cert.ID)+`}`))
-	req = req.WithContext(auth.ContextWithUsername(req.Context(), "api-token-admin"))
+	req = req.WithContext(auth.ContextWithGlobalAPIToken(req.Context()))
 	resp := httptest.NewRecorder()
 	h.RenewCertificate(resp, req)
 	if resp.Code != http.StatusConflict || !strings.Contains(resp.Body.String(), "重复提交") {
@@ -181,7 +181,7 @@ func TestManualCertificateDeployReportsReloadFailureAndKeepsSettings(t *testing.
 	})
 	body := `{"id":` + itoa64(cert.ID) + `,"deploy_target":"xray","deploy_cert_path":"/tmp/new.pem","deploy_key_path":"/tmp/new.key"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/certificates/deploy", bytes.NewBufferString(body))
-	req = req.WithContext(auth.ContextWithUsername(req.Context(), "api-token-admin"))
+	req = req.WithContext(auth.ContextWithGlobalAPIToken(req.Context()))
 	resp := httptest.NewRecorder()
 	h.DeployCertificate(resp, req)
 	if resp.Code != http.StatusBadGateway || !strings.Contains(resp.Body.String(), "已恢复旧证书") {
@@ -203,7 +203,7 @@ func TestCreateCertificateRejectsInvalidRequestBeforeBackgroundOperation(t *test
 		"domain":"*.example.test","email":"admin@example.test","provider":"letsencrypt",
 		"challenge_mode":"standalone","auto_renew":true
 	}`))
-	req = req.WithContext(auth.ContextWithUsername(req.Context(), "api-token-admin"))
+	req = req.WithContext(auth.ContextWithGlobalAPIToken(req.Context()))
 	resp := httptest.NewRecorder()
 	h.CreateCertificate(resp, req)
 	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "DNS-01") {
@@ -236,7 +236,7 @@ func TestCreateCertificateReservesIssuanceOperation(t *testing.T) {
 		"domain":"guarded-issue.example.test","email":"admin@example.test",
 		"provider":"letsencrypt-staging","challenge_mode":"standalone"
 	}`))
-	createReq = createReq.WithContext(auth.ContextWithUsername(createReq.Context(), "api-token-admin"))
+	createReq = createReq.WithContext(auth.ContextWithGlobalAPIToken(createReq.Context()))
 	createResp := httptest.NewRecorder()
 	h.CreateCertificate(createResp, createReq)
 	if createResp.Code != http.StatusAccepted {
@@ -255,7 +255,7 @@ func TestCreateCertificateReservesIssuanceOperation(t *testing.T) {
 		t.Fatalf("ListCertificates: certs=%#v err=%v", certs, err)
 	}
 	renewReq := httptest.NewRequest(http.MethodPost, "/api/admin/certificates/renew", bytes.NewBufferString(`{"id":`+itoa64(certs[0].ID)+`}`))
-	renewReq = renewReq.WithContext(auth.ContextWithUsername(renewReq.Context(), "api-token-admin"))
+	renewReq = renewReq.WithContext(auth.ContextWithGlobalAPIToken(renewReq.Context()))
 	renewResp := httptest.NewRecorder()
 	h.RenewCertificate(renewResp, renewReq)
 	if renewResp.Code != http.StatusConflict {

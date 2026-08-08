@@ -56,6 +56,37 @@ type ServerConfig struct {
 	ChildAPIToken  string `yaml:"child_api_token"` // 用于子 API 身份验证的令牌
 }
 
+func isLongLivedRequestPath(requestPath string) bool {
+	switch requestPath {
+	case "/mcp",
+		"/api/admin/update/apply-sse",
+		"/api/admin/remote/xray/install-stream",
+		"/api/admin/remote/xray/remove-stream",
+		"/api/admin/remote/nginx/install-stream",
+		"/api/admin/remote/nginx/remove-stream",
+		"/api/admin/remote/agent/upgrade-stream",
+		"/api/admin/remote/agent/uninstall-stream",
+		"/api/ws/dashboard",
+		"/api/public/probe-ws",
+		"/api/remote/ws",
+		"/api/speedtest/tester/ws":
+		return true
+	default:
+		return false
+	}
+}
+
+func withLongLivedRequestDeadlines(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isLongLivedRequestPath(r.URL.Path) {
+			controller := http.NewResponseController(w)
+			_ = controller.SetReadDeadline(time.Time{})
+			_ = controller.SetWriteDeadline(time.Time{})
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // 从 YAML 文件加载配置
 func loadConfig(path string) (*ServerConfig, error) {
 	data, err := os.ReadFile(path)
@@ -135,6 +166,17 @@ func main() {
 		select {}
 	}
 	initTimezone()
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		logger.Error("无法确定工作目录", "error", err)
+		os.Exit(1)
+	}
+	if restored, restoreErr := handler.ApplyPendingBackupRestore(workingDirectory); restoreErr != nil {
+		logger.Error("启动前应用备份恢复失败，已保留原数据", "error", restoreErr)
+		os.Exit(1)
+	} else if restored {
+		logger.Info("已在启动前原子应用待恢复备份")
+	}
 	logger.Info("RelayDock 服务器启动中", "version", version.Version)
 
 	dataDirectory, err := runtimepaths.DataDirectory()
@@ -194,6 +236,9 @@ func main() {
 	}
 
 	tokenStore := auth.NewTokenStore(24 * time.Hour)
+	// Storage owns the atomic DB lifecycle transition; connect its post-commit
+	// hook immediately so every disable/delete caller also revokes service tokens.
+	repo.SetSessionRevoker(tokenStore.RevokeAllForUser)
 	if jwtSecret := os.Getenv("JWT_SECRET"); jwtSecret != "" {
 		tokenStore.SetSecret(jwtSecret)
 		logger.Info("JWT_SECRET 已配置，会话令牌将使用 HMAC 签名")
@@ -355,11 +400,9 @@ func main() {
 	})
 
 	mux.Handle("/api/login", handler.NewLoginHandler(authManager, tokenStore, repo, loginRateLimiter, twoFactorStore, turnstileVerifier))
-	mux.Handle("/api/login/2fa", handler.NewTwoFactorLoginHandler(tokenStore, repo, twoFactorStore))
-	mux.Handle("/api/login/recovery", handler.NewRecoveryLoginHandler(tokenStore, repo, twoFactorStore))
-
-	// 仅限管理端点
-	mux.Handle("/api/admin/credentials", auth.RequireAdmin(tokenStore, userRepo, handler.NewCredentialsHandler(authManager, tokenStore)))
+	mux.Handle("/api/login/2fa", handler.NewTwoFactorLoginHandler(authManager, tokenStore, repo, twoFactorStore, loginRateLimiter))
+	mux.Handle("/api/login/recovery", handler.NewRecoveryLoginHandler(authManager, tokenStore, repo, twoFactorStore, loginRateLimiter))
+	mux.Handle("/api/logout", auth.RequireToken(tokenStore, userRepo, handler.NewLogoutHandler(tokenStore, repo)))
 
 	// TG bot 相关 API(单前缀,handler 内部按 path 分发):
 	//   - invites CRUD(admin web UI 用)
@@ -371,7 +414,7 @@ func main() {
 	mux.Handle("/api/admin/users/create", auth.RequireAdmin(tokenStore, userRepo, userCreateHandler))
 	// /api/admin/users/delete 依赖 remoteManageHandler + limiterPusher 做 xray client 清理，注册下移到 ~line 348 之后
 	// /api/admin/users/status (启用/禁用) 同样依赖 remoteManageHandler + limiterPusher,见同区
-	mux.Handle("/api/admin/users/reset-password", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserResetPasswordHandler(repo)))
+	mux.Handle("/api/admin/users/reset-password", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserResetPasswordHandler(authManager, repo, tokenStore, twoFactorStore)))
 	mux.Handle("/api/admin/users/remark", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserRemarkHandler(repo)))
 	mux.Handle("/api/admin/users/short-code", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserShortCodeHandler(repo)))
 	mux.Handle("/api/admin/users/update-email", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserUpdateEmailHandler(repo)))
@@ -415,8 +458,8 @@ func main() {
 
 	// Template V3 端点（仅限管理员）
 	templateV3Handler := handler.NewTemplateV3Handler(repo)
-	mux.Handle("/api/admin/template-v3", auth.RequireToken(tokenStore, userRepo, templateV3Handler))
-	mux.Handle("/api/admin/template-v3/", auth.RequireToken(tokenStore, userRepo, templateV3Handler))
+	mux.Handle("/api/admin/template-v3", auth.RequireAdmin(tokenStore, userRepo, templateV3Handler))
+	mux.Handle("/api/admin/template-v3/", auth.RequireAdmin(tokenStore, userRepo, templateV3Handler))
 
 	// 包管理端点（仅限管理员）— list/create 不依赖 limiterPusher;delete 需解绑用户,延后到 remoteManageHandler/limiterPusher 创建后注册
 	mux.Handle("/api/admin/packages", auth.RequireAdmin(tokenStore, userRepo, handler.NewPackageListHandler(repo)))
@@ -430,9 +473,8 @@ func main() {
 	mux.Handle("/api/user/2fa/setup", auth.RequireToken(tokenStore, userRepo, handler.NewTwoFactorSetupHandler(authManager, repo)))
 	mux.Handle("/api/user/2fa/verify-setup", auth.RequireToken(tokenStore, userRepo, handler.NewTwoFactorVerifySetupHandler(repo)))
 	mux.Handle("/api/user/2fa/disable", auth.RequireToken(tokenStore, userRepo, handler.NewTwoFactorDisableHandler(authManager, repo)))
-	mux.Handle("/api/user/password", auth.RequireToken(tokenStore, userRepo, handler.NewPasswordHandler(authManager)))
+	mux.Handle("/api/user/password", auth.RequireToken(tokenStore, userRepo, handler.NewPasswordHandler(authManager, tokenStore, repo, twoFactorStore)))
 	mux.Handle("/api/user/profile", auth.RequireToken(tokenStore, userRepo, handler.NewProfileHandler(repo)))
-	mux.Handle("/api/user/settings", auth.RequireToken(tokenStore, userRepo, handler.NewUserSettingsHandler(repo, tokenStore)))
 	mux.Handle("/api/user/config", auth.RequireToken(tokenStore, userRepo, handler.NewUserConfigHandler(repo)))
 	mux.Handle("/api/user/token", auth.RequireToken(tokenStore, userRepo, handler.NewUserTokenHandler(repo)))
 	// 代理集合(Clash proxy-provider)配置 — 用户自己 CRUD;handler 内做 username 隔离
@@ -443,8 +485,8 @@ func main() {
 	mux.Handle("/api/user/external-subscriptions", auth.RequireToken(tokenStore, userRepo, handler.NewExternalSubscriptionsHandler(repo)))
 	mux.Handle("/api/user/external-subscriptions/nodes", auth.RequireToken(tokenStore, userRepo, handler.NewExternalSubscriptionNodesHandler(repo)))
 	mux.Handle("/api/user/external-subscriptions/check-filter", auth.RequireToken(tokenStore, userRepo, handler.NewExternalSubscriptionCheckFilterHandler(repo)))
-	// Debug日志相关endpoint
-	mux.Handle("/api/user/debug/", auth.RequireToken(tokenStore, userRepo, handler.NewDebugHandler(repo)))
+	// Debug changes the process-wide logger and is therefore an admin-only diagnostic.
+	mux.Handle("/api/user/debug/", auth.RequireAdmin(tokenStore, userRepo, handler.NewDebugHandler(repo)))
 
 	mux.Handle("/api/traffic/summary", auth.RequireToken(tokenStore, userRepo, trafficHandler))
 	mux.Handle("/api/traffic/summary/aggregated", auth.RequireToken(tokenStore, userRepo, trafficHandler))
@@ -454,13 +496,13 @@ func main() {
 	mux.Handle("/api/subscribe-files", auth.RequireToken(tokenStore, userRepo, handler.NewSubscribeFilesListHandler(repo)))
 	mux.Handle("/api/clash/subscribe", handler.NewSubscriptionEndpoint(tokenStore, repo, subscribeDir))
 
-	// Xray 管理端点（经过身份验证的用户）
+	// Legacy local-Xray endpoints control one process-wide API and are admin-only.
 	xrayHandler := handler.NewXrayHandler(repo)
-	mux.Handle("/api/xray/outbound/add", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(xrayHandler.AddOutbound)))
-	mux.Handle("/api/xray/outbound/remove", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(xrayHandler.RemoveOutbound)))
-	mux.Handle("/api/xray/outbound/list", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(xrayHandler.ListOutbounds)))
-	mux.Handle("/api/xray/stats", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(xrayHandler.GetStats)))
-	mux.Handle("/api/xray/stats/system", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(xrayHandler.GetSystemStats)))
+	mux.Handle("/api/xray/outbound/add", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayHandler.AddOutbound)))
+	mux.Handle("/api/xray/outbound/remove", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayHandler.RemoveOutbound)))
+	mux.Handle("/api/xray/outbound/list", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayHandler.ListOutbounds)))
+	mux.Handle("/api/xray/stats", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayHandler.GetStats)))
+	mux.Handle("/api/xray/stats/system", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayHandler.GetSystemStats)))
 
 	// 流量收集器（早期创建，以便可以与处理程序共享）
 	trafficCollector := traffic.NewCollector(repo)
@@ -480,10 +522,12 @@ func main() {
 	// Xray 服务器处理程序（远程服务器管理复用）
 	xrayServerHandler := handler.NewXrayServerHandler(repo, trafficCollector, cryptoConfig)
 
-	// 面向浏览器的实时数据推送 WS(替代前端高频轮询):RequireToken 认(支持 ?token= query 参数),
-	// hub 内按 admin/user 角色区分推送内容。数据源复用 xrayServerHandler.BuildRemoteServersList。
+	// 面向浏览器的实时数据推送 WS(替代前端高频轮询):先用会话换取短时、一次性 ticket,
+	// 再在 upgrade 前消费 ticket。hub 内按 admin/user 角色区分推送内容。
 	dashboardWSHub := handler.NewDashboardWSHub(repo, xrayServerHandler, getAllowedOrigins())
-	mux.Handle("/api/ws/dashboard", auth.RequireToken(tokenStore, userRepo, dashboardWSHub))
+	dashboardWSHub.SetTokenStore(tokenStore)
+	mux.Handle("/api/ws/ticket", auth.RequireToken(tokenStore, userRepo, handler.NewWebSocketTicketHandler(tokenStore)))
+	mux.Handle("/api/ws/dashboard", auth.RequireWebSocketTicket(tokenStore, userRepo, dashboardWSHub))
 
 	// 远程服务器管理端点（仅限管理员）
 	mux.Handle("/api/admin/remote-servers", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.ListRemoteServers)))
@@ -543,6 +587,10 @@ func main() {
 	remoteWSHandler.SetCapabilityManager(capabilityManager)
 	xrayServerHandler.SetLimiterPusher(limiterPusher)
 	xrayServerHandler.SetCapabilityManager(capabilityManager)
+	// Username changes must refresh Agent limiter identities, so these handlers
+	// are registered only after the pusher is available.
+	mux.Handle("/api/admin/credentials", auth.RequireAdmin(tokenStore, userRepo, handler.NewCredentialsHandler(authManager, tokenStore, repo, twoFactorStore, limiterPusher)))
+	mux.Handle("/api/user/settings", auth.RequireToken(tokenStore, userRepo, handler.NewUserSettingsHandler(repo, tokenStore, limiterPusher)))
 
 	// 远程服务器管理代理（将命令转发到子服务器）
 	remoteManageHandler := handler.NewRemoteManageHandler(repo, remoteWSHandler)
@@ -1177,8 +1225,8 @@ func main() {
 	// 创建订阅处理程序（在端点和短链接之间共享）
 	subscriptionHandler := handler.NewSubscriptionHandlerConcrete(repo, subscribeDir)
 
-	// 短链接重置端点（已验证）
-	mux.Handle("/api/user/short-link", auth.RequireToken(tokenStore, userRepo, handler.NewShortLinkResetHandler(repo)))
+	// This endpoint rotates every subscription link and is a global admin action.
+	mux.Handle("/api/user/short-link", auth.RequireAdmin(tokenStore, userRepo, handler.NewShortLinkResetHandler(repo)))
 	mux.Handle("/api/user/custom-short-code", auth.RequireToken(tokenStore, userRepo, handler.NewUserCustomShortCodeSelfHandler(repo)))
 
 	// 临时订阅端点
@@ -1293,8 +1341,12 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           handlerWithHostEnforce,
+		Handler:           withLongLivedRequestDeadlines(handlerWithHostEnforce),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 
 	collectorCtx, stopCollector := context.WithCancel(context.Background())

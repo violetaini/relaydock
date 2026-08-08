@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"time"
 )
+
+var ErrInvalidLogFilename = errors.New("invalid log filename")
 
 // LogManager 日志文件管理器
 type LogManager struct {
@@ -166,11 +169,45 @@ func (m *LogManager) CheckRotation(currentPath string) (needRotate bool, newPath
 
 // 删除指定日志文件
 func (m *LogManager) DeleteLogFile(filename string) error {
-	path := filepath.Join(m.BaseDir, filename)
+	path, err := m.ResolveLogFile(filename)
+	if err != nil {
+		return err
+	}
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("删除日志文件失败: %w", err)
 	}
 	return nil
+}
+
+// ResolveLogFile accepts only a direct, regular file in BaseDir. It rejects
+// traversal and symlinks so callers never resolve a user-controlled path
+// outside the diagnostic log directory.
+func (m *LogManager) ResolveLogFile(filename string) (string, error) {
+	filename = strings.TrimSpace(filename)
+	if filename == "" || filename != filepath.Base(filename) ||
+		!strings.HasPrefix(filename, "log_") || !strings.HasSuffix(filename, ".txt") {
+		return "", ErrInvalidLogFilename
+	}
+
+	baseDir, err := filepath.Abs(m.BaseDir)
+	if err != nil {
+		return "", err
+	}
+	candidate, err := filepath.Abs(filepath.Join(baseDir, filename))
+	if err != nil {
+		return "", err
+	}
+	if filepath.Dir(candidate) != baseDir {
+		return "", ErrInvalidLogFilename
+	}
+	info, err := os.Lstat(candidate)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", ErrInvalidLogFilename
+	}
+	return candidate, nil
 }
 
 // 列出所有日志文件

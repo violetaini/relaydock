@@ -318,6 +318,9 @@ func validateUsername(s string) error {
 	if !usernameRe.MatchString(s) {
 		return errors.New("用户名只能包含字母、数字、短横线,长度 3-20,且不能包含下划线")
 	}
+	if storage.IsReservedUsername(s) {
+		return errors.New("该用户名为系统保留名称")
+	}
 	return nil
 }
 

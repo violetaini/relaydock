@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/violetaini/relaydock/internal/auth"
@@ -26,6 +27,16 @@ func NewTemplateV3Handler(repo *storage.TrafficRepository) *TemplateV3Handler {
 
 // ServeHTTP handles HTTP requests for v3 template operations
 func (h *TemplateV3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	username := auth.UsernameFromContext(r.Context())
+	if username == "" {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if !userIsAdmin(r.Context(), h.repo, username) {
+		writeJSONError(w, http.StatusForbidden, "administrator access required")
+		return
+	}
+
 	path := strings.TrimPrefix(r.URL.Path, "/api/admin/template-v3")
 
 	switch {
@@ -462,10 +473,7 @@ func int64ToString(n int64) string {
 }
 
 func floatToString(f float64) string {
-	// Simple float to string conversion
-	return strings.TrimRight(strings.TrimRight(
-		strings.Replace(string(rune(int(f))), "", "", -1),
-		"0"), ".")
+	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
 func boolToString(b bool) string {

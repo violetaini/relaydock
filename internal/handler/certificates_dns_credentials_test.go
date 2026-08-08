@@ -44,7 +44,7 @@ func newDNSCredentialsTestFixture(t *testing.T) dnsCredentialsTestFixture {
 
 func adminDNSCredentialsRequest(method, path string) *http.Request {
 	request := httptest.NewRequest(method, path, nil)
-	return request.WithContext(auth.ContextWithUsername(request.Context(), "api-token-admin"))
+	return request.WithContext(auth.ContextWithGlobalAPIToken(request.Context()))
 }
 
 func assertDNSCredentialsNoStore(t *testing.T, response *httptest.ResponseRecorder) {

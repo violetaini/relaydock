@@ -25,6 +25,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -43,12 +44,19 @@ const (
 	headerSecureChannelExpired = "X-Secure-Channel-Expired"
 	userSessionTTL             = 30 * time.Minute
 	maxEncryptedBodyBytes      = 8 << 20 // 8 MiB,防 DoS
+	maxSecureChannelResponse   = 8 << 20 // 8 MiB plaintext before encryption
 	sessionIDBytes             = 16      // 128-bit session id
+	maxUserSecureSessions      = 4096
+	maxHandshakeClients        = 10000
+	handshakeWindowDuration    = time.Minute
+	maxHandshakesPerWindow     = 30
 )
 
 // UserSecureChannelHandler 管理前端会话池 + 提供握手 endpoint。
 type UserSecureChannelHandler struct {
-	sessions sync.Map // sessionID(hex string) -> *userSession
+	mu         sync.Mutex
+	sessions   map[string]*userSession
+	handshakes map[string]*handshakeWindow
 }
 
 type userSession struct {
@@ -58,9 +66,18 @@ type userSession struct {
 	mu        sync.Mutex // 串行化 Encrypt/Decrypt(seq 计数与窗口都是 atomic / mu 保护,这里再加一层语义)
 }
 
+type handshakeWindow struct {
+	started  time.Time
+	lastSeen time.Time
+	count    int
+}
+
 // NewUserSecureChannelHandler 创建会话池并启动后台清理。
 func NewUserSecureChannelHandler() *UserSecureChannelHandler {
-	h := &UserSecureChannelHandler{}
+	h := &UserSecureChannelHandler{
+		sessions:   make(map[string]*userSession),
+		handshakes: make(map[string]*handshakeWindow),
+	}
 	go h.cleanupLoop()
 	return h
 }
@@ -71,6 +88,11 @@ func NewUserSecureChannelHandler() *UserSecureChannelHandler {
 func (h *UserSecureChannelHandler) Handshake(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.allowHandshake(GetClientIP(r), time.Now()) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "too many handshake requests", http.StatusTooManyRequests)
 		return
 	}
 
@@ -106,9 +128,13 @@ func (h *UserSecureChannelHandler) Handshake(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	sid := newSessionID()
+	sid, err := newSessionID()
+	if err != nil {
+		http.Error(w, "session id generation failed", http.StatusInternalServerError)
+		return
+	}
 	now := time.Now()
-	h.sessions.Store(sid, &userSession{sess: sess, createdAt: now, lastUsed: now})
+	h.storeSession(sid, &userSession{sess: sess, createdAt: now, lastUsed: now}, now)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
@@ -127,20 +153,11 @@ func (h *UserSecureChannelHandler) SecureChannelMiddleware(next http.Handler) ht
 		}
 
 		sid := r.Header.Get(headerSessionID)
-		entryAny, ok := h.sessions.Load(sid)
+		entry, ok := h.loadSession(sid, time.Now())
 		if !ok {
 			h.sendSessionExpired(w)
 			return
 		}
-		entry := entryAny.(*userSession)
-
-		// TTL 过期 → 删 session + 412
-		if time.Since(entry.lastUsed) > userSessionTTL {
-			h.sessions.Delete(sid)
-			h.sendSessionExpired(w)
-			return
-		}
-
 		// **关键**:GET/HEAD/DELETE/OPTIONS 的 body 会被浏览器 XHR/fetch 按规范丢弃,
 		// 前端发不出来 envelope。这些方法只加密响应,不解密请求 body。
 		hasBody := r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch
@@ -148,10 +165,14 @@ func (h *UserSecureChannelHandler) SecureChannelMiddleware(next http.Handler) ht
 		if hasBody {
 			// 解密 request body — body 是 base64 编码的 envelope(ASCII 友好,阿里云 / Cloudflare 等
 			// CDN/WAF 不会改 ASCII 文本;binary body 会被某些 WAF "智能扫描"而失真)
-			bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxEncryptedBodyBytes))
+			bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxEncryptedBodyBytes+1))
 			r.Body.Close()
 			if err != nil {
 				http.Error(w, "read body", http.StatusBadRequest)
+				return
+			}
+			if len(bodyBytes) > maxEncryptedBodyBytes {
+				http.Error(w, "encrypted body too large", http.StatusRequestEntityTooLarge)
 				return
 			}
 			envelope, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(bodyBytes)))
@@ -184,15 +205,21 @@ func (h *UserSecureChannelHandler) SecureChannelMiddleware(next http.Handler) ht
 			r.Header.Set("Content-Type", "application/json")
 		}
 
-		entry.lastUsed = time.Now()
+		h.touchSession(sid, entry, time.Now())
 
 		// 缓冲下游响应
 		recorder := &responseRecorder{
 			ResponseWriter: w,
 			body:           &bytes.Buffer{},
 			status:         http.StatusOK,
+			limit:          maxSecureChannelResponse,
 		}
 		next.ServeHTTP(recorder, r)
+		if recorder.overflow {
+			recorder.body.Reset()
+			_, _ = recorder.body.WriteString(`{"error":"secure channel response too large","code":"response_too_large"}`)
+			recorder.status = http.StatusInternalServerError
+		}
 
 		// 加密响应
 		entry.mu.Lock()
@@ -226,32 +253,124 @@ func (h *UserSecureChannelHandler) cleanupLoop() {
 	t := time.NewTicker(5 * time.Minute)
 	defer t.Stop()
 	for range t.C {
-		now := time.Now()
-		h.sessions.Range(func(k, v any) bool {
-			e := v.(*userSession)
-			if now.Sub(e.lastUsed) > userSessionTTL {
-				h.sessions.Delete(k)
-			}
-			return true
-		})
+		h.cleanup(time.Now())
 	}
 }
 
-func newSessionID() string {
+func (h *UserSecureChannelHandler) allowHandshake(clientIP string, now time.Time) bool {
+	if strings.TrimSpace(clientIP) == "" {
+		clientIP = "unknown"
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if len(h.handshakes) >= maxHandshakeClients {
+		for key, window := range h.handshakes {
+			if now.Sub(window.lastSeen) > handshakeWindowDuration {
+				delete(h.handshakes, key)
+			}
+		}
+	}
+	if len(h.handshakes) >= maxHandshakeClients {
+		var oldestKey string
+		var oldest time.Time
+		for key, window := range h.handshakes {
+			if oldestKey == "" || window.lastSeen.Before(oldest) {
+				oldestKey, oldest = key, window.lastSeen
+			}
+		}
+		delete(h.handshakes, oldestKey)
+	}
+
+	window := h.handshakes[clientIP]
+	if window == nil || now.Sub(window.started) >= handshakeWindowDuration {
+		h.handshakes[clientIP] = &handshakeWindow{started: now, lastSeen: now, count: 1}
+		return true
+	}
+	window.lastSeen = now
+	if window.count >= maxHandshakesPerWindow {
+		return false
+	}
+	window.count++
+	return true
+}
+
+func (h *UserSecureChannelHandler) storeSession(id string, session *userSession, now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pruneSessionsLocked(now)
+	if len(h.sessions) >= maxUserSecureSessions {
+		var oldestID string
+		var oldest time.Time
+		for candidateID, candidate := range h.sessions {
+			if oldestID == "" || candidate.lastUsed.Before(oldest) {
+				oldestID, oldest = candidateID, candidate.lastUsed
+			}
+		}
+		delete(h.sessions, oldestID)
+	}
+	h.sessions[id] = session
+}
+
+func (h *UserSecureChannelHandler) loadSession(id string, now time.Time) (*userSession, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	entry, ok := h.sessions[id]
+	if !ok {
+		return nil, false
+	}
+	if now.Sub(entry.lastUsed) > userSessionTTL {
+		delete(h.sessions, id)
+		return nil, false
+	}
+	return entry, true
+}
+
+func (h *UserSecureChannelHandler) touchSession(id string, entry *userSession, now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if current, ok := h.sessions[id]; ok && current == entry {
+		entry.lastUsed = now
+	}
+}
+
+func (h *UserSecureChannelHandler) pruneSessionsLocked(now time.Time) {
+	for id, entry := range h.sessions {
+		if now.Sub(entry.lastUsed) > userSessionTTL {
+			delete(h.sessions, id)
+		}
+	}
+}
+
+func (h *UserSecureChannelHandler) cleanup(now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.pruneSessionsLocked(now)
+	for key, window := range h.handshakes {
+		if now.Sub(window.lastSeen) > handshakeWindowDuration {
+			delete(h.handshakes, key)
+		}
+	}
+}
+
+func newSessionID() (string, error) {
 	b := make([]byte, sessionIDBytes)
 	if _, err := rand.Read(b); err != nil {
-		// rand.Read 在 Go 1.x 上从不失败,但万一返回 err 用时间戳兜底也比 panic 强
-		return hex.EncodeToString([]byte(time.Now().Format("20060102150405000000000")))
+		return "", err
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 // responseRecorder 缓冲下游 handler 写的 status + body,供加密包装。
 type responseRecorder struct {
 	http.ResponseWriter
-	body   *bytes.Buffer
-	status int
+	body     *bytes.Buffer
+	status   int
+	limit    int
+	overflow bool
 }
+
+var errSecureChannelResponseTooLarge = errors.New("secure channel response too large")
 
 func (r *responseRecorder) WriteHeader(code int) {
 	r.status = code
@@ -259,6 +378,10 @@ func (r *responseRecorder) WriteHeader(code int) {
 }
 
 func (r *responseRecorder) Write(b []byte) (int, error) {
+	if r.overflow || r.limit > 0 && len(b) > r.limit-r.body.Len() {
+		r.overflow = true
+		return 0, errSecureChannelResponseTooLarge
+	}
 	return r.body.Write(b)
 }
 

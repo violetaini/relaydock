@@ -91,12 +91,44 @@ type TrafficRecord struct {
 // TrafficRepository 管理流量使用快照的持久性。
 type TrafficRepository struct {
 	db                       *sql.DB
+	authMutationMu           sync.RWMutex
+	sessionRevokerMu         sync.RWMutex
+	sessionRevoker           func(string)
 	managedNodeMu            sync.Mutex
 	remoteInstallationLeases sync.Map // serverID (int64) -> *sync.RWMutex
 	nodeSecretMu             sync.RWMutex
 	nodeSecretBox            *secretbox.Box
 	billingCacheMu           sync.Mutex
 	billingCache             map[int64]trafficBillingCacheEntry
+}
+
+// AuthMutationMutex is shared with auth.Manager so account lifecycle changes
+// cannot race the final session-issuance callback after authentication.
+func (r *TrafficRepository) AuthMutationMutex() *sync.RWMutex {
+	if r == nil {
+		return nil
+	}
+	return &r.authMutationMu
+}
+
+// SetSessionRevoker connects persistent account lifecycle changes to the
+// process-local token store without making storage depend on auth.
+func (r *TrafficRepository) SetSessionRevoker(revoke func(string)) {
+	if r == nil {
+		return
+	}
+	r.sessionRevokerMu.Lock()
+	r.sessionRevoker = revoke
+	r.sessionRevokerMu.Unlock()
+}
+
+func (r *TrafficRepository) revokeMemorySessions(username string) {
+	r.sessionRevokerMu.RLock()
+	revoke := r.sessionRevoker
+	r.sessionRevokerMu.RUnlock()
+	if revoke != nil {
+		revoke(username)
+	}
 }
 
 // SubscriptionLink 表示向客户端公开的可配置订阅条目。
@@ -185,40 +217,49 @@ func scanSubscriptionLink(scanner rowScanner) (SubscriptionLink, error) {
 }
 
 var (
-	ErrTokenNotFound                 = errors.New("token not found")
-	ErrUserNotFound                  = errors.New("user not found")
-	ErrUserExists                    = errors.New("user already exists")
-	ErrRuleVersionNotFound           = errors.New("rule version not found")
-	ErrSubscriptionNotFound          = errors.New("subscription link not found")
-	ErrSubscriptionExists            = errors.New("subscription link already exists")
-	ErrNodeNotFound                  = errors.New("node not found")
-	ErrNodeMutationChanged           = errors.New("node inbound mutation changed during operation")
-	ErrSubscribeFileNotFound         = errors.New("subscribe file not found")
-	ErrSubscribeFileExists           = errors.New("subscribe file already exists")
-	ErrSubscribeFileChanged          = errors.New("subscribe file changed during operation")
-	ErrSubscribeFilenameHistory      = errors.New("subscribe filename has archived history")
-	ErrCustomShortCodeExists         = errors.New("该短码已被占用，请更换一个")
-	ErrSharedServerNotFound          = errors.New("shared server not found")
-	ErrFederatedServerNotFound       = errors.New("federated server not found")
-	ErrUserSettingsNotFound          = errors.New("user settings not found")
-	ErrExternalSubscriptionNotFound  = errors.New("external subscription not found")
-	ErrExternalSubscriptionExists    = errors.New("external subscription already exists")
-	ErrPackageNotFound               = errors.New("package not found")
-	ErrPackageExists                 = errors.New("package already exists")
-	ErrRemoteServerNotFound          = errors.New("remote server not found")
-	ErrRemoteServerExists            = errors.New("remote server already exists")
-	ErrRemoteListenPortMismatch      = errors.New("remote Agent listen port mismatch")
-	ErrRemoteInstallationActive      = errors.New("remote server installation is already active")
-	ErrRemoteInstallationInvalid     = errors.New("remote server installation is invalid or expired")
-	ErrRemoteInstallationAborted     = errors.New("remote server installation was aborted")
-	ErrRemoteInstallationRollingBack = errors.New("remote server installation is rolling back")
-	ErrRemoteInstallationPolicy      = errors.New("remote server installation policy changed")
-	ErrRemoteInstallationNotReady    = errors.New("remote server installation is not ready")
-	ErrRemoteInstallationNotPrepared = errors.New("remote server installation is not prepared")
-	ErrRemoteInstallTicketInvalid    = errors.New("remote server install ticket is invalid, expired, or already used")
-	ErrCertificateNotFound           = errors.New("certificate not found")
-	ErrCertificateExists             = errors.New("certificate already exists")
+	ErrTokenNotFound                             = errors.New("token not found")
+	ErrUserNotFound                              = errors.New("user not found")
+	ErrUserExists                                = errors.New("user already exists")
+	ErrUserInactive                              = errors.New("user is inactive")
+	ErrReservedUsername                          = errors.New("username is reserved")
+	ErrUsernameRenameRequiresCredentialMigration = errors.New("username cannot be changed while remote access is configured")
+	ErrRuleVersionNotFound                       = errors.New("rule version not found")
+	ErrSubscriptionNotFound                      = errors.New("subscription link not found")
+	ErrSubscriptionExists                        = errors.New("subscription link already exists")
+	ErrNodeNotFound                              = errors.New("node not found")
+	ErrNodeMutationChanged                       = errors.New("node inbound mutation changed during operation")
+	ErrSubscribeFileNotFound                     = errors.New("subscribe file not found")
+	ErrSubscribeFileExists                       = errors.New("subscribe file already exists")
+	ErrSubscribeFileChanged                      = errors.New("subscribe file changed during operation")
+	ErrSubscribeFilenameHistory                  = errors.New("subscribe filename has archived history")
+	ErrCustomShortCodeExists                     = errors.New("该短码已被占用，请更换一个")
+	ErrSharedServerNotFound                      = errors.New("shared server not found")
+	ErrFederatedServerNotFound                   = errors.New("federated server not found")
+	ErrUserSettingsNotFound                      = errors.New("user settings not found")
+	ErrExternalSubscriptionNotFound              = errors.New("external subscription not found")
+	ErrExternalSubscriptionExists                = errors.New("external subscription already exists")
+	ErrPackageNotFound                           = errors.New("package not found")
+	ErrPackageExists                             = errors.New("package already exists")
+	ErrRemoteServerNotFound                      = errors.New("remote server not found")
+	ErrRemoteServerExists                        = errors.New("remote server already exists")
+	ErrRemoteListenPortMismatch                  = errors.New("remote Agent listen port mismatch")
+	ErrRemoteInstallationActive                  = errors.New("remote server installation is already active")
+	ErrRemoteInstallationInvalid                 = errors.New("remote server installation is invalid or expired")
+	ErrRemoteInstallationAborted                 = errors.New("remote server installation was aborted")
+	ErrRemoteInstallationRollingBack             = errors.New("remote server installation is rolling back")
+	ErrRemoteInstallationPolicy                  = errors.New("remote server installation policy changed")
+	ErrRemoteInstallationNotReady                = errors.New("remote server installation is not ready")
+	ErrRemoteInstallationNotPrepared             = errors.New("remote server installation is not prepared")
+	ErrRemoteInstallTicketInvalid                = errors.New("remote server install ticket is invalid, expired, or already used")
+	ErrCertificateNotFound                       = errors.New("certificate not found")
+	ErrCertificateExists                         = errors.New("certificate already exists")
 )
+
+const ReservedGlobalAPITokenUsername = "api-token-admin"
+
+func IsReservedUsername(username string) bool {
+	return strings.EqualFold(strings.TrimSpace(username), ReservedGlobalAPITokenUsername)
+}
 
 // IsValidRemoteManagementListenPort reserves port+1 for the expiry guard.
 // Zero means the Agent default and is resolved during first heartbeat.
@@ -5105,10 +5146,15 @@ func (r *TrafficRepository) EnsureUser(ctx context.Context, username, passwordHa
 	if username == "" {
 		return errors.New("username is required")
 	}
+	if IsReservedUsername(username) {
+		return ErrReservedUsername
+	}
 	if passwordHash == "" {
 		return errors.New("password hash is required")
 	}
 
+	r.authMutationMu.Lock()
+	defer r.authMutationMu.Unlock()
 	_, err := r.db.ExecContext(ctx, `INSERT INTO users (username, password_hash, nickname, role) VALUES (?, ?, ?, ?) ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash`, username, passwordHash, username, RoleUser)
 	if err != nil {
 		return fmt.Errorf("ensure user: %w", err)
@@ -5132,6 +5178,9 @@ func (r *TrafficRepository) CreateUser(ctx context.Context, username, email, nic
 	if username == "" {
 		return errors.New("username is required")
 	}
+	if IsReservedUsername(username) {
+		return ErrReservedUsername
+	}
 	if passwordHash == "" {
 		return errors.New("password hash is required")
 	}
@@ -5146,6 +5195,8 @@ func (r *TrafficRepository) CreateUser(ctx context.Context, username, email, nic
 		role = RoleUser
 	}
 
+	r.authMutationMu.Lock()
+	defer r.authMutationMu.Unlock()
 	_, err := r.db.ExecContext(ctx, `INSERT INTO users (username, password_hash, email, nickname, role, is_active, remark) VALUES (?, ?, ?, ?, ?, 1, ?)`, username, passwordHash, email, nickname, role, remark)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -5332,6 +5383,270 @@ func (r *TrafficRepository) UpdateUserPassword(ctx context.Context, username, pa
 	return nil
 }
 
+// UpdateUserPasswordAndDeleteSessions atomically changes a password and
+// removes every persisted session for the account. This prevents an old
+// bearer token from becoming valid again after a process restart.
+func (r *TrafficRepository) UpdateUserPasswordAndDeleteSessions(ctx context.Context, username, passwordHash string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("username is required")
+	}
+	if passwordHash == "" {
+		return errors.New("password hash is required")
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("update password begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx,
+		`UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`,
+		passwordHash, username)
+	if err != nil {
+		return fmt.Errorf("update user password: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("password rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrUserNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE username = ?`, username); err != nil {
+		return fmt.Errorf("delete changed-password sessions: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("update password commit: %w", err)
+	}
+	return nil
+}
+
+type userIdentityColumn struct {
+	table  string
+	column string
+}
+
+var userIdentityColumnNames = map[string]struct{}{
+	"username":          {},
+	"created_by":        {},
+	"bind_username":     {},
+	"billable_username": {},
+}
+
+func quoteSQLiteIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
+// userIdentityColumns discovers account ownership columns from the live schema.
+// Several optional subsystems create their tables in separate migrations, so a
+// static table list would silently orphan data when one of those schemas grows.
+func userIdentityColumns(ctx context.Context, tx *sql.Tx) ([]userIdentityColumn, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM sqlite_master
+		WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'users'
+		ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("list user-owned tables: %w", err)
+	}
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan user-owned table: %w", err)
+		}
+		tables = append(tables, table)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close user-owned table rows: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate user-owned tables: %w", err)
+	}
+
+	columns := make([]userIdentityColumn, 0, len(tables))
+	for _, table := range tables {
+		columnRows, err := tx.QueryContext(ctx, `PRAGMA table_info(`+quoteSQLiteIdentifier(table)+`)`)
+		if err != nil {
+			return nil, fmt.Errorf("inspect table %q: %w", table, err)
+		}
+		for columnRows.Next() {
+			var (
+				cid        int
+				name       string
+				columnType string
+				notNull    int
+				defaultVal sql.NullString
+				primaryKey int
+			)
+			if err := columnRows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &primaryKey); err != nil {
+				_ = columnRows.Close()
+				return nil, fmt.Errorf("scan columns for table %q: %w", table, err)
+			}
+			if _, ok := userIdentityColumnNames[strings.ToLower(name)]; ok {
+				columns = append(columns, userIdentityColumn{table: table, column: name})
+			}
+		}
+		if err := columnRows.Close(); err != nil {
+			return nil, fmt.Errorf("close columns for table %q: %w", table, err)
+		}
+		if err := columnRows.Err(); err != nil {
+			return nil, fmt.Errorf("iterate columns for table %q: %w", table, err)
+		}
+	}
+	return columns, nil
+}
+
+func renameUserInTx(ctx context.Context, tx *sql.Tx, oldUsername, newUsername string) error {
+	if IsReservedUsername(newUsername) {
+		return ErrReservedUsername
+	}
+	var targetExists int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM users WHERE username = ?)`, newUsername).Scan(&targetExists); err != nil {
+		return fmt.Errorf("check target username: %w", err)
+	}
+	if targetExists != 0 {
+		return ErrUserExists
+	}
+	// Remote client identities and routing rules can embed the username. Until
+	// Agent and SQLite changes have a durable reconciliation journal, renaming
+	// such an account would risk leaving the two systems permanently split.
+	var hasRemoteBindings int
+	if err := tx.QueryRowContext(ctx, `SELECT
+		EXISTS(SELECT 1 FROM user_inbound_configs WHERE username = ?)
+		OR EXISTS(SELECT 1 FROM user_outbounds WHERE username = ?)
+		OR EXISTS(SELECT 1 FROM user_subaccounts WHERE username = ?)`,
+		oldUsername, oldUsername, oldUsername).Scan(&hasRemoteBindings); err != nil {
+		return fmt.Errorf("check remote bindings before username rename: %w", err)
+	}
+	if hasRemoteBindings != 0 {
+		return ErrUsernameRenameRequiresCredentialMigration
+	}
+
+	// This also protects installations that explicitly enable foreign_keys on
+	// their DSN: all parent/child changes are checked only at commit time.
+	if _, err := tx.ExecContext(ctx, `PRAGMA defer_foreign_keys = ON`); err != nil {
+		return fmt.Errorf("defer username foreign keys: %w", err)
+	}
+	columns, err := userIdentityColumns(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, target := range columns {
+		query := `UPDATE ` + quoteSQLiteIdentifier(target.table) +
+			` SET ` + quoteSQLiteIdentifier(target.column) + ` = ? WHERE ` +
+			quoteSQLiteIdentifier(target.column) + ` = ?`
+		if _, err := tx.ExecContext(ctx, query, newUsername, oldUsername); err != nil {
+			return fmt.Errorf("rename %s.%s: %w", target.table, target.column, err)
+		}
+	}
+
+	result, err := tx.ExecContext(ctx,
+		`UPDATE users SET username = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`,
+		newUsername, oldUsername)
+	if err != nil {
+		return fmt.Errorf("rename user: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rename user rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
+func (r *TrafficRepository) validateUsernameRename(ctx context.Context, oldUsername, newUsername string) error {
+	var sourceExists, targetExists int
+	if err := r.db.QueryRowContext(ctx, `SELECT
+		EXISTS(SELECT 1 FROM users WHERE username = ?),
+		EXISTS(SELECT 1 FROM users WHERE username = ?)`, oldUsername, newUsername).Scan(&sourceExists, &targetExists); err != nil {
+		return fmt.Errorf("validate username rename: %w", err)
+	}
+	if sourceExists == 0 {
+		return ErrUserNotFound
+	}
+	if targetExists != 0 {
+		return ErrUserExists
+	}
+	return nil
+}
+
+// UpdateCredentialsAndDeleteSessions atomically renames an account, updates
+// its password when requested, and invalidates all persisted sessions.
+func (r *TrafficRepository) UpdateCredentialsAndDeleteSessions(ctx context.Context, currentUsername, newUsername, passwordHash string) (string, error) {
+	if r == nil || r.db == nil {
+		return "", errors.New("traffic repository not initialized")
+	}
+	currentUsername = strings.TrimSpace(currentUsername)
+	newUsername = strings.TrimSpace(newUsername)
+	if currentUsername == "" {
+		return "", errors.New("current username is required")
+	}
+	if newUsername == "" {
+		newUsername = currentUsername
+	}
+	if IsReservedUsername(newUsername) {
+		return "", ErrReservedUsername
+	}
+	if newUsername == currentUsername && passwordHash == "" {
+		return "", errors.New("username or password must be provided")
+	}
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
+
+	if newUsername != currentUsername {
+		if err := r.validateUsernameRename(ctx, currentUsername, newUsername); err != nil {
+			return "", err
+		}
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("update credentials begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if newUsername != currentUsername {
+		if err := renameUserInTx(ctx, tx, currentUsername, newUsername); err != nil {
+			return "", err
+		}
+	}
+
+	if passwordHash != "" {
+		result, err := tx.ExecContext(ctx,
+			`UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`,
+			passwordHash, newUsername)
+		if err != nil {
+			return "", fmt.Errorf("update user password: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return "", fmt.Errorf("password rows affected: %w", err)
+		}
+		if affected == 0 {
+			return "", ErrUserNotFound
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM sessions WHERE username = ? OR username = ?`,
+		currentUsername, newUsername); err != nil {
+		return "", fmt.Errorf("delete changed-credentials sessions: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("update credentials commit: %w", err)
+	}
+	r.invalidateTrafficBillingCache()
+	return newUsername, nil
+}
+
 // 设置指定用户的角色。
 func (r *TrafficRepository) UpdateUserRole(ctx context.Context, username, role string) error {
 	if r == nil || r.db == nil {
@@ -5405,22 +5720,20 @@ func (r *TrafficRepository) UpdateUserStatus(ctx context.Context, username strin
 	if username == "" {
 		return errors.New("username is required")
 	}
+	if !active {
+		return r.DisableUserAndDeleteSessions(ctx, username)
+	}
+	r.authMutationMu.Lock()
+	defer r.authMutationMu.Unlock()
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
-	if active {
-		if pending, err := r.IsUserDeletionPending(ctx, username); err != nil {
-			return err
-		} else if pending {
-			return ErrUserDeletionPending
-		}
+	if pending, err := r.IsUserDeletionPending(ctx, username); err != nil {
+		return err
+	} else if pending {
+		return ErrUserDeletionPending
 	}
 
-	value := 0
-	if active {
-		value = 1
-	}
-
-	res, err := r.db.ExecContext(ctx, `UPDATE users SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, value, username)
+	res, err := r.db.ExecContext(ctx, `UPDATE users SET is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, username)
 	if err != nil {
 		return fmt.Errorf("update user status: %w", err)
 	}
@@ -5528,6 +5841,14 @@ func (r *TrafficRepository) UpdateUserProfile(ctx context.Context, username stri
 
 // 更改用户名并更新相关表。
 func (r *TrafficRepository) RenameUser(ctx context.Context, oldUsername, newUsername string) error {
+	return r.RenameUserAndRun(ctx, oldUsername, newUsername, nil)
+}
+
+// RenameUserAndRun keeps the durable rename and its process-local identity
+// migration in one authentication mutation critical section. The callback is
+// invoked only after the database transaction commits successfully and must
+// not call another account mutation method on this repository.
+func (r *TrafficRepository) RenameUserAndRun(ctx context.Context, oldUsername, newUsername string, afterCommit func()) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
@@ -5537,37 +5858,33 @@ func (r *TrafficRepository) RenameUser(ctx context.Context, oldUsername, newUser
 	if oldUsername == "" || newUsername == "" {
 		return errors.New("usernames are required")
 	}
+	if IsReservedUsername(newUsername) {
+		return ErrReservedUsername
+	}
+	r.authMutationMu.Lock()
+	defer r.authMutationMu.Unlock()
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
+	if err := r.validateUsernameRename(ctx, oldUsername, newUsername); err != nil {
+		return err
+	}
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("rename user begin tx: %w", err)
 	}
+	defer func() { _ = tx.Rollback() }()
 
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		} else {
-			_ = tx.Commit()
-		}
-	}()
-
-	res, err := tx.ExecContext(ctx, `UPDATE users SET username = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, newUsername, oldUsername)
-	if err != nil {
-		return fmt.Errorf("rename user: %w", err)
+	if err := renameUserInTx(ctx, tx, oldUsername, newUsername); err != nil {
+		return err
 	}
-
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("rename user rows affected: %w", err)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("rename user commit: %w", err)
 	}
-	if affected == 0 {
-		return ErrUserNotFound
+	r.invalidateTrafficBillingCache()
+	if afterCommit != nil {
+		afterCommit()
 	}
-
-	if _, err = tx.ExecContext(ctx, `UPDATE user_tokens SET username = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, newUsername, oldUsername); err != nil {
-		return fmt.Errorf("rename user tokens: %w", err)
-	}
-
 	return nil
 }
 
@@ -5594,9 +5911,20 @@ func (r *TrafficRepository) CreateSession(ctx context.Context, token, username s
 		return errors.New("username is required")
 	}
 
-	const stmt = `INSERT INTO sessions (token, username, expires_at) VALUES (?, ?, ?)`
-	if _, err := r.db.ExecContext(ctx, stmt, token, username, expiresAt); err != nil {
+	const stmt = `INSERT INTO sessions (token, username, expires_at)
+		SELECT ?, ?, ? WHERE EXISTS (
+			SELECT 1 FROM users WHERE username = ? AND is_active = 1
+		)`
+	result, err := r.db.ExecContext(ctx, stmt, token, username, expiresAt, username)
+	if err != nil {
 		return fmt.Errorf("create session: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("create session rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrUserInactive
 	}
 
 	return nil
@@ -5653,6 +5981,8 @@ func (r *TrafficRepository) DisableUserAndDeleteSessions(ctx context.Context, us
 		return errors.New("username is required")
 	}
 
+	r.authMutationMu.Lock()
+	defer r.authMutationMu.Unlock()
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 
@@ -5680,6 +6010,7 @@ func (r *TrafficRepository) DisableUserAndDeleteSessions(ctx context.Context, us
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("disable user commit: %w", err)
 	}
+	r.revokeMemorySessions(username)
 	return nil
 }
 

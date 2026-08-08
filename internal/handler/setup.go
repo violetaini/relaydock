@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -20,6 +21,11 @@ import (
 	"github.com/violetaini/relaydock/internal/storage"
 	"github.com/violetaini/relaydock/templates"
 )
+
+// setupMu serializes all unauthenticated operations which are only valid while
+// the repository has no users. Without this guard two concurrent requests can
+// both pass the empty-user check and create separate administrator accounts.
+var setupMu sync.Mutex
 
 type setupStatusResponse struct {
 	NeedsSetup bool `json:"needs_setup"`
@@ -107,6 +113,9 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository) http.Handler {
 			writeError(w, http.StatusMethodNotAllowed, errors.New("only POST is supported"))
 			return
 		}
+
+		setupMu.Lock()
+		defer setupMu.Unlock()
 
 		// 检查是否还需要设置
 		users, err := repo.ListUsers(r.Context(), 1)

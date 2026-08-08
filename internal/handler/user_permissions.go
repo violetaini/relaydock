@@ -110,11 +110,14 @@ func loadUserPermConfig(ctx context.Context, repo *storage.TrafficRepository) Us
 
 // userIsAdmin 判断用户是否管理员(admin 不受数据隔离 / 配额限制)。
 func userIsAdmin(ctx context.Context, repo *storage.TrafficRepository, username string) bool {
-	if username == "" {
+	if auth.IsGlobalAPIToken(ctx) {
+		return true
+	}
+	if username == "" || repo == nil {
 		return false
 	}
 	u, err := repo.GetUser(ctx, username)
-	return err == nil && u.Role == storage.RoleAdmin
+	return err == nil && u.IsActive && u.Role == storage.RoleAdmin
 }
 
 // checkUserQuota 包级配额校验,供各 create handler 调用。admin 不受限。

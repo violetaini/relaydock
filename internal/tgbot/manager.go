@@ -170,7 +170,7 @@ func (m *Manager) startService(parent context.Context, s Settings) (*bot.Service
 	if adminUsername == "" {
 		return nil, nil, "", errors.New("未找到已启用的管理员账号")
 	}
-	token, _, err := m.tokens.IssueWithTTL(adminUsername, 365*24*time.Hour)
+	token, _, err := m.tokens.IssueServiceWithTTL(adminUsername, 365*24*time.Hour)
 	if err != nil {
 		return nil, nil, "", err
 	}

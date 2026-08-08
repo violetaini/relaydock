@@ -20,8 +20,8 @@ type bruteForceRecord struct {
 }
 
 type BruteForceProtector struct {
-	mu            sync.RWMutex
-	attempts      sync.Map // IP -> *bruteForceRecord
+	mu            sync.Mutex
+	attempts      map[string]*bruteForceRecord
 	enabled       bool
 	maxFailures   int
 	window        time.Duration
@@ -31,11 +31,14 @@ type BruteForceProtector struct {
 	skipLocalIP bool
 }
 
+const maxTrackedBruteForceIPs = 10_000
+
 // NewBruteForceProtector 用 hardcoded 默认值构造。
 // 加严:24h 窗口内 5 次失败 → 封 24h,防订阅 token 枚举。
 // 启动时若 system_settings 里有自定义阈值,main.go 会改用 NewBruteForceProtectorWithConfig。
 func NewBruteForceProtector() *BruteForceProtector {
 	p := &BruteForceProtector{
+		attempts:      make(map[string]*bruteForceRecord),
 		enabled:       true,
 		maxFailures:   5,
 		window:        24 * time.Hour,
@@ -50,6 +53,7 @@ func NewBruteForceProtector() *BruteForceProtector {
 // windowMinutes / blockMinutes 用分钟为单位,因为前端配置面板按分钟输入更直观。
 func NewBruteForceProtectorWithConfig(enabled bool, maxFailures, windowMinutes, blockMinutes int) *BruteForceProtector {
 	p := &BruteForceProtector{
+		attempts:      make(map[string]*bruteForceRecord),
 		enabled:       enabled,
 		maxFailures:   maxFailures,
 		window:        time.Duration(windowMinutes) * time.Minute,
@@ -70,9 +74,9 @@ func (p *BruteForceProtector) SetSkipLocalIP(skip bool) {
 
 // shouldSkip 返回是否应跳过该 IP — 当 skipLocalIP 开启且 IP 落在本地/私有网段。
 func (p *BruteForceProtector) shouldSkip(ip string) bool {
-	p.mu.RLock()
+	p.mu.Lock()
 	skip := p.skipLocalIP
-	p.mu.RUnlock()
+	p.mu.Unlock()
 	return skip && IsLocalOrPrivateIP(ip)
 }
 
@@ -87,8 +91,8 @@ func (p *BruteForceProtector) UpdateConfig(enabled bool, maxFailures, windowMinu
 }
 
 func (p *BruteForceProtector) getConfig() (bool, int, time.Duration, time.Duration) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.enabled, p.maxFailures, p.window, p.blockDuration
 }
 
@@ -97,19 +101,26 @@ func GetBruteForceProtector() *BruteForceProtector {
 }
 
 func (p *BruteForceProtector) IsBlocked(ip, path string) bool {
-	enabled, _, _, _ := p.getConfig()
-	if !enabled {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.enabled {
 		return false
 	}
-	if p.shouldSkip(ip) {
+	if p.skipLocalIP && IsLocalOrPrivateIP(ip) {
 		return false
 	}
 
-	val, ok := p.attempts.Load(ip)
+	rec, ok := p.attempts[ip]
 	if !ok {
+		if !p.ensureCapacityLocked(time.Now()) {
+			logger.Warn("[BRUTE_FORCE] tracking capacity exhausted; rejecting untracked IP",
+				"ip", ip,
+				"path", path,
+			)
+			return true
+		}
 		return false
 	}
-	rec := val.(*bruteForceRecord)
 
 	now := time.Now()
 	if !rec.blockUntil.IsZero() && now.Before(rec.blockUntil) {
@@ -126,58 +137,60 @@ func (p *BruteForceProtector) IsBlocked(ip, path string) bool {
 		logger.Info("✅ [BRUTE_FORCE] IP封禁已过期，已自动解除",
 			"ip", ip,
 		)
-		p.attempts.Delete(ip)
+		delete(p.attempts, ip)
 	}
 	return false
 }
 
 func (p *BruteForceProtector) RecordFailure(ip, path string) {
-	enabled, maxFailures, window, blockDuration := p.getConfig()
-	if !enabled {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.enabled {
 		return
 	}
-	if p.shouldSkip(ip) {
+	if p.skipLocalIP && IsLocalOrPrivateIP(ip) {
 		return
 	}
 
 	now := time.Now()
 
-	val, loaded := p.attempts.Load(ip)
+	rec, loaded := p.attempts[ip]
 	if !loaded {
+		if !p.ensureCapacityLocked(now) {
+			return
+		}
 		logger.Warn("⚠️ [BRUTE_FORCE] 订阅探测失败",
 			"ip", ip,
 			"访问路径", path,
-			"次数", fmt.Sprintf("1/%d", maxFailures),
+			"次数", fmt.Sprintf("1/%d", p.maxFailures),
 		)
-		p.attempts.Store(ip, &bruteForceRecord{
+		p.attempts[ip] = &bruteForceRecord{
 			count:     1,
 			firstTime: now,
-		})
+		}
 		return
 	}
-
-	rec := val.(*bruteForceRecord)
 
 	if !rec.blockUntil.IsZero() && now.Before(rec.blockUntil) {
 		return
 	}
 
-	if now.Sub(rec.firstTime) > window {
+	if now.Sub(rec.firstTime) > p.window {
 		logger.Warn("⚠️ [BRUTE_FORCE] 订阅探测失败（窗口重置）",
 			"ip", ip,
 			"访问路径", path,
-			"次数", fmt.Sprintf("1/%d", maxFailures),
+			"次数", fmt.Sprintf("1/%d", p.maxFailures),
 		)
-		p.attempts.Store(ip, &bruteForceRecord{
+		p.attempts[ip] = &bruteForceRecord{
 			count:     1,
 			firstTime: now,
-		})
+		}
 		return
 	}
 
 	rec.count++
-	if rec.count >= maxFailures {
-		rec.blockUntil = now.Add(blockDuration)
+	if rec.count >= p.maxFailures {
+		rec.blockUntil = now.Add(p.blockDuration)
 		logger.Warn("🚫🚫🚫 [BRUTE_FORCE] IP 已被封禁！",
 			"ip", ip,
 			"触发路径", path,
@@ -196,13 +209,29 @@ func (p *BruteForceProtector) RecordFailure(ip, path string) {
 		logger.Warn("⚠️ [BRUTE_FORCE] 订阅探测失败",
 			"ip", ip,
 			"访问路径", path,
-			"次数", fmt.Sprintf("%d/%d", rec.count, maxFailures),
+			"次数", fmt.Sprintf("%d/%d", rec.count, p.maxFailures),
 		)
 	}
 }
 
 func (p *BruteForceProtector) RecordSuccess(ip string) {
-	p.attempts.Delete(ip)
+	p.mu.Lock()
+	delete(p.attempts, ip)
+	p.mu.Unlock()
+}
+
+// ensureCapacityLocked only reclaims expired records. Dropping an active
+// record would let a high-cardinality probe evict an existing IP ban.
+func (p *BruteForceProtector) ensureCapacityLocked(now time.Time) bool {
+	if len(p.attempts) < maxTrackedBruteForceIPs {
+		return true
+	}
+	for ip, rec := range p.attempts {
+		if rec == nil || (!rec.blockUntil.IsZero() && !now.Before(rec.blockUntil)) || (rec.blockUntil.IsZero() && now.Sub(rec.firstTime) > p.window) {
+			delete(p.attempts, ip)
+		}
+	}
+	return len(p.attempts) < maxTrackedBruteForceIPs
 }
 
 // StatusRecorder wraps http.ResponseWriter to capture the status code.

@@ -102,6 +102,10 @@ func (h *XrayHandler) AddOutbound(w stdhttp.ResponseWriter, r *stdhttp.Request) 
 		stdhttp.Error(w, "Unauthorized", stdhttp.StatusUnauthorized)
 		return
 	}
+	if !userIsAdmin(ctx, h.repo, username) {
+		stdhttp.Error(w, "Forbidden", stdhttp.StatusForbidden)
+		return
+	}
 
 	var req AddOutboundRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -163,6 +167,10 @@ func (h *XrayHandler) RemoveOutbound(w stdhttp.ResponseWriter, r *stdhttp.Reques
 		stdhttp.Error(w, "Unauthorized", stdhttp.StatusUnauthorized)
 		return
 	}
+	if !userIsAdmin(ctx, h.repo, username) {
+		stdhttp.Error(w, "Forbidden", stdhttp.StatusForbidden)
+		return
+	}
 
 	var req RemoveOutboundRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -215,6 +223,10 @@ func (h *XrayHandler) ListOutbounds(w stdhttp.ResponseWriter, r *stdhttp.Request
 		stdhttp.Error(w, "Unauthorized", stdhttp.StatusUnauthorized)
 		return
 	}
+	if !userIsAdmin(ctx, h.repo, username) {
+		stdhttp.Error(w, "Forbidden", stdhttp.StatusForbidden)
+		return
+	}
 
 	// 获取 Xray 连接设置
 	xrayHost, xrayPort, err := h.getXraySettings(ctx, username)
@@ -230,7 +242,7 @@ func (h *XrayHandler) ListOutbounds(w stdhttp.ResponseWriter, r *stdhttp.Request
 	}
 	defer client.Connection.Close()
 
-	tags, err := handler.ListInboundTags(ctx, client.Handler)
+	tags, err := handler.ListOutboundTags(ctx, client.Handler)
 	response := ListOutboundsResponse{
 		Success: err == nil,
 		Message: func() string {
@@ -264,6 +276,10 @@ func (h *XrayHandler) GetStats(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	username := auth.UsernameFromContext(ctx)
 	if username == "" {
 		stdhttp.Error(w, "Unauthorized", stdhttp.StatusUnauthorized)
+		return
+	}
+	if !userIsAdmin(ctx, h.repo, username) {
+		stdhttp.Error(w, "Forbidden", stdhttp.StatusForbidden)
 		return
 	}
 
@@ -327,6 +343,10 @@ func (h *XrayHandler) GetSystemStats(w stdhttp.ResponseWriter, r *stdhttp.Reques
 	username := auth.UsernameFromContext(ctx)
 	if username == "" {
 		stdhttp.Error(w, "Unauthorized", stdhttp.StatusUnauthorized)
+		return
+	}
+	if !userIsAdmin(ctx, h.repo, username) {
+		stdhttp.Error(w, "Forbidden", stdhttp.StatusForbidden)
 		return
 	}
 

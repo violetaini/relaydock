@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 // 惰性 ticker:仅在有客户端连接时运行;数据按 admin/user 角色区分。
 type DashboardWSHub struct {
 	repo           *storage.TrafficRepository
+	tokens         *auth.TokenStore
 	servers        *XrayServerHandler // 复用 BuildRemoteServersList
 	trafficSummary http.Handler       // /api/traffic/summary(admin 全局)
 	trafficApi     http.Handler       // /api/admin/traffic(明细)
@@ -41,10 +43,11 @@ type DashboardWSHub struct {
 }
 
 type dashClient struct {
-	conn     *websocket.Conn
-	isAdmin  bool
-	username string
-	writeMu  sync.Mutex
+	conn         *websocket.Conn
+	isAdmin      bool
+	username     string
+	sessionToken string
+	writeMu      sync.Mutex
 }
 
 func (c *dashClient) send(v any) error {
@@ -62,6 +65,10 @@ func NewDashboardWSHub(repo *storage.TrafficRepository, servers *XrayServerHandl
 	}
 	h.upgrader = websocket.Upgrader{CheckOrigin: h.checkOrigin}
 	return h
+}
+
+func (h *DashboardWSHub) SetTokenStore(tokens *auth.TokenStore) {
+	h.tokens = tokens
 }
 
 // SetTrafficHandlers 注入 traffic 相关 handler(它们在 hub 之后构造),用于快照复用其 JSON 输出。
@@ -94,23 +101,41 @@ func (h *DashboardWSHub) callJSON(handler http.Handler, target, username string)
 	return json.RawMessage(rec.Body.Bytes())
 }
 
-// checkOrigin:本 WS 用 URL query 里的 token 鉴权(非 ambient cookie),跨站页面拿不到 token,
-// 天然不存在跨站 WS 劫持(CSWSH),故无需 Origin 校验 —— 与现有 agent/测速 WS 一致返回 true。
-// (曾做「Origin host == 请求 Host」同源校验,但在 CDN/反代改写 Host 时会误拒合法连接。)
 func (h *DashboardWSHub) checkOrigin(r *http.Request) bool {
-	return true
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+	if strings.EqualFold(parsed.Host, r.Host) {
+		return true
+	}
+	for _, allowed := range h.allowedOrigins {
+		if allowed != "*" && strings.EqualFold(strings.TrimRight(allowed, "/"), strings.TrimRight(origin, "/")) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *DashboardWSHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 鉴权由 auth.RequireToken 中间件在 upgrade 前完成,username 已注入 ctx。
+	// A one-time WebSocket ticket is consumed before upgrade and injects username.
 	username := auth.UsernameFromContext(r.Context())
-	isAdmin := username == "api-token-admin" || userIsAdmin(r.Context(), h.repo, username)
+	sessionToken := auth.SessionTokenFromContext(r.Context())
+	isAdmin := sessionToken != "" && userIsAdmin(r.Context(), h.repo, username)
+	if !isAdmin {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	c := &dashClient{conn: conn, isAdmin: isAdmin, username: username}
+	c := &dashClient{conn: conn, isAdmin: isAdmin, username: username, sessionToken: sessionToken}
 	id := h.nextID.Add(1)
 	h.clients.Store(id, c)
 	if h.clientCount.Add(1) == 1 {
@@ -143,6 +168,20 @@ func (h *DashboardWSHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(70 * time.Second))
+	}
+}
+
+func (h *DashboardWSHub) clientIsAuthorizedAdmin(c *dashClient) bool {
+	if c == nil || !c.isAdmin || h.tokens == nil || c.sessionToken == "" {
+		return false
+	}
+	username, ok := h.tokens.Lookup(c.sessionToken)
+	return ok && username == c.username && userIsAdmin(context.Background(), h.repo, c.username)
+}
+
+func (h *DashboardWSHub) closeUnauthorizedClient(c *dashClient) {
+	if c != nil && c.conn != nil {
+		_ = c.conn.Close()
 	}
 }
 
@@ -227,11 +266,13 @@ func (h *DashboardWSHub) broadcastSnapshot() {
 	var adminMsg map[string]any // 惰性构建:只有 admin 连接时才算一次
 	h.clients.Range(func(_, v any) bool {
 		c := v.(*dashClient)
-		if c.isAdmin {
+		if h.clientIsAuthorizedAdmin(c) {
 			if adminMsg == nil {
 				adminMsg = h.buildAdminSnapshot(ctx, c.username)
 			}
 			_ = c.send(adminMsg)
+		} else {
+			h.closeUnauthorizedClient(c)
 		}
 		return true
 	})
@@ -241,8 +282,10 @@ func (h *DashboardWSHub) broadcastSnapshot() {
 func (h *DashboardWSHub) broadcastToAdmins(msg any) {
 	h.clients.Range(func(_, v any) bool {
 		c := v.(*dashClient)
-		if c.isAdmin {
+		if h.clientIsAuthorizedAdmin(c) {
 			_ = c.send(msg)
+		} else {
+			h.closeUnauthorizedClient(c)
 		}
 		return true
 	})
@@ -253,9 +296,11 @@ func (h *DashboardWSHub) representativeAdmin() string {
 	username := ""
 	h.clients.Range(func(_, v any) bool {
 		c := v.(*dashClient)
-		if c.isAdmin {
+		if h.clientIsAuthorizedAdmin(c) {
 			username = c.username
 			return false
+		} else {
+			h.closeUnauthorizedClient(c)
 		}
 		return true
 	})
@@ -301,7 +346,9 @@ func (h *DashboardWSHub) broadcastServerStatus() {
 }
 
 func (h *DashboardWSHub) pushTo(c *dashClient) {
-	if c.isAdmin {
+	if h.clientIsAuthorizedAdmin(c) {
 		_ = c.send(h.buildAdminSnapshot(context.Background(), c.username))
+	} else {
+		h.closeUnauthorizedClient(c)
 	}
 }

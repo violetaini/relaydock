@@ -17,9 +17,11 @@ type Credentials struct {
 }
 
 type Manager struct {
-	repo     *storage.TrafficRepository
-	mu       sync.RWMutex
-	username string
+	repo *storage.TrafficRepository
+	// mu serializes credential mutations with the final session issuance step.
+	// A login authenticated against the old hash must not create a session after
+	// a concurrent password reset has removed all existing sessions.
+	mu *sync.RWMutex
 }
 
 func NewManager(repo *storage.TrafficRepository) (*Manager, error) {
@@ -27,67 +29,122 @@ func NewManager(repo *storage.TrafficRepository) (*Manager, error) {
 		return nil, errors.New("auth manager requires repository")
 	}
 
-	m := &Manager{repo: repo}
+	m := &Manager{repo: repo, mu: repo.AuthMutationMutex()}
 	return m, nil
 }
 
 func (m *Manager) Authenticate(ctx context.Context, username, password string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok, err := m.authenticateLocked(ctx, username, password)
+	return ok, err
+}
+
+// AuthenticateAndRun keeps a successful password verification and the caller's
+// session issuance callback in one credential critical section.
+func (m *Manager) AuthenticateAndRun(ctx context.Context, username, password string, run func(storage.User) error) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	user, ok, err := m.authenticateLocked(ctx, username, password)
+	if err != nil || !ok {
+		return ok, err
+	}
+	if run != nil {
+		if err := run(user); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// RunForActiveUser serializes a session issuance following a completed 2FA
+// challenge with credential mutations for the same process.
+func (m *Manager) RunForActiveUser(ctx context.Context, username string, run func(storage.User) error) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	user, err := m.activeUserLocked(ctx, username)
+	if err != nil {
+		return err
+	}
+	if run != nil {
+		return run(user)
+	}
+	return nil
+}
+
+func (m *Manager) authenticateLocked(ctx context.Context, username, password string) (storage.User, bool, error) {
 	username = strings.TrimSpace(username)
 	if username == "" {
-		return false, nil
+		return storage.User{}, false, nil
 	}
 
 	user, err := m.repo.GetUser(ctx, username)
 	if err != nil {
 		if errors.Is(err, storage.ErrUserNotFound) {
-			return false, nil
+			return storage.User{}, false, nil
 		}
-		return false, err
+		return storage.User{}, false, err
 	}
-
 	if !user.IsActive {
-		return false, nil
+		return storage.User{}, false, nil
 	}
 
 	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)) != nil {
-		return false, nil
+		return storage.User{}, false, nil
 	}
 
-	return true, nil
+	return user, true, nil
 }
 
-func (m *Manager) Update(ctx context.Context, username, password string) error {
+func (m *Manager) activeUserLocked(ctx context.Context, username string) (storage.User, error) {
+	user, err := m.repo.GetUser(ctx, strings.TrimSpace(username))
+	if err != nil {
+		return storage.User{}, err
+	}
+	if !user.IsActive {
+		return storage.User{}, errors.New("user is disabled")
+	}
+	return user, nil
+}
+
+func (m *Manager) Update(ctx context.Context, currentUsername, username, password string) (string, error) {
+	return m.UpdateAndRun(ctx, currentUsername, username, password, nil)
+}
+
+func (m *Manager) UpdateAndRun(ctx context.Context, currentUsername, username, password string, run func(string)) (string, error) {
+	currentUsername = strings.TrimSpace(currentUsername)
+	username = strings.TrimSpace(username)
+	if currentUsername == "" {
+		return "", errors.New("current username is required")
+	}
 	if username == "" && password == "" {
-		return errors.New("username or password must be provided")
+		return "", errors.New("username or password must be provided")
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	current := m.username
-
-	if username != "" && username != current {
-		if err := m.repo.RenameUser(ctx, current, username); err != nil {
-			return err
-		}
-		current = username
-	}
-
+	var hash string
 	if password != "" {
-		hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		generated, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		if err != nil {
-			return err
+			return "", err
 		}
-		if err := m.repo.UpdateUserPassword(ctx, current, string(hash)); err != nil {
-			return err
-		}
+		hash = string(generated)
 	}
 
-	m.username = current
-	return nil
+	updated, err := m.repo.UpdateCredentialsAndDeleteSessions(ctx, currentUsername, username, hash)
+	if err == nil && run != nil {
+		run(updated)
+	}
+	return updated, err
 }
 
 func (m *Manager) ChangePassword(ctx context.Context, username, currentPassword, newPassword string) error {
+	return m.ChangePasswordAndRun(ctx, username, currentPassword, newPassword, nil)
+}
+
+func (m *Manager) ChangePasswordAndRun(ctx context.Context, username, currentPassword, newPassword string, run func()) error {
 	username = strings.TrimSpace(username)
 	if username == "" {
 		return errors.New("username is required")
@@ -96,16 +153,15 @@ func (m *Manager) ChangePassword(ctx context.Context, username, currentPassword,
 		return errors.New("passwords are required")
 	}
 
-	user, err := m.repo.GetUser(ctx, username)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	user, err := m.activeUserLocked(ctx, username)
 	if err != nil {
 		if errors.Is(err, storage.ErrUserNotFound) {
 			return errors.New("user not found")
 		}
 		return err
-	}
-
-	if !user.IsActive {
-		return errors.New("user is disabled")
 	}
 
 	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(currentPassword)) != nil {
@@ -117,24 +173,39 @@ func (m *Manager) ChangePassword(ctx context.Context, username, currentPassword,
 		return err
 	}
 
-	if err := m.repo.UpdateUserPassword(ctx, username, string(hash)); err != nil {
+	if err := m.repo.UpdateUserPasswordAndDeleteSessions(ctx, username, string(hash)); err != nil {
 		return err
 	}
-
-	if username == m.username {
-		m.mu.Lock()
-		m.username = username
-		m.mu.Unlock()
+	if run != nil {
+		run()
 	}
 
 	return nil
 }
 
-func (m *Manager) Credentials(ctx context.Context) (Credentials, error) {
-	m.mu.RLock()
-	username := m.username
-	m.mu.RUnlock()
+// ResetPasswordAndRun is the administrator reset variant. The caller must
+// validate reset authorization before invoking it.
+func (m *Manager) ResetPasswordAndRun(ctx context.Context, username, passwordHash string, run func()) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("username is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.repo.UpdateUserPasswordAndDeleteSessions(ctx, username, passwordHash); err != nil {
+		return err
+	}
+	if run != nil {
+		run()
+	}
+	return nil
+}
 
+func (m *Manager) Credentials(ctx context.Context, username string) (Credentials, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return Credentials{}, errors.New("username is required")
+	}
 	user, err := m.repo.GetUser(ctx, username)
 	if err != nil {
 		return Credentials{}, err

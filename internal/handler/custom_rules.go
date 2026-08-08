@@ -231,7 +231,7 @@ func handleCreateCustomRule(w http.ResponseWriter, r *http.Request, repo *storag
 	}
 
 	// 触发自动同步以订阅启用自动同步的文件（同步收集添加的组）
-	addedGroups := triggerAutoSync(repo, rule.ID)
+	addedGroups := triggerAutoSync(r.Context(), repo, rule.ID)
 	logger.Info("[CreateCustomRule] 为规则添加代理组", "name", rule.Name, "added_groups", addedGroups, "count", len(addedGroups))
 
 	response := customRuleResponse{
@@ -299,7 +299,7 @@ func handleUpdateCustomRule(w http.ResponseWriter, r *http.Request, repo *storag
 	}
 
 	// 触发自动同步以订阅启用自动同步的文件（同步收集添加的组）
-	addedGroups := triggerAutoSync(repo, rule.ID)
+	addedGroups := triggerAutoSync(r.Context(), repo, rule.ID)
 	logger.Info("[UpdateCustomRule] 为规则添加代理组", "name", rule.Name, "added_groups", addedGroups, "count", len(addedGroups))
 
 	response := customRuleResponse{
@@ -334,9 +334,11 @@ func handleDeleteCustomRule(w http.ResponseWriter, r *http.Request, repo *storag
 
 // triggerAutoSync 触发自定义规则自动同步以订阅启用自动同步的文件
 // 返回在所有文件中添加的所有代理组的列表
-func triggerAutoSync(repo *storage.TrafficRepository, ruleID int64) []string {
-	ctx := context.Background()
-
+func triggerAutoSync(ctx context.Context, repo *storage.TrafficRepository, ruleID int64) []string {
+	rule, err := repo.GetCustomRule(ctx, ruleID)
+	if err != nil || !rule.Enabled {
+		return nil
+	}
 	// 获取所有启用自动同步的订阅文件
 	files, err := repo.GetSubscribeFilesWithAutoSync(ctx)
 	if err != nil {
@@ -355,6 +357,14 @@ func triggerAutoSync(repo *storage.TrafficRepository, ruleID int64) []string {
 
 	// 同步到每个文件
 	for _, file := range files {
+		allowed, err := customRuleAllowedForSubscribeFile(ctx, repo, file, *rule)
+		if err != nil {
+			logger.Info("[AutoSync] Failed to authorize rule for file", "filename", file.Filename, "id", file.ID, "error", err)
+			continue
+		}
+		if !allowed {
+			continue
+		}
 		addedGroups, err := syncCustomRulesToFile(ctx, repo, file)
 		if err != nil {
 			logger.Info("[AutoSync] Failed to sync to file (ID)", "filename", file.Filename, "id", file.ID, "error", err)

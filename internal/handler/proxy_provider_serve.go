@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"container/list"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -18,38 +21,185 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// GeoIP 缓存和 API 配置
-const ipInfoToken = "cddae164b36656"
+const (
+	geoIPCacheTTL             = 24 * time.Hour
+	maxGeoIPCacheEntries      = 4096
+	subscriptionCacheTTL      = 5 * time.Minute
+	maxSubscriptionBytes      = 50 << 20 // 50MB
+	maxSubscriptionCacheBytes = 64 << 20 // cache budget shared by all subscriptions
+	maxSubscriptionCacheItems = 1024
+)
 
 type geoIPResponse struct {
 	IP          string `json:"ip"`
 	CountryCode string `json:"country_code"`
 }
 
-var geoIPCache = sync.Map{}         // 地图[字符串]字符串（ip -> 国家/地区代码）
+var geoIPCache = newBoundedGeoIPCache(maxGeoIPCacheEntries, geoIPCacheTTL)
 var geoIPLookupPending = sync.Map{} // map[string]struct{}; prevents duplicate asynchronous lookups
-
-// 订阅内容缓存（5分钟过期）
-const subscriptionCacheTTL = 5 * time.Minute
-
-// 拉取外部订阅时的单次读取上限,防超大 body OOM(订阅内容通常 <几 MB)
-const maxSubscriptionBytes = 50 << 20 // 50MB
 
 type subscriptionCacheEntry struct {
 	content   []byte
 	fetchedAt time.Time
+	element   *list.Element
 }
 
-var subscriptionCache = sync.Map{} // map[string]*subscriptionCacheEntry (url -> 条目)
+type boundedSubscriptionCache struct {
+	mu       sync.Mutex
+	entries  map[string]*subscriptionCacheEntry
+	lru      *list.List
+	bytes    int64
+	maxBytes int64
+	maxItems int
+}
+
+type geoIPCacheEntry struct {
+	value     string
+	expiresAt time.Time
+}
+
+type boundedGeoIPCache struct {
+	mu         sync.Mutex
+	entries    map[string]geoIPCacheEntry
+	maxEntries int
+	ttl        time.Duration
+}
+
+var subscriptionCache = newBoundedSubscriptionCache(maxSubscriptionCacheBytes)
+
+func newBoundedGeoIPCache(maxEntries int, ttl time.Duration) *boundedGeoIPCache {
+	return &boundedGeoIPCache{entries: make(map[string]geoIPCacheEntry), maxEntries: maxEntries, ttl: ttl}
+}
+
+// Store/Load/Delete intentionally match sync.Map's small surface because tests
+// and public-probe handlers seed this package cache directly.
+func (c *boundedGeoIPCache) Store(key, value any) {
+	ip, ok := key.(string)
+	country, valueOK := value.(string)
+	if !ok || !valueOK {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.entries) >= c.maxEntries {
+		now := time.Now()
+		for candidate, entry := range c.entries {
+			if now.After(entry.expiresAt) {
+				delete(c.entries, candidate)
+			}
+		}
+	}
+	if len(c.entries) >= c.maxEntries {
+		for candidate := range c.entries {
+			delete(c.entries, candidate)
+			break
+		}
+	}
+	c.entries[ip] = geoIPCacheEntry{value: country, expiresAt: time.Now().Add(c.ttl)}
+}
+
+func (c *boundedGeoIPCache) Load(key any) (any, bool) {
+	ip, ok := key.(string)
+	if !ok {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[ip]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(entry.expiresAt) {
+		delete(c.entries, ip)
+		return nil, false
+	}
+	return entry.value, true
+}
+
+func (c *boundedGeoIPCache) Delete(key any) {
+	ip, ok := key.(string)
+	if !ok {
+		return
+	}
+	c.mu.Lock()
+	delete(c.entries, ip)
+	c.mu.Unlock()
+}
+
+func newBoundedSubscriptionCache(maxBytes int64) *boundedSubscriptionCache {
+	return &boundedSubscriptionCache{
+		entries:  make(map[string]*subscriptionCacheEntry),
+		lru:      list.New(),
+		maxBytes: maxBytes,
+		maxItems: maxSubscriptionCacheItems,
+	}
+}
+
+func (c *boundedSubscriptionCache) get(key string, now time.Time) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+	if now.Sub(entry.fetchedAt) >= subscriptionCacheTTL {
+		c.removeLocked(key, entry)
+		return nil, false
+	}
+	c.lru.MoveToFront(entry.element)
+	return entry.content, true
+}
+
+func (c *boundedSubscriptionCache) put(key string, content []byte, now time.Time) {
+	size := int64(len(content))
+	if size > c.maxBytes {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if existing, ok := c.entries[key]; ok {
+		c.removeLocked(key, existing)
+	}
+	for len(c.entries) >= c.maxItems && c.lru.Len() > 0 {
+		oldestKey := c.lru.Back().Value.(string)
+		c.removeLocked(oldestKey, c.entries[oldestKey])
+	}
+	for c.bytes+size > c.maxBytes && c.lru.Len() > 0 {
+		oldestKey := c.lru.Back().Value.(string)
+		c.removeLocked(oldestKey, c.entries[oldestKey])
+	}
+	entry := &subscriptionCacheEntry{content: content, fetchedAt: now}
+	entry.element = c.lru.PushFront(key)
+	c.entries[key] = entry
+	c.bytes += size
+}
+
+func (c *boundedSubscriptionCache) delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		c.removeLocked(key, entry)
+	}
+}
+
+func (c *boundedSubscriptionCache) removeLocked(key string, entry *subscriptionCacheEntry) {
+	delete(c.entries, key)
+	c.lru.Remove(entry.element)
+	c.bytes -= int64(len(entry.content))
+}
 
 // 失效指定URL的订阅内容缓存
 func InvalidateSubscriptionContentCache(url string) {
-	subscriptionCache.Delete(url)
+	subscriptionCache.delete(url)
 }
 
 // 查询 IP 的国家代码
 func getGeoIPCountryCode(ipOrHost string) string {
 	if ipOrHost == "" {
+		return ""
+	}
+	token := strings.TrimSpace(os.Getenv("ARCWAY_IPINFO_TOKEN"))
+	if token == "" {
 		return ""
 	}
 
@@ -72,7 +222,7 @@ func getGeoIPCountryCode(ipOrHost string) string {
 
 	// 查询 API
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("https://api.ipinfo.io/lite/%s?token=%s", ip, ipInfoToken))
+	resp, err := client.Get(fmt.Sprintf("https://api.ipinfo.io/lite/%s?token=%s", url.PathEscape(ip), url.QueryEscape(token)))
 	if err != nil {
 		logger.Info("[GeoIP] IP查询失败", "ip", ip, "error", err)
 		// 缓存空结果避免重复查询
@@ -80,6 +230,11 @@ func getGeoIPCountryCode(ipOrHost string) string {
 		return ""
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		logger.Info("[GeoIP] 查询返回非成功状态", "ip", ip, "status", resp.StatusCode)
+		geoIPCache.Store(ip, "")
+		return ""
+	}
 
 	var result geoIPResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -114,6 +269,9 @@ func cachedOrQueueGeoIPCountryCode(ipAddress string) string {
 		return ""
 	}
 	if !isGeoIPLookupPublicIP(ip) {
+		return ""
+	}
+	if strings.TrimSpace(os.Getenv("ARCWAY_IPINFO_TOKEN")) == "" {
 		return ""
 	}
 	if _, loaded := geoIPLookupPending.LoadOrStore(key, struct{}{}); !loaded {
@@ -158,14 +316,9 @@ func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error)
 	cacheKey := sub.URL
 
 	// 检查缓存
-	if cached, ok := subscriptionCache.Load(cacheKey); ok {
-		entry := cached.(*subscriptionCacheEntry)
-		if time.Since(entry.fetchedAt) < subscriptionCacheTTL {
-			logger.Info("[SubscriptionCache] 缓存命中", "url", sub.URL)
-			return entry.content, nil
-		}
-		// 缓存过期，删除
-		subscriptionCache.Delete(cacheKey)
+	if content, ok := subscriptionCache.get(cacheKey, time.Now()); ok {
+		logger.Info("[SubscriptionCache] 缓存命中", "url", sub.URL)
+		return content, nil
 	}
 
 	logger.Info("[SubscriptionCache] 缓存未命中，正在拉取", "url", sub.URL)
@@ -200,10 +353,7 @@ func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error)
 	}
 
 	// 存入缓存
-	subscriptionCache.Store(cacheKey, &subscriptionCacheEntry{
-		content:   body,
-		fetchedAt: time.Now(),
-	})
+	subscriptionCache.put(cacheKey, body, time.Now())
 
 	return body, nil
 }

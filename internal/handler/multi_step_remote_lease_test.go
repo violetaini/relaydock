@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
@@ -116,6 +117,47 @@ func TestCredentialMigrationRejectsNegativeAgentACK(t *testing.T) {
 	}
 	if stored.CredentialJSON != config.CredentialJSON {
 		t.Fatalf("negative ACK changed credential: %s", stored.CredentialJSON)
+	}
+}
+
+func TestUsernameRenameWithRemoteClientIsRejectedWithoutAgentMutation(t *testing.T) {
+	var requests []map[string]interface{}
+	agent := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid payload", http.StatusBadRequest)
+			return
+		}
+		requests = append(requests, payload)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "changed": true})
+	})
+	repo, server, _, config := createCredentialMigrationFixture(t, agent)
+	manager, err := auth.NewManager(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/api/admin/credentials", strings.NewReader(`{"username":"renamed"}`))
+	request = request.WithContext(auth.ContextWithUsername(request.Context(), "alice"))
+	response := httptest.NewRecorder()
+	NewCredentialsHandler(manager, auth.NewTokenStore(time.Hour), repo, nil).ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "密码可单独修改") {
+		t.Fatalf("unclear conflict response: %q", response.Body.String())
+	}
+	if len(requests) != 0 {
+		t.Fatalf("rejected rename sent %d Agent request(s)", len(requests))
+	}
+	stored, err := repo.GetUserInboundConfig(context.Background(), "alice", server.ID, "vless-in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.CredentialJSON != config.CredentialJSON {
+		t.Fatalf("rejected rename changed credential: %s", stored.CredentialJSON)
+	}
+	if _, err := repo.GetUser(context.Background(), "alice"); err != nil {
+		t.Fatalf("rejected rename changed account: %v", err)
 	}
 }
 

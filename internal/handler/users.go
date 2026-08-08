@@ -180,6 +180,9 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 	if repo == nil {
 		panic("user status handler requires repository")
 	}
+	if tokens != nil {
+		repo.SetSessionRevoker(tokens.RevokeAllForUser)
+	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -247,7 +250,7 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 			// both stores makes revocation immediate and prevents a restart from
 			// loading a previously issued session back into memory.
 			if tokens != nil {
-				tokens.RevokeUser(username)
+				tokens.RevokeAllForUser(username)
 			}
 		}
 
@@ -294,8 +297,8 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 	})
 }
 
-func NewUserResetPasswordHandler(repo *storage.TrafficRepository) http.Handler {
-	if repo == nil {
+func NewUserResetPasswordHandler(manager *auth.Manager, repo *storage.TrafficRepository, tokens *auth.TokenStore, twoFactorStore *auth.TwoFactorPendingStore) http.Handler {
+	if manager == nil || repo == nil || tokens == nil {
 		panic("user reset handler requires repository")
 	}
 
@@ -349,7 +352,12 @@ func NewUserResetPasswordHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 
-		if err := repo.UpdateUserPassword(r.Context(), username, string(hash)); err != nil {
+		if err := manager.ResetPasswordAndRun(r.Context(), username, string(hash), func() {
+			tokens.RevokeUser(username)
+			if twoFactorStore != nil {
+				twoFactorStore.RevokeUser(username)
+			}
+		}); err != nil {
 			if errors.Is(err, storage.ErrUserNotFound) {
 				writeError(w, http.StatusNotFound, errors.New("user not found"))
 				return
@@ -357,7 +365,6 @@ func NewUserResetPasswordHandler(repo *storage.TrafficRepository) http.Handler {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(userResetResponse{Username: username, Password: newPassword})
 	})

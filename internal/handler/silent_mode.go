@@ -143,13 +143,7 @@ func (m *SilentModeManager) extractUsername(r *http.Request) string {
 		return ""
 	}
 
-	if token := strings.TrimSpace(r.Header.Get(auth.AuthHeader)); token != "" {
-		if username, ok := m.tokens.Lookup(token); ok {
-			return username
-		}
-	}
-
-	if token := strings.TrimSpace(r.URL.Query().Get("token")); token != "" {
+	if token := auth.BearerToken(r); token != "" {
 		if username, ok := m.tokens.Lookup(token); ok {
 			return username
 		}
@@ -168,6 +162,7 @@ func (m *SilentModeManager) isAllowedPath(path string) bool {
 	allowedPrefixes := []string{
 		"/api/clash/subscribe",
 		"/api/proxy-provider/",
+		"/api/ws/dashboard",
 		"/t/",
 	}
 

@@ -164,6 +164,10 @@ func (h *shortLinkResetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
 		return
 	}
+	if !userIsAdmin(r.Context(), h.repo, username) {
+		writeError(w, http.StatusForbidden, errors.New("administrator access required"))
+		return
+	}
 
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("only POST is supported"))

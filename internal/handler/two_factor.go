@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,13 +14,16 @@ import (
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
-func NewTwoFactorLoginHandler(tokens *auth.TokenStore, repo *storage.TrafficRepository, tfStore *auth.TwoFactorPendingStore) http.Handler {
+const maxTwoFactorLoginBodyBytes int64 = 16 << 10
+
+func NewTwoFactorLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, repo *storage.TrafficRepository, tfStore *auth.TwoFactorPendingStore, rateLimiter *LoginRateLimiter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, errors.New("only POST is supported"))
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, maxTwoFactorLoginBodyBytes)
 		var payload struct {
 			TwoFactorToken string `json:"two_factor_token"`
 			Code           string `json:"code"`
@@ -29,35 +33,98 @@ func NewTwoFactorLoginHandler(tokens *auth.TokenStore, repo *storage.TrafficRepo
 			return
 		}
 
-		username, rememberMe, ok := tfStore.Validate(payload.TwoFactorToken)
+		payload.TwoFactorToken = strings.TrimSpace(payload.TwoFactorToken)
+		payload.Code = strings.TrimSpace(payload.Code)
+		if len(payload.TwoFactorToken) > 256 || len(payload.Code) > 32 {
+			writeError(w, http.StatusBadRequest, errors.New("invalid 2FA request"))
+			return
+		}
+		clientIP := GetClientIP(r)
+		if rateLimiter != nil {
+			if err := rateLimiter.Reserve(clientIP, ""); err != nil {
+				writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts, please try again later"))
+				return
+			}
+		}
+
+		username, rememberMe, ok := tfStore.Acquire(payload.TwoFactorToken)
 		if !ok {
+			if rateLimiter != nil {
+				rateLimiter.RecordFailure(clientIP, "")
+			}
 			writeError(w, http.StatusUnauthorized, errors.New("invalid or expired 2FA token"))
 			return
+		}
+		if rateLimiter != nil {
+			if err := rateLimiter.AttachAccount(username); err != nil {
+				rateLimiter.Release(clientIP, "")
+				tfStore.Finish(payload.TwoFactorToken, false)
+				writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts, please try again later"))
+				return
+			}
 		}
 
 		user, err := repo.GetUser(r.Context(), username)
 		if err != nil {
+			tfStore.Finish(payload.TwoFactorToken, false)
+			if rateLimiter != nil {
+				rateLimiter.RecordFailure(clientIP, username)
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 
-		if !auth.ValidateTOTPCode(user.TOTPSecret, strings.TrimSpace(payload.Code)) {
+		if !auth.ValidateTOTPCode(user.TOTPSecret, payload.Code) {
+			tfStore.Finish(payload.TwoFactorToken, false)
+			if rateLimiter != nil {
+				rateLimiter.RecordFailure(clientIP, username)
+			}
 			writeError(w, http.StatusUnauthorized, errors.New("invalid 2FA code"))
 			return
 		}
 
-		tfStore.Consume(payload.TwoFactorToken)
-		issueLoginSession(w, r, tokens, repo, user, rememberMe)
+		var token string
+		var expiry time.Time
+		err = manager.RunForActiveUser(r.Context(), username, func(active storage.User) error {
+			if !tfStore.IsAcquired(payload.TwoFactorToken) {
+				return errors.New("2FA challenge was revoked")
+			}
+			token, expiry, err = createLoginSession(r.Context(), tokens, repo, active, rememberMe)
+			if err != nil {
+				return err
+			}
+			if !tfStore.Finish(payload.TwoFactorToken, true) {
+				tokens.Revoke(token)
+				if repo != nil {
+					_ = repo.DeleteSession(r.Context(), token)
+				}
+				return errors.New("2FA challenge was revoked")
+			}
+			return nil
+		})
+		if err != nil {
+			tfStore.Finish(payload.TwoFactorToken, false)
+			if rateLimiter != nil {
+				rateLimiter.RecordFailure(clientIP, username)
+			}
+			writeError(w, http.StatusUnauthorized, errors.New("invalid or expired 2FA token"))
+			return
+		}
+		if rateLimiter != nil {
+			rateLimiter.RecordSuccess(clientIP, username)
+		}
+		writeLoginSession(w, r, token, expiry, user, rememberMe)
 	})
 }
 
-func NewRecoveryLoginHandler(tokens *auth.TokenStore, repo *storage.TrafficRepository, tfStore *auth.TwoFactorPendingStore) http.Handler {
+func NewRecoveryLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, repo *storage.TrafficRepository, tfStore *auth.TwoFactorPendingStore, rateLimiter *LoginRateLimiter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, errors.New("only POST is supported"))
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, maxTwoFactorLoginBodyBytes)
 		var payload struct {
 			TwoFactorToken string `json:"two_factor_token"`
 			RecoveryCode   string `json:"recovery_code"`
@@ -67,37 +134,101 @@ func NewRecoveryLoginHandler(tokens *auth.TokenStore, repo *storage.TrafficRepos
 			return
 		}
 
-		username, rememberMe, ok := tfStore.Validate(payload.TwoFactorToken)
+		payload.TwoFactorToken = strings.TrimSpace(payload.TwoFactorToken)
+		payload.RecoveryCode = strings.TrimSpace(payload.RecoveryCode)
+		if len(payload.TwoFactorToken) > 256 || len(payload.RecoveryCode) > 128 {
+			writeError(w, http.StatusBadRequest, errors.New("invalid recovery request"))
+			return
+		}
+		clientIP := GetClientIP(r)
+		if rateLimiter != nil {
+			if err := rateLimiter.Reserve(clientIP, ""); err != nil {
+				writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts, please try again later"))
+				return
+			}
+		}
+
+		username, rememberMe, ok := tfStore.Acquire(payload.TwoFactorToken)
 		if !ok {
+			if rateLimiter != nil {
+				rateLimiter.RecordFailure(clientIP, "")
+			}
 			writeError(w, http.StatusUnauthorized, errors.New("invalid or expired 2FA token"))
 			return
+		}
+		if rateLimiter != nil {
+			if err := rateLimiter.AttachAccount(username); err != nil {
+				rateLimiter.Release(clientIP, "")
+				tfStore.Finish(payload.TwoFactorToken, false)
+				writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts, please try again later"))
+				return
+			}
 		}
 
 		user, err := repo.GetUser(r.Context(), username)
 		if err != nil {
+			tfStore.Finish(payload.TwoFactorToken, false)
+			if rateLimiter != nil {
+				rateLimiter.RecordFailure(clientIP, username)
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 
 		hashedCodes, err := parseRecoveryCodes(user.RecoveryCodes)
 		if err != nil {
+			tfStore.Finish(payload.TwoFactorToken, false)
+			if rateLimiter != nil {
+				rateLimiter.Release(clientIP, username)
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 
 		valid, _ := auth.ValidateRecoveryCode(payload.RecoveryCode, hashedCodes)
 		if !valid {
+			tfStore.Finish(payload.TwoFactorToken, false)
+			if rateLimiter != nil {
+				rateLimiter.RecordFailure(clientIP, username)
+			}
 			writeError(w, http.StatusUnauthorized, errors.New("invalid recovery code"))
 			return
 		}
 
-		tfStore.Consume(payload.TwoFactorToken)
-
-		if err := repo.DisableUserTOTP(r.Context(), username); err != nil {
-			logger.Warn("[2FA] 恢复码重设失败", "username", username, "error", err)
+		var token string
+		var expiry time.Time
+		err = manager.RunForActiveUser(r.Context(), username, func(active storage.User) error {
+			if !tfStore.IsAcquired(payload.TwoFactorToken) {
+				return errors.New("2FA challenge was revoked")
+			}
+			if err := repo.DisableUserTOTP(r.Context(), username); err != nil {
+				return err
+			}
+			token, expiry, err = createLoginSession(r.Context(), tokens, repo, active, rememberMe)
+			if err != nil {
+				return err
+			}
+			if !tfStore.Finish(payload.TwoFactorToken, true) {
+				tokens.Revoke(token)
+				if repo != nil {
+					_ = repo.DeleteSession(r.Context(), token)
+				}
+				return errors.New("2FA challenge was revoked")
+			}
+			return nil
+		})
+		if err != nil {
+			tfStore.Finish(payload.TwoFactorToken, false)
+			if rateLimiter != nil {
+				rateLimiter.RecordFailure(clientIP, username)
+			}
+			writeError(w, http.StatusUnauthorized, errors.New("invalid or expired 2FA token"))
+			return
 		}
-
-		issueLoginSession(w, r, tokens, repo, user, rememberMe)
+		if rateLimiter != nil {
+			rateLimiter.RecordSuccess(clientIP, username)
+		}
+		writeLoginSession(w, r, token, expiry, user, rememberMe)
 	})
 }
 
@@ -256,7 +387,7 @@ func NewTwoFactorDisableHandler(manager *auth.Manager, repo *storage.TrafficRepo
 	})
 }
 
-func issueLoginSession(w http.ResponseWriter, r *http.Request, tokens *auth.TokenStore, repo *storage.TrafficRepository, user storage.User, rememberMe bool) {
+func createLoginSession(ctx context.Context, tokens *auth.TokenStore, repo *storage.TrafficRepository, user storage.User, rememberMe bool) (string, time.Time, error) {
 	var ttl time.Duration
 	if rememberMe {
 		ttl = 30 * 24 * time.Hour
@@ -266,16 +397,19 @@ func issueLoginSession(w http.ResponseWriter, r *http.Request, tokens *auth.Toke
 
 	token, expiry, err := tokens.IssueWithTTL(user.Username, ttl)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return "", time.Time{}, err
 	}
 
 	if repo != nil {
-		if err := repo.CreateSession(r.Context(), token, user.Username, expiry); err != nil {
-			logger.Warn("[认证] 会话持久化失败", "username", user.Username, "error", err)
+		if err := repo.CreateSession(ctx, token, user.Username, expiry); err != nil {
+			tokens.Revoke(token)
+			return "", time.Time{}, err
 		}
 	}
+	return token, expiry, nil
+}
 
+func writeLoginSession(w http.ResponseWriter, r *http.Request, token string, expiry time.Time, user storage.User, rememberMe bool) {
 	clientIP := GetClientIP(r)
 	logger.Info("[认证] 登录成功",
 		"username", user.Username,

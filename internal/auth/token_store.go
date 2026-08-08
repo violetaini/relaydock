@@ -18,21 +18,35 @@ import (
 type session struct {
 	username string
 	expiry   time.Time
+	service  bool
+}
+
+type websocketTicket struct {
+	username     string
+	sessionToken string
+	expiry       time.Time
 }
 
 type contextKey string
 
 const (
-	userContextKey contextKey = "github.com/violetaini/relaydock/auth/username"
+	userContextKey         contextKey = "github.com/violetaini/relaydock/auth/username"
+	sessionTokenContextKey contextKey = "github.com/violetaini/relaydock/auth/session-token"
+	authSourceContextKey   contextKey = "github.com/violetaini/relaydock/auth/source"
 )
+
+type authSourceMarker struct{}
+
+const GlobalAPITokenSubject = "api-token-admin"
 
 const AuthHeader = "Authorization"
 
 type TokenStore struct {
-	mu     sync.RWMutex
-	tokens map[string]session
-	ttl    time.Duration
-	secret []byte // HMAC signing secret; nil = use plain random tokens
+	mu      sync.RWMutex
+	tokens  map[string]session
+	tickets map[string]websocketTicket
+	ttl     time.Duration
+	secret  []byte // HMAC signing secret; nil = use plain random tokens
 }
 
 func NewTokenStore(ttl time.Duration) *TokenStore {
@@ -40,8 +54,9 @@ func NewTokenStore(ttl time.Duration) *TokenStore {
 		ttl = 24 * time.Hour
 	}
 	return &TokenStore{
-		tokens: make(map[string]session),
-		ttl:    ttl,
+		tokens:  make(map[string]session),
+		tickets: make(map[string]websocketTicket),
+		ttl:     ttl,
 	}
 }
 
@@ -57,6 +72,17 @@ func (s *TokenStore) Issue(username string) (string, time.Time, error) {
 
 // 使用自定义 TTL 为指定用户名创建新令牌。
 func (s *TokenStore) IssueWithTTL(username string, ttl time.Duration) (string, time.Time, error) {
+	return s.issueWithTTL(username, ttl, false)
+}
+
+// IssueServiceWithTTL creates an in-process service credential. Service
+// credentials remain attached to their account for authorization checks, but
+// are not browser login sessions and therefore survive password rotation.
+func (s *TokenStore) IssueServiceWithTTL(username string, ttl time.Duration) (string, time.Time, error) {
+	return s.issueWithTTL(username, ttl, true)
+}
+
+func (s *TokenStore) issueWithTTL(username string, ttl time.Duration, service bool) (string, time.Time, error) {
 	username = strings.TrimSpace(username)
 	if username == "" {
 		return "", time.Time{}, errors.New("username is required")
@@ -74,7 +100,7 @@ func (s *TokenStore) IssueWithTTL(username string, ttl time.Duration) (string, t
 	expiry := time.Now().Add(ttl)
 
 	s.mu.Lock()
-	s.tokens[token] = session{username: username, expiry: expiry}
+	s.tokens[token] = session{username: username, expiry: expiry, service: service}
 	s.mu.Unlock()
 
 	return token, expiry, nil
@@ -110,6 +136,11 @@ func (s *TokenStore) cleanupExpired() {
 			delete(s.tokens, token)
 		}
 	}
+	for ticket, sess := range s.tickets {
+		if now.After(sess.expiry) {
+			delete(s.tickets, ticket)
+		}
+	}
 	s.mu.Unlock()
 }
 
@@ -124,9 +155,20 @@ func (s *TokenStore) Revoke(token string) {
 	s.mu.Unlock()
 }
 
-// RevokeUser removes every in-memory session belonging to username. Persistent
-// session rows are deleted by the caller in the same account-disable flow.
+// RevokeUser removes interactive login sessions belonging to username. Service
+// credentials have an independent lifecycle and are intentionally preserved
+// across password changes.
 func (s *TokenStore) RevokeUser(username string) {
+	s.revokeUser(username, false)
+}
+
+// RevokeAllForUser removes interactive and service credentials. Account
+// disable/delete flows must use this stronger operation.
+func (s *TokenStore) RevokeAllForUser(username string) {
+	s.revokeUser(username, true)
+}
+
+func (s *TokenStore) revokeUser(username string, includeServices bool) {
 	username = strings.TrimSpace(username)
 	if username == "" {
 		return
@@ -134,8 +176,16 @@ func (s *TokenStore) RevokeUser(username string) {
 
 	s.mu.Lock()
 	for token, sess := range s.tokens {
-		if sess.username == username {
+		if sess.username == username && (includeServices || !sess.service) {
 			delete(s.tokens, token)
+		}
+	}
+	for ticket, sess := range s.tickets {
+		if sess.username == username {
+			if parent, ok := s.tokens[sess.sessionToken]; ok && parent.service && !includeServices {
+				continue
+			}
+			delete(s.tickets, ticket)
 		}
 	}
 	s.mu.Unlock()
@@ -144,6 +194,7 @@ func (s *TokenStore) RevokeUser(username string) {
 func (s *TokenStore) RevokeAll() {
 	s.mu.Lock()
 	s.tokens = make(map[string]session)
+	s.tickets = make(map[string]websocketTicket)
 	s.mu.Unlock()
 }
 
@@ -176,10 +227,87 @@ func (s *TokenStore) UpdateUsername(oldUsername, newUsername string) {
 	s.mu.Lock()
 	for token, sess := range s.tokens {
 		if sess.username == oldUsername {
-			s.tokens[token] = session{username: newUsername, expiry: sess.expiry}
+			sess.username = newUsername
+			s.tokens[token] = sess
+		}
+	}
+	for ticket, sess := range s.tickets {
+		if sess.username == oldUsername {
+			sess.username = newUsername
+			s.tickets[ticket] = sess
 		}
 	}
 	s.mu.Unlock()
+}
+
+// IssueWebSocketTicket creates a short-lived, one-time credential for browser
+// WebSocket handshakes. Long-lived bearer tokens must not appear in URLs.
+func (s *TokenStore) IssueWebSocketTicket(username, sessionToken string, ttl time.Duration) (string, time.Time, error) {
+	username = strings.TrimSpace(username)
+	sessionToken = strings.TrimSpace(sessionToken)
+	if username == "" || sessionToken == "" {
+		return "", time.Time{}, errors.New("username and session token are required")
+	}
+	if owner, ok := s.Lookup(sessionToken); !ok || owner != username {
+		return "", time.Time{}, errors.New("active browser session is required")
+	}
+	if ttl <= 0 || ttl > time.Minute {
+		ttl = 30 * time.Second
+	}
+	ticket, err := randomToken(32)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	expiry := time.Now().Add(ttl)
+	s.mu.Lock()
+	now := time.Now()
+	oldestTicket := ""
+	oldestExpiry := time.Time{}
+	userTicketCount := 0
+	for existing, pending := range s.tickets {
+		if now.After(pending.expiry) {
+			delete(s.tickets, existing)
+			continue
+		}
+		if pending.username == username {
+			userTicketCount++
+			if oldestTicket == "" || pending.expiry.Before(oldestExpiry) {
+				oldestTicket, oldestExpiry = existing, pending.expiry
+			}
+		}
+	}
+	if userTicketCount >= maxWebSocketTicketsPerUser && oldestTicket != "" {
+		delete(s.tickets, oldestTicket)
+	}
+	s.tickets[ticket] = websocketTicket{username: username, sessionToken: sessionToken, expiry: expiry}
+	s.mu.Unlock()
+	return ticket, expiry, nil
+}
+
+const maxWebSocketTicketsPerUser = 4
+
+// ConsumeWebSocketTicket validates and atomically removes a ticket so replayed
+// handshake URLs cannot establish a second connection.
+func (s *TokenStore) ConsumeWebSocketTicket(ticket string) (username, sessionToken string, ok bool) {
+	ticket = strings.TrimSpace(ticket)
+	if ticket == "" {
+		return "", "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.tickets[ticket]
+	if !ok {
+		return "", "", false
+	}
+	delete(s.tickets, ticket)
+	if time.Now().After(sess.expiry) {
+		return "", "", false
+	}
+	activeUsername, active := s.tokens[sess.sessionToken]
+	if !active || time.Now().After(activeUsername.expiry) || activeUsername.username != sess.username {
+		return "", "", false
+	}
+	return sess.username, sess.sessionToken, true
 }
 
 // 如果会话有效，查找将返回与所提供的令牌关联的用户名。
@@ -223,6 +351,25 @@ func ContextWithUsername(ctx context.Context, username string) context.Context {
 	return context.WithValue(ctx, userContextKey, username)
 }
 
+func ContextWithSessionToken(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, sessionTokenContextKey, token)
+}
+
+// ContextWithGlobalAPIToken records the authenticated source separately from
+// the display subject. A username can never forge this marker.
+func ContextWithGlobalAPIToken(ctx context.Context) context.Context {
+	ctx = ContextWithUsername(ctx, GlobalAPITokenSubject)
+	return context.WithValue(ctx, authSourceContextKey, authSourceMarker{})
+}
+
+func IsGlobalAPIToken(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	_, ok := ctx.Value(authSourceContextKey).(authSourceMarker)
+	return ok
+}
+
 // 从请求上下文中检索经过身份验证的用户名。
 func UsernameFromContext(ctx context.Context) string {
 	if ctx == nil {
@@ -230,6 +377,14 @@ func UsernameFromContext(ctx context.Context) string {
 	}
 	username, _ := ctx.Value(userContextKey).(string)
 	return username
+}
+
+func SessionTokenFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	token, _ := ctx.Value(sessionTokenContextKey).(string)
+	return token
 }
 
 // 返回用户名（如果存在），否则返回提供的后备值。
@@ -279,15 +434,7 @@ func RequireToken(store *TokenStore, repo UserRepository, next http.Handler) htt
 			return true
 		}
 
-		// 使用标准 Authorization: Bearer <token>。
-		token := ""
-		if bearer := strings.TrimSpace(r.Header.Get(AuthHeader)); bearer != "" {
-			token = strings.TrimSpace(strings.TrimPrefix(bearer, "Bearer "))
-		}
-		// 回退到查询参数（对于不支持自定义标头的 SSE）
-		if token == "" {
-			token = strings.TrimSpace(r.URL.Query().Get("token"))
-		}
+		token := BearerToken(r)
 
 		// 1) 会话 token
 		if username, ok := store.Lookup(token); ok {
@@ -305,13 +452,53 @@ func RequireToken(store *TokenStore, repo UserRepository, next http.Handler) htt
 			// 3) 全局 API token，授予管理员权限。
 			apiToken, err := repo.GetAPIToken(r.Context())
 			if err == nil && token == apiToken && apiToken != "" {
-				ctx := ContextWithUsername(r.Context(), "api-token-admin")
+				ctx := ContextWithGlobalAPIToken(r.Context())
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
 		}
 
 		WriteUnauthorizedResponse(w)
+	})
+}
+
+// BearerToken returns an Authorization bearer token. A single raw header value
+// remains accepted for compatibility with existing API clients. Query
+// parameters are intentionally excluded so session credentials stay out of
+// access logs, referrers and copied URLs.
+func BearerToken(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	fields := strings.Fields(strings.TrimSpace(r.Header.Get(AuthHeader)))
+	if len(fields) == 1 {
+		return fields[0]
+	}
+	if len(fields) == 2 && strings.EqualFold(fields[0], "Bearer") {
+		return strings.TrimSpace(fields[1])
+	}
+	return ""
+}
+
+// RequireWebSocketTicket authenticates one WebSocket upgrade using a
+// short-lived ticket. The ticket is consumed before the handler runs.
+func RequireWebSocketTicket(store *TokenStore, repo UserRepository, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		username, sessionToken, ok := store.ConsumeWebSocketTicket(r.URL.Query().Get("ticket"))
+		if !ok {
+			WriteUnauthorizedResponse(w)
+			return
+		}
+		if repo != nil {
+			user, err := repo.GetUser(r.Context(), username)
+			if err != nil || !user.IsActive {
+				WriteUnauthorizedResponse(w)
+				return
+			}
+		}
+		ctx := ContextWithUsername(r.Context(), username)
+		ctx = ContextWithSessionToken(ctx, sessionToken)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -347,8 +534,9 @@ func RequireAdmin(store *TokenStore, repo UserRepository, next http.Handler) htt
 			return
 		}
 
-		// 如果通过 API token 认证，授予管理员权限
-		if username == "api-token-admin" {
+		// The global API token carries an unforgeable authentication-source
+		// marker. User-controlled usernames are never treated as credentials.
+		if IsGlobalAPIToken(r.Context()) {
 			next.ServeHTTP(w, r)
 			return
 		}

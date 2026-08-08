@@ -46,6 +46,10 @@ func (h *debugHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
 		return
 	}
+	if !userIsAdmin(r.Context(), h.repo, username) {
+		writeError(w, http.StatusForbidden, errors.New("administrator access required"))
+		return
+	}
 
 	path := strings.TrimPrefix(r.URL.Path, "/api/user/debug")
 	path = strings.Trim(path, "/")
@@ -250,13 +254,13 @@ func (h *debugHandler) handleStatus(w http.ResponseWriter, r *http.Request, user
 }
 
 func (h *debugHandler) handleDownload(w http.ResponseWriter, r *http.Request, username string) {
-	filename := r.URL.Query().Get("file")
+	filename := strings.TrimSpace(r.URL.Query().Get("file"))
 	if filename == "" {
 		writeError(w, http.StatusBadRequest, errors.New("文件名不能为空"))
 		return
 	}
 
-	if !strings.HasPrefix(filename, "log_") || !strings.HasSuffix(filename, ".txt") {
+	if filename != filepath.Base(filename) || !strings.HasPrefix(filename, "log_") || !strings.HasSuffix(filename, ".txt") {
 		writeError(w, http.StatusBadRequest, errors.New("无效的文件名"))
 		return
 	}
@@ -267,12 +271,20 @@ func (h *debugHandler) handleDownload(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 
-	if settings.DebugLogPath != "" && filepath.Base(settings.DebugLogPath) != filename {
+	if settings.DebugLogPath == "" || filepath.Base(settings.DebugLogPath) != filename {
 		writeError(w, http.StatusForbidden, errors.New("无权访问该文件"))
 		return
 	}
 
-	filePath := filepath.Join(h.logManager.BaseDir, filename)
+	filePath, err := h.logManager.ResolveLogFile(filename)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, errors.New("文件不存在"))
+			return
+		}
+		writeError(w, http.StatusBadRequest, errors.New("无效的文件名"))
+		return
+	}
 
 	fileInfo, err := os.Stat(filePath)
 	if err != nil {
@@ -302,12 +314,13 @@ func (h *debugHandler) handleDownload(w http.ResponseWriter, r *http.Request, us
 
 	logger.Info("[Debug日志] 文件已下载", "user", username, "file", filename, "size", fileInfo.Size())
 
+	ownedFilename := filepath.Base(settings.DebugLogPath)
 	go func() {
 		time.Sleep(1 * time.Second)
-		if err := h.logManager.DeleteLogFile(filename); err != nil {
-			logger.Error("[Debug日志] 删除文件失败", "file", filename, "error", err)
+		if err := h.logManager.DeleteLogFile(ownedFilename); err != nil {
+			logger.Error("[Debug日志] 删除文件失败", "file", ownedFilename, "error", err)
 		} else {
-			logger.Info("[Debug日志] 文件已删除", "file", filename)
+			logger.Info("[Debug日志] 文件已删除", "file", ownedFilename)
 		}
 	}()
 }

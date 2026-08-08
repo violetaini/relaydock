@@ -30,6 +30,18 @@ func ListInboundTags(ctx context.Context, client command.HandlerServiceClient) (
 	return tags, nil
 }
 
+func ListOutboundTags(ctx context.Context, client command.HandlerServiceClient) ([]string, error) {
+	resp, err := client.ListOutbounds(ctx, &command.ListOutboundsRequest{})
+	if err != nil {
+		return nil, err
+	}
+	tags := make([]string, 0, len(resp.GetOutbounds()))
+	for _, outbound := range resp.GetOutbounds() {
+		tags = append(tags, outbound.GetTag())
+	}
+	return tags, nil
+}
+
 func GetInboundUsers(ctx context.Context, client command.HandlerServiceClient, inboundTag string) ([]*protocol.User, error) {
 	resp, err := client.GetInboundUsers(ctx, &command.GetInboundUserRequest{
 		Tag: inboundTag,

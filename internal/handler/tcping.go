@@ -162,7 +162,7 @@ func (h *tcpingHandler) resolveRequests(ctx context.Context, requests []TCPingRe
 	if username == "" {
 		return nil, http.StatusUnauthorized, errors.New("用户未认证")
 	}
-	isAdmin := username == "api-token-admin" || userIsAdmin(ctx, h.repo, username)
+	isAdmin := userIsAdmin(ctx, h.repo, username)
 
 	visible := map[int64]storage.Node{}
 	if !isAdmin {

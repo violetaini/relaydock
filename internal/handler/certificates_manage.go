@@ -246,9 +246,7 @@ func (h *CertificateHandler) requireAdmin(r *http.Request) bool {
 	if username == "" {
 		return false
 	}
-	// 全局 API token 走 auth.RequireToken 之后会得到 "api-token-admin" 虚拟用户名,
-	// 该虚拟用户不在 db 里,GetUser 会失败 → 必须短路放行,跟 auth.RequireAdmin 同款行为。
-	if username == "api-token-admin" {
+	if auth.IsGlobalAPIToken(r.Context()) {
 		return true
 	}
 	user, err := h.repo.GetUser(r.Context(), username)

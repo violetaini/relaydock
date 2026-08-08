@@ -21,9 +21,13 @@ type userSettingsResponse struct {
 	Profile profileResponse `json:"profile"`
 }
 
-func NewUserSettingsHandler(repo *storage.TrafficRepository, tokens *auth.TokenStore) http.Handler {
+func NewUserSettingsHandler(repo *storage.TrafficRepository, tokens *auth.TokenStore, pushers ...*LimiterConfigPusher) http.Handler {
 	if repo == nil || tokens == nil {
 		panic("user settings handler requires repository and token store")
+	}
+	var pusher *LimiterConfigPusher
+	if len(pushers) > 0 {
+		pusher = pushers[0]
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -69,17 +73,30 @@ func NewUserSettingsHandler(repo *storage.TrafficRepository, tokens *auth.TokenS
 				return
 			}
 
-			if err := repo.RenameUser(r.Context(), username, desiredUsername); err != nil {
-				lower := strings.ToLower(err.Error())
-				if strings.Contains(lower, "unique") {
+			if err := repo.RenameUserAndRun(r.Context(), username, desiredUsername, func() {
+				tokens.UpdateUsername(username, desiredUsername)
+				if limiter := GetLoginRateLimiter(); limiter != nil {
+					limiter.RenameUsername(username, desiredUsername)
+				}
+			}); err != nil {
+				if errors.Is(err, storage.ErrUserExists) || strings.Contains(strings.ToLower(err.Error()), "unique") {
 					writeError(w, http.StatusConflict, errors.New("用户名已存在"))
+					return
+				}
+				if errors.Is(err, storage.ErrReservedUsername) {
+					writeError(w, http.StatusBadRequest, errors.New("该用户名为系统保留名称"))
+					return
+				}
+				if errors.Is(err, storage.ErrUsernameRenameRequiresCredentialMigration) {
+					writeError(w, http.StatusConflict, errors.New("该账号已配置远端节点凭据或出站，请先解绑相关配置再修改用户名"))
 					return
 				}
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
-
-			tokens.UpdateUsername(username, desiredUsername)
+			if pusher != nil {
+				pusher.PushToAllServersForUser(r.Context(), desiredUsername)
+			}
 			username = desiredUsername
 		}
 

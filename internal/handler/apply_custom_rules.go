@@ -222,24 +222,25 @@ func applyCustomRulesToYamlSmart(ctx context.Context, repo *storage.TrafficRepos
 		return nil, nil, fmt.Errorf("failed to get custom rules: %w", err)
 	}
 
-	// 数据隔离 + 订阅级选择:
-	//   - 只应用该订阅"所有者"自己创建的覆写规则(排除管理员/他人的规则);
-	//   - 若该订阅指定了生效规则集(SelectedCustomRuleIDs),进一步只应用选中的。
-	// 兼容:历史/管理员订阅 CreatedBy 为空时不做所有者过滤(沿用旧的"全部启用生效")。
-	if sf, ferr := repo.GetSubscribeFileByID(ctx, subscribeFileID); ferr == nil {
-		selected := makeIDSet(sf.SelectedCustomRuleIDs)
-		filtered := rules[:0]
-		for _, ru := range rules {
-			if sf.CreatedBy != "" && ru.CreatedBy != sf.CreatedBy {
-				continue
-			}
-			if len(selected) > 0 && !selected[ru.ID] {
-				continue
-			}
-			filtered = append(filtered, ru)
-		}
-		rules = filtered
+	// Data isolation is explicit: a subscription only applies rules selected on
+	// that subscription. Owned subscriptions may only select their owner's
+	// rules; ownerless legacy subscriptions may only select an administrator's
+	// rules.
+	sf, err := repo.GetSubscribeFileByID(ctx, subscribeFileID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get subscribe file: %w", err)
 	}
+	filtered := rules[:0]
+	for _, rule := range rules {
+		allowed, err := customRuleAllowedForSubscribeFile(ctx, repo, sf, rule)
+		if err != nil {
+			return nil, nil, err
+		}
+		if allowed {
+			filtered = append(filtered, rule)
+		}
+	}
+	rules = filtered
 
 	if len(rules) == 0 {
 		return yamlData, nil, nil
@@ -315,6 +316,27 @@ func applyCustomRulesToYamlSmart(ctx context.Context, repo *storage.TrafficRepos
 	result := RemoveUnicodeEscapeQuotes(string(modifiedData))
 
 	return []byte(result), addedGroups, nil
+}
+
+func customRuleAllowedForSubscribeFile(ctx context.Context, repo *storage.TrafficRepository, file storage.SubscribeFile, rule storage.CustomRule) (bool, error) {
+	selected := makeIDSet(file.SelectedCustomRuleIDs)
+	if !selected[rule.ID] {
+		return false, nil
+	}
+	if file.CreatedBy != "" {
+		return rule.CreatedBy == file.CreatedBy, nil
+	}
+	if strings.TrimSpace(rule.CreatedBy) == "" {
+		return false, nil
+	}
+	creator, err := repo.GetUser(ctx, rule.CreatedBy)
+	if err != nil {
+		if errors.Is(err, storage.ErrUserNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get custom rule creator: %w", err)
+	}
+	return creator.Role == storage.RoleAdmin, nil
 }
 
 // 应用 DNS 自定义规则

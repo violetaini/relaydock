@@ -88,6 +88,8 @@ func (r *TrafficRepository) WithUsersProvisioningLease(ctx context.Context, user
 		normalized = append(normalized, username)
 	}
 	sort.Strings(normalized)
+	r.authMutationMu.Lock()
+	defer r.authMutationMu.Unlock()
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	for _, username := range normalized {
@@ -147,6 +149,8 @@ func (r *TrafficRepository) PrepareUserDeletion(ctx context.Context, username, a
 		return nil, ErrManagedInvalidArgument
 	}
 
+	r.authMutationMu.Lock()
+	defer r.authMutationMu.Unlock()
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -177,6 +181,9 @@ ON CONFLICT(username) DO UPDATE SET requested_by = excluded.requested_by, update
 		`UPDATE users SET is_active = 0, updated_at = ? WHERE username = ?`, now, username,
 	); err != nil {
 		return nil, fmt.Errorf("disable user for deletion: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE username = ?`, username); err != nil {
+		return nil, fmt.Errorf("delete sessions for user deletion: %w", err)
 	}
 
 	// Package credentials are not always materialized as package access sources.
@@ -243,6 +250,7 @@ WHERE grant_id IN (SELECT id FROM user_server_grants WHERE username = ?)`, now, 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit prepare user deletion: %w", err)
 	}
+	r.revokeMemorySessions(username)
 
 	rows, err := r.db.QueryContext(ctx, selectUserInboundAccessSource+`
 WHERE username = ? ORDER BY id ASC`, username)
@@ -362,6 +370,8 @@ func (r *TrafficRepository) FinalizeUserDeletion(ctx context.Context, username, 
 	if username == "" || actor == "" {
 		return ErrManagedInvalidArgument
 	}
+	r.authMutationMu.Lock()
+	defer r.authMutationMu.Unlock()
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -377,6 +387,7 @@ func (r *TrafficRepository) FinalizeUserDeletion(ctx context.Context, username, 
 		return fmt.Errorf("check user before final deletion: %w", err)
 	}
 	if userExists == 0 && tombstoneExists == 0 {
+		r.revokeMemorySessions(username)
 		return nil
 	}
 
@@ -445,5 +456,6 @@ WHERE kind = 'bind' AND bind_username = ?`, username); err != nil {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit finalize user deletion: %w", err)
 	}
+	r.revokeMemorySessions(username)
 	return nil
 }
