@@ -65,6 +65,11 @@ func (s *Service) Start(parent context.Context) error {
 	b, err := bot.New(
 		s.cfg.TGBotToken,
 		bot.WithDefaultHandler(s.defaultHandler),
+		bot.WithMiddlewares(s.rateLimitUpdate, s.authorizeUpdate),
+		bot.WithAllowedUpdates(bot.AllowedUpdates{
+			models.AllowedUpdateMessage,
+			models.AllowedUpdateCallbackQuery,
+		}),
 		bot.WithSkipGetMe(),
 		bot.WithNotAsyncHandlers(),
 	)

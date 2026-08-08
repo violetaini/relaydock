@@ -5,11 +5,11 @@ import (
 	"time"
 )
 
-// 简单 per-tg_id 限流:固定窗口 60 秒,N 次。算法跟嵌入式版同款。
+// 简单 per-tg_id 全局限流:固定窗口 60 秒,N 次。
 
 const (
 	rateWindowSeconds = 60
-	rateMaxPerWindow  = 5
+	rateMaxPerWindow  = 20
 	rateLimitMaxKeys  = 10000
 )
 

@@ -17,7 +17,7 @@ import (
 //	B) /start <code>:校验 kind = bind → 调主控 /bind kind=bind
 //	   /start <code>:校验 kind = new  → 开启多步注册对话(收集 username/email)
 //
-// 群里 /start 直接拒(防邀请码泄露)。
+// 群聊更新由全局访问中间件静默拒绝，避免邀请码和账号信息回显。
 func (s *Service) handleStart(ctx context.Context, b *bot.Bot, update *models.Update) {
 	if update.Message == nil || update.Message.From == nil {
 		return
@@ -27,20 +27,23 @@ func (s *Service) handleStart(ctx context.Context, b *bot.Bot, update *models.Up
 	tgHandle := update.Message.From.Username
 
 	if update.Message.Chat.Type != "private" {
-		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "请在私聊里使用本机器人。",
-		})
 		return
 	}
 
-	args := strings.TrimSpace(strings.TrimPrefix(update.Message.Text, "/start"))
-	args = strings.TrimSpace(args)
+	info, userErr := s.client.UserByTG(ctx, tgID)
+	knownUser := s.cfg.IsAdmin(tgID) || (userErr == nil && info.Bound)
+
+	command, args, validCommand := telegramCommand(update.Message.Text)
+	if !validCommand || command != "start" {
+		return
+	}
 
 	// A 无 code
-	if args == "" {
-		info, err := s.client.UserByTG(ctx, tgID)
-		if err == nil && info.Bound {
+	if len(args) == 0 {
+		if !knownUser {
+			return
+		}
+		if info != nil && info.Bound {
 			_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
 				ChatID: chatID,
 				Text: fmt.Sprintf("已绑定账号:%s\n\n常用:/me /sub /traffic /nodes /unbind /help",
@@ -57,20 +60,30 @@ func (s *Service) handleStart(ctx context.Context, b *bot.Bot, update *models.Up
 	}
 
 	// B/C 有 code
-	code := strings.ToUpper(strings.Fields(args)[0])
+	if len(args) != 1 {
+		return
+	}
+	code := strings.ToUpper(args[0])
 
 	// 注册邀请码需要先知道 kind,但不能从管理列表里找:列表有条数上限,
 	// 会让较早创建、仍有效的深链被误判为不存在。
 	ic, found, err := s.client.LookupInvite(ctx, code)
 	if err != nil {
-		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "查询邀请码失败:" + err.Error()})
+		if knownUser {
+			_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "查询邀请码失败:" + err.Error()})
+		}
 		return
 	}
 	if !found {
-		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "邀请码不存在。"})
+		if knownUser {
+			_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "邀请码不存在。"})
+		}
 		return
 	}
 	if !ic.Usable {
+		if !knownUser {
+			return
+		}
 		reason := "邀请码已不可用"
 		if ic.Revoked {
 			reason = "邀请码已被撤销"
@@ -82,7 +95,7 @@ func (s *Service) handleStart(ctx context.Context, b *bot.Bot, update *models.Up
 	}
 
 	// 已绑 → 拒
-	if info, err := s.client.UserByTG(ctx, tgID); err == nil && info.Bound {
+	if info != nil && info.Bound {
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID,
 			Text:   fmt.Sprintf("当前 TG 已绑定到 %s,请先 /unbind 解绑。", info.Username),

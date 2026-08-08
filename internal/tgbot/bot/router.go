@@ -9,19 +9,21 @@ import (
 
 // registerCommands 注册所有命令。B2 阶段先 /help + 占位 /start,B4 补全。
 func registerCommands(b *bot.Bot, s *Service) {
-	// go-telegram/bot 的 MatchTypeCommand 比对的是去掉前导 "/" 后的命令名,
-	// 所以注册 pattern 不能带 "/"(消息原文仍是 "/help",handler 内 TrimPrefix 不受影响)。
-	b.RegisterHandler(bot.HandlerTypeMessageText, "help", bot.MatchTypeCommand, s.handleHelp)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "start", bot.MatchTypeCommand, s.handleStart)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "me", bot.MatchTypeCommand, s.handleMe)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "sub", bot.MatchTypeCommand, s.handleSub)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "traffic", bot.MatchTypeCommand, s.handleTraffic)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "nodes", bot.MatchTypeCommand, s.handleNodes)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "unbind", bot.MatchTypeCommand, s.handleUnbind)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "notify", bot.MatchTypeCommand, s.handleNotify)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "admin_invite", bot.MatchTypeCommand, s.withRateLimit(s.handleAdminInvite))
-	b.RegisterHandler(bot.HandlerTypeMessageText, "admin_user", bot.MatchTypeCommand, s.withRateLimit(s.handleAdminUser))
-	b.RegisterHandler(bot.HandlerTypeMessageText, "announce", bot.MatchTypeCommand, s.withRateLimit(s.handleAnnounce))
+	// 普通命令要求 BotCommand entity 从消息开头出现。/start 使用自定义
+	// matcher，以兼容 Telegram 私聊中显式携带 @botname 的命令形式。
+	b.RegisterHandler(bot.HandlerTypeMessageText, "help", bot.MatchTypeCommandStartOnly, s.handleHelp)
+	b.RegisterHandlerMatchFunc(func(update *models.Update) bool {
+		return commandAtStart(update, "start")
+	}, s.handleStart)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "me", bot.MatchTypeCommandStartOnly, s.handleMe)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "sub", bot.MatchTypeCommandStartOnly, s.handleSub)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "traffic", bot.MatchTypeCommandStartOnly, s.handleTraffic)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "nodes", bot.MatchTypeCommandStartOnly, s.handleNodes)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "unbind", bot.MatchTypeCommandStartOnly, s.handleUnbind)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "notify", bot.MatchTypeCommandStartOnly, s.handleNotify)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "admin_invite", bot.MatchTypeCommandStartOnly, s.handleAdminInvite)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "admin_user", bot.MatchTypeCommandStartOnly, s.handleAdminUser)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "announce", bot.MatchTypeCommandStartOnly, s.handleAnnounce)
 	// /admin_invite create 的按钮交互回调(类型/套餐/有效期)。
 	b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "iv:", bot.MatchTypePrefix, s.handleInviteCallback)
 }
@@ -69,21 +71,5 @@ func (s *Service) defaultHandler(ctx context.Context, b *bot.Bot, update *models
 	}
 	if s.continueRegistration(ctx, b, update) {
 		return
-	}
-}
-
-// withRateLimit per-tg_id 5次/分钟。
-func (s *Service) withRateLimit(h bot.HandlerFunc) bot.HandlerFunc {
-	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
-		if update.Message != nil && update.Message.From != nil {
-			if !allowTGID(update.Message.From.ID) {
-				_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
-					ChatID: update.Message.Chat.ID,
-					Text:   "操作太频繁,请稍后再试(每分钟限 5 次)。",
-				})
-				return
-			}
-		}
-		h(ctx, b, update)
 	}
 }
