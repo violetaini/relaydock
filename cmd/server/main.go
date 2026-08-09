@@ -479,6 +479,9 @@ func main() {
 	mux.Handle("/api/user/token", auth.RequireToken(tokenStore, userRepo, handler.NewUserTokenHandler(repo)))
 	// 代理集合(Clash proxy-provider)配置 — 用户自己 CRUD;handler 内做 username 隔离
 	mux.Handle("/api/user/proxy-provider-configs", auth.RequireToken(tokenStore, userRepo, handler.NewProxyProviderConfigsHandler(repo)))
+	mux.Handle("/api/user/proxy-provider-configs/rotate", auth.RequireToken(tokenStore, userRepo, handler.NewProxyProviderTokenRotateHandler(repo)))
+	// Mihomo 通过独立、可撤销的 Authorization 凭据拉取规范化节点内容。
+	mux.Handle("/api/proxy-provider/", handler.NewProxyProviderContentHandler(repo))
 	// 每用户 API 令牌(供 MCP / 程序化访问);明文仅创建时返回一次
 	mux.Handle("/api/user/api-tokens", auth.RequireToken(tokenStore, userRepo, handler.NewUserAPITokensHandler(repo)))
 	mux.Handle("/api/user/api-tokens/", auth.RequireToken(tokenStore, userRepo, handler.NewUserAPITokensHandler(repo)))

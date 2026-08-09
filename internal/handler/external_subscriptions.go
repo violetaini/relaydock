@@ -172,20 +172,19 @@ func handleCreateExternalSubscription(w http.ResponseWriter, r *http.Request, re
 	client := safefetch.NewClient(30*time.Second, maxSubscriptionBytes)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
 	if err != nil {
-		logger.Info("[外部订阅] 创建请求失败", "name", name, "error", err)
+		logger.Info("[外部订阅] 创建请求失败", "name", name, "error", sanitizeSubscriptionRequestError(err))
 	} else {
 		req.Header.Set("User-Agent", userAgent)
-		logger.Info("[外部订阅] 获取流量信息", "name", name, "user_agent", userAgent)
+		logger.Info("[外部订阅] 获取流量信息", "name", name)
 		resp, err := client.Do(req)
 		if err != nil {
-			logger.Info("[外部订阅] 请求失败", "error", err)
+			logger.Info("[外部订阅] 请求失败", "name", name, "error", sanitizeSubscriptionRequestError(err))
 		} else {
 			defer resp.Body.Close()
 			logger.Info("[外部订阅] 响应状态", "name", name, "status_code", resp.StatusCode)
 			if resp.StatusCode == http.StatusOK {
 				// 解析订阅用户信息标头以获取流量信息
 				userInfo := resp.Header.Get("subscription-userinfo")
-				logger.Info("[外部订阅] subscription-userinfo头", "name", name, "header", userInfo)
 				if userInfo != "" {
 					trafficUpload, trafficDownload, trafficTotal, trafficExpire = ParseTrafficInfoHeader(userInfo)
 					logger.Info("[外部订阅] 解析流量信息", "upload", trafficUpload, "download", trafficDownload, "total", trafficTotal)

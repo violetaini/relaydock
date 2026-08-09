@@ -93,9 +93,10 @@ type ContextKey string
 const TokenInvalidKey ContextKey = "token_invalid"
 
 type SubscriptionHandler struct {
-	repo     *storage.TrafficRepository
-	baseDir  string
-	fallback string
+	repo                                *storage.TrafficRepository
+	baseDir                             string
+	fallback                            string
+	syncReferencedExternalSubscriptions func(context.Context, *storage.TrafficRepository, string, string, []storage.ExternalSubscription) error
 }
 
 type subscriptionEndpoint struct {
@@ -149,7 +150,12 @@ func newSubscriptionHandler(repo *storage.TrafficRepository, baseDir, fallback s
 		fallback = subscriptionDefaultType
 	}
 
-	return &SubscriptionHandler{repo: repo, baseDir: cleanedBase, fallback: fallback}
+	return &SubscriptionHandler{
+		repo:                                repo,
+		baseDir:                             cleanedBase,
+		fallback:                            fallback,
+		syncReferencedExternalSubscriptions: syncReferencedExternalSubscriptions,
+	}
 }
 
 func (s *subscriptionEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -456,6 +462,9 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	//   - 都没 → 走静态文件路径(原行为)
 	var data []byte
 	fromTemplate := false
+	var templateFile storage.SubscribeFile
+	templateForceServerProviders := false
+	crossOwnerAccess := hasSubscribeFile && subscriptionProviderRequiresServerMaterialization(username, subscribeFile.CreatedBy)
 	if hasSubscribeFile {
 		effectiveTemplate := subscribeFile.TemplateFilename
 		if effectiveTemplate == "" && h.repo != nil {
@@ -475,12 +484,18 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			stepStart = time.Now()
 			sfForGen := subscribeFile
 			sfForGen.TemplateFilename = effectiveTemplate
-			templateData, genErr := h.generateFromTemplate(r.Context(), sfForGen)
+			templateFile = sfForGen
+			templateForceServerProviders = proxyProviderRequiresServerMaterialization(r.URL.Query().Get("t")) || crossOwnerAccess
+			templateData, genErr := h.generateFromTemplate(
+				r.Context(),
+				sfForGen,
+				templateForceServerProviders,
+			)
 			if genErr != nil {
 				// The raw file may still contain the template owner's credential.
-				// Ordinary users therefore fail closed instead of taking the legacy
-				// fallback when isolated template generation fails.
-				if subscriptionCreatorRequiresIsolation(r.Context(), h.repo, sfForGen.CreatedBy) {
+				// Cross-owner requests and ordinary-user templates therefore fail
+				// closed instead of taking the legacy fallback.
+				if crossOwnerAccess || subscriptionCreatorRequiresIsolation(r.Context(), h.repo, sfForGen.CreatedBy) {
 					logger.Info("[Subscription] 用户模板生成失败，拒绝回退原始文件", "error", genErr, "template", effectiveTemplate)
 					writeError(w, http.StatusServiceUnavailable, errors.New("订阅配置暂不可用"))
 					return
@@ -493,8 +508,6 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 	}
-	_ = fromTemplate
-
 	// 文件读取（如果模板生成失败或未绑定模板）
 	if len(data) == 0 {
 		stepStart = time.Now()
@@ -566,7 +579,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 						for _, sub := range subsToSync {
 							if sub.LastSyncAt == nil {
 								// 以前从未同步过
-								logger.Info("[Subscription] 订阅从未同步过，将进行同步", "name", sub.Name, "url", sub.URL)
+								logger.Info("[Subscription] 订阅从未同步过，将进行同步", "name", sub.Name)
 								shouldSync = true
 								break
 							}
@@ -575,7 +588,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 							elapsed := time.Since(*sub.LastSyncAt).Minutes()
 							if elapsed >= float64(settings.CacheExpireMinutes) {
 								// 缓存已过期
-								logger.Info("[Subscription] 订阅缓存已过期，将进行同步", "name", sub.Name, "url", sub.URL, "elapsed_minutes", elapsed, "expire_minutes", settings.CacheExpireMinutes)
+								logger.Info("[Subscription] 订阅缓存已过期，将进行同步", "name", sub.Name, "elapsed_minutes", elapsed, "expire_minutes", settings.CacheExpireMinutes)
 								shouldSync = true
 								break
 							}
@@ -592,34 +605,48 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 					if shouldSync {
 						logger.Info("[Subscription] 开始同步用户的外部订阅(仅引用的订阅)", "user", username)
 						// 仅同步引用的外部订阅
-						if err := syncReferencedExternalSubscriptions(r.Context(), h.repo, h.baseDir, username, subsToSync); err != nil {
+						if err := h.syncReferencedExternalSubscriptions(r.Context(), h.repo, h.baseDir, username, subsToSync); err != nil {
 							logger.Info("[Subscription] 同步外部订阅失败", "error", err)
 							// 记录错误但不要使请求失败
 							// 同步是尽力而为的
 						} else {
 							logger.Info("[Subscription] External subscriptions sync completed successfully")
 
-							// 同步后重新读取订阅文件以获取更新的节点
-							unlock, lockErr := lockSubscriptionFilenames(filename)
-							if lockErr != nil {
-								writeError(w, http.StatusInternalServerError, lockErr)
-								return
-							}
-							updatedData, err := os.ReadFile(resolvedPath)
-							if err != nil {
-								unlock()
-								logger.Info("[Subscription] 同步后重新读取订阅文件失败", "error", err)
+							if fromTemplate {
+								updatedData, renderErr := h.generateFromTemplate(
+									r.Context(), templateFile, templateForceServerProviders,
+								)
+								if renderErr != nil {
+									// Keep the already validated pre-sync result. Sync is best effort,
+									// and falling back to the raw file can expose Provider credentials.
+									logger.Info("[Subscription] 同步后重新生成模板失败，保留原结果", "error", renderErr)
+								} else {
+									data = updatedData
+									logger.Info("[Subscription] 同步后重新生成模板成功", "bytes", len(data))
+								}
 							} else {
-								hydrated, hydrateErr := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, filename, string(updatedData))
-								if hydrateErr != nil {
-									unlock()
-									logger.Info("[Subscription] 同步后 WireGuard 节点私钥引用解析失败", "error", hydrateErr)
-									writeError(w, http.StatusServiceUnavailable, errors.New("WireGuard 节点配置暂不可用"))
+								// Non-template subscriptions continue to refresh their static file.
+								unlock, lockErr := lockSubscriptionFilenames(filename)
+								if lockErr != nil {
+									writeError(w, http.StatusInternalServerError, lockErr)
 									return
 								}
-								data = []byte(hydrated)
-								unlock()
-								logger.Info("[Subscription] 同步后重新读取订阅文件成功", "bytes", len(data))
+								updatedData, err := os.ReadFile(resolvedPath)
+								if err != nil {
+									unlock()
+									logger.Info("[Subscription] 同步后重新读取订阅文件失败", "error", err)
+								} else {
+									hydrated, hydrateErr := hydrateWireGuardSubscriptionContent(r.Context(), h.repo, filename, string(updatedData))
+									if hydrateErr != nil {
+										unlock()
+										logger.Info("[Subscription] 同步后 WireGuard 节点私钥引用解析失败", "error", hydrateErr)
+										writeError(w, http.StatusServiceUnavailable, errors.New("WireGuard 节点配置暂不可用"))
+										return
+									}
+									data = []byte(hydrated)
+									unlock()
+									logger.Info("[Subscription] 同步后重新读取订阅文件成功", "bytes", len(data))
+								}
 							}
 						}
 					}
@@ -774,6 +801,22 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	logger.Info("[⏱️ 耗时监测] 覆写脚本执行完成", "step", "override_script", "duration_ms", time.Since(stepStart).Milliseconds())
+	if crossOwnerAccess {
+		containsProviders, inspectErr := subscriptionContainsProxyProviders(data)
+		if inspectErr != nil {
+			logger.Info("[Subscription] 跨所有者订阅解析失败，拒绝返回", "error", inspectErr, "filename", filename)
+			writeError(w, http.StatusServiceUnavailable, errors.New("订阅配置暂不可用"))
+			return
+		}
+		if containsProviders {
+			// A Provider definition can carry an Arcway bearer copied from another
+			// response. That durable capability is not scoped to this assignment,
+			// so it would survive revocation if handed to a grantee.
+			logger.Info("[Subscription] 跨所有者订阅包含 Provider 定义，拒绝返回", "filename", filename)
+			writeError(w, http.StatusServiceUnavailable, errors.New("订阅配置暂不可用"))
+			return
+		}
+	}
 
 	// 格式转换
 	stepStart = time.Now()
@@ -1040,7 +1083,41 @@ func subscriptionCreatorRequiresIsolation(ctx context.Context, repo *storage.Tra
 	return err != nil || user.Role != storage.RoleAdmin
 }
 
-func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscribeFile storage.SubscribeFile) ([]byte, error) {
+// subscriptionProviderRequiresServerMaterialization prevents a grantee from
+// receiving the file creator's durable Provider bearer credential. The main
+// subscription authorization is revalidated on every fetch, while a copied
+// Provider credential would otherwise survive assignment revocation.
+func subscriptionProviderRequiresServerMaterialization(requester, creator string) bool {
+	requester = strings.TrimSpace(requester)
+	creator = strings.TrimSpace(creator)
+	if requester == "" {
+		return false
+	}
+	return creator == "" || requester != creator
+}
+
+// subscriptionContainsProxyProviders identifies durable Provider capabilities
+// in the final YAML before client conversion. Cross-owner responses cannot
+// safely forward these definitions because their credentials are not scoped to
+// the revocable file assignment.
+func subscriptionContainsProxyProviders(content []byte) (bool, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal(content, &root); err != nil {
+		return false, fmt.Errorf("parse subscription YAML: %w", err)
+	}
+	rootMap := yamlDocumentMapping(&root)
+	if rootMap == nil {
+		return false, nil
+	}
+	var document map[string]any
+	if err := rootMap.Decode(&document); err != nil {
+		return false, fmt.Errorf("decode subscription YAML: %w", err)
+	}
+	_, exists := document["proxy-providers"]
+	return exists, nil
+}
+
+func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscribeFile storage.SubscribeFile, forceServerProviders bool) ([]byte, error) {
 	if subscribeFile.TemplateFilename == "" {
 		return nil, errors.New("订阅未绑定模板")
 	}
@@ -1179,15 +1256,16 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 		return nil, errors.New("无可用节点")
 	}
 
-	processor := substore.NewTemplateV3Processor(nil, nil)
-	result, err := processor.ProcessTemplate(string(templateContent), proxies)
+	result, err := renderTemplateWithProxyProviders(
+		ctx,
+		h.repo,
+		string(templateContent),
+		proxies,
+		creator,
+		forceServerProviders,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("处理模板失败: %w", err)
-	}
-
-	result, err = injectProxiesIntoTemplate(result, proxies)
-	if err != nil {
-		return nil, fmt.Errorf("注入代理节点失败: %w", err)
 	}
 
 	// 孤儿节点裁剪:顶层 proxies: 只保留被 proxy-groups 实际引用的节点,删掉没被引用的
@@ -1221,6 +1299,7 @@ func getKeys(m map[string]bool) []string {
 // 还检查引用外部订阅的代理提供程序配置的代理提供程序
 func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username string, repo *storage.TrafficRepository) (map[string]bool, error) {
 	usedURLs := make(map[string]bool)
+	proxyNames := make(map[string]bool)
 
 	// 解析 YAML 内容
 	var yamlContent map[string]any
@@ -1233,7 +1312,6 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 		logger.Info("[Subscription] 找到订阅文件中的代理节点", "count", len(proxies))
 
 		// 收集所有代理名称
-		proxyNames := make(map[string]bool)
 		for _, proxy := range proxies {
 			if proxyMap, ok := proxy.(map[string]any); ok {
 				if name, ok := proxyMap["name"].(string); ok && name != "" {
@@ -1261,7 +1339,7 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 					// 如果节点有 RawURL，直接使用
 					if node.RawURL != "" {
 						usedURLs[node.RawURL] = true
-						logger.Info("[Subscription] 从节点找到外部订阅URL", "node_name", node.NodeName, "url", node.RawURL)
+						logger.Info("[Subscription] 从节点找到外部订阅来源", "node_name", node.NodeName)
 					}
 					// 如果节点有 Tag（外部订阅名称），记录下来
 					if node.Tag != "" && node.Tag != "手动输入" {
@@ -1284,7 +1362,7 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 					for _, sub := range externalSubs {
 						if usedTags[sub.Name] {
 							usedURLs[sub.URL] = true
-							logger.Info("[Subscription] 从节点Tag找到外部订阅URL", "tag", sub.Name, "url", sub.URL)
+							logger.Info("[Subscription] 从节点Tag找到外部订阅", "tag", sub.Name)
 						}
 					}
 				}
@@ -1297,14 +1375,8 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 	if proxyGroups, ok := yamlContent["proxy-groups"].([]any); ok {
 		logger.Info("[Subscription] 检查 proxy-groups", "group_count", len(proxyGroups))
 		providerNames := make(map[string]bool)
-		groupNames := make(map[string]bool) // 兼容模式：收集 proxy-group 的名称
 		for _, group := range proxyGroups {
 			if groupMap, ok := group.(map[string]any); ok {
-				// 收集 proxy-group 名称（兼容模式会创建同名的 proxy-group）
-				if groupName, ok := groupMap["name"].(string); ok && groupName != "" {
-					groupNames[groupName] = true
-				}
-
 				// 收集 use 字段中的 provider 名称（客户端模式）
 				if useList, ok := groupMap["use"].([]any); ok {
 					for _, use := range useList {
@@ -1317,17 +1389,8 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 			}
 		}
 
-		// 合并两种模式的名称
-		allNames := make(map[string]bool)
-		for name := range providerNames {
-			allNames[name] = true
-		}
-		for name := range groupNames {
-			allNames[name] = true
-		}
-
-		if len(allNames) > 0 {
-			logger.Info("[Subscription] 找到代理集合引用", "count", len(allNames), "from_use", len(providerNames), "from_groups", len(groupNames))
+		if len(providerNames) > 0 {
+			logger.Info("[Subscription] 找到代理集合引用", "count", len(providerNames))
 
 			// 获取该用户的所有代理提供商配置
 			configs, err := repo.ListProxyProviderConfigs(ctx, username)
@@ -1350,10 +1413,10 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 					// 查找与名称匹配的配置并获取其外部订阅 URL
 					for _, config := range configs {
 						logger.Info("[Subscription] 检查配置", "config_name", config.Name, "external_sub_id", config.ExternalSubscriptionID, "process_mode", config.ProcessMode)
-						if allNames[config.Name] {
+						if providerNames[config.Name] {
 							if url, ok := subIDToURL[config.ExternalSubscriptionID]; ok {
 								usedURLs[url] = true
-								logger.Info("[Subscription] 从代理集合配置找到外部订阅URL", "config_name", config.Name, "mode", config.ProcessMode, "url", url)
+								logger.Info("[Subscription] 从代理集合配置找到外部订阅", "config_name", config.Name, "mode", config.ProcessMode)
 							} else {
 								logger.Info("[Subscription] 配置的外部订阅ID未找到对应URL", "config_name", config.Name, "external_sub_id", config.ExternalSubscriptionID)
 							}
@@ -1368,8 +1431,34 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 		logger.Info("[Subscription] YAML 中未找到 proxy-groups")
 	}
 
-	// 检查 proxy-providers 部分（用于客户端模式的代理集合配置）
-	// 当处理模式为客户端模式时，YAML 文件中包含 proxy-providers 配置，URL 为内部 API 端点
+	// 服务端物化后 use 会被替换为带 Provider 命名空间的节点名；按当前
+	// owner 的 Provider 名称恢复来源订阅，不解析或记录任何上游 URL。
+	if len(proxyNames) > 0 {
+		configs, configErr := repo.ListProxyProviderConfigs(ctx, username)
+		if configErr == nil {
+			externalSubs, listErr := repo.ListExternalSubscriptions(ctx, username)
+			if listErr == nil {
+				subIDToURL := make(map[int64]string, len(externalSubs))
+				for _, sub := range externalSubs {
+					subIDToURL[sub.ID] = sub.URL
+				}
+				for _, config := range configs {
+					prefix := strings.TrimSpace(config.Name) + " / "
+					for proxyName := range proxyNames {
+						if strings.HasPrefix(proxyName, prefix) {
+							if upstreamURL, ok := subIDToURL[config.ExternalSubscriptionID]; ok {
+								usedURLs[upstreamURL] = true
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 检查 proxy-providers 部分。Provider URL 只包含非敏感数字 ID；
+	// Authorization 凭据既不需要解析，也不会进入这里的日志。
 	if proxyProviders, ok := yamlContent["proxy-providers"].(map[string]any); ok {
 		logger.Info("[Subscription] 找到 proxy-providers 配置", "count", len(proxyProviders))
 
@@ -1394,16 +1483,21 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 		}
 
 		// 解析每个 provider 的 URL，查找内部 API 端点
-		for providerName, provider := range proxyProviders {
+		for _, provider := range proxyProviders {
 			if providerMap, ok := provider.(map[string]any); ok {
 				if urlStr, ok := providerMap["url"].(string); ok && urlStr != "" {
-					// 检查是否为内部 API 端点：/api/proxy-provider/{id}
-					if configIDStr, found := strings.CutPrefix(urlStr, "/api/proxy-provider/"); found {
+					parsedURL, parseErr := url.Parse(urlStr)
+					if parseErr != nil {
+						continue
+					}
+					pathValue := parsedURL.Path
+					if pathValue == "" {
+						pathValue = urlStr
+					}
+					if configIDStr, found := strings.CutPrefix(pathValue, proxyProviderContentPath); found {
 						if configID, err := strconv.ParseInt(configIDStr, 10, 64); err == nil {
 							if url, ok := configIDToURL[configID]; ok {
 								usedURLs[url] = true
-								logger.Info("[Subscription] 从 proxy-providers 找到外部订阅URL",
-									"provider_name", providerName, "config_id", configID, "url", url)
 							}
 						}
 					}
@@ -1442,7 +1536,7 @@ func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.Traf
 		subSyncStart := time.Now()
 		nodeCount, updatedSub, err := syncSingleExternalSubscription(ctx, client, repo, subscribeDir, username, sub, userSettings)
 		if err != nil {
-			logger.Info("[⏱️ 耗时监测] 同步订阅失败", "name", sub.Name, "url", sub.URL, "error", err, "duration_ms", time.Since(subSyncStart).Milliseconds())
+			logger.Info("[⏱️ 耗时监测] 同步订阅失败", "name", sub.Name, "error", err, "duration_ms", time.Since(subSyncStart).Milliseconds())
 			continue
 		}
 
@@ -1475,8 +1569,8 @@ func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.Traf
 	// 失效外部订阅内容缓存
 	for url := range syncedSubURLs {
 		InvalidateSubscriptionContentCache(url)
-		logger.Info("[Subscription] 失效外部订阅内容缓存", "url", url)
 	}
+	logger.Info("[Subscription] 已失效外部订阅内容缓存", "count", len(syncedSubURLs))
 
 	return nil
 }

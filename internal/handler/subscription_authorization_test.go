@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -188,5 +190,259 @@ func TestSubscriptionShortLinksRequireCurrentUserSuffixAndAssignment(t *testing.
 	revoked := fetchSubscription(t, handler, httptest.NewRequest(http.MethodGet, "/x/"+revokedCode, nil))
 	if revoked.Code != http.StatusForbidden || strings.Contains(revoked.Body.String(), "authorization-fixture") {
 		t.Fatalf("revoked composite status=%d body=%s", revoked.Code, revoked.Body.String())
+	}
+}
+
+func TestAssignedTemplateMaterializesCreatorProviderBeforeRevocation(t *testing.T) {
+	repo, directory, file := newSubscriptionAuthorizationFixture(t)
+	ctx := context.Background()
+	if _, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "local", Protocol: "ss", Enabled: true,
+		ClashConfig: `{"name":"local","type":"ss","server":"local.example","port":443,"cipher":"aes-128-gcm","password":"local-secret"}`,
+	}); err != nil {
+		t.Fatalf("create local node: %v", err)
+	}
+	source := storage.ExternalSubscription{
+		Username: "admin", Name: "provider source", URL: "https://provider.example/subscription",
+	}
+	sourceID, err := repo.CreateExternalSubscription(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateProxyProviderConfig(ctx, &storage.ProxyProviderConfig{
+		Username: "admin", ExternalSubscriptionID: sourceID, Name: "airport", Type: "http", ProcessMode: "client",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	providerContent := []byte("proxies:\n  - {name: Provider Node, type: ss, server: provider.example, port: 443, cipher: aes-128-gcm, password: provider-secret}\n")
+	cacheKey := subscriptionContentCacheKey(source.URL)
+	subscriptionCache.put(cacheKey, providerContent, time.Now())
+	t.Cleanup(func() { subscriptionCache.delete(cacheKey) })
+
+	const templateName = "assigned-provider-capability-test.yaml"
+	if err := os.MkdirAll("rule_templates", 0755); err != nil {
+		t.Fatal(err)
+	}
+	templatePath := filepath.Join("rule_templates", templateName)
+	template := "mode: rule\nproxies: []\nproxy-groups:\n  - name: PROXY\n    type: select\n    use: [airport]\nrules:\n  - MATCH,PROXY\n"
+	if err := os.WriteFile(templatePath, []byte(template), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(templatePath) })
+	file.TemplateFilename = templateName
+	file, err = repo.UpdateSubscribeFile(ctx, file)
+	if err != nil {
+		t.Fatalf("bind template: %v", err)
+	}
+	if err := repo.AssignSubscriptionToUser(ctx, "alice", file.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewSubscriptionHandlerConcrete(repo, directory)
+	request := httptest.NewRequest(http.MethodGet, "/api/clash/subscribe?filename="+file.Filename, nil)
+	request = request.WithContext(auth.ContextWithUsername(request.Context(), "alice"))
+	response := fetchSubscription(t, handler, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("assigned fetch status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "airport / Provider Node") {
+		t.Fatalf("assigned provider was not materialized: %s", body)
+	}
+	if strings.Contains(body, "proxy-providers:") || strings.Contains(body, "Authorization") || strings.Contains(body, proxyProviderAccessTokenPrefix) {
+		t.Fatalf("assigned response exposed a durable provider capability: %s", body)
+	}
+
+	if err := repo.RemoveSubscriptionFromUser(ctx, "alice", file.ID); err != nil {
+		t.Fatal(err)
+	}
+	revokedRequest := httptest.NewRequest(http.MethodGet, "/api/clash/subscribe?filename="+file.Filename, nil)
+	revokedRequest = revokedRequest.WithContext(auth.ContextWithUsername(revokedRequest.Context(), "alice"))
+	revoked := fetchSubscription(t, handler, revokedRequest)
+	if revoked.Code != http.StatusForbidden {
+		t.Fatalf("revoked assigned fetch status=%d body=%s", revoked.Code, revoked.Body.String())
+	}
+}
+
+func TestAssignedRawSubscriptionRejectsDurableProviderCapability(t *testing.T) {
+	repo, directory, file := newSubscriptionAuthorizationFixture(t)
+	if err := repo.ConfigureNodeSecretEncryption(bytes.Repeat([]byte{0x73}, 32)); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	sourceID, err := repo.CreateExternalSubscription(ctx, storage.ExternalSubscription{
+		Username: "admin", Name: "raw provider source", URL: "https://provider.example/raw-capability",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerID, err := repo.CreateProxyProviderConfig(ctx, &storage.ProxyProviderConfig{
+		Username: "admin", ExternalSubscriptionID: sourceID, Name: "airport", Type: "http", ProcessMode: "client",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := repo.EnsureProxyProviderAccessToken(ctx, providerID, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := "mode: rule\nproxy-providers:\n  airport:\n    type: http\n    url: https://panel.example.test/api/proxy-provider/" + strconv.FormatInt(providerID, 10) + "\n    header:\n      Authorization:\n        - Bearer " + token + "\nproxy-groups:\n  - name: PROXY\n    type: select\n    use: [airport]\nrules:\n  - MATCH,PROXY\n"
+	if err := os.WriteFile(filepath.Join(directory, file.Filename), []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AssignSubscriptionToUser(ctx, "alice", file.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewSubscriptionHandlerConcrete(repo, directory)
+	request := httptest.NewRequest(http.MethodGet, "/api/clash/subscribe?filename="+file.Filename, nil)
+	request = request.WithContext(auth.ContextWithUsername(request.Context(), "alice"))
+	response := fetchSubscription(t, handler, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("assigned raw Provider fetch status=%d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), token) || strings.Contains(response.Body.String(), "Authorization") {
+		t.Fatalf("assigned raw response exposed Provider capability: %s", response.Body.String())
+	}
+
+	ownerRequest := httptest.NewRequest(http.MethodGet, "/api/clash/subscribe?filename="+file.Filename, nil)
+	ownerRequest = ownerRequest.WithContext(auth.ContextWithUsername(ownerRequest.Context(), "admin"))
+	ownerResponse := fetchSubscription(t, handler, ownerRequest)
+	if ownerResponse.Code != http.StatusOK || !strings.Contains(ownerResponse.Body.String(), token) {
+		t.Fatalf("owner raw Provider fetch status=%d body=%s", ownerResponse.Code, ownerResponse.Body.String())
+	}
+
+	if err := repo.RemoveSubscriptionFromUser(ctx, "alice", file.ID); err != nil {
+		t.Fatal(err)
+	}
+	revokedRequest := httptest.NewRequest(http.MethodGet, "/api/clash/subscribe?filename="+file.Filename, nil)
+	revokedRequest = revokedRequest.WithContext(auth.ContextWithUsername(revokedRequest.Context(), "alice"))
+	revoked := fetchSubscription(t, handler, revokedRequest)
+	if revoked.Code != http.StatusForbidden || strings.Contains(revoked.Body.String(), token) {
+		t.Fatalf("revoked raw Provider fetch status=%d body=%s", revoked.Code, revoked.Body.String())
+	}
+}
+
+func TestSubscriptionContainsProxyProvidersHandlesYAMLIndirection(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		content string
+		want    bool
+		wantErr bool
+	}{
+		"absent": {
+			content: "mode: rule\nproxies: []\n",
+		},
+		"empty definition": {
+			content: "mode: rule\nproxy-providers: {}\n",
+			want:    true,
+		},
+		"merged definition": {
+			content: "defaults: &defaults\n  proxy-providers:\n    hidden: {type: http, url: https://panel.example.test/api/proxy-provider/7}\n<<: *defaults\n",
+			want:    true,
+		},
+		"duplicate definition": {
+			content: "proxy-providers: {}\nproxy-providers:\n  hidden: {type: http, url: https://panel.example.test/api/proxy-provider/7}\n",
+			wantErr: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := subscriptionContainsProxyProviders([]byte(testCase.content))
+			if (err != nil) != testCase.wantErr {
+				t.Fatalf("error=%v wantErr=%v", err, testCase.wantErr)
+			}
+			if got != testCase.want {
+				t.Fatalf("containsProviders=%v want=%v", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestForceSyncRegeneratesProviderTemplateInsteadOfReturningRawFile(t *testing.T) {
+	repo, directory, file := newSubscriptionAuthorizationFixture(t)
+	ctx := context.Background()
+	if _, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "local", Protocol: "ss", Enabled: true,
+		ClashConfig: `{"name":"local","type":"ss","server":"local.example","port":443,"cipher":"aes-128-gcm","password":"local-secret"}`,
+	}); err != nil {
+		t.Fatalf("create local node: %v", err)
+	}
+	source := storage.ExternalSubscription{
+		Username: "admin", Name: "provider source", URL: "https://provider.example/force-sync",
+	}
+	sourceID, err := repo.CreateExternalSubscription(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateProxyProviderConfig(ctx, &storage.ProxyProviderConfig{
+		Username: "admin", ExternalSubscriptionID: sourceID, Name: "airport", Type: "http", ProcessMode: "server",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cacheKey := subscriptionContentCacheKey(source.URL)
+	putProviderContent := func(name string) {
+		content := []byte("proxies:\n  - {name: " + name + ", type: ss, server: provider.example, port: 443, cipher: aes-128-gcm, password: provider-secret}\n")
+		subscriptionCache.put(cacheKey, content, time.Now())
+	}
+	putProviderContent("Before Sync")
+	t.Cleanup(func() { subscriptionCache.delete(cacheKey) })
+
+	const templateName = "force-sync-provider-regeneration-test.yaml"
+	if err := os.MkdirAll("rule_templates", 0755); err != nil {
+		t.Fatal(err)
+	}
+	templatePath := filepath.Join("rule_templates", templateName)
+	template := "mode: rule\nproxies: []\nproxy-groups:\n  - name: PROXY\n    type: select\n    use: [airport]\nrules:\n  - MATCH,PROXY\n"
+	if err := os.WriteFile(templatePath, []byte(template), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(templatePath) })
+	file.TemplateFilename = templateName
+	file, err = repo.UpdateSubscribeFile(ctx, file)
+	if err != nil {
+		t.Fatalf("bind template: %v", err)
+	}
+	if err := repo.UpsertUserSettings(ctx, storage.UserSettings{
+		Username: "admin", ForceSyncExternal: true, CacheExpireMinutes: 0, KeepNodeName: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewSubscriptionHandlerConcrete(repo, directory)
+	syncCalled := false
+	handler.syncReferencedExternalSubscriptions = func(_ context.Context, _ *storage.TrafficRepository, _, _ string, subscriptions []storage.ExternalSubscription) error {
+		syncCalled = true
+		if len(subscriptions) != 1 || subscriptions[0].ID != sourceID {
+			t.Fatalf("subscriptions selected for sync = %#v", subscriptions)
+		}
+		putProviderContent("After Sync")
+		return nil
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/clash/subscribe?filename="+file.Filename, nil)
+	request = request.WithContext(auth.ContextWithUsername(request.Context(), "admin"))
+	response := fetchSubscription(t, handler, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("force-sync fetch status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !syncCalled {
+		t.Fatal("referenced provider subscription was not synchronized")
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "airport / After Sync") || strings.Contains(body, "airport / Before Sync") {
+		t.Fatalf("template was not regenerated after sync: %s", body)
+	}
+	if strings.Contains(body, "authorization-fixture") {
+		t.Fatalf("rendered template was overwritten with the raw file: %s", body)
+	}
+}
+
+func TestProviderMaterializationTreatsOwnerlessTemplatesAsCrossOwner(t *testing.T) {
+	if !subscriptionProviderRequiresServerMaterialization("admin", "") {
+		t.Fatal("ownerless template could issue the fallback admin's Provider credential")
+	}
+	if !subscriptionProviderRequiresServerMaterialization("bob", "alice") {
+		t.Fatal("assigned template did not require Provider materialization")
+	}
+	if subscriptionProviderRequiresServerMaterialization("alice", "alice") {
+		t.Fatal("owner fetch unexpectedly required Provider materialization")
 	}
 }

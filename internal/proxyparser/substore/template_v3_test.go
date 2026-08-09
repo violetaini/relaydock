@@ -1,12 +1,39 @@
 package substore
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
+
+func TestTemplateVariableLogsDoNotExposeValues(t *testing.T) {
+	const secret = "template-secret-value-must-not-leak"
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	template := `private_filter: ` + secret + `
+proxies: []
+proxy-groups:
+  - name: Private
+    type: select
+    filter: private_filter
+rules: []
+`
+	processor := NewTemplateV3Processor(nil, nil)
+	if _, err := processor.ProcessTemplate(template, nil); err != nil {
+		t.Fatalf("ProcessTemplate: %v", err)
+	}
+	if strings.Contains(logs.String(), secret) {
+		t.Fatalf("template variable value was logged: %s", logs.String())
+	}
+}
 
 // 模拟节点数据
 func createMockProxies() []map[string]any {
@@ -1018,5 +1045,201 @@ proxy-groups:
 	}
 	if strings.Contains(result, "美国 01") {
 		t.Errorf("'美国 01' should be excluded by filter")
+	}
+}
+
+func TestTemplateV3Processor_PreservesNativeProviderUse(t *testing.T) {
+	template := `
+provider-filter: "server|native"
+proxy-groups:
+  - name: Mixed
+    type: select
+    use:
+      - server-b
+      - native-b
+      - server-a
+      - native-a
+      - native-b
+      - unknown
+    filter: provider-filter
+    exclude-filter: blocked
+    exclude-type: trojan
+  - name: NativeOnly
+    type: select
+    use:
+      - native-a
+    filter: HK
+    exclude-filter: expired
+    exclude-type: ss|http
+  - name: ServerOnly
+    type: select
+    use:
+      - server-a
+    filter: server
+    exclude-filter: blocked
+    exclude-type: trojan
+`
+
+	proxies := []map[string]any{
+		{"name": "server-a-node", "type": "vmess", "server": "a.example.com", "port": 443},
+		{"name": "server-b-node", "type": "vless", "server": "b.example.com", "port": 443},
+		{"name": "HK unrelated", "type": "vmess", "server": "hk.example.com", "port": 443},
+	}
+	processor := NewTemplateV3ProcessorWithOptions(nil, TemplateV3ProcessorOptions{
+		ServerProviders: map[string][]string{
+			"server-a": {"server-a-node"},
+			"server-b": {"server-b-node"},
+		},
+		NativeProviders: []string{"native-a", "native-b"},
+	})
+
+	result, err := processor.ProcessTemplate(template, proxies)
+	if err != nil {
+		t.Fatalf("ProcessTemplate failed: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(result), &parsed); err != nil {
+		t.Fatalf("Result is not valid YAML: %v", err)
+	}
+	if _, ok := parsed["provider-filter"]; ok {
+		t.Fatal("resolved provider-filter variable should be removed from the output")
+	}
+
+	mixed := findTemplateV3TestGroup(t, parsed, "Mixed")
+	assertTemplateV3StringList(t, mixed, "proxies", []string{"server-b-node", "server-a-node"})
+	assertTemplateV3StringList(t, mixed, "use", []string{"native-b", "native-a"})
+	assertTemplateV3StringField(t, mixed, "filter", "server|native")
+	assertTemplateV3StringField(t, mixed, "exclude-filter", "blocked")
+	assertTemplateV3StringField(t, mixed, "exclude-type", "trojan")
+
+	nativeOnly := findTemplateV3TestGroup(t, parsed, "NativeOnly")
+	if _, ok := nativeOnly["proxies"]; ok {
+		t.Fatalf("native-only group should not gain inline proxies: %#v", nativeOnly["proxies"])
+	}
+	assertTemplateV3StringList(t, nativeOnly, "use", []string{"native-a"})
+	assertTemplateV3StringField(t, nativeOnly, "filter", "HK")
+	assertTemplateV3StringField(t, nativeOnly, "exclude-filter", "expired")
+	assertTemplateV3StringField(t, nativeOnly, "exclude-type", "ss|http")
+
+	serverOnly := findTemplateV3TestGroup(t, parsed, "ServerOnly")
+	assertTemplateV3StringList(t, serverOnly, "proxies", []string{"server-a-node"})
+	for _, field := range []string{"use", "filter", "exclude-filter", "exclude-type"} {
+		if _, ok := serverOnly[field]; ok {
+			t.Errorf("server-only group should not preserve processed field %q", field)
+		}
+	}
+}
+
+func TestTemplateV3Processor_ProviderMarkerAndIncludeAllAreDeterministic(t *testing.T) {
+	template := `
+proxy-providers:
+  native-z:
+    type: http
+    url: https://example.com/z.yaml
+  native-a:
+    type: http
+    url: https://example.com/a.yaml
+proxy-groups:
+  - name: Marker
+    type: select
+    proxies:
+      - DIRECT
+      - __PROXY_PROVIDERS__
+      - REJECT
+  - name: IncludeAllProviders
+    type: select
+    include-all-providers: true
+`
+
+	proxies := []map[string]any{
+		{"name": "a-1", "type": "vmess", "server": "a.example.com", "port": 443},
+		{"name": "shared", "type": "vless", "server": "shared.example.com", "port": 443},
+		{"name": "z-2", "type": "trojan", "server": "z.example.com", "port": 443},
+	}
+	options := TemplateV3ProcessorOptions{
+		ServerProviders: map[string][]string{
+			"z-server": {"z-2", "shared"},
+			"a-server": {"a-1", "shared"},
+		},
+		NativeProviders: []string{"native-z", "native-a", "native-z"},
+	}
+
+	var firstResult string
+	for i := 0; i < 5; i++ {
+		processor := NewTemplateV3ProcessorWithOptions(nil, options)
+		result, err := processor.ProcessTemplate(template, proxies)
+		if err != nil {
+			t.Fatalf("ProcessTemplate failed on run %d: %v", i, err)
+		}
+		if i == 0 {
+			firstResult = result
+		} else if result != firstResult {
+			t.Fatalf("provider processing is not deterministic on run %d", i)
+		}
+	}
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(firstResult), &parsed); err != nil {
+		t.Fatalf("Result is not valid YAML: %v", err)
+	}
+	if _, ok := parsed["proxy-providers"]; !ok {
+		t.Fatal("top-level native proxy-providers should be preserved")
+	}
+
+	marker := findTemplateV3TestGroup(t, parsed, "Marker")
+	assertTemplateV3StringList(t, marker, "proxies", []string{"DIRECT", "a-1", "shared", "z-2", "REJECT"})
+	assertTemplateV3StringList(t, marker, "use", []string{"native-a", "native-z"})
+
+	includeAll := findTemplateV3TestGroup(t, parsed, "IncludeAllProviders")
+	assertTemplateV3StringList(t, includeAll, "proxies", []string{"a-1", "shared", "z-2"})
+	assertTemplateV3StringList(t, includeAll, "use", []string{"native-a", "native-z"})
+	if _, ok := includeAll["include-all-providers"]; ok {
+		t.Fatal("include-all-providers should be materialized and removed")
+	}
+}
+
+func findTemplateV3TestGroup(t *testing.T, parsed map[string]any, name string) map[string]any {
+	t.Helper()
+	groups, ok := parsed["proxy-groups"].([]any)
+	if !ok {
+		t.Fatalf("proxy-groups not found in result: %#v", parsed["proxy-groups"])
+	}
+	for _, item := range groups {
+		group, ok := item.(map[string]any)
+		if ok && group["name"] == name {
+			return group
+		}
+	}
+	t.Fatalf("proxy group %q not found", name)
+	return nil
+}
+
+func assertTemplateV3StringList(t *testing.T, group map[string]any, field string, expected []string) {
+	t.Helper()
+	values, ok := group[field].([]any)
+	if !ok {
+		t.Fatalf("field %q is not a list: %#v", field, group[field])
+	}
+	actual := make([]string, len(values))
+	for i, value := range values {
+		actual[i], ok = value.(string)
+		if !ok {
+			t.Fatalf("field %q contains a non-string value: %#v", field, value)
+		}
+	}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Errorf("field %q = %v, expected %v", field, actual, expected)
+	}
+}
+
+func assertTemplateV3StringField(t *testing.T, group map[string]any, field, expected string) {
+	t.Helper()
+	actual, ok := group[field].(string)
+	if !ok {
+		t.Fatalf("field %q is not a string: %#v", field, group[field])
+	}
+	if actual != expected {
+		t.Errorf("field %q = %q, expected %q", field, actual, expected)
 	}
 }

@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/violetaini/relaydock/internal/capabilities"
-	"github.com/violetaini/relaydock/internal/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/storage"
 
 	"github.com/google/uuid"
@@ -1184,16 +1183,16 @@ func (h *PackageAssignHandler) autoGenerateSubscription(ctx context.Context, use
 		return
 	}
 
-	processor := substore.NewTemplateV3Processor(nil, nil)
-	result, err := processor.ProcessTemplate(templateContent, proxies)
+	// This legacy path persists a YAML snapshot. Native Provider credentials
+	// must only be emitted by request-time rendering so token rotation can take
+	// effect immediately; expand every Provider before writing the snapshot.
+	result, err := renderTemplateWithProxyProviders(ctx, h.repo, templateContent, proxies, username, true)
 	if err != nil {
 		log.Printf("[PackageAssign] 自动生成订阅失败: 处理模板错误: %v", err)
 		return
 	}
-
-	result, err = injectProxiesIntoTemplate(result, proxies)
-	if err != nil {
-		log.Printf("[PackageAssign] 自动生成订阅失败: 注入代理错误: %v", err)
+	if strings.Contains(result, proxyProviderAccessTokenPrefix) {
+		log.Printf("[PackageAssign] 自动生成订阅失败: 拒绝持久化 Provider 访问凭据")
 		return
 	}
 

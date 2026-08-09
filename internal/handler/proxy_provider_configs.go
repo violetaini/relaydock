@@ -3,7 +3,10 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -112,6 +115,133 @@ func (d ProxyProviderConfigDTO) toStorage(username string) *storage.ProxyProvide
 	}
 }
 
+const (
+	maxProxyProviderNameBytes     = 128
+	maxProxyProviderRegexBytes    = 1024
+	minProxyProviderInterval      = 60
+	maxProxyProviderInterval      = 7 * 24 * 60 * 60
+	minProxyProviderHealthTimeout = 100
+	maxProxyProviderHealthTimeout = 60_000
+)
+
+func normalizeProxyProviderMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "mmw", "server":
+		return "server"
+	case "", "client":
+		return "client"
+	default:
+		return strings.ToLower(strings.TrimSpace(mode))
+	}
+}
+
+func normalizeAndValidateProxyProviderDTO(dto *ProxyProviderConfigDTO) error {
+	if dto == nil {
+		return errors.New("provider config is required")
+	}
+	dto.Name = strings.TrimSpace(dto.Name)
+	if dto.Name == "" {
+		return errors.New("name is required")
+	}
+	if len(dto.Name) > maxProxyProviderNameBytes || strings.ContainsAny(dto.Name, "\r\n\x00") {
+		return errors.New("name is invalid or too long")
+	}
+	if strings.HasPrefix(dto.Name, "__") && strings.HasSuffix(dto.Name, "__") {
+		return errors.New("name is reserved")
+	}
+
+	dto.Type = strings.ToLower(strings.TrimSpace(dto.Type))
+	if dto.Type == "" {
+		dto.Type = "http"
+	}
+	if dto.Type != "http" {
+		return errors.New("type must be http")
+	}
+	dto.ProcessMode = normalizeProxyProviderMode(dto.ProcessMode)
+	if dto.ProcessMode != "client" && dto.ProcessMode != "server" {
+		return errors.New("process_mode must be client or server")
+	}
+	if dto.Interval < minProxyProviderInterval || dto.Interval > maxProxyProviderInterval {
+		return fmt.Errorf("interval must be between %d and %d seconds", minProxyProviderInterval, maxProxyProviderInterval)
+	}
+	if dto.SizeLimit < 0 || dto.SizeLimit > maxProxyProviderBytes {
+		return fmt.Errorf("size_limit must be between 0 and %d bytes", maxProxyProviderBytes)
+	}
+	dto.Proxy = strings.TrimSpace(dto.Proxy)
+	if dto.Proxy == "" {
+		dto.Proxy = "DIRECT"
+	}
+	if len(dto.Proxy) > maxProxyProviderNameBytes || strings.ContainsAny(dto.Proxy, "\r\n\x00") {
+		return errors.New("proxy is invalid or too long")
+	}
+	if strings.TrimSpace(dto.Header) != "" {
+		return errors.New("custom provider headers are not supported")
+	}
+	if strings.TrimSpace(dto.Override) != "" {
+		return errors.New("provider override is not supported")
+	}
+	dto.Header = ""
+	dto.Override = ""
+
+	if dto.HealthCheckInterval == 0 {
+		dto.HealthCheckInterval = 300
+	}
+	if dto.HealthCheckTimeout == 0 {
+		dto.HealthCheckTimeout = 5000
+	}
+	if dto.HealthCheckExpectedStatus == 0 {
+		dto.HealthCheckExpectedStatus = http.StatusNoContent
+	}
+	dto.HealthCheckURL = strings.TrimSpace(dto.HealthCheckURL)
+	if dto.HealthCheckEnabled {
+		if err := validateProxyProviderHealthURL(dto.HealthCheckURL); err != nil {
+			return err
+		}
+	}
+	if dto.HealthCheckInterval < minProxyProviderInterval || dto.HealthCheckInterval > maxProxyProviderInterval {
+		return fmt.Errorf("health_check_interval must be between %d and %d seconds", minProxyProviderInterval, maxProxyProviderInterval)
+	}
+	if dto.HealthCheckTimeout < minProxyProviderHealthTimeout || dto.HealthCheckTimeout > maxProxyProviderHealthTimeout {
+		return fmt.Errorf("health_check_timeout must be between %d and %d milliseconds", minProxyProviderHealthTimeout, maxProxyProviderHealthTimeout)
+	}
+	if dto.HealthCheckExpectedStatus < 100 || dto.HealthCheckExpectedStatus > 599 {
+		return errors.New("health_check_expected_status must be between 100 and 599")
+	}
+
+	for name, expression := range map[string]*string{
+		"filter":         &dto.Filter,
+		"exclude_filter": &dto.ExcludeFilter,
+		"exclude_type":   &dto.ExcludeType,
+	} {
+		*expression = strings.TrimSpace(*expression)
+		if len(*expression) > maxProxyProviderRegexBytes {
+			return fmt.Errorf("%s is too long", name)
+		}
+		if *expression != "" {
+			if _, err := regexp.Compile(*expression); err != nil {
+				return fmt.Errorf("%s must be a valid regular expression", name)
+			}
+		}
+	}
+
+	dto.GeoIPFilter = strings.TrimSpace(dto.GeoIPFilter)
+	if dto.GeoIPFilter != "" {
+		return errors.New("geo_ip_filter is not supported for runtime providers; use filter or exclude_filter")
+	}
+	return nil
+}
+
+func validateProxyProviderHealthURL(rawURL string) error {
+	if rawURL == "" || len(rawURL) > 2048 {
+		return errors.New("health_check_url is required and must not exceed 2048 bytes")
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Hostname() == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return errors.New("health_check_url must be an http or https URL without credentials")
+	}
+	return nil
+}
+
 func (h *ProxyProviderConfigsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	username := auth.UsernameFromContext(r.Context())
 	if username == "" {
@@ -153,16 +283,23 @@ func (h *ProxyProviderConfigsHandler) handleCreate(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusBadRequest, errors.New("invalid request body"))
 		return
 	}
-	if strings.TrimSpace(dto.Name) == "" {
-		writeError(w, http.StatusBadRequest, errors.New("name is required"))
+	if err := normalizeAndValidateProxyProviderDTO(&dto); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	if !h.requireOwnedExternalSubscription(w, r, dto.ExternalSubscriptionID, username) {
 		return
 	}
+	if !h.requireUniqueName(w, r, username, dto.Name, 0) {
+		return
+	}
 	cfg := dto.toStorage(username)
 	id, err := h.repo.CreateProxyProviderConfig(r.Context(), cfg)
 	if err != nil {
+		if errors.Is(err, storage.ErrProxyProviderConfigExists) {
+			writeError(w, http.StatusConflict, errors.New("a proxy provider with this name already exists"))
+			return
+		}
 		if errors.Is(err, storage.ErrExternalSubscriptionNotFound) {
 			writeError(w, http.StatusNotFound, errors.New("external subscription not found"))
 			return
@@ -202,7 +339,14 @@ func (h *ProxyProviderConfigsHandler) handleUpdate(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusBadRequest, errors.New("invalid request body"))
 		return
 	}
+	if err := normalizeAndValidateProxyProviderDTO(&dto); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if !h.requireOwnedExternalSubscription(w, r, dto.ExternalSubscriptionID, username) {
+		return
+	}
+	if !h.requireUniqueName(w, r, username, dto.Name, id) {
 		return
 	}
 	dto.ID = id
@@ -211,6 +355,10 @@ func (h *ProxyProviderConfigsHandler) handleUpdate(w http.ResponseWriter, r *htt
 	cfg.ID = id
 
 	if err := h.repo.UpdateProxyProviderConfig(r.Context(), cfg); err != nil {
+		if errors.Is(err, storage.ErrProxyProviderConfigExists) {
+			writeError(w, http.StatusConflict, errors.New("a proxy provider with this name already exists"))
+			return
+		}
 		if errors.Is(err, storage.ErrExternalSubscriptionNotFound) {
 			writeError(w, http.StatusNotFound, errors.New("external subscription not found"))
 			return
@@ -241,6 +389,21 @@ func (h *ProxyProviderConfigsHandler) requireOwnedExternalSubscription(w http.Re
 	return true
 }
 
+func (h *ProxyProviderConfigsHandler) requireUniqueName(w http.ResponseWriter, r *http.Request, username, name string, excludeID int64) bool {
+	configs, err := h.repo.ListProxyProviderConfigs(r.Context(), username)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return false
+	}
+	for _, config := range configs {
+		if config.ID != excludeID && strings.TrimSpace(config.Name) == name {
+			writeError(w, http.StatusConflict, errors.New("a proxy provider with this name already exists"))
+			return false
+		}
+	}
+	return true
+}
+
 func (h *ProxyProviderConfigsHandler) handleDelete(w http.ResponseWriter, r *http.Request, username string) {
 	id, err := parseIDQuery(r)
 	if err != nil {
@@ -258,11 +421,50 @@ func (h *ProxyProviderConfigsHandler) handleDelete(w http.ResponseWriter, r *htt
 		return
 	}
 	if existing.Username != username {
-		writeError(w, http.StatusForbidden, errors.New("该操作仅可对自己创建的代理集合进行"))
+		writeError(w, http.StatusNotFound, errors.New("not found"))
 		return
 	}
 	if err := h.repo.DeleteProxyProviderConfig(r.Context(), id, username); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+}
+
+type ProxyProviderTokenRotateHandler struct {
+	repo *storage.TrafficRepository
+}
+
+func NewProxyProviderTokenRotateHandler(repo *storage.TrafficRepository) http.Handler {
+	if repo == nil {
+		panic("proxy provider token rotate handler requires repository")
+	}
+	return &ProxyProviderTokenRotateHandler{repo: repo}
+}
+
+func (h *ProxyProviderTokenRotateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, errors.New("only POST is supported"))
+		return
+	}
+	username := auth.UsernameFromContext(r.Context())
+	if username == "" {
+		writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
+		return
+	}
+	id, err := parseIDQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if _, err := h.repo.RotateProxyProviderAccessToken(r.Context(), id, username); err != nil {
+		if errors.Is(err, storage.ErrProxyProviderAccessNotFound) {
+			writeError(w, http.StatusNotFound, errors.New("not found"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, errors.New("failed to rotate proxy provider access"))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

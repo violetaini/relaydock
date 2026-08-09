@@ -3,17 +3,20 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/violetaini/relaydock/internal/logger"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/violetaini/relaydock/internal/auth"
+	"github.com/violetaini/relaydock/internal/logger"
 	"github.com/violetaini/relaydock/internal/safefetch"
 	"github.com/violetaini/relaydock/internal/storage"
 
@@ -235,7 +238,8 @@ func syncExternalSubscriptions(ctx context.Context, repo *storage.TrafficReposit
 	return nil
 }
 
-// 提取用户订阅文件中使用的所有外部订阅 URL
+// 提取当前用户订阅文件中使用的所有外部订阅 URL。Provider 的内部
+// URL 只用于解析归属，访问凭据绝不作为上游 URL 返回或写入日志。
 func getUsedExternalSubscriptionURLs(ctx context.Context, repo *storage.TrafficRepository, subscribeDir, username string) (map[string]bool, error) {
 	usedURLs := make(map[string]bool)
 
@@ -249,37 +253,105 @@ func getUsedExternalSubscriptionURLs(ctx context.Context, repo *storage.TrafficR
 		return nil, fmt.Errorf("list subscribe files: %w", err)
 	}
 
-	// 从订阅目录中读取每个 YAML 文件
+	isAdmin := userIsAdmin(ctx, repo, username)
+	assignedFileIDs := make(map[int64]bool)
+	if !isAdmin {
+		ids, err := repo.GetUserSubscriptionIDs(ctx, username)
+		if err != nil {
+			return nil, fmt.Errorf("list assigned subscribe files: %w", err)
+		}
+		for _, id := range ids {
+			assignedFileIDs[id] = true
+		}
+	}
+
+	externalSubs, err := repo.ListExternalSubscriptions(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("list external subscriptions: %w", err)
+	}
+	allowedDirectURLs := make(map[string]bool, len(externalSubs))
+	for _, sub := range externalSubs {
+		if upstreamURL := strings.TrimSpace(sub.URL); upstreamURL != "" {
+			allowedDirectURLs[upstreamURL] = true
+		}
+	}
+
+	// 从订阅目录中读取当前用户可访问的 YAML 文件
 	for _, file := range allFiles {
+		owner := strings.TrimSpace(file.CreatedBy)
+		if !isAdmin && owner != username && !assignedFileIDs[file.ID] {
+			continue
+		}
+		if err := storage.ValidateSubscribeFilename(file.Filename); err != nil {
+			logger.Info("[External Sync] Skip invalid subscription filename", "name", file.Name)
+			continue
+		}
 		// 从磁盘读取 YAML 文件
-		filePath := fmt.Sprintf("%s/%s", subscribeDir, file.Filename)
+		filePath := filepath.Join(subscribeDir, file.Filename)
 		content, err := os.ReadFile(filePath)
 		if err != nil {
-			logger.Info("[External Sync] Failed to read file", "value", filePath, "error", err)
+			logger.Info("[External Sync] Failed to read file", "name", file.Name, "error", err)
 			continue
 		}
-
-		// 解析 YAML 内容
-		var yamlContent map[string]any
-		if err := yaml.Unmarshal(content, &yamlContent); err != nil {
-			logger.Info("[External Sync] Failed to parse YAML for file", "name", file.Name, "error", err)
+		fileURLs, parseErr := GetExternalSubscriptionsFromFile(ctx, content, username, repo)
+		if parseErr != nil {
+			logger.Info("[External Sync] Failed to inspect subscription", "name", file.Name, "error", parseErr)
 			continue
 		}
-
-		// 提取代理提供商 URL
-		if proxyProviders, ok := yamlContent["proxy-providers"].(map[string]any); ok {
-			for _, provider := range proxyProviders {
-				if providerMap, ok := provider.(map[string]any); ok {
-					if url, ok := providerMap["url"].(string); ok && url != "" {
-						usedURLs[url] = true
-						logger.Info("[External Sync] Found used subscription URL in file", "name", file.Name, "param", url)
-					}
-				}
-			}
+		for upstreamURL := range fileURLs {
+			usedURLs[upstreamURL] = true
+		}
+		for upstreamURL := range directProxyProviderURLs(content, allowedDirectURLs) {
+			usedURLs[upstreamURL] = true
 		}
 	}
 
 	return usedURLs, nil
+}
+
+func directProxyProviderURLs(content []byte, allowedURLs map[string]bool) map[string]bool {
+	result := make(map[string]bool)
+	if len(allowedURLs) == 0 {
+		return result
+	}
+
+	var document map[string]any
+	if err := yaml.Unmarshal(content, &document); err != nil {
+		return result
+	}
+	providers, ok := document["proxy-providers"].(map[string]any)
+	if !ok {
+		return result
+	}
+	for _, provider := range providers {
+		providerMap, ok := provider.(map[string]any)
+		if !ok {
+			continue
+		}
+		upstreamURL, ok := providerMap["url"].(string)
+		if !ok {
+			continue
+		}
+		upstreamURL = strings.TrimSpace(upstreamURL)
+		if allowedURLs[upstreamURL] {
+			result[upstreamURL] = true
+		}
+	}
+	return result
+}
+
+// sanitizeSubscriptionRequestError strips every net/http url.Error wrapper.
+// Those wrappers include the complete source URL, which commonly contains an
+// upstream credential in its path or query string.
+func sanitizeSubscriptionRequestError(err error) error {
+	for err != nil {
+		var requestErr *url.Error
+		if !errors.As(err, &requestErr) || requestErr.Err == nil || requestErr.Err == err {
+			return err
+		}
+		err = requestErr.Err
+	}
+	return errors.New("subscription request failed")
 }
 
 // syncSingleExternalSubscription 从单个外部订阅获取并同步节点
@@ -289,13 +361,14 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 	syncScope := settings.SyncScope
 	keepNodeName := settings.KeepNodeName
 
-	logger.Info("[外部订阅同步] 开始获取订阅内容", "name", sub.Name, "url", sub.URL)
+	logger.Info("[外部订阅同步] 开始获取订阅内容", "name", sub.Name)
 
 	// 获取订阅内容
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sub.URL, nil)
 	if err != nil {
-		logger.Info("[外部订阅同步] 创建HTTP请求失败", "error", err)
-		return 0, sub, fmt.Errorf("create request: %w", err)
+		safeErr := sanitizeSubscriptionRequestError(err)
+		logger.Info("[外部订阅同步] 创建HTTP请求失败", "source_id", sub.ID, "error", safeErr)
+		return 0, sub, fmt.Errorf("create request for subscription source %d: %w", sub.ID, safeErr)
 	}
 
 	// 使用订阅保存的 User-Agent，如果为空则使用默认值
@@ -308,8 +381,9 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 
 	resp, err := client.Do(req)
 	if err != nil {
-		logger.Info("[外部订阅同步] 请求订阅URL失败", "error", err)
-		return 0, sub, fmt.Errorf("fetch subscription: %w", err)
+		safeErr := sanitizeSubscriptionRequestError(err)
+		logger.Info("[外部订阅同步] 请求订阅URL失败", "source_id", sub.ID, "error", safeErr)
+		return 0, sub, fmt.Errorf("fetch subscription source %d: %w", sub.ID, safeErr)
 	}
 	defer resp.Body.Close()
 
@@ -343,7 +417,7 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 						}
 					}
 				} else {
-					logger.Info("[外部订阅同步] clash-meta UA 请求失败", "error", doErr)
+					logger.Info("[外部订阅同步] clash-meta UA 请求失败", "source_id", sub.ID, "error", sanitizeSubscriptionRequestError(doErr))
 				}
 			}
 		}
@@ -744,8 +818,7 @@ func ParseTrafficInfoHeader(userInfo string) (upload, download, total int64, exp
 // parseAndUpdateTrafficInfo 解析订阅用户信息标头并更新流量信息
 // 格式：上传=0；下载=685404160；总计=1073741824；过期=1705276800
 func parseAndUpdateTrafficInfo(ctx context.Context, repo *storage.TrafficRepository, sub *storage.ExternalSubscription, userInfo string) {
-	logger.Info("[External Sync] Parsing traffic info for subscription ()", "name", sub.Name, "url", sub.URL)
-	logger.Info("[External Sync] Raw subscription-userinfo", "value", userInfo)
+	logger.Info("[External Sync] Parsing traffic info for subscription", "name", sub.Name)
 
 	// 解析订阅用户信息
 	// 示例：上传=0；下载=685404160；总计=1073741824；过期=1705276800
@@ -771,7 +844,7 @@ func parseAndUpdateTrafficInfo(ctx context.Context, repo *storage.TrafficReposit
 				sub.Upload = int64(f)
 				logger.Info("[外部订阅同步] 解析上传流量(浮点)", "bytes", sub.Upload, "mb", f/(1024*1024))
 			} else {
-				logger.Info("[外部订阅同步] 解析上传流量失败", "value", value, "error", err)
+				logger.Info("[外部订阅同步] 解析上传流量失败")
 			}
 		case "download":
 			if v, err := strconv.ParseInt(value, 10, 64); err == nil {
@@ -782,7 +855,7 @@ func parseAndUpdateTrafficInfo(ctx context.Context, repo *storage.TrafficReposit
 				sub.Download = int64(f)
 				logger.Info("[外部订阅同步] 解析下载流量(浮点)", "bytes", sub.Download, "mb", f/(1024*1024))
 			} else {
-				logger.Info("[外部订阅同步] 解析下载流量失败", "value", value, "error", err)
+				logger.Info("[外部订阅同步] 解析下载流量失败")
 			}
 		case "total":
 			if v, err := strconv.ParseInt(value, 10, 64); err == nil {
@@ -793,7 +866,7 @@ func parseAndUpdateTrafficInfo(ctx context.Context, repo *storage.TrafficReposit
 				sub.Total = int64(f)
 				logger.Info("[外部订阅同步] 解析总流量(浮点)", "bytes", sub.Total, "gb", f/(1024*1024*1024))
 			} else {
-				logger.Info("[外部订阅同步] 解析总流量失败", "value", value, "error", err)
+				logger.Info("[外部订阅同步] 解析总流量失败")
 			}
 		case "expire":
 			if v, err := strconv.ParseInt(value, 10, 64); err == nil && v > 0 {

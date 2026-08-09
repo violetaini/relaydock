@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -130,7 +131,7 @@ func NewTemplateConvertHandler() http.Handler {
 		if req.TemplateURL != "" {
 			content, err := fetchRemoteContent(req.TemplateURL, 30*time.Second)
 			if err != nil {
-				writeError(w, http.StatusBadRequest, errors.New("failed to fetch template: "+err.Error()))
+				writeError(w, http.StatusBadRequest, errors.New("failed to fetch template"))
 				return
 			}
 			templateContent = content
@@ -155,7 +156,7 @@ func NewTemplateConvertHandler() http.Handler {
 		// 获取 ACL 配置
 		aclContent, err := fetchRemoteContent(req.RuleSource, 30*time.Second)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, errors.New("failed to fetch rule source: "+err.Error()))
+			writeError(w, http.StatusBadRequest, errors.New("failed to fetch rule source"))
 			return
 		}
 
@@ -370,17 +371,17 @@ func fetchRemoteContent(url string, timeout time.Duration) (string, error) {
 	client := safefetch.NewClient(timeout, 10<<20)
 	resp, err := client.Get(url)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("fetch remote content: %w", sanitizeSubscriptionRequestError(err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", errors.New("HTTP " + resp.Status)
+		return "", fmt.Errorf("remote content returned status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", errors.New("read remote content failed")
 	}
 
 	return string(body), nil
@@ -422,7 +423,7 @@ func NewTemplateFetchSourceHandler() http.Handler {
 
 		content, err := fetchRemoteContent(fetchURL, 30*time.Second)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeError(w, http.StatusInternalServerError, errors.New("failed to fetch template source"))
 			return
 		}
 

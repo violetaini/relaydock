@@ -334,7 +334,7 @@ func (h *TrafficSummaryHandler) syncAndFetchExternalSubscriptionTraffic(ctx cont
 func (h *TrafficSummaryHandler) fetchExternalSubscriptionTrafficInfo(ctx context.Context, sub storage.ExternalSubscription) (storage.ExternalSubscription, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sub.URL, nil)
 	if err != nil {
-		return sub, fmt.Errorf("create request: %w", err)
+		return sub, fmt.Errorf("create request for subscription source %d: %w", sub.ID, sanitizeSubscriptionRequestError(err))
 	}
 
 	userAgent := sub.UserAgent
@@ -345,7 +345,7 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTrafficInfo(ctx context
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return sub, fmt.Errorf("fetch subscription: %w", err)
+		return sub, fmt.Errorf("fetch subscription source %d: %w", sub.ID, sanitizeSubscriptionRequestError(err))
 	}
 	defer resp.Body.Close()
 

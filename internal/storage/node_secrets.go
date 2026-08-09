@@ -35,6 +35,12 @@ func (r *TrafficRepository) ConfigureNodeSecretEncryption(masterKey []byte) erro
 	r.nodeSecretMu.Lock()
 	r.nodeSecretBox = box
 	r.nodeSecretMu.Unlock()
+	if err := r.verifyExistingProxyProviderAccessTokens(context.Background()); err != nil {
+		r.nodeSecretMu.Lock()
+		r.nodeSecretBox = nil
+		r.nodeSecretMu.Unlock()
+		return err
+	}
 	if err := r.verifyExistingWireGuardNodeSecrets(context.Background()); err != nil {
 		r.nodeSecretMu.Lock()
 		r.nodeSecretBox = nil

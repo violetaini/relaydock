@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -134,7 +136,7 @@ func (h *TemplateV3Handler) handleProcessTemplate(w http.ResponseWriter, r *http
 	}
 
 	// Process the template
-	result, err := h.processV3Template(string(content), req.Proxies)
+	result, err := h.processV3Template(r.Context(), auth.UsernameFromContext(r.Context()), string(content), req.Proxies)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "处理模板失败: "+err.Error())
 		return
@@ -160,7 +162,7 @@ func (h *TemplateV3Handler) handlePreviewTemplate(w http.ResponseWriter, r *http
 	}
 
 	// Process the template
-	result, err := h.processV3Template(req.TemplateContent, req.Proxies)
+	result, err := h.processV3Template(r.Context(), auth.UsernameFromContext(r.Context()), req.TemplateContent, req.Proxies)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "处理模板失败: "+err.Error())
 		return
@@ -263,7 +265,7 @@ func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http
 	}
 
 	// Process the template
-	result, err := h.processV3Template(string(templateContent), proxies)
+	result, err := h.processV3Template(r.Context(), username, string(templateContent), proxies)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "处理模板失败: "+err.Error())
 		return
@@ -276,23 +278,8 @@ func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http
 }
 
 // processV3Template processes a v3 template with the given proxies
-func (h *TemplateV3Handler) processV3Template(templateContent string, proxies []map[string]any) (string, error) {
-	// Create processor with empty providers (v3 doesn't use external providers)
-	processor := substore.NewTemplateV3Processor(nil, nil)
-
-	// Process the template
-	result, err := processor.ProcessTemplate(templateContent, proxies)
-	if err != nil {
-		return "", err
-	}
-
-	// Inject proxies into the result
-	result, err = injectProxiesIntoTemplate(result, proxies)
-	if err != nil {
-		return "", err
-	}
-
-	return result, nil
+func (h *TemplateV3Handler) processV3Template(ctx context.Context, username, templateContent string, proxies []map[string]any) (string, error) {
+	return renderTemplateWithProxyProviders(ctx, h.repo, templateContent, proxies, username, false)
 }
 
 // injectProxiesIntoTemplate injects proxy nodes into the template's proxies section
@@ -311,25 +298,26 @@ func injectProxiesIntoTemplate(templateContent string, proxies []map[string]any)
 		return templateContent, nil
 	}
 
+	proxiesNode := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	for _, proxy := range proxies {
+		proxiesNode.Content = append(proxiesNode.Content, mapToYAMLNode(proxy))
+	}
+
 	// Find proxies key and inject nodes
+	found := false
 	for i := 0; i < len(rootMap.Content); i += 2 {
 		keyNode := rootMap.Content[i]
 		if keyNode.Value == "proxies" {
-			// Create new proxies sequence
-			proxiesNode := &yaml.Node{
-				Kind: yaml.SequenceNode,
-				Tag:  "!!seq",
-			}
-
-			// Add each proxy as a mapping node
-			for _, proxy := range proxies {
-				proxyNode := mapToYAMLNode(proxy)
-				proxiesNode.Content = append(proxiesNode.Content, proxyNode)
-			}
-
 			rootMap.Content[i+1] = proxiesNode
+			found = true
 			break
 		}
+	}
+	if !found {
+		rootMap.Content = append(rootMap.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "proxies"},
+			proxiesNode,
+		)
 	}
 
 	// Marshal back to YAML
@@ -365,11 +353,16 @@ func mapToYAMLNode(m map[string]any) *yaml.Node {
 		}
 	}
 
-	// Add remaining keys
-	for key, value := range m {
+	// Add remaining keys deterministically so generated subscriptions are stable.
+	remainingKeys := make([]string, 0, len(m))
+	for key := range m {
 		if !addedKeys[key] {
-			addKeyValueToNode(node, key, value)
+			remainingKeys = append(remainingKeys, key)
 		}
+	}
+	sort.Strings(remainingKeys)
+	for _, key := range remainingKeys {
+		addKeyValueToNode(node, key, m[key])
 	}
 
 	return node

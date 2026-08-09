@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/violetaini/relaydock/internal/auth"
@@ -30,6 +31,9 @@ func newProxyProviderFixture(t *testing.T) proxyProviderFixture {
 		t.Fatalf("create repository: %v", err)
 	}
 	t.Cleanup(func() { _ = repo.Close() })
+	if err := repo.ConfigureNodeSecretEncryption(bytes.Repeat([]byte{0x42}, 32)); err != nil {
+		t.Fatalf("configure provider token encryption: %v", err)
+	}
 
 	for _, username := range []string{"alice", "bob"} {
 		if err := repo.CreateUser(context.Background(), username, username+"@example.test", username, "test-hash", storage.RoleUser, ""); err != nil {
@@ -261,5 +265,82 @@ func TestProxyProviderStorageMutationsRequireOwnedSource(t *testing.T) {
 	}
 	if persisted == nil || persisted.Username != "alice" || persisted.ExternalSubscriptionID != fixture.aliceSource1 || persisted.Name != owned.Name {
 		t.Fatalf("rejected storage update changed provider: %#v", persisted)
+	}
+}
+
+func TestProxyProviderConfigValidationAndUniqueNames(t *testing.T) {
+	fixture := newProxyProviderFixture(t)
+	valid := proxyProviderDTO(fixture.aliceSource1)
+	valid.ProcessMode = "mmw"
+	created := serveProxyProviderRequest(t, fixture.handler, http.MethodPost, "/api/user/proxy-provider-configs", "alice", valid)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("legacy mode create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var result ProxyProviderConfigDTO
+	if err := json.Unmarshal(created.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ProcessMode != "server" || result.Type != "http" {
+		t.Fatalf("legacy mode was not normalized: %#v", result)
+	}
+
+	duplicate := proxyProviderDTO(fixture.aliceSource2)
+	response := serveProxyProviderRequest(t, fixture.handler, http.MethodPost, "/api/user/proxy-provider-configs", "alice", duplicate)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("duplicate status=%d body=%s, want 409", response.Code, response.Body.String())
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*ProxyProviderConfigDTO)
+	}{
+		{name: "reserved name", mutate: func(dto *ProxyProviderConfigDTO) { dto.Name = "__PROXY_PROVIDERS__" }},
+		{name: "unsupported type", mutate: func(dto *ProxyProviderConfigDTO) { dto.Type = "file" }},
+		{name: "short interval", mutate: func(dto *ProxyProviderConfigDTO) { dto.Interval = 1 }},
+		{name: "oversized content", mutate: func(dto *ProxyProviderConfigDTO) { dto.SizeLimit = maxProxyProviderBytes + 1 }},
+		{name: "invalid filter", mutate: func(dto *ProxyProviderConfigDTO) { dto.Filter = "[" }},
+		{name: "invalid health URL", mutate: func(dto *ProxyProviderConfigDTO) { dto.HealthCheckURL = "file:///tmp/check" }},
+		{name: "unsafe header", mutate: func(dto *ProxyProviderConfigDTO) { dto.Header = `{"Authorization":"secret"}` }},
+		{name: "unsupported override", mutate: func(dto *ProxyProviderConfigDTO) { dto.Override = "prefix: test" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dto := proxyProviderDTO(fixture.aliceSource2)
+			dto.Name = "other-" + test.name
+			test.mutate(&dto)
+			response := serveProxyProviderRequest(t, fixture.handler, http.MethodPost, "/api/user/proxy-provider-configs", "alice", dto)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestProxyProviderDeleteAndRotateHideForeignResources(t *testing.T) {
+	fixture := newProxyProviderFixture(t)
+	ctx := context.Background()
+	id, err := fixture.repo.CreateProxyProviderConfig(ctx, proxyProviderDTO(fixture.aliceSource1).toStorage("alice"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foreignDelete := serveProxyProviderRequest(t, fixture.handler, http.MethodDelete, "/api/user/proxy-provider-configs?id="+strconv.FormatInt(id, 10), "bob", ProxyProviderConfigDTO{})
+	missingDelete := serveProxyProviderRequest(t, fixture.handler, http.MethodDelete, "/api/user/proxy-provider-configs?id=999999", "bob", ProxyProviderConfigDTO{})
+	if foreignDelete.Code != http.StatusNotFound || missingDelete.Code != http.StatusNotFound || foreignDelete.Body.String() != missingDelete.Body.String() {
+		t.Fatalf("foreign delete differs from missing: foreign=%d %q missing=%d %q", foreignDelete.Code, foreignDelete.Body.String(), missingDelete.Code, missingDelete.Body.String())
+	}
+
+	rotateHandler := NewProxyProviderTokenRotateHandler(fixture.repo)
+	foreignRotate := serveProxyProviderRequest(t, rotateHandler, http.MethodPost, "/api/user/proxy-provider-configs/rotate?id="+strconv.FormatInt(id, 10), "bob", ProxyProviderConfigDTO{})
+	missingRotate := serveProxyProviderRequest(t, rotateHandler, http.MethodPost, "/api/user/proxy-provider-configs/rotate?id=999999", "bob", ProxyProviderConfigDTO{})
+	if foreignRotate.Code != http.StatusNotFound || missingRotate.Code != http.StatusNotFound || foreignRotate.Body.String() != missingRotate.Body.String() {
+		t.Fatalf("foreign rotation differs from missing: foreign=%d %q missing=%d %q", foreignRotate.Code, foreignRotate.Body.String(), missingRotate.Code, missingRotate.Body.String())
+	}
+
+	ownerRotate := serveProxyProviderRequest(t, rotateHandler, http.MethodPost, "/api/user/proxy-provider-configs/rotate?id="+strconv.FormatInt(id, 10), "alice", ProxyProviderConfigDTO{})
+	if ownerRotate.Code != http.StatusOK {
+		t.Fatalf("owner rotate status=%d body=%s", ownerRotate.Code, ownerRotate.Body.String())
+	}
+	if strings.Contains(ownerRotate.Body.String(), "arcway_pp_") {
+		t.Fatalf("rotation response exposed token: %s", ownerRotate.Body.String())
 	}
 }

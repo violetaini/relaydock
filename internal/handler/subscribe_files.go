@@ -380,7 +380,8 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 
 	resp, err := h.fetchClient.Do(httpReq)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, errors.New("无法获取订阅内容: "+err.Error()))
+		logger.Info("[订阅文件] 获取外部订阅失败", "error", sanitizeSubscriptionRequestError(err))
+		writeError(w, http.StatusBadRequest, errors.New("无法获取订阅内容"))
 		return
 	}
 	defer resp.Body.Close()

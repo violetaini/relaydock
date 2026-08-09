@@ -238,6 +238,7 @@ var (
 	ErrUserSettingsNotFound                      = errors.New("user settings not found")
 	ErrExternalSubscriptionNotFound              = errors.New("external subscription not found")
 	ErrExternalSubscriptionExists                = errors.New("external subscription already exists")
+	ErrProxyProviderConfigExists                 = errors.New("proxy provider config already exists")
 	ErrPackageNotFound                           = errors.New("package not found")
 	ErrPackageExists                             = errors.New("package already exists")
 	ErrRemoteServerNotFound                      = errors.New("remote server not found")
@@ -2744,6 +2745,8 @@ CREATE TABLE IF NOT EXISTS proxy_provider_configs (
     geo_ip_filter TEXT,
     override TEXT,
     process_mode TEXT DEFAULT 'client',
+    access_token_hash TEXT NOT NULL DEFAULT '',
+    access_token_ciphertext TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (external_subscription_id) REFERENCES external_subscriptions(id) ON DELETE CASCADE
@@ -2758,6 +2761,61 @@ CREATE INDEX IF NOT EXISTS idx_proxy_provider_configs_external_subscription_id O
 	// 添加 geo_ip_filter 列（为旧数据库迁移）
 	if err := r.ensureProxyProviderConfigColumn("geo_ip_filter", "TEXT"); err != nil {
 		return fmt.Errorf("ensure geo_ip_filter column: %w", err)
+	}
+	if err := r.ensureProxyProviderConfigColumn("access_token_hash", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("ensure proxy provider access token hash: %w", err)
+	}
+	if err := r.ensureProxyProviderConfigColumn("access_token_ciphertext", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("ensure proxy provider access token ciphertext: %w", err)
+	}
+	if _, err := r.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_provider_configs_access_token_hash ON proxy_provider_configs(access_token_hash) WHERE access_token_hash != ''`); err != nil {
+		return fmt.Errorf("create proxy provider access token index: %w", err)
+	}
+	// Legacy databases can contain duplicate owner/name pairs that prevent a
+	// unique index from being installed. Keep those rows available for manual
+	// repair, while triggers prevent every new insert or rename from extending
+	// the inconsistency. The error text intentionally contains "unique" so the
+	// storage API maps trigger aborts to ErrProxyProviderConfigExists.
+	const proxyProviderOwnerNameTriggers = `
+CREATE TRIGGER IF NOT EXISTS trg_proxy_provider_configs_owner_name_insert
+BEFORE INSERT ON proxy_provider_configs
+WHEN NEW.name != '' AND EXISTS (
+    SELECT 1 FROM proxy_provider_configs
+    WHERE username = NEW.username AND name = NEW.name
+)
+BEGIN
+    SELECT RAISE(ABORT, 'proxy provider owner-name unique conflict');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_proxy_provider_configs_owner_name_update
+BEFORE UPDATE OF username, name ON proxy_provider_configs
+WHEN NEW.name != '' AND EXISTS (
+    SELECT 1 FROM proxy_provider_configs
+    WHERE username = NEW.username AND name = NEW.name AND id != OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'proxy provider owner-name unique conflict');
+END;
+`
+	if _, err := r.db.Exec(proxyProviderOwnerNameTriggers); err != nil {
+		return fmt.Errorf("create proxy provider owner-name triggers: %w", err)
+	}
+	var duplicateProviderNames int
+	if err := r.db.QueryRow(`
+		SELECT COUNT(*) FROM (
+			SELECT username, name FROM proxy_provider_configs
+			WHERE name != '' GROUP BY username, name HAVING COUNT(*) > 1
+		)`).Scan(&duplicateProviderNames); err != nil {
+		return fmt.Errorf("check duplicate proxy provider names: %w", err)
+	}
+	if duplicateProviderNames == 0 {
+		if _, err := r.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_provider_configs_owner_name ON proxy_provider_configs(username, name) WHERE name != ''`); err != nil {
+			return fmt.Errorf("create proxy provider owner-name index: %w", err)
+		}
+	} else {
+		// Preserve legacy rows instead of making the service unbootable. The
+		// triggers reject additional duplicates and the renderer fails closed
+		// until an owner resolves the existing conflict.
+		log.Printf("[Migrate] skipped proxy provider owner-name index: %d duplicate name group(s) require manual resolution", duplicateProviderNames)
 	}
 
 	// 证书表 - 存储由 ACME 管理的 SSL/TLS 证书
@@ -5511,7 +5569,7 @@ func userIdentityColumns(ctx context.Context, tx *sql.Tx) ([]userIdentityColumn,
 	return columns, nil
 }
 
-func renameUserInTx(ctx context.Context, tx *sql.Tx, oldUsername, newUsername string) error {
+func (r *TrafficRepository) renameUserInTx(ctx context.Context, tx *sql.Tx, oldUsername, newUsername string) error {
 	if IsReservedUsername(newUsername) {
 		return ErrReservedUsername
 	}
@@ -5554,6 +5612,9 @@ func renameUserInTx(ctx context.Context, tx *sql.Tx, oldUsername, newUsername st
 		if _, err := tx.ExecContext(ctx, query, newUsername, oldUsername); err != nil {
 			return fmt.Errorf("rename %s.%s: %w", target.table, target.column, err)
 		}
+	}
+	if err := r.resealProxyProviderAccessTokensForUsernameRename(ctx, tx, oldUsername, newUsername); err != nil {
+		return err
 	}
 
 	result, err := tx.ExecContext(ctx,
@@ -5624,7 +5685,7 @@ func (r *TrafficRepository) UpdateCredentialsAndDeleteSessions(ctx context.Conte
 	defer func() { _ = tx.Rollback() }()
 
 	if newUsername != currentUsername {
-		if err := renameUserInTx(ctx, tx, currentUsername, newUsername); err != nil {
+		if err := r.renameUserInTx(ctx, tx, currentUsername, newUsername); err != nil {
 			return "", err
 		}
 	}
@@ -5885,7 +5946,7 @@ func (r *TrafficRepository) RenameUserAndRun(ctx context.Context, oldUsername, n
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := renameUserInTx(ctx, tx, oldUsername, newUsername); err != nil {
+	if err := r.renameUserInTx(ctx, tx, oldUsername, newUsername); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -7249,6 +7310,9 @@ func (r *TrafficRepository) CreateProxyProviderConfig(ctx context.Context, confi
 		config.ExternalSubscriptionID, config.Username,
 	)
 	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return 0, ErrProxyProviderConfigExists
+		}
 		return 0, fmt.Errorf("create proxy provider config: %w", err)
 	}
 	rows, err := result.RowsAffected()
@@ -7514,6 +7578,9 @@ func (r *TrafficRepository) UpdateProxyProviderConfig(ctx context.Context, confi
 		config.ID, config.Username, config.ExternalSubscriptionID, config.Username,
 	)
 	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return ErrProxyProviderConfigExists
+		}
 		return fmt.Errorf("update proxy provider config: %w", err)
 	}
 

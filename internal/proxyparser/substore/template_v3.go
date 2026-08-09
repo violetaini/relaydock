@@ -1,6 +1,7 @@
 package substore
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/violetaini/relaydock/internal/proxyparser/logger"
@@ -122,11 +123,21 @@ type ProxyNode struct {
 type TemplateV3Processor struct {
 	allProxies        []ProxyNode         // All available proxy nodes
 	proxyGroups       []string            // Names of proxy groups (for reference)
-	providers         map[string][]string // Provider name -> proxy names
+	serverProviders   map[string][]string // Server provider name -> expanded proxy names
+	nativeProviders   []string            // Native client provider names, sorted for stable output
+	nativeProviderSet map[string]bool     // Native client provider names for lookup
 	regionGroupsAdded bool                // Whether region proxy groups have been added
 	regionGroupNames  []string            // Names of region proxy groups
 	variables         map[string]string   // 模板自定义变量（非标准顶级键）
 	usedVariables     map[string]bool     // 被实际引用的变量
+}
+
+// TemplateV3ProcessorOptions configures how provider references are materialized.
+// ServerProviders are expanded into proxy names. NativeProviders remain in a
+// proxy group's use field for Mihomo to load at runtime.
+type TemplateV3ProcessorOptions struct {
+	ServerProviders map[string][]string
+	NativeProviders []string
 }
 
 // Clash/mihomo 标准顶级键（不视为自定义变量）
@@ -146,9 +157,35 @@ var standardTopLevelKeys = map[string]bool{
 
 // NewTemplateV3Processor creates a new v3 template processor
 func NewTemplateV3Processor(proxies []ProxyNode, providers map[string][]string) *TemplateV3Processor {
+	return NewTemplateV3ProcessorWithOptions(proxies, TemplateV3ProcessorOptions{
+		ServerProviders: providers,
+	})
+}
+
+// NewTemplateV3ProcessorWithOptions creates a v3 template processor with
+// separate server-expanded and Mihomo-native providers.
+func NewTemplateV3ProcessorWithOptions(proxies []ProxyNode, options TemplateV3ProcessorOptions) *TemplateV3Processor {
+	serverProviders := make(map[string][]string, len(options.ServerProviders))
+	for name, providerProxies := range options.ServerProviders {
+		serverProviders[name] = append([]string(nil), providerProxies...)
+	}
+
+	nativeProviderSet := make(map[string]bool, len(options.NativeProviders))
+	nativeProviders := make([]string, 0, len(options.NativeProviders))
+	for _, name := range options.NativeProviders {
+		if name == "" || nativeProviderSet[name] {
+			continue
+		}
+		nativeProviderSet[name] = true
+		nativeProviders = append(nativeProviders, name)
+	}
+	sort.Strings(nativeProviders)
+
 	return &TemplateV3Processor{
 		allProxies:        proxies,
-		providers:         providers,
+		serverProviders:   serverProviders,
+		nativeProviders:   nativeProviders,
+		nativeProviderSet: nativeProviderSet,
 		proxyGroups:       []string{},
 		regionGroupsAdded: false,
 		regionGroupNames:  GetRegionProxyGroupNames(),
@@ -207,8 +244,8 @@ func (p *TemplateV3Processor) ProcessTemplate(templateContent string, proxies []
 			// 收集模板自定义变量（非标准顶级键的标量值）
 			p.variables = collectVariables(rootMap)
 			if len(p.variables) > 0 {
-				for name, value := range p.variables {
-					logger.Info("[模板变量] 发现自定义变量", "name", name, "value", value)
+				for name := range p.variables {
+					logger.Info("[模板变量] 发现自定义变量", "name", name)
 				}
 			}
 
@@ -436,8 +473,8 @@ func (p *TemplateV3Processor) processProxyGroups(groupsNode *yaml.Node) error {
 			if err := p.processProxyGroup(groupNode); err != nil {
 				return err
 			}
-			// Check if proxies is empty after processing
-			if p.hasEmptyProxies(groupNode) {
+			// Check if both proxies and native provider use are empty after processing.
+			if p.hasNoProxySources(groupNode) {
 				// Record the removed group name
 				for i := 0; i < len(groupNode.Content); i += 2 {
 					if groupNode.Content[i].Value == "name" {
@@ -494,15 +531,17 @@ func (p *TemplateV3Processor) filterProxyGroupNames(names []string, removedGroup
 	return result
 }
 
-// hasEmptyProxies checks if a proxy group has empty or no proxies
-func (p *TemplateV3Processor) hasEmptyProxies(groupNode *yaml.Node) bool {
+// hasNoProxySources checks if a proxy group has neither proxies nor providers.
+func (p *TemplateV3Processor) hasNoProxySources(groupNode *yaml.Node) bool {
 	for i := 0; i < len(groupNode.Content); i += 2 {
-		if groupNode.Content[i].Value == "proxies" {
+		if groupNode.Content[i].Value == "proxies" || groupNode.Content[i].Value == "use" {
 			valueNode := groupNode.Content[i+1]
-			return valueNode.Kind == yaml.SequenceNode && len(valueNode.Content) == 0
+			if valueNode.Kind == yaml.SequenceNode && len(valueNode.Content) > 0 {
+				return false
+			}
 		}
 	}
-	// No proxies field found, treat as empty
+	// No non-empty proxies or use field found, treat as empty.
 	return true
 }
 
@@ -510,14 +549,18 @@ func (p *TemplateV3Processor) hasEmptyProxies(groupNode *yaml.Node) bool {
 func (p *TemplateV3Processor) processProxyGroup(groupNode *yaml.Node) error {
 	group := p.parseProxyGroup(groupNode)
 
-	// Calculate the final proxy list
-	finalProxies := p.calculateProxies(group)
+	// Calculate server-expanded proxies and providers that Mihomo must load.
+	finalProxies, nativeProviders := p.calculateProxySources(group)
 
 	// Update the proxies field in the YAML node
 	p.updateProxiesInNode(groupNode, finalProxies)
+	p.updateUseInNode(groupNode, nativeProviders)
+	if len(nativeProviders) > 0 {
+		p.updateNativeFilterFields(groupNode, group)
+	}
 
 	// Remove mihomo-specific fields that we've processed
-	p.removeMihomoFields(groupNode)
+	p.removeMihomoFields(groupNode, len(nativeProviders) > 0)
 
 	return nil
 }
@@ -561,7 +604,7 @@ func (p *TemplateV3Processor) parseProxyGroup(groupNode *yaml.Node) ProxyGroupV3
 			group.Filter = valueNode.Value
 			// 解析变量引用：filter 值如果是自定义变量名，替换为变量值
 			if resolved, ok := p.variables[group.Filter]; ok {
-				logger.Info("[模板变量] 代理组 filter 引用变量已解析", "group", group.Name, "variable", group.Filter, "resolved", resolved)
+				logger.Info("[模板变量] 代理组 filter 引用变量已解析", "group", group.Name, "variable", group.Filter)
 				p.usedVariables[group.Filter] = true
 				group.Filter = resolved
 			}
@@ -569,7 +612,7 @@ func (p *TemplateV3Processor) parseProxyGroup(groupNode *yaml.Node) ProxyGroupV3
 			group.ExcludeFilter = valueNode.Value
 			// 解析变量引用
 			if resolved, ok := p.variables[group.ExcludeFilter]; ok {
-				logger.Info("[模板变量] 代理组 exclude-filter 引用变量已解析", "group", group.Name, "variable", group.ExcludeFilter, "resolved", resolved)
+				logger.Info("[模板变量] 代理组 exclude-filter 引用变量已解析", "group", group.Name, "variable", group.ExcludeFilter)
 				p.usedVariables[group.ExcludeFilter] = true
 				group.ExcludeFilter = resolved
 			}
@@ -592,15 +635,12 @@ func (p *TemplateV3Processor) parseProxyGroup(groupNode *yaml.Node) ProxyGroupV3
 	return group
 }
 
-// calculateProxies calculates the final proxy list based on include/filter options
-func (p *TemplateV3Processor) calculateProxies(group ProxyGroupV3) []string {
+// calculateProxySources calculates expanded proxies and native provider names.
+func (p *TemplateV3Processor) calculateProxySources(group ProxyGroupV3) ([]string, []string) {
 	var result []string
 
 	// Calculate proxy nodes (from include-all-proxies, include-type, filter)
 	proxyNodes := p.calculateProxyNodes(group)
-
-	// Calculate proxy providers (from use, include-all-providers)
-	proxyProviders := p.calculateProxyProviders(group)
 
 	// Check if proxies list contains markers
 	hasNodesMarker := false
@@ -618,13 +658,16 @@ func (p *TemplateV3Processor) calculateProxies(group ProxyGroupV3) []string {
 		}
 	}
 
+	// The provider marker itself means "include every provider".
+	serverProviderProxies, nativeProviders := p.calculateProxyProviders(group, hasProvidersMarker)
+
 	// If markers are present, use them to determine order
 	if hasNodesMarker || hasProvidersMarker || hasRegionGroupsMarker {
 		for _, proxy := range group.Proxies {
 			if proxy == ProxyNodesMarker {
 				result = append(result, proxyNodes...)
 			} else if proxy == ProxyProvidersMarker {
-				result = append(result, proxyProviders...)
+				result = append(result, serverProviderProxies...)
 			} else if proxy == RegionProxyGroupsMarker {
 				result = append(result, p.regionGroupNames...)
 			} else {
@@ -638,7 +681,7 @@ func (p *TemplateV3Processor) calculateProxies(group ProxyGroupV3) []string {
 		}
 		result = append(result, group.Proxies...)
 		result = append(result, proxyNodes...)
-		result = append(result, proxyProviders...)
+		result = append(result, serverProviderProxies...)
 	}
 
 	// Apply filter (include matching) - only to proxy nodes, not to proxy groups
@@ -660,24 +703,28 @@ func (p *TemplateV3Processor) calculateProxies(group ProxyGroupV3) []string {
 	// Remove duplicates while preserving order
 	result = removeDuplicates(result)
 
-	return result
+	return result, removeDuplicates(nativeProviders)
 }
 
 // calculateProxyNodes calculates proxy nodes from include options
 func (p *TemplateV3Processor) calculateProxyNodes(group ProxyGroupV3) []string {
 	var nodes []string
 
-	// 检查 proxies 列表中是否包含 __PROXY_NODES__ 占位符，等同于 include-all-proxies
+	// Provider markers are also explicit includes, but they do not select regular
+	// top-level proxies.
 	hasNodesMarker := false
+	hasProvidersMarker := false
 	for _, proxy := range group.Proxies {
 		if proxy == ProxyNodesMarker {
 			hasNodesMarker = true
-			break
+		}
+		if proxy == ProxyProvidersMarker {
+			hasProvidersMarker = true
 		}
 	}
 
 	// Check if explicit include option is set (not counting filter as include)
-	hasExplicitInclude := group.IncludeAll || group.IncludeAllProxies || group.IncludeType != "" || hasNodesMarker
+	hasExplicitInclude := group.IncludeAll || group.IncludeAllProxies || group.IncludeAllProviders || group.IncludeType != "" || hasNodesMarker || hasProvidersMarker
 
 	if group.IncludeAll || group.IncludeAllProxies || hasNodesMarker {
 		for _, proxy := range p.allProxies {
@@ -690,7 +737,7 @@ func (p *TemplateV3Processor) calculateProxyNodes(group ProxyGroupV3) []string {
 				nodes = append(nodes, proxy.Name)
 			}
 		}
-	} else if !hasExplicitInclude && (group.Filter != "" || group.ExcludeFilter != "") {
+	} else if !hasExplicitInclude && len(group.Use) == 0 && (group.Filter != "" || group.ExcludeFilter != "") {
 		// If no explicit include option is set but filter/exclude-filter is present,
 		// implicitly include all proxies (mihomo behavior)
 		for _, proxy := range p.allProxies {
@@ -701,23 +748,34 @@ func (p *TemplateV3Processor) calculateProxyNodes(group ProxyGroupV3) []string {
 	return nodes
 }
 
-// calculateProxyProviders calculates proxy providers from include options
-func (p *TemplateV3Processor) calculateProxyProviders(group ProxyGroupV3) []string {
-	var providers []string
+// calculateProxyProviders separates server-expanded provider proxies from
+// provider names that must stay in Mihomo's native use field.
+func (p *TemplateV3Processor) calculateProxyProviders(group ProxyGroupV3, hasProvidersMarker bool) ([]string, []string) {
+	var serverProxies []string
+	var nativeProviders []string
 
-	if group.IncludeAll || group.IncludeAllProviders {
-		for _, providerProxies := range p.providers {
-			providers = append(providers, providerProxies...)
+	if group.IncludeAll || group.IncludeAllProviders || hasProvidersMarker {
+		serverProviderNames := make([]string, 0, len(p.serverProviders))
+		for name := range p.serverProviders {
+			serverProviderNames = append(serverProviderNames, name)
 		}
-	} else if len(group.Use) > 0 {
+		sort.Strings(serverProviderNames)
+		for _, name := range serverProviderNames {
+			serverProxies = append(serverProxies, p.serverProviders[name]...)
+		}
+		nativeProviders = append(nativeProviders, p.nativeProviders...)
+	} else {
 		for _, providerName := range group.Use {
-			if providerProxies, ok := p.providers[providerName]; ok {
-				providers = append(providers, providerProxies...)
+			if providerProxies, ok := p.serverProviders[providerName]; ok {
+				serverProxies = append(serverProxies, providerProxies...)
+			}
+			if p.nativeProviderSet[providerName] {
+				nativeProviders = append(nativeProviders, providerName)
 			}
 		}
 	}
 
-	return providers
+	return removeDuplicates(serverProxies), removeDuplicates(nativeProviders)
 }
 
 // applyFilterPreservingGroups applies filter but preserves proxy group names
@@ -790,6 +848,9 @@ func (p *TemplateV3Processor) updateProxiesInNode(groupNode *yaml.Node, proxies 
 	if proxiesIndex >= 0 {
 		// Replace existing proxies
 		groupNode.Content[proxiesIndex] = proxiesNode
+	} else if len(proxies) == 0 {
+		// A native-provider-only group does not need an empty proxies field.
+		return
 	} else {
 		// Add proxies field after name and type
 		insertIndex := 4 // After name and type (2 key-value pairs = 4 nodes)
@@ -812,18 +873,69 @@ func (p *TemplateV3Processor) updateProxiesInNode(groupNode *yaml.Node, proxies 
 	}
 }
 
+// updateUseInNode keeps only providers that Mihomo must load natively.
+func (p *TemplateV3Processor) updateUseInNode(groupNode *yaml.Node, providers []string) {
+	for i := 0; i < len(groupNode.Content); i += 2 {
+		if groupNode.Content[i].Value != "use" {
+			continue
+		}
+		if len(providers) == 0 {
+			groupNode.Content = append(groupNode.Content[:i], groupNode.Content[i+2:]...)
+			return
+		}
+		groupNode.Content[i+1] = stringSequenceNode(providers)
+		return
+	}
+
+	if len(providers) == 0 {
+		return
+	}
+	groupNode.Content = append(groupNode.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "use"},
+		stringSequenceNode(providers),
+	)
+}
+
+func stringSequenceNode(values []string) *yaml.Node {
+	sequence := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	for _, value := range values {
+		sequence.Content = append(sequence.Content, &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!str",
+			Value: value,
+		})
+	}
+	return sequence
+}
+
+// updateNativeFilterFields writes resolved variables back before their root
+// definitions are removed. Mihomo needs these fields to filter native providers.
+func (p *TemplateV3Processor) updateNativeFilterFields(groupNode *yaml.Node, group ProxyGroupV3) {
+	resolvedValues := map[string]string{
+		"filter":         group.Filter,
+		"exclude-filter": group.ExcludeFilter,
+		"exclude-type":   group.ExcludeType,
+	}
+	for i := 0; i < len(groupNode.Content); i += 2 {
+		if value, ok := resolvedValues[groupNode.Content[i].Value]; ok {
+			groupNode.Content[i+1].Value = value
+		}
+	}
+}
+
 // removeMihomoFields removes mihomo-specific fields from the proxy group
-func (p *TemplateV3Processor) removeMihomoFields(groupNode *yaml.Node) {
+func (p *TemplateV3Processor) removeMihomoFields(groupNode *yaml.Node, preserveNativeFields bool) {
 	fieldsToRemove := map[string]bool{
-		"use":                         true,
 		"include-all":                 true,
 		"include-type":                true,
 		"include-all-proxies":         true,
 		"include-all-providers":       true,
 		"include-region-proxy-groups": true,
-		"filter":                      true,
-		"exclude-filter":              true,
-		"exclude-type":                true,
+	}
+	if !preserveNativeFields {
+		fieldsToRemove["filter"] = true
+		fieldsToRemove["exclude-filter"] = true
+		fieldsToRemove["exclude-type"] = true
 	}
 
 	newContent := make([]*yaml.Node, 0, len(groupNode.Content))

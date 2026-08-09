@@ -2,7 +2,9 @@ package handler
 
 import (
 	"container/list"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,10 +12,12 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/logger"
 	"github.com/violetaini/relaydock/internal/proxyparser"
 	"github.com/violetaini/relaydock/internal/safefetch"
@@ -22,12 +26,15 @@ import (
 )
 
 const (
-	geoIPCacheTTL             = 24 * time.Hour
-	maxGeoIPCacheEntries      = 4096
-	subscriptionCacheTTL      = 5 * time.Minute
-	maxSubscriptionBytes      = 50 << 20 // 50MB
-	maxSubscriptionCacheBytes = 64 << 20 // cache budget shared by all subscriptions
-	maxSubscriptionCacheItems = 1024
+	proxyProviderAccessTokenPrefix = "arcway_pp_"
+	geoIPCacheTTL                  = 24 * time.Hour
+	maxGeoIPCacheEntries           = 4096
+	subscriptionCacheTTL           = 5 * time.Minute
+	maxSubscriptionBytes           = 50 << 20 // 50MB
+	maxSubscriptionCacheBytes      = 64 << 20 // cache budget shared by all subscriptions
+	maxSubscriptionCacheItems      = 1024
+	maxProxyProviderNodes          = 20_000
+	maxProxyProviderBytes          = 50 << 20
 )
 
 type geoIPResponse struct {
@@ -37,6 +44,7 @@ type geoIPResponse struct {
 
 var geoIPCache = newBoundedGeoIPCache(maxGeoIPCacheEntries, geoIPCacheTTL)
 var geoIPLookupPending = sync.Map{} // map[string]struct{}; prevents duplicate asynchronous lookups
+var geoIPHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
 type subscriptionCacheEntry struct {
 	content   []byte
@@ -182,6 +190,16 @@ func (c *boundedSubscriptionCache) delete(key string) {
 	}
 }
 
+func (c *boundedSubscriptionCache) deletePrefix(prefix string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, entry := range c.entries {
+		if strings.HasPrefix(key, prefix) {
+			c.removeLocked(key, entry)
+		}
+	}
+}
+
 func (c *boundedSubscriptionCache) removeLocked(key string, entry *subscriptionCacheEntry) {
 	delete(c.entries, key)
 	c.lru.Remove(entry.element)
@@ -190,7 +208,21 @@ func (c *boundedSubscriptionCache) removeLocked(key string, entry *subscriptionC
 
 // 失效指定URL的订阅内容缓存
 func InvalidateSubscriptionContentCache(url string) {
-	subscriptionCache.delete(url)
+	subscriptionCache.deletePrefix(subscriptionContentCachePrefix(url) + ":")
+}
+
+func subscriptionContentCachePrefix(rawURL string) string {
+	sum := sha256.Sum256([]byte(rawURL))
+	return fmt.Sprintf("subscription:%x", sum[:])
+}
+
+func subscriptionContentCacheKey(rawURL string, userAgents ...string) string {
+	userAgent := "clash-meta/2.4.0"
+	if len(userAgents) > 0 && strings.TrimSpace(userAgents[0]) != "" {
+		userAgent = strings.TrimSpace(userAgents[0])
+	}
+	sum := sha256.Sum256([]byte(userAgent))
+	return fmt.Sprintf("%s:%x", subscriptionContentCachePrefix(rawURL), sum[:])
 }
 
 // 查询 IP 的国家代码
@@ -221,10 +253,9 @@ func getGeoIPCountryCode(ipOrHost string) string {
 	}
 
 	// 查询 API
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("https://api.ipinfo.io/lite/%s?token=%s", url.PathEscape(ip), url.QueryEscape(token)))
+	resp, err := geoIPHTTPClient.Get(fmt.Sprintf("https://api.ipinfo.io/lite/%s?token=%s", url.PathEscape(ip), url.QueryEscape(token)))
 	if err != nil {
-		logger.Info("[GeoIP] IP查询失败", "ip", ip, "error", err)
+		logger.Info("[GeoIP] IP查询失败", "ip", ip, "error", sanitizeSubscriptionRequestError(err))
 		// 缓存空结果避免重复查询
 		geoIPCache.Store(ip, "")
 		return ""
@@ -313,32 +344,32 @@ func isGeoIPLookupPublicIP(ip net.IP) bool {
 
 // 通过缓存获取订阅内容（5 分钟 TTL）
 func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error) {
-	cacheKey := sub.URL
+	userAgent := strings.TrimSpace(sub.UserAgent)
+	if userAgent == "" {
+		userAgent = "clash-meta/2.4.0"
+	}
+	cacheKey := subscriptionContentCacheKey(sub.URL, userAgent)
 
 	// 检查缓存
 	if content, ok := subscriptionCache.get(cacheKey, time.Now()); ok {
-		logger.Info("[SubscriptionCache] 缓存命中", "url", sub.URL)
+		logger.Info("[SubscriptionCache] 缓存命中", "source_id", sub.ID, "source_name", sub.Name)
 		return content, nil
 	}
 
-	logger.Info("[SubscriptionCache] 缓存未命中，正在拉取", "url", sub.URL)
+	logger.Info("[SubscriptionCache] 缓存未命中，正在拉取", "source_id", sub.ID, "source_name", sub.Name)
 
 	// 拉取订阅内容
 	client := safefetch.NewClient(30*time.Second, maxSubscriptionBytes)
 	req, err := http.NewRequest(http.MethodGet, sub.URL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, fmt.Errorf("create request for subscription source %d: invalid URL", sub.ID)
 	}
 
-	userAgent := sub.UserAgent
-	if userAgent == "" {
-		userAgent = "clash-meta/2.4.0"
-	}
 	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch subscription: %w", err)
+		return nil, fmt.Errorf("fetch subscription source %d: %w", sub.ID, sanitizeSubscriptionRequestError(err))
 	}
 	defer resp.Body.Close()
 
@@ -356,6 +387,120 @@ func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error)
 	subscriptionCache.put(cacheKey, body, time.Now())
 
 	return body, nil
+}
+
+type proxyProviderContentFetcher func(*storage.ExternalSubscription) ([]byte, error)
+
+// ProxyProviderContentHandler serves a provider's normalized proxy list through
+// an opaque, independently revocable Authorization credential. The URL contains
+// only a non-secret provider ID so reverse-proxy access logs cannot capture the
+// credential.
+type ProxyProviderContentHandler struct {
+	repo  *storage.TrafficRepository
+	fetch proxyProviderContentFetcher
+}
+
+func NewProxyProviderContentHandler(repo *storage.TrafficRepository) http.Handler {
+	if repo == nil {
+		panic("proxy provider content handler requires repository")
+	}
+	return &ProxyProviderContentHandler{repo: repo, fetch: fetchSubscriptionContent}
+}
+
+func (h *ProxyProviderContentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	const routePrefix = "/api/proxy-provider/"
+	if !strings.HasPrefix(r.URL.Path, routePrefix) {
+		writeProxyProviderNotFound(w)
+		return
+	}
+	providerIDText := strings.TrimPrefix(r.URL.Path, routePrefix)
+	providerID, err := strconv.ParseInt(providerIDText, 10, 64)
+	if err != nil || providerID <= 0 || strings.Contains(providerIDText, "/") {
+		writeProxyProviderNotFound(w)
+		return
+	}
+
+	token := auth.BearerToken(r)
+	cfg, sub, err := h.repo.ResolveProxyProviderAccess(r.Context(), token)
+	if err != nil {
+		writeProxyProviderNotFound(w)
+		return
+	}
+	providerType := ""
+	if cfg != nil {
+		providerType = strings.ToLower(strings.TrimSpace(cfg.Type))
+		if providerType == "" {
+			providerType = "http"
+		}
+	}
+	if cfg == nil || sub == nil || cfg.ID != providerID || providerType != "http" || normalizeProxyProviderMode(cfg.ProcessMode) != "client" {
+		writeProxyProviderNotFound(w)
+		return
+	}
+
+	content, err := h.fetch(sub)
+	if err != nil {
+		http.Error(w, "proxy provider source unavailable", http.StatusBadGateway)
+		return
+	}
+	proxies, err := decodeProviderNodeSet(cfg, content)
+	if err != nil || len(proxies) == 0 {
+		http.Error(w, "proxy provider source unavailable", http.StatusBadGateway)
+		return
+	}
+	normalized, err := marshalProxyProviderContent(proxies, cfg.SizeLimit)
+	if err != nil {
+		http.Error(w, "proxy provider source unavailable", http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(normalized)))
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	_, _ = w.Write(normalized)
+}
+
+func writeProxyProviderNotFound(w http.ResponseWriter) {
+	http.Error(w, "not found", http.StatusNotFound)
+}
+
+func normalizeProxyProviderContent(content []byte, configuredLimit int) ([]byte, error) {
+	config := &storage.ProxyProviderConfig{Type: "http", SizeLimit: configuredLimit}
+	proxies, err := decodeProviderNodeSet(config, content)
+	if err != nil {
+		return nil, err
+	}
+	return marshalProxyProviderContent(proxies, configuredLimit)
+}
+
+func proxyProviderContentLimit(configuredLimit int) int {
+	if configuredLimit > 0 && configuredLimit < maxProxyProviderBytes {
+		return configuredLimit
+	}
+	return maxProxyProviderBytes
+}
+
+func marshalProxyProviderContent(proxies []map[string]any, configuredLimit int) ([]byte, error) {
+	limit := proxyProviderContentLimit(configuredLimit)
+	normalized, err := yaml.Marshal(map[string]any{"proxies": proxies})
+	if err != nil {
+		return nil, fmt.Errorf("marshal proxy provider content: %w", err)
+	}
+	if len(normalized) > limit || len(normalized) > maxProxyProviderBytes {
+		return nil, errors.New("normalized proxy provider content exceeds size limit")
+	}
+	return normalized, nil
 }
 
 // preprocessSubscriptionContent 预处理订阅内容。

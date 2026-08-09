@@ -175,15 +175,15 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Process template with nodes
-	processor := substore.NewTemplateV3Processor(nil, nil)
-	result, err := processor.ProcessTemplate(templateContent, proxies)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	result, err = injectProxiesIntoTemplate(result, proxies)
+	// Process template with nodes and the requesting user's Provider namespace.
+	result, err := renderTemplateWithProxyProviders(
+		r.Context(),
+		h.repo,
+		templateContent,
+		proxies,
+		username,
+		proxyProviderRequiresServerMaterialization(r.URL.Query().Get("t")),
+	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -346,13 +346,14 @@ func (h *PackageSubscribeHandler) serveAllNodes(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	processor := substore.NewTemplateV3Processor(nil, nil)
-	result, err := processor.ProcessTemplate(templateContent, proxies)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	result, err = injectProxiesIntoTemplate(result, proxies)
+	result, err := renderTemplateWithProxyProviders(
+		r.Context(),
+		h.repo,
+		templateContent,
+		proxies,
+		user.Username,
+		proxyProviderRequiresServerMaterialization(r.URL.Query().Get("t")),
+	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
