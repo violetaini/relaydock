@@ -6639,14 +6639,22 @@ func (r *TrafficRepository) DeleteExternalSubscription(ctx context.Context, id i
 		return errors.New("username is required")
 	}
 
-	// 先删除关联的代理集合配置
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin delete external subscription: %w", err)
+	}
+	defer tx.Rollback()
+
+	// The parent delete remains owner-scoped. Keeping both deletes in one
+	// transaction ensures a foreign or missing ID cannot orphan another user's
+	// provider configs before the ownership check fails.
 	const deleteProvidersStmt = `DELETE FROM proxy_provider_configs WHERE external_subscription_id = ?`
-	if _, err := r.db.ExecContext(ctx, deleteProvidersStmt, id); err != nil {
+	if _, err := tx.ExecContext(ctx, deleteProvidersStmt, id); err != nil {
 		return fmt.Errorf("delete related proxy provider configs: %w", err)
 	}
 
 	const stmt = `DELETE FROM external_subscriptions WHERE id = ? AND username = ?`
-	result, err := r.db.ExecContext(ctx, stmt, id, username)
+	result, err := tx.ExecContext(ctx, stmt, id, username)
 	if err != nil {
 		return fmt.Errorf("delete external subscription: %w", err)
 	}
@@ -6660,6 +6668,9 @@ func (r *TrafficRepository) DeleteExternalSubscription(ctx context.Context, id i
 		return ErrExternalSubscriptionNotFound
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete external subscription: %w", err)
+	}
 	return nil
 }
 
@@ -6734,16 +6745,24 @@ func (r *TrafficRepository) DeleteExternalSubscriptionByID(ctx context.Context, 
 	if id <= 0 {
 		return errors.New("subscription id is required")
 	}
-	if _, err := r.db.ExecContext(ctx, `DELETE FROM proxy_provider_configs WHERE external_subscription_id = ?`, id); err != nil {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin delete external subscription by id: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM proxy_provider_configs WHERE external_subscription_id = ?`, id); err != nil {
 		return fmt.Errorf("delete related proxy provider configs: %w", err)
 	}
-	result, err := r.db.ExecContext(ctx, `DELETE FROM external_subscriptions WHERE id = ?`, id)
+	result, err := tx.ExecContext(ctx, `DELETE FROM external_subscriptions WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete external subscription by id: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
 		return ErrExternalSubscriptionNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete external subscription by id: %w", err)
 	}
 	return nil
 }
@@ -7217,16 +7236,27 @@ func (r *TrafficRepository) CreateProxyProviderConfig(ctx context.Context, confi
 			health_check_enabled, health_check_url, health_check_interval, health_check_timeout,
 			health_check_lazy, health_check_expected_status,
 			filter, exclude_filter, exclude_type, geo_ip_filter, override, process_mode
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		FROM external_subscriptions
+		WHERE id = ? AND username = ?
 	`,
 		config.Username, config.ExternalSubscriptionID, config.Name, config.Type,
 		config.Interval, config.Proxy, config.SizeLimit, config.Header,
 		healthCheckEnabled, config.HealthCheckURL, config.HealthCheckInterval, config.HealthCheckTimeout,
 		healthCheckLazy, config.HealthCheckExpectedStatus,
 		config.Filter, config.ExcludeFilter, config.ExcludeType, config.GeoIPFilter, config.Override, config.ProcessMode,
+		config.ExternalSubscriptionID, config.Username,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("create proxy provider config: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("get rows affected: %w", err)
+	}
+	if rows == 0 {
+		return 0, ErrExternalSubscriptionNotFound
 	}
 
 	return result.LastInsertId()
@@ -7466,18 +7496,22 @@ func (r *TrafficRepository) UpdateProxyProviderConfig(ctx context.Context, confi
 
 	result, err := r.db.ExecContext(ctx, `
 		UPDATE proxy_provider_configs SET
-			name = ?, type = ?, interval = ?, proxy = ?, size_limit = ?, header = ?,
+			external_subscription_id = ?, name = ?, type = ?, interval = ?, proxy = ?, size_limit = ?, header = ?,
 			health_check_enabled = ?, health_check_url = ?, health_check_interval = ?,
 			health_check_timeout = ?, health_check_lazy = ?, health_check_expected_status = ?,
 			filter = ?, exclude_filter = ?, exclude_type = ?, geo_ip_filter = ?, override = ?, process_mode = ?,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = ? AND username = ?
+		  AND EXISTS (
+			SELECT 1 FROM external_subscriptions
+			WHERE external_subscriptions.id = ? AND external_subscriptions.username = ?
+		  )
 	`,
-		config.Name, config.Type, config.Interval, config.Proxy, config.SizeLimit, config.Header,
+		config.ExternalSubscriptionID, config.Name, config.Type, config.Interval, config.Proxy, config.SizeLimit, config.Header,
 		healthCheckEnabled, config.HealthCheckURL, config.HealthCheckInterval,
 		config.HealthCheckTimeout, healthCheckLazy, config.HealthCheckExpectedStatus,
 		config.Filter, config.ExcludeFilter, config.ExcludeType, config.GeoIPFilter, config.Override, config.ProcessMode,
-		config.ID, config.Username,
+		config.ID, config.Username, config.ExternalSubscriptionID, config.Username,
 	)
 	if err != nil {
 		return fmt.Errorf("update proxy provider config: %w", err)
@@ -7488,7 +7522,7 @@ func (r *TrafficRepository) UpdateProxyProviderConfig(ctx context.Context, confi
 		return fmt.Errorf("get rows affected: %w", err)
 	}
 	if rowsAffected == 0 {
-		return errors.New("proxy provider config not found or not owned by user")
+		return ErrExternalSubscriptionNotFound
 	}
 
 	return nil
@@ -14767,6 +14801,79 @@ func (r *TrafficRepository) UpdateCertificate(ctx context.Context, cert *Certifi
 	return nil
 }
 
+// UpdateCertificateSettings updates administrator-controlled certificate
+// metadata without writing issued material, status, dates, or messages. Those
+// fields may change concurrently while an ACME operation is in flight.
+func (r *TrafficRepository) UpdateCertificateSettings(ctx context.Context, cert *Certificate) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if cert == nil || cert.ID <= 0 {
+		return errors.New("certificate id is required")
+	}
+	autoRenew := 0
+	if cert.AutoRenew {
+		autoRenew = 1
+	}
+	autoDeploy := 0
+	if cert.AutoDeploy {
+		autoDeploy = 1
+	}
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE certificates SET
+		    domain = ?, email = ?, provider = ?, auto_renew = ?,
+		    challenge_mode = ?, webroot_path = ?, dns_provider_id = ?,
+		    deploy_target = ?, deploy_cert_path = ?, deploy_key_path = ?,
+		    auto_deploy = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`,
+		cert.Domain, cert.Email, cert.Provider, autoRenew, cert.ChallengeMode,
+		sql.NullString{String: cert.WebrootPath, Valid: cert.WebrootPath != ""}, cert.DNSProviderID,
+		cert.DeployTarget,
+		sql.NullString{String: cert.DeployCertPath, Valid: cert.DeployCertPath != ""},
+		sql.NullString{String: cert.DeployKeyPath, Valid: cert.DeployKeyPath != ""},
+		autoDeploy, cert.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("update certificate settings: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("get rows affected: %w", err)
+	}
+	if rows == 0 {
+		return ErrCertificateNotFound
+	}
+	return nil
+}
+
+// UpdateCertificateDeploymentSettings persists a successful manual deployment
+// without replaying a stale certificate snapshot over concurrently renewed
+// material or automation settings.
+func (r *TrafficRepository) UpdateCertificateDeploymentSettings(ctx context.Context, id int64, target, certPath, keyPath string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if id <= 0 {
+		return errors.New("certificate id is required")
+	}
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE certificates SET deploy_target = ?, deploy_cert_path = ?, deploy_key_path = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`, target, sql.NullString{String: certPath, Valid: certPath != ""}, sql.NullString{String: keyPath, Valid: keyPath != ""}, id)
+	if err != nil {
+		return fmt.Errorf("update certificate deployment settings: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("get rows affected: %w", err)
+	}
+	if rows == 0 {
+		return ErrCertificateNotFound
+	}
+	return nil
+}
+
 // 仅更新证书的状态和消息。
 func (r *TrafficRepository) UpdateCertificateStatus(ctx context.Context, id int64, status, message string) error {
 	if r == nil || r.db == nil {
@@ -14834,6 +14941,36 @@ func (r *TrafficRepository) UpdateCertificateIssued(ctx context.Context, id int6
 		return ErrCertificateNotFound
 	}
 
+	return nil
+}
+
+// UpdateCertificateIssuedWithDefaultDeployPaths is used by manual uploads of
+// an existing certificate. It replaces issued material and initializes missing
+// deployment paths in one statement, so no stale full-record update can restore
+// the old PEM after a successful upload.
+func (r *TrafficRepository) UpdateCertificateIssuedWithDefaultDeployPaths(ctx context.Context, id int64, certPath, keyPath, certPEM, keyPEM string, issueDate, expiryDate time.Time, deployCertPath, deployKeyPath string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE certificates SET
+		    cert_path = ?, key_path = ?, cert_pem = ?, key_pem = ?, status = ?,
+		    issue_date = ?, expiry_date = ?, message = NULL,
+		    deploy_cert_path = CASE WHEN COALESCE(TRIM(deploy_cert_path), '') = '' THEN ? ELSE deploy_cert_path END,
+		    deploy_key_path = CASE WHEN COALESCE(TRIM(deploy_key_path), '') = '' THEN ? ELSE deploy_key_path END,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`, certPath, keyPath, certPEM, keyPEM, CertStatusValid, issueDate, expiryDate, deployCertPath, deployKeyPath, id)
+	if err != nil {
+		return fmt.Errorf("update uploaded certificate issued material: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("get rows affected: %w", err)
+	}
+	if rows == 0 {
+		return ErrCertificateNotFound
+	}
 	return nil
 }
 

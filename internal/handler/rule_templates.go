@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/storage"
@@ -16,6 +18,7 @@ import (
 
 type RuleTemplatesHandler struct {
 	repo *storage.TrafficRepository
+	mu   sync.RWMutex
 }
 
 func NewRuleTemplatesHandler(repo *storage.TrafficRepository) *RuleTemplatesHandler {
@@ -111,6 +114,8 @@ func (h *RuleTemplatesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *RuleTemplatesHandler) handleListTemplates(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	templatesDir := "rule_templates"
 
 	// 读取目录
@@ -170,6 +175,8 @@ func (h *RuleTemplatesHandler) handleListTemplates(w http.ResponseWriter, r *htt
 }
 
 func (h *RuleTemplatesHandler) handleGetTemplate(w http.ResponseWriter, r *http.Request, templateName string) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	// 安全性：防止目录遍历
 	if strings.Contains(templateName, "..") || strings.Contains(templateName, "/") || strings.Contains(templateName, "\\") {
 		http.Error(w, "Invalid template name", http.StatusBadRequest)
@@ -200,9 +207,18 @@ func (h *RuleTemplatesHandler) handleGetTemplate(w http.ResponseWriter, r *http.
 }
 
 func (h *RuleTemplatesHandler) handleUpdateTemplate(w http.ResponseWriter, r *http.Request, templateName string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	// 安全性：防止目录遍历
 	if strings.Contains(templateName, "..") || strings.Contains(templateName, "/") || strings.Contains(templateName, "\\") {
 		http.Error(w, "Invalid template name", http.StatusBadRequest)
+		return
+	}
+	// Re-check ownership while holding the filesystem mutation lock. A
+	// delete/re-upload of the same filename cannot transfer the target between
+	// the outer authorization check and this write.
+	if !h.canModifyRuleTemplate(r, templateName) {
+		http.Error(w, "无权修改该模板", http.StatusForbidden)
 		return
 	}
 
@@ -222,6 +238,7 @@ func (h *RuleTemplatesHandler) handleUpdateTemplate(w http.ResponseWriter, r *ht
 	// 解析请求体
 	var payload struct {
 		Content string `json:"content"`
+		NewName string `json:"new_name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -242,8 +259,40 @@ func (h *RuleTemplatesHandler) handleUpdateTemplate(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// 将内容写入文件
-	if err := os.WriteFile(templatePath, []byte(payload.Content), 0644); err != nil {
+	newName := strings.TrimSpace(payload.NewName)
+	if newName == "" {
+		newName = templateName
+	}
+	if strings.Contains(newName, "..") || strings.Contains(newName, "/") || strings.Contains(newName, "\\") {
+		http.Error(w, "Invalid filename", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasSuffix(newName, ".yaml") && !strings.HasSuffix(newName, ".yml") {
+		newName += ".yaml"
+	}
+	newPath := filepath.Join(templatesDir, newName)
+	if newName != templateName {
+		if h.repo != nil {
+			cfg, err := h.repo.GetSystemConfig(r.Context())
+			if err != nil {
+				http.Error(w, "读取默认模板设置失败", http.StatusInternalServerError)
+				return
+			}
+			if cfg.DefaultTemplateFilename == templateName {
+				http.Error(w, "默认模板不能重命名，请先更换默认模板", http.StatusConflict)
+				return
+			}
+		}
+		if _, err := os.Stat(newPath); err == nil {
+			writeError(w, http.StatusConflict, errors.New("目标文件名已存在"))
+			return
+		} else if !os.IsNotExist(err) {
+			http.Error(w, "Failed to inspect target template", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if err := h.replaceRuleTemplateAtomically(r.Context(), templatePath, newPath, templateName, newName, []byte(payload.Content)); err != nil {
 		http.Error(w, "Failed to save template", http.StatusInternalServerError)
 		return
 	}
@@ -251,11 +300,80 @@ func (h *RuleTemplatesHandler) handleUpdateTemplate(w http.ResponseWriter, r *ht
 	// 返回成功响应
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message": "模板保存成功",
+		"message":  "模板保存成功",
+		"filename": newName,
 	})
 }
 
+func (h *RuleTemplatesHandler) replaceRuleTemplateAtomically(ctx context.Context, oldPath, newPath, oldName, newName string, content []byte) error {
+	temp, err := os.CreateTemp(filepath.Dir(oldPath), ".rule-template-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Chmod(0644); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if _, err := temp.Write(content); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if oldName == newName {
+		return os.Rename(tempPath, oldPath)
+	}
+
+	backup, err := os.CreateTemp(filepath.Dir(oldPath), ".rule-template-backup-*.tmp")
+	if err != nil {
+		return err
+	}
+	backupPath := backup.Name()
+	if err := backup.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(backupPath); err != nil {
+		return err
+	}
+	if err := os.Rename(oldPath, backupPath); err != nil {
+		return err
+	}
+	restoreOld := func() {
+		_ = os.Remove(newPath)
+		_ = os.Rename(backupPath, oldPath)
+	}
+	if err := os.Rename(tempPath, newPath); err != nil {
+		restoreOld()
+		return err
+	}
+	ownerRenamed := false
+	if h.repo != nil {
+		if err := h.repo.RenameRuleTemplateOwner(ctx, oldName, newName); err != nil {
+			restoreOld()
+			return err
+		}
+		ownerRenamed = true
+	}
+	if err := os.Remove(backupPath); err != nil {
+		if ownerRenamed {
+			_ = h.repo.RenameRuleTemplateOwner(ctx, newName, oldName)
+		}
+		restoreOld()
+		return err
+	}
+	return nil
+}
+
 func (h *RuleTemplatesHandler) handleDeleteTemplate(w http.ResponseWriter, r *http.Request, templateName string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	// 安全性：防止目录遍历
 	if strings.Contains(templateName, "..") || strings.Contains(templateName, "/") || strings.Contains(templateName, "\\") {
 		http.Error(w, "Invalid template name", http.StatusBadRequest)
@@ -271,6 +389,10 @@ func (h *RuleTemplatesHandler) handleDeleteTemplate(w http.ResponseWriter, r *ht
 			http.Error(w, "默认模板不能删除，请先更换默认模板", http.StatusConflict)
 			return
 		}
+	}
+	if !h.canModifyRuleTemplate(r, templateName) {
+		http.Error(w, "无权删除该模板", http.StatusForbidden)
+		return
 	}
 
 	templatesDir := "rule_templates"
@@ -301,6 +423,8 @@ func (h *RuleTemplatesHandler) handleDeleteTemplate(w http.ResponseWriter, r *ht
 }
 
 func (h *RuleTemplatesHandler) handleRenameTemplate(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	// 解析请求体
 	var payload struct {
 		OldName string `json:"old_name"`
@@ -377,12 +501,15 @@ func (h *RuleTemplatesHandler) handleRenameTemplate(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// 重命名文件
-	if err := os.Rename(oldPath, newPath); err != nil {
+	content, err := os.ReadFile(oldPath)
+	if err != nil {
+		http.Error(w, "Failed to read template", http.StatusInternalServerError)
+		return
+	}
+	if err := h.replaceRuleTemplateAtomically(r.Context(), oldPath, newPath, oldName, newName, content); err != nil {
 		http.Error(w, "Failed to rename template", http.StatusInternalServerError)
 		return
 	}
-	_ = h.repo.RenameRuleTemplateOwner(r.Context(), oldName, newName)
 
 	// 返回成功响应
 	w.Header().Set("Content-Type", "application/json")
@@ -393,6 +520,8 @@ func (h *RuleTemplatesHandler) handleRenameTemplate(w http.ResponseWriter, r *ht
 }
 
 func (h *RuleTemplatesHandler) handleUploadTemplate(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	// 解析多部分表单（限制为 10MB）
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		http.Error(w, "Failed to parse form data", http.StatusBadRequest)

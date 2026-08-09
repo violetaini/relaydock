@@ -157,9 +157,16 @@ func (h *ProxyProviderConfigsHandler) handleCreate(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusBadRequest, errors.New("name is required"))
 		return
 	}
+	if !h.requireOwnedExternalSubscription(w, r, dto.ExternalSubscriptionID, username) {
+		return
+	}
 	cfg := dto.toStorage(username)
 	id, err := h.repo.CreateProxyProviderConfig(r.Context(), cfg)
 	if err != nil {
+		if errors.Is(err, storage.ErrExternalSubscriptionNotFound) {
+			writeError(w, http.StatusNotFound, errors.New("external subscription not found"))
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -186,7 +193,7 @@ func (h *ProxyProviderConfigsHandler) handleUpdate(w http.ResponseWriter, r *htt
 		return
 	}
 	if existing.Username != username {
-		writeError(w, http.StatusForbidden, errors.New("该操作仅可对自己创建的代理集合进行"))
+		writeError(w, http.StatusNotFound, errors.New("not found"))
 		return
 	}
 
@@ -195,18 +202,43 @@ func (h *ProxyProviderConfigsHandler) handleUpdate(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusBadRequest, errors.New("invalid request body"))
 		return
 	}
+	if !h.requireOwnedExternalSubscription(w, r, dto.ExternalSubscriptionID, username) {
+		return
+	}
 	dto.ID = id
-	// 不允许通过 PUT 改 external_subscription_id(归属);也不允许改 username
+	// username 始终来自认证上下文；来源订阅可切换，但必须属于同一用户。
 	cfg := dto.toStorage(username)
 	cfg.ID = id
-	cfg.ExternalSubscriptionID = existing.ExternalSubscriptionID
 
 	if err := h.repo.UpdateProxyProviderConfig(r.Context(), cfg); err != nil {
+		if errors.Is(err, storage.ErrExternalSubscriptionNotFound) {
+			writeError(w, http.StatusNotFound, errors.New("external subscription not found"))
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(toDTO(*cfg))
+}
+
+func (h *ProxyProviderConfigsHandler) requireOwnedExternalSubscription(w http.ResponseWriter, r *http.Request, id int64, username string) bool {
+	if id <= 0 {
+		writeError(w, http.StatusBadRequest, errors.New("external_subscription_id must be greater than zero"))
+		return false
+	}
+
+	if _, err := h.repo.GetExternalSubscription(r.Context(), id, username); err != nil {
+		if errors.Is(err, storage.ErrExternalSubscriptionNotFound) {
+			// GetExternalSubscription 同时按 ID 和 owner 查询，故不存在与他人资源对外呈现相同结果。
+			writeError(w, http.StatusNotFound, errors.New("external subscription not found"))
+			return false
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return false
+	}
+
+	return true
 }
 
 func (h *ProxyProviderConfigsHandler) handleDelete(w http.ResponseWriter, r *http.Request, username string) {

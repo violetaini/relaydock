@@ -69,6 +69,29 @@ func automaticCertificateReloadTarget(value string) (string, bool) {
 	}
 }
 
+func validateCertificateAutoRenew(cert *storage.Certificate) error {
+	if cert == nil {
+		return errors.New("证书不存在")
+	}
+	if strings.EqualFold(strings.TrimSpace(cert.Provider), "manual") || strings.EqualFold(strings.TrimSpace(cert.ChallengeMode), "manual") {
+		return errors.New("手动上传证书不能启用自动续期")
+	}
+	return nil
+}
+
+func validateCertificateAutoDeploy(cert *storage.Certificate) error {
+	if cert == nil {
+		return errors.New("证书不存在")
+	}
+	if _, ok := certificateReloadTarget(cert.DeployTarget); !ok {
+		return errors.New("启用自动部署前必须选择部署目标")
+	}
+	if strings.TrimSpace(cert.DeployCertPath) == "" || strings.TrimSpace(cert.DeployKeyPath) == "" {
+		return errors.New("启用自动部署前必须填写证书和私钥路径")
+	}
+	return nil
+}
+
 type CertificateHandler struct {
 	repo               *storage.TrafficRepository
 	wsHandler          *RemoteWSHandler
@@ -204,6 +227,30 @@ type SingleCertificateResponse struct {
 	Success     bool                 `json:"success"`
 	Message     string               `json:"message,omitempty"`
 	Certificate *CertificateResponse `json:"certificate,omitempty"`
+}
+
+type CertificateDeployRequest struct {
+	ID              int64   `json:"id"`
+	DeployTarget    string  `json:"deploy_target"`
+	DeployCertPath  string  `json:"deploy_cert_path"`
+	DeployKeyPath   string  `json:"deploy_key_path"`
+	DeployLocal     *bool   `json:"deploy_local"`
+	RemoteServerIDs []int64 `json:"remote_server_ids"`
+}
+
+type CertificateDeployResult struct {
+	Scope      string `json:"scope"`
+	ServerID   int64  `json:"server_id,omitempty"`
+	ServerName string `json:"server_name"`
+	Success    bool   `json:"success"`
+	Error      string `json:"error,omitempty"`
+}
+
+type CertificateDeployResponse struct {
+	Success        bool                      `json:"success"`
+	PartialFailure bool                      `json:"partial_failure"`
+	Message        string                    `json:"message"`
+	Deployments    []CertificateDeployResult `json:"deployments"`
 }
 
 func certificateToResponse(cert *storage.Certificate) CertificateResponse {
@@ -491,13 +538,16 @@ func (h *CertificateHandler) UpdateCertificate(w http.ResponseWriter, r *http.Re
 	cert.DeployCertPath = req.DeployCertPath
 	cert.DeployKeyPath = req.DeployKeyPath
 	cert.AutoDeploy = req.AutoDeploy
-	if err := h.repo.UpdateCertificate(ctx, cert); err != nil {
+	if err := h.repo.UpdateCertificateSettings(ctx, cert); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint") {
 			respondJSON(w, http.StatusConflict, map[string]any{"success": false, "message": "该域名的证书记录已存在"})
 			return
 		}
 		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "更新证书记录失败"})
 		return
+	}
+	if refreshed, refreshErr := h.repo.GetCertificate(ctx, cert.ID); refreshErr == nil {
+		cert = refreshed
 	}
 	resp := certificateToResponse(cert)
 	respondJSON(w, http.StatusOK, SingleCertificateResponse{
@@ -945,6 +995,21 @@ func (h *CertificateHandler) SetAutoRenew(w http.ResponseWriter, r *http.Request
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	cert, err := h.repo.GetCertificate(ctx, req.ID)
+	if err != nil {
+		if err == storage.ErrCertificateNotFound {
+			respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
+			return
+		}
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "读取证书失败"})
+		return
+	}
+	if req.AutoRenew {
+		if err := validateCertificateAutoRenew(cert); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
+			return
+		}
+	}
 
 	if err := h.repo.SetCertificateAutoRenew(ctx, req.ID, req.AutoRenew); err != nil {
 		if err == storage.ErrCertificateNotFound {
@@ -976,6 +1041,21 @@ func (h *CertificateHandler) SetAutoDeploy(w http.ResponseWriter, r *http.Reques
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	cert, err := h.repo.GetCertificate(ctx, req.ID)
+	if err != nil {
+		if err == storage.ErrCertificateNotFound {
+			respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
+			return
+		}
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "读取证书失败"})
+		return
+	}
+	if req.AutoDeploy {
+		if err := validateCertificateAutoDeploy(cert); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
+			return
+		}
+	}
 
 	if err := h.repo.SetCertificateAutoDeploy(ctx, req.ID, req.AutoDeploy); err != nil {
 		if err == storage.ErrCertificateNotFound {
@@ -1127,6 +1207,16 @@ func (h *CertificateHandler) HandleCertUpdate(serverID int64, payload WSCertUpda
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	cert, err := h.repo.GetCertificate(ctx, payload.CertID)
+	if err != nil {
+		log.Printf("[Certificate] Ignore cert_update for cert_id=%d from server_id=%d: %v", payload.CertID, serverID, err)
+		return
+	}
+	if cert.RemoteServerID <= 0 || cert.RemoteServerID != serverID {
+		log.Printf("[Certificate] Ignore cert_update for cert_id=%d: bound server=%d, sender=%d", payload.CertID, cert.RemoteServerID, serverID)
+		return
+	}
+
 	if payload.Success {
 		if err := h.repo.UpdateCertificateIssued(ctx, payload.CertID, payload.CertPath, payload.KeyPath, payload.CertPEM, payload.KeyPEM, payload.IssueDate, payload.ExpiryDate); err != nil {
 			log.Printf("[Certificate] HandleCertUpdate UpdateCertificateIssued failed: %v", err)
@@ -1134,20 +1224,8 @@ func (h *CertificateHandler) HandleCertUpdate(serverID int64, payload WSCertUpda
 		}
 		log.Printf("[Certificate] Remote certificate issued for domain from cert_update, cert_id=%d, server_id=%d", payload.CertID, serverID)
 
-		// 部署到主服务器和所有远程服务器（如果配置）
-		cert, err := h.repo.GetCertificate(ctx, payload.CertID)
-		if err == nil && cert.DeployCertPath != "" && cert.DeployKeyPath != "" {
-			automaticTarget := cert.DeployTarget
-			if cert.AutoDeploy {
-				automaticTarget = "both"
-			}
-			if deployTarget, shouldDeploy := automaticCertificateReloadTarget(automaticTarget); shouldDeploy {
-				if deployErr := h.deployLocal(payload.CertPEM, payload.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget); deployErr != nil {
-					log.Printf("[Certificate] Local deploy from cert_update failed: %v", deployErr)
-				}
-				h.deployToAllRemotes(cert.Domain, payload.CertPEM, payload.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget, true)
-			}
-		}
+		// Legacy remote-issued certificates remain bound to the issuing server.
+		h.deployAfterIssue(cert, &acme.CertResult{CertPEM: payload.CertPEM, KeyPEM: payload.KeyPEM})
 	} else {
 		if err := h.repo.UpdateCertificateStatus(ctx, payload.CertID, storage.CertStatusFailed, payload.Error); err != nil {
 			log.Printf("[Certificate] HandleCertUpdate UpdateCertificateStatus failed: %v", err)
@@ -1187,32 +1265,54 @@ func (h *CertificateHandler) buildCertRequest(ctx context.Context, cert *storage
 	return req, nil
 }
 
-// 处理颁发后的证书部署 - 部署到主服务器和所有远程服务器。
+// deployAfterIssue deploys renewed material only when automation is explicitly
+// enabled. A certificate belongs either to the controller or to one legacy
+// remote server; issuance never broadcasts it to unrelated servers.
 func (h *CertificateHandler) deployAfterIssue(cert *storage.Certificate, result *acme.CertResult) {
-	automaticTarget := cert.DeployTarget
-	if cert.AutoDeploy && cert.DeployCertPath != "" && cert.DeployKeyPath != "" {
-		automaticTarget = "both"
-	}
-	deployTarget, shouldDeploy := automaticCertificateReloadTarget(automaticTarget)
-	if !shouldDeploy {
+	if cert == nil || result == nil {
 		return
 	}
-	if cert.DeployCertPath == "" || cert.DeployKeyPath == "" {
+	if cert.ID > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		refreshed, err := h.repo.GetCertificate(ctx, cert.ID)
+		cancel()
+		if err != nil {
+			log.Printf("[Certificate] Skip automatic deploy for certificate %d: refresh settings: %v", cert.ID, err)
+			return
+		}
+		cert = refreshed
+	}
+	if !cert.AutoDeploy {
+		return
+	}
+	if err := validateCertificateAutoDeploy(cert); err != nil {
+		log.Printf("[Certificate] Skip automatic deploy for %s: %v", cert.Domain, err)
+		return
+	}
+	reloadTarget, _ := automaticCertificateReloadTarget(cert.DeployTarget)
+
+	if cert.RemoteServerID > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		server, err := h.repo.GetRemoteServer(ctx, cert.RemoteServerID)
+		if err == nil {
+			err = h.deployToRemoteServerSync(ctx, server, certificateRemoteDeployPayload(cert.Domain, result.CertPEM, result.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, reloadTarget, true))
+		}
+		if err != nil {
+			log.Printf("[Certificate] Automatic deploy to bound server %d failed for %s: %v", cert.RemoteServerID, cert.Domain, err)
+			h.appendCertificateLogDurable(cert.ID, "自动部署到绑定服务器失败: "+err.Error())
+		} else {
+			log.Printf("[Certificate] Automatic deploy succeeded for %s on server %s", cert.Domain, server.Name)
+		}
 		return
 	}
 
-	// 本地部署（主）
-	if err := h.deployLocal(result.CertPEM, result.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget); err != nil {
+	if err := h.deployLocal(result.CertPEM, result.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, reloadTarget); err != nil {
 		log.Printf("[Certificate] Local deploy failed for %s: %v", cert.Domain, err)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = h.repo.AppendCertificateLog(ctx, cert.ID, "自动部署失败，旧证书已恢复: "+err.Error())
+		h.appendCertificateLogDurable(cert.ID, "自动部署失败，旧证书已恢复: "+err.Error())
 	} else {
 		log.Printf("[Certificate] Local deploy succeeded for %s to %s", cert.Domain, cert.DeployCertPath)
 	}
-
-	// 部署到所有远程服务器
-	h.deployToAllRemotes(cert.Domain, result.CertPEM, result.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, deployTarget, true)
 }
 
 func (h *CertificateHandler) checkMasterCertReady(cert *storage.Certificate) {
@@ -1237,32 +1337,16 @@ func (h *CertificateHandler) checkMasterCertReady(cert *storage.Certificate) {
 	log.Printf("[Certificate] 主控域名证书已签发，等待用户确认部署: %s", cert.Domain)
 }
 
-// 将 cert_deploy 消息发送到特定的远程代理。
-func (h *CertificateHandler) deployRemoteCertificate(cert *storage.Certificate, certPEM, keyPEM string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	server, err := h.repo.GetRemoteServer(ctx, cert.RemoteServerID)
-	if err != nil {
-		log.Printf("[Certificate] GetRemoteServer for deploy failed: %v", err)
-		return
-	}
-
-	reloadTarget, shouldDeploy := automaticCertificateReloadTarget(cert.DeployTarget)
-	if !shouldDeploy {
-		return
-	}
-	payload := WSCertDeployPayload{
-		Domain:    cert.Domain,
+func certificateRemoteDeployPayload(domain, certPEM, keyPEM, certPath, keyPath, reloadTarget string, automatic bool) WSCertDeployPayload {
+	return WSCertDeployPayload{
+		Domain:    domain,
 		CertPEM:   certPEM,
 		KeyPEM:    keyPEM,
-		CertPath:  filepath.Join(filepath.Dir(cert.DeployCertPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployCertPath)),
-		KeyPath:   filepath.Join(filepath.Dir(cert.DeployKeyPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployKeyPath)),
+		CertPath:  filepath.Join(filepath.Dir(certPath), certDeployFilename(domain)+filepath.Ext(certPath)),
+		KeyPath:   filepath.Join(filepath.Dir(keyPath), certDeployFilename(domain)+filepath.Ext(keyPath)),
 		Reload:    reloadTarget,
-		Automatic: true,
+		Automatic: automatic,
 	}
-
-	h.deployToRemoteServer(server, payload)
 }
 
 // deployToRemoteServerSync 在调用方的上下文中持有 server mutation lease，
@@ -1368,32 +1452,6 @@ func (h *CertificateHandler) deployCertToServerSyncLeasedWithReload(ctx context.
 	return certPath, keyPath, nil
 }
 
-// 将证书部署到所有连接的远程服务器。
-func (h *CertificateHandler) deployToAllRemotes(domain, certPEM, keyPEM, certPath, keyPath, reloadTarget string, automatic bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	servers, err := h.repo.ListRemoteServers(ctx)
-	if err != nil || len(servers) == 0 {
-		return
-	}
-
-	payload := WSCertDeployPayload{
-		Domain:    domain,
-		CertPEM:   certPEM,
-		KeyPEM:    keyPEM,
-		CertPath:  filepath.Join(filepath.Dir(certPath), certDeployFilename(domain)+filepath.Ext(certPath)),
-		KeyPath:   filepath.Join(filepath.Dir(keyPath), certDeployFilename(domain)+filepath.Ext(keyPath)),
-		Reload:    reloadTarget,
-		Automatic: automatic,
-	}
-
-	for i := range servers {
-		go h.deployToRemoteServer(&servers[i], payload)
-	}
-	log.Printf("[Certificate] Initiated deploy to %d remote server(s) for %s", len(servers), domain)
-}
-
 // 通过 HTTP POST 将证书推送到代理。
 // 走 buildAgentURLCandidates 的 v4-first → v6-fallback 候选清单,消灭旧的 strings.LastIndex 截断 bug。
 func (h *CertificateHandler) deployRemoteCertificateHTTP(ctx context.Context, server *storage.RemoteServer, payload WSCertDeployPayload) error {
@@ -1459,18 +1517,35 @@ func (h *CertificateHandler) DeployCertificate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	var req struct {
-		ID             int64  `json:"id"`
-		DeployTarget   string `json:"deploy_target"`
-		DeployCertPath string `json:"deploy_cert_path"`
-		DeployKeyPath  string `json:"deploy_key_path"`
-	}
+	var req CertificateDeployRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "请求格式错误"})
 		return
 	}
-	if req.ID == 0 || req.DeployTarget == "" || req.DeployCertPath == "" || req.DeployKeyPath == "" {
+	req.DeployTarget = strings.ToLower(strings.TrimSpace(req.DeployTarget))
+	req.DeployCertPath = strings.TrimSpace(req.DeployCertPath)
+	req.DeployKeyPath = strings.TrimSpace(req.DeployKeyPath)
+	reloadTarget, validTarget := certificateReloadTarget(req.DeployTarget)
+	if req.ID <= 0 || !validTarget || req.DeployCertPath == "" || req.DeployKeyPath == "" {
 		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "缺少必要参数"})
+		return
+	}
+	deployLocal := req.DeployLocal == nil || *req.DeployLocal
+	remoteIDs := make([]int64, 0, len(req.RemoteServerIDs))
+	seenRemoteIDs := make(map[int64]struct{}, len(req.RemoteServerIDs))
+	for _, serverID := range req.RemoteServerIDs {
+		if serverID <= 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "远端服务器 ID 无效"})
+			return
+		}
+		if _, exists := seenRemoteIDs[serverID]; exists {
+			continue
+		}
+		seenRemoteIDs[serverID] = struct{}{}
+		remoteIDs = append(remoteIDs, serverID)
+	}
+	if !deployLocal && len(remoteIDs) == 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "至少选择主控或一台远端服务器"})
 		return
 	}
 
@@ -1484,32 +1559,84 @@ func (h *CertificateHandler) DeployCertificate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 本地部署（主）
-	if err := h.deployLocal(cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget); err != nil {
-		log.Printf("[Certificate] Local deploy failed for %s: %v", cert.Domain, err)
-		_ = h.repo.AppendCertificateLog(r.Context(), cert.ID, "部署失败，已恢复旧证书: "+err.Error())
-		respondJSON(w, http.StatusBadGateway, map[string]any{"success": false, "message": "证书部署或服务重载失败，已恢复旧证书: " + err.Error()})
+	results := make([]CertificateDeployResult, 0, len(remoteIDs)+1)
+	successCount := 0
+	if deployLocal {
+		result := CertificateDeployResult{Scope: "local", ServerName: "主控"}
+		if err := h.deployLocal(cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, reloadTarget); err != nil {
+			log.Printf("[Certificate] Local deploy failed for %s: %v", cert.Domain, err)
+			_ = h.repo.AppendCertificateLog(r.Context(), cert.ID, "部署到主控失败，已恢复旧证书: "+err.Error())
+			result.Error = "已恢复旧证书: " + err.Error()
+		} else {
+			result.Success = true
+			successCount++
+		}
+		results = append(results, result)
+	}
+
+	for _, serverID := range remoteIDs {
+		result := CertificateDeployResult{Scope: "remote", ServerID: serverID, ServerName: fmt.Sprintf("服务器 #%d", serverID)}
+		server, getErr := h.repo.GetRemoteServer(r.Context(), serverID)
+		if getErr != nil {
+			result.Error = "服务器不存在或不可用"
+			results = append(results, result)
+			continue
+		}
+		result.ServerName = server.Name
+		deployCtx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		deployErr := h.deployToRemoteServerSync(deployCtx, server, certificateRemoteDeployPayload(cert.Domain, cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, reloadTarget, false))
+		cancel()
+		if deployErr != nil {
+			log.Printf("[Certificate] Remote deploy failed for %s on %s: %v", cert.Domain, server.Name, deployErr)
+			_ = h.repo.AppendCertificateLog(r.Context(), cert.ID, fmt.Sprintf("部署到服务器 %s 失败: %v", server.Name, deployErr))
+			result.Error = deployErr.Error()
+		} else {
+			result.Success = true
+			successCount++
+		}
+		results = append(results, result)
+	}
+
+	if successCount > 0 {
+		if err := h.repo.UpdateCertificateDeploymentSettings(r.Context(), cert.ID, req.DeployTarget, req.DeployCertPath, req.DeployKeyPath); err != nil {
+			log.Printf("[Certificate] UpdateCertificate deploy settings failed: %v", err)
+			respondJSON(w, http.StatusInternalServerError, CertificateDeployResponse{
+				Success: false, PartialFailure: true,
+				Message:     "证书已部署，但保存部署设置失败",
+				Deployments: results,
+			})
+			return
+		}
+	}
+
+	failed := make([]string, 0, len(results)-successCount)
+	for _, result := range results {
+		if !result.Success {
+			failed = append(failed, result.ServerName+": "+result.Error)
+		}
+	}
+	if len(failed) > 0 {
+		partial := successCount > 0
+		status := http.StatusBadGateway
+		message := "证书部署失败：" + strings.Join(failed, "；")
+		if partial {
+			status = http.StatusMultiStatus
+			message = "证书仅部署到部分目标；失败：" + strings.Join(failed, "；")
+		}
+		respondJSON(w, status, CertificateDeployResponse{
+			Success: false, PartialFailure: partial, Message: message, Deployments: results,
+		})
 		return
 	}
 
-	// 仅在文件和服务均成功切换后保存部署设置。
-	cert.DeployTarget = req.DeployTarget
-	cert.DeployCertPath = req.DeployCertPath
-	cert.DeployKeyPath = req.DeployKeyPath
-	if err := h.repo.UpdateCertificate(r.Context(), cert); err != nil {
-		log.Printf("[Certificate] UpdateCertificate deploy settings failed: %v", err)
-		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "证书已部署，但保存部署设置失败"})
-		return
-	}
-
-	// 部署到所有远程服务器
-	h.deployToAllRemotes(cert.Domain, cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget, false)
-
-	respondJSON(w, http.StatusOK, map[string]any{"success": true, "message": "证书已部署到主服务器，远程服务器部署已提交"})
+	respondJSON(w, http.StatusOK, CertificateDeployResponse{
+		Success: true, Message: fmt.Sprintf("证书已部署到 %d 个目标", successCount), Deployments: results,
+	})
 }
 
-// DeployAutoDeployCertificates 将所有 auto_deploy 证书部署到特定的远程服务器。
-// 在远程服务器安装 nginx/xray 后调用。
+// DeployAutoDeployCertificates deploys only certificates explicitly bound to
+// the server being installed. Controller certificates are never broadcast to a
+// newly connected server.
 func (h *CertificateHandler) DeployAutoDeployCertificates(serverID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1527,21 +1654,16 @@ func (h *CertificateHandler) DeployAutoDeployCertificates(serverID int64) {
 
 	attempted := 0
 	for _, cert := range certs {
-		reloadTarget, shouldDeploy := automaticCertificateReloadTarget("both")
-		if !shouldDeploy || strings.TrimSpace(cert.DeployCertPath) == "" || strings.TrimSpace(cert.DeployKeyPath) == "" {
-			log.Printf("[Certificate] Skip auto-deploy %s: no valid deployment target or paths", cert.Domain)
+		if cert.RemoteServerID != serverID {
 			continue
 		}
-		payload := WSCertDeployPayload{
-			Domain:    cert.Domain,
-			CertPEM:   cert.CertPEM,
-			KeyPEM:    cert.KeyPEM,
-			CertPath:  filepath.Join(filepath.Dir(cert.DeployCertPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployCertPath)),
-			KeyPath:   filepath.Join(filepath.Dir(cert.DeployKeyPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployKeyPath)),
-			Reload:    reloadTarget,
-			Automatic: true,
+		if err := validateCertificateAutoDeploy(&cert); err != nil {
+			log.Printf("[Certificate] Skip auto-deploy %s: %v", cert.Domain, err)
+			continue
 		}
+		reloadTarget, _ := automaticCertificateReloadTarget(cert.DeployTarget)
 		attempted++
+		payload := certificateRemoteDeployPayload(cert.Domain, cert.CertPEM, cert.KeyPEM, cert.DeployCertPath, cert.DeployKeyPath, reloadTarget, true)
 		if err := h.deployToRemoteServerSync(ctx, server, payload); err != nil {
 			log.Printf("[Certificate] Auto-deploy %s to server %s failed: %v", cert.Domain, server.Name, err)
 		}
@@ -1910,17 +2032,17 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 
 	existing, err := h.repo.GetCertificateByDomain(ctx, req.Domain, 0)
 	if err == nil && existing != nil {
-		if err := h.repo.UpdateCertificateIssued(ctx, existing.ID, result.CertPath, result.KeyPath, result.CertPEM, result.KeyPEM, result.IssueDate, result.ExpiryDate); err != nil {
+		if err := h.repo.UpdateCertificateIssuedWithDefaultDeployPaths(ctx, existing.ID, result.CertPath, result.KeyPath, result.CertPEM, result.KeyPEM, result.IssueDate, result.ExpiryDate, deployCertPath, deployKeyPath); err != nil {
 			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("更新证书失败: %v", err)})
 			return
 		}
-		if existing.DeployCertPath == "" {
-			existing.DeployCertPath = deployCertPath
-			existing.DeployKeyPath = deployKeyPath
-			_ = h.repo.UpdateCertificate(ctx, existing)
+		refreshed, refreshErr := h.repo.GetCertificate(ctx, existing.ID)
+		if refreshErr != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("读取更新后的证书失败: %v", refreshErr)})
+			return
 		}
-		h.syncManagedXrayAfterMaterialUpdate(existing, result.CertPEM, result.KeyPEM)
-		h.checkMasterCertReady(existing)
+		h.syncManagedXrayAfterMaterialUpdate(refreshed, result.CertPEM, result.KeyPEM)
+		h.checkMasterCertReady(refreshed)
 		respondJSON(w, http.StatusOK, map[string]any{"success": true, "message": "证书已更新", "certificate_id": existing.ID})
 		return
 	}
