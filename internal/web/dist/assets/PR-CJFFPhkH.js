@@ -1,0 +1,1 @@
+var e=`/assets/PR-BCQ9VMV9.svg`;export{e as default};

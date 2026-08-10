@@ -1,0 +1,1 @@
+var e=`/assets/PN-BoYMlVbi.svg`;export{e as default};

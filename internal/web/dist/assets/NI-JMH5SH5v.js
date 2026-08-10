@@ -1,0 +1,1 @@
+var e=`/assets/NI-BWOjjHUB.svg`;export{e as default};

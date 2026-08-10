@@ -1,0 +1,1 @@
+var e=`/assets/AX-CbBM043U.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/GB-NIR-BfvSJlUE.svg`;export{e as default};

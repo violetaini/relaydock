@@ -1,0 +1,1 @@
+var e=`/assets/UA-Br55j-Ok.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/TK-Xdf16iwG.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/IE-CC1H49FQ.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/SC-Fe4m23dg.svg`;export{e as default};

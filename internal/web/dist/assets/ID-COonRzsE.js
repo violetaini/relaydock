@@ -1,0 +1,1 @@
+var e=`/assets/ID-DbKtDLTH.svg`;export{e as default};

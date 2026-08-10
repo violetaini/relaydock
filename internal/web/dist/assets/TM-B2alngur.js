@@ -1,0 +1,1 @@
+var e=`/assets/TM-Q0_tZogc.svg`;export{e as default};

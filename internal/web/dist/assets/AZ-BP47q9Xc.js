@@ -1,0 +1,1 @@
+var e=`/assets/AZ-DrrubhpT.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/KH--SGtKIXk.svg`;export{e as default};

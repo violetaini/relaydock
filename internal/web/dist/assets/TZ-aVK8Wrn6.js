@@ -1,0 +1,1 @@
+var e=`/assets/TZ-Birtj-Ap.svg`;export{e as default};

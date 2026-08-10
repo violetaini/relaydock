@@ -1,0 +1,1 @@
+var e=`/assets/GD-DAO8XfGY.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/MH-CSDsymgM.svg`;export{e as default};

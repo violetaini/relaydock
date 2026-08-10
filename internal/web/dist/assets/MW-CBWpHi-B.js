@@ -1,0 +1,1 @@
+var e=`/assets/MW-BFfhnlSS.svg`;export{e as default};

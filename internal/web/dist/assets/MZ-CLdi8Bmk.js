@@ -1,0 +1,1 @@
+var e=`/assets/MZ-ChManqvd.svg`;export{e as default};

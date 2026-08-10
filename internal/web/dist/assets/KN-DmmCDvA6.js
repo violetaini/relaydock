@@ -1,0 +1,1 @@
+var e=`/assets/KN-BnoCAizs.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/GN-P-Ux_2MV.svg`;export{e as default};

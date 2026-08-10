@@ -1,0 +1,1 @@
+var e=`/assets/KZ-BOTFym3t.svg`;export{e as default};

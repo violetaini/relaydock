@@ -1,0 +1,1 @@
+var e=`/assets/NF-CY6edboS.svg`;export{e as default};

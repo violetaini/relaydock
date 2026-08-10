@@ -1,0 +1,1 @@
+var e=`/assets/LR-BEo_pwWZ.svg`;export{e as default};

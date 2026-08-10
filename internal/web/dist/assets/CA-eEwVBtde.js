@@ -1,0 +1,1 @@
+var e=`/assets/CA-DpxVLGOt.svg`;export{e as default};

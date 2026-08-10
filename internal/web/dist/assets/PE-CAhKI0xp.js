@@ -1,0 +1,1 @@
+var e=`/assets/PE-6vlqA1PR.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/AQ-DRPCALPj.svg`;export{e as default};

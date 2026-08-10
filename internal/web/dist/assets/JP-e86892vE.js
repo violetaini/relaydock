@@ -1,0 +1,1 @@
+var e=`/assets/JP-C15v8xO5.svg`;export{e as default};

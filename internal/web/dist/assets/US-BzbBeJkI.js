@@ -1,0 +1,1 @@
+var e=`/assets/UM-BIihpTIZ.svg`;export{e as default};

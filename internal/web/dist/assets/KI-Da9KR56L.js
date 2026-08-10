@@ -1,0 +1,1 @@
+var e=`/assets/KI-BFkvzycv.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/GF-BBb4Ygk2.svg`;export{e as default};

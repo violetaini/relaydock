@@ -1,0 +1,1 @@
+var e=`/assets/GQ-CMXnblkc.svg`;export{e as default};

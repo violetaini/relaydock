@@ -1,0 +1,1 @@
+var e=`/assets/PL-B64UUA-d.svg`;export{e as default};

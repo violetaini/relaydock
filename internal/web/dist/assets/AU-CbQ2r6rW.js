@@ -1,0 +1,1 @@
+var e=`/assets/AU-GWLJ9PMU.svg`;export{e as default};

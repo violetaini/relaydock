@@ -1,0 +1,1 @@
+var e=`/assets/DK-Bo6B6VKW.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/MQ-DGyiiL9y.svg`;export{e as default};

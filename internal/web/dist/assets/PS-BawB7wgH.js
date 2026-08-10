@@ -1,0 +1,1 @@
+var e=`/assets/PS-DjKUNjWI.svg`;export{e as default};

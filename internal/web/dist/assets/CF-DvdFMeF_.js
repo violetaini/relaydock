@@ -1,0 +1,1 @@
+var e=`/assets/CF-CDV8o52V.svg`;export{e as default};

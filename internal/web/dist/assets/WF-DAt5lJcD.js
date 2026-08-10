@@ -1,0 +1,1 @@
+var e=`/assets/WF-Dg3_GQs6.svg`;export{e as default};

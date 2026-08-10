@@ -1,0 +1,1 @@
+var e=`/assets/SI-BGnIxv0f.svg`;export{e as default};

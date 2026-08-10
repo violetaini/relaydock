@@ -1,0 +1,1 @@
+var e=`/assets/LU-DDesr4XE.svg`;export{e as default};

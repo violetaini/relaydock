@@ -1,0 +1,1 @@
+var e=`/assets/NZ-p_QmAL2u.svg`;export{e as default};

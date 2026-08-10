@@ -1,0 +1,1 @@
+var e=`/assets/RW-CcdcmdD_.svg`;export{e as default};

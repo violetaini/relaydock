@@ -1,0 +1,1 @@
+var e=`/assets/FM-BEXa0-0n.svg`;export{e as default};

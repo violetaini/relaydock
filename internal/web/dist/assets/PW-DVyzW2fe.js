@@ -1,0 +1,1 @@
+var e=`/assets/PW-CIY85KEc.svg`;export{e as default};

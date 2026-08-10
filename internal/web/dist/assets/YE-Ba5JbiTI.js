@@ -1,0 +1,1 @@
+var e=`/assets/YE-Bed-ZIzM.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/CK-BRWH--FF.svg`;export{e as default};

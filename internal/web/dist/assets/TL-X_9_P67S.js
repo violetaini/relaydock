@@ -1,0 +1,1 @@
+var e=`/assets/TL-BetakWwX.svg`;export{e as default};

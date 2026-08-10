@@ -1,0 +1,1 @@
+var e=`/assets/CI-CcUXpA6n.svg`;export{e as default};

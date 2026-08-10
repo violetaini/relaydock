@@ -1,0 +1,1 @@
+var e=`/assets/YT-CVY_VWqc.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/TV-DSrClyhN.svg`;export{e as default};

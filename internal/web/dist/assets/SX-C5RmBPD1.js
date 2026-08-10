@@ -1,0 +1,1 @@
+var e=`/assets/SX-CaLCbk_l.svg`;export{e as default};

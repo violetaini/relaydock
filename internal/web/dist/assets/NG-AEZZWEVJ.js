@@ -1,0 +1,1 @@
+var e=`/assets/NG-CBflXNuV.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/IQ-C1IgmfVN.svg`;export{e as default};

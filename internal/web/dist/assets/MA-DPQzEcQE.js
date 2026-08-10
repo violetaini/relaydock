@@ -1,0 +1,1 @@
+var e=`/assets/MA-BLUde-fg.svg`;export{e as default};

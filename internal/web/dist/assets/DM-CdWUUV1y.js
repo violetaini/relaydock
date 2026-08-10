@@ -1,0 +1,1 @@
+var e=`/assets/DM-hj_5P_Cs.svg`;export{e as default};

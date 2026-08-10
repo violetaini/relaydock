@@ -1,0 +1,1 @@
+var e=`/assets/MK-DcIT_zvi.svg`;export{e as default};

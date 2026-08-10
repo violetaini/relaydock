@@ -1,0 +1,1 @@
+var e=`/assets/LI-DoiFujn-.svg`;export{e as default};

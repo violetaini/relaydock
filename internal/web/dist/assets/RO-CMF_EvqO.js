@@ -1,0 +1,1 @@
+var e=`/assets/RO-Cl_f24A6.svg`;export{e as default};

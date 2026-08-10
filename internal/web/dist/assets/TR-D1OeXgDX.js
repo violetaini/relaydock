@@ -1,0 +1,1 @@
+var e=`/assets/TR-DytyHZit.svg`;export{e as default};

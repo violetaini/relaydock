@@ -1,0 +1,1 @@
+var e=`/assets/CV-Dw3_Rfy-.svg`;export{e as default};

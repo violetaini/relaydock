@@ -1,0 +1,1 @@
+var e=`/assets/NA-Brw2P60a.svg`;export{e as default};

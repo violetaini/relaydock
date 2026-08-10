@@ -1,0 +1,1 @@
+var e=`/assets/NP-CaTCpynz.svg`;export{e as default};

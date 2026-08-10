@@ -1,0 +1,1 @@
+var e=`/assets/MS-CWou_ZjW.svg`;export{e as default};

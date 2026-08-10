@@ -1,0 +1,1 @@
+var e=`/assets/JO-V86BksDO.svg`;export{e as default};

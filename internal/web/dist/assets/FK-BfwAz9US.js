@@ -1,0 +1,1 @@
+var e=`/assets/FK-CuSGUyKi.svg`;export{e as default};

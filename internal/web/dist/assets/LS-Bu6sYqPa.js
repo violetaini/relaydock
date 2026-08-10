@@ -1,0 +1,1 @@
+var e=`/assets/LS-BaxwwrU_.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/MU-Bodt8ctK.svg`;export{e as default};

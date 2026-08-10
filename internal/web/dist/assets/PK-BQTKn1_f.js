@@ -1,0 +1,1 @@
+var e=`/assets/PK-J5Oa_gD0.svg`;export{e as default};

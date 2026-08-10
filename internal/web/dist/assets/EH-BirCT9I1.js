@@ -1,0 +1,1 @@
+var e=`/assets/EH-B_fldauP.svg`;export{e as default};

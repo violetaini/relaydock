@@ -1,0 +1,1 @@
+var e=`/assets/TD-Zije_DXX.svg`;export{e as default};

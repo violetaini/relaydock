@@ -1,0 +1,1 @@
+var e=`/assets/BO-CVtRot57.svg`;export{e as default};

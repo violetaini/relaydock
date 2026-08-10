@@ -1,0 +1,1 @@
+var e=`/assets/JE-Boxgl-AG.svg`;export{e as default};

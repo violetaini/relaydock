@@ -1,0 +1,1 @@
+var e=`/assets/BM-DoVIuxYL.svg`;export{e as default};

@@ -1,0 +1,1 @@
+var e=`/assets/CC-CNRvtxWA.svg`;export{e as default};

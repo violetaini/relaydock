@@ -1,0 +1,1 @@
+var e=`/assets/BL-BriLI_UT.svg`;export{e as default};
