@@ -141,6 +141,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
 			continue
 		}
+		delete(proxyConfig, storage.ManagedShadowsocksMultiUserMarker)
 		if !applyUserCredentials(proxyConfig, node, credMap) {
 			continue
 		}
@@ -334,6 +335,7 @@ func (h *PackageSubscribeHandler) serveAllNodes(w http.ResponseWriter, r *http.R
 		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
 			continue
 		}
+		delete(proxyConfig, storage.ManagedShadowsocksMultiUserMarker)
 		proxies = append(proxies, proxyConfig)
 	}
 	if len(proxies) == 0 {
@@ -583,6 +585,7 @@ func applyMultiplierPrefix(proxy map[string]any, node storage.Node, pkg *storage
 }
 
 func applyUserCredentials(proxy map[string]any, node storage.Node, credMap map[credKey]string) bool {
+	defer delete(proxy, storage.ManagedShadowsocksMultiUserMarker)
 	managed := strings.TrimSpace(node.OriginalServer) != "" || strings.TrimSpace(node.InboundTag) != ""
 	if !managed {
 		return true
@@ -635,11 +638,12 @@ func applyCredToProxy(proxy map[string]any, protocol string, cred map[string]any
 			return true
 		}
 	case "ss", "shadowsocks":
+		delete(proxy, storage.ManagedShadowsocksMultiUserMarker)
 		if userPass, ok := cred["password"].(string); ok && userPass != "" {
-			if nodePass, ok := proxy["password"].(string); ok && nodePass != "" {
-				// 仅 SS2022 需要 "master:userPass" 双段拼接(老 SS 单段密码不该改)。
-				cipher, _ := proxy["cipher"].(string)
-				if strings.HasPrefix(strings.ToLower(cipher), "2022-") {
+			cipher, _ := proxy["cipher"].(string)
+			cipher = strings.ToLower(strings.TrimSpace(cipher))
+			if strings.HasPrefix(cipher, "2022-") {
+				if nodePass, ok := proxy["password"].(string); ok && nodePass != "" {
 					// 兜底:存量 clash_config 可能还是老格式 "master:firstClient" — 剥掉冒号后段,
 					// 只保留 master,再拼当前用户密码,得到正确的两段。新节点直接 nodePass 就是 master 一段。
 					if idx := strings.Index(nodePass, ":"); idx >= 0 {
@@ -650,6 +654,13 @@ func applyCredToProxy(proxy map[string]any, protocol string, cred map[string]any
 						return true
 					}
 				}
+			} else if cipher == "aes-128-gcm" || cipher == "aes-256-gcm" {
+				method, _ := cred["method"].(string)
+				if !strings.EqualFold(strings.TrimSpace(method), cipher) {
+					return false
+				}
+				proxy["password"] = userPass
+				return true
 			}
 		}
 	case "trojan", "anytls":

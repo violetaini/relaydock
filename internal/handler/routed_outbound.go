@@ -74,7 +74,7 @@ func (h *RoutedOutboundHandler) list(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("list routed nodes: %v", err))
 		return
 	}
-	respondJSON(w, http.StatusOK, map[string]any{"items": items})
+	respondJSON(w, http.StatusOK, map[string]any{"items": sanitizeRoutedNodeDetailsForExternal(items)})
 }
 
 type createRoutedOutboundReq struct {
@@ -181,7 +181,7 @@ func (h *RoutedOutboundHandler) create(w http.ResponseWriter, r *http.Request) {
 	// / hy=auth / ss=password+method 长度),然后把 email 覆盖成 _admin__ 占位。
 	// 之前这里直接硬编码 {id: uuid},导致 trojan/ss/hy routed 节点的 admin 占位 client 字段名错位,
 	// xray reload 失败 + 客户端连不上。
-	adminCred, _, err := generateRoutedClientCred(parent.Protocol, "", adminEmail)
+	adminCred, _, err := generateRoutedClientCred(parent.Protocol, routedShadowsocksMethod(parent), adminEmail)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("生成 admin client 凭据失败: %v", err))
 		return
@@ -272,6 +272,7 @@ func (h *RoutedOutboundHandler) create(w http.ResponseWriter, r *http.Request) {
 	}
 	clashWithAdmin := cloneClashWithCredential(parent.ClashConfig, parent.Protocol, adminCred, nodeName)
 	parsedWithAdmin := parent.ParsedConfig // parsed_config 是 xray inbound 结构,与凭据无关,直接继承
+	parsedWithAdmin, _, _, _ = sanitizeManagedShadowsocksConfig(parsedWithAdmin)
 	outboundJSONBytes, _ := json.Marshal(outboundCopy)
 	credBytes, _ := json.Marshal(adminCred)
 	detail := storage.RoutedNodeDetail{
@@ -302,6 +303,7 @@ func (h *RoutedOutboundHandler) create(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("DB 写入失败,远端变更已回滚: %v", err))
 		return
 	}
+	created = sanitizeRoutedNodeDetailForExternal(created)
 
 	// 给 creator 自己也写一行 user_subaccounts:让 creator 拉订阅时(buildRoutedProxyForUser)
 	// 能拿到这个 routed 节点 + 占位 client 凭据,流量上报后 ResolveUsernameByEmail 命中 → 归 creator。
@@ -676,6 +678,21 @@ func generateRoutedClientCred(protocol, method, email string) (map[string]interf
 		return cred, "", err
 	}
 	return cred, string(b), nil
+}
+
+func routedShadowsocksMethod(node storage.Node) string {
+	if canonicalManagedProtocol(node.Protocol) != "shadowsocks" {
+		return ""
+	}
+	var config map[string]interface{}
+	if json.Unmarshal([]byte(node.ClashConfig), &config) != nil {
+		return ""
+	}
+	method, _ := config["cipher"].(string)
+	if strings.TrimSpace(method) == "" {
+		method, _ = config["method"].(string)
+	}
+	return strings.ToLower(strings.TrimSpace(method))
 }
 
 // peekInboundClientByEmail 在 agent 上的某 inbound 里按 email 查现存 client。
@@ -1079,7 +1096,7 @@ func computeRoutedNodeUserCred(ctx context.Context, rm *RemoteManageHandler, rep
 		}
 	} else {
 		// 用 generateRoutedClientCred 按 routed 节点继承的 protocol 选对字段(vless=id / trojan=password / ...)
-		newCred, newCredJSON, gerr := generateRoutedClientCred(routed.Protocol, "", userEmail)
+		newCred, newCredJSON, gerr := generateRoutedClientCred(routed.Protocol, routedShadowsocksMethod(routed.Node), userEmail)
 		if gerr != nil {
 			return nil, fmt.Errorf("generate routed user cred: %w", gerr)
 		}
@@ -1705,6 +1722,9 @@ func cloneClashWithCredential(parentClash, protocol string, newCred map[string]i
 	if err := json.Unmarshal([]byte(parentClash), &pc); err != nil {
 		return parentClash
 	}
+	// A routed child is derived from a parent inbound; it is not proof that the
+	// child itself has a safely managed multi-user inbound.
+	delete(pc, storage.ManagedShadowsocksMultiUserMarker)
 	// 节点名换
 	if newName != "" {
 		pc["name"] = newName
@@ -1728,17 +1748,25 @@ func cloneClashWithCredential(parentClash, protocol string, newCred map[string]i
 			pc["password"] = id
 		}
 	case "shadowsocks", "ss":
-		// SS2022 user password 拼到节点 master password 后面 `master:userPass`。
-		// 父 clash_config 可能已经是 `master:firstClient`(node 创建时拼好的 admin 视角默认值),
-		// 也可能只 master(空 inbound),统一剥到只剩 master 再拼,避免三段叠加。
 		if userPass, ok := newCred["password"].(string); ok && userPass != "" {
-			if nodePass, ok := pc["password"].(string); ok && nodePass != "" {
+			cipher, _ := pc["cipher"].(string)
+			cipher = strings.ToLower(strings.TrimSpace(cipher))
+			switch {
+			case strings.HasPrefix(cipher, "2022-"):
+				// SS2022 combines the server master key and per-user key.
+				nodePass, _ := pc["password"].(string)
 				if idx := strings.Index(nodePass, ":"); idx >= 0 {
 					nodePass = nodePass[:idx]
 				}
-				pc["password"] = nodePass + ":" + userPass
-			} else {
-				pc["password"] = userPass
+				if nodePass != "" {
+					pc["password"] = nodePass + ":" + userPass
+				}
+			case cipher == "aes-128-gcm" || cipher == "aes-256-gcm":
+				method, _ := newCred["method"].(string)
+				if strings.EqualFold(strings.TrimSpace(method), cipher) {
+					// Classic multi-user AES uses the per-client password directly.
+					pc["password"] = userPass
+				}
 			}
 		}
 	case "hysteria2", "hysteria", "hy2":

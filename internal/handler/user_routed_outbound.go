@@ -65,7 +65,7 @@ func (h *UserRoutedOutboundHandler) list(w http.ResponseWriter, r *http.Request,
 	usedToday, _ := h.repo.CountUserRoutedOutboundActionsToday(r.Context(), username)
 	cfg := loadUserPermConfig(r.Context(), h.repo)
 	respondJSON(w, http.StatusOK, map[string]any{
-		"items":   items,
+		"items":   sanitizeRoutedNodeDetailsForExternal(items),
 		"enabled": cfg.RoutedOutboundEnabled,
 		"quota":   map[string]int{"used": used, "max": cfg.QuotaRoutedOutbound},
 		"daily":   map[string]int{"used": usedToday, "max": cfg.DailyLimitRoutedOutbound},
@@ -228,7 +228,7 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 	// ====== 执行 ======
 	// 用户子账号 email = `<username>__<short>__<label>`,cred 按父 inbound 协议正确生成主字段(参见 generateRoutedClientCred)
 	userEmail := fmt.Sprintf("%s__%s__%s", username, shortID, labelSlug)
-	userCred, _, err := generateRoutedClientCred(parent.Protocol, "", userEmail)
+	userCred, _, err := generateRoutedClientCred(parent.Protocol, routedShadowsocksMethod(parent), userEmail)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("生成 client 凭据失败: %v", err))
 		return
@@ -302,6 +302,7 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 		nodeName = fmt.Sprintf("%s-%s", parent.NodeName, rawLabel)
 	}
 	clashWithUser := cloneClashWithCredential(parent.ClashConfig, parent.Protocol, userCred, nodeName)
+	parsedWithUser, _, _, _ := sanitizeManagedShadowsocksConfig(parent.ParsedConfig)
 	outboundJSONBytes, _ := json.Marshal(outboundCopy)
 	credBytes, _ := json.Marshal(userCred)
 	detail := storage.RoutedNodeDetail{
@@ -310,7 +311,7 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 			RawURL:         parent.RawURL,
 			NodeName:       nodeName,
 			Protocol:       parent.Protocol,
-			ParsedConfig:   parent.ParsedConfig,
+			ParsedConfig:   parsedWithUser,
 			ClashConfig:    clashWithUser,
 			Enabled:        true,
 			Tag:            "路由出站",
@@ -333,6 +334,7 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("DB 写入失败,远端变更已回滚: %v", err))
 		return
 	}
+	created = sanitizeRoutedNodeDetailForExternal(created)
 
 	// 写 user_subaccounts(凭据存档,暂停/续费用得上)
 	if _, err := h.repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{

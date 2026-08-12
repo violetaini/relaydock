@@ -334,13 +334,13 @@ func TestManagedCredentialProtocolSnapshotRejectsAllowedProtocolDrift(t *testing
 	}
 }
 
-func TestManagedCatalogRejectsProtocolThatDriftedUnsafe(t *testing.T) {
+func TestManagedCatalogRejectsShadowsocksCipherThatDriftedUnsafe(t *testing.T) {
 	repo, _ := newManagedNodesTestRepository(t)
 	ctx, server, node, _ := seedManagedNodesTest(t, repo)
 	now := time.Date(2026, 7, 26, 8, 30, 0, 0, time.UTC)
 	createManagedGrantForTest(t, repo, ctx, server.ID, now)
 	node.Protocol = "shadowsocks"
-	node.ClashConfig = `{"name":"classic-ss","type":"ss","cipher":"aes-256-gcm"}`
+	node.ClashConfig = `{"name":"unsupported-ss","type":"ss","cipher":"chacha20-ietf-poly1305"}`
 	if _, err := repo.UpdateNode(ctx, node); err != nil {
 		t.Fatalf("drift catalog node to classic Shadowsocks: %v", err)
 	}

@@ -500,6 +500,7 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 		}
 
 		// 将代理编组为 JSON 以进行存储
+		delete(proxyMap, storage.ManagedShadowsocksMultiUserMarker)
 		clashConfigBytes, err := json.Marshal(proxyMap)
 		if err != nil {
 			continue

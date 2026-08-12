@@ -1238,6 +1238,7 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 			if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
 				continue
 			}
+			delete(proxyConfig, storage.ManagedShadowsocksMultiUserMarker)
 			if userScoped && !applyUserCredentials(proxyConfig, node, credMap) {
 				continue
 			}

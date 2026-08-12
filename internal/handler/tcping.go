@@ -340,6 +340,7 @@ func (h *tcpingHandler) mihomoProbeConfigForNode(ctx context.Context, node stora
 	if config == "" {
 		return "", fmt.Errorf("节点 %d 缺少 Mihomo 配置", node.ID)
 	}
+	config, _, _, _ = sanitizeManagedShadowsocksConfig(config)
 	configProtocol, err := mihomoProbeConfigProtocol(config)
 	if err != nil {
 		return "", fmt.Errorf("节点 %d 的 Mihomo 配置缺少有效协议类型", node.ID)

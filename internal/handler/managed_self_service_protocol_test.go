@@ -257,7 +257,7 @@ func assertClassicShadowsocksRejected(t *testing.T, response *httptest.ResponseR
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusBadRequest, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "Shadowsocks 2022") {
+	if !strings.Contains(response.Body.String(), "Shadowsocks 自助发布") {
 		t.Fatalf("response does not explain the safe protocol requirement: %s", response.Body.String())
 	}
 }

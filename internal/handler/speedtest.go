@@ -145,7 +145,8 @@ func (h *SpeedTestHandler) handleRun(w http.ResponseWriter, r *http.Request) {
 	rec.ID = id
 	rec.CreatedAt = time.Now()
 
-	go h.runSpeedTestAsync(id, req.TesterID, node.ClashConfig, req.Bytes, req.URL, req.Threads, req.LatencyOnly)
+	clashConfig, _, _, _ := sanitizeManagedShadowsocksConfig(node.ClashConfig)
+	go h.runSpeedTestAsync(id, req.TesterID, clashConfig, req.Bytes, req.URL, req.Threads, req.LatencyOnly)
 
 	respondJSON(w, http.StatusOK, map[string]any{"success": true, "result": rec})
 }

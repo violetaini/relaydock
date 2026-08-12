@@ -26,6 +26,9 @@ func collectInboundClientAddItem(ctx context.Context, cache *InboundCache, repo 
 	if !ok {
 		return nil, false, fmt.Errorf("inbound cache miss for server=%d tag=%s", serverID, inboundTag)
 	}
+	if err := validateClassicShadowsocksManagedSettings(ib.Protocol, ib.Settings); err != nil {
+		return nil, false, err
+	}
 
 	// Existing credentials still need an idempotent Agent call: package renewal
 	// or source coexistence may have changed their absolute deadline.

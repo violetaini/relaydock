@@ -110,7 +110,7 @@ func TestManagedProtocolPresetsBuildWithPinnedXrayCore(t *testing.T) {
 			inbound: map[string]interface{}{
 				"tag": "ss-aes-128", "listen": "0.0.0.0", "port": 18444, "protocol": "shadowsocks",
 				"settings": map[string]interface{}{
-					"method": "aes-128-gcm", "password": "classic-password", "email": "admin", "network": "tcp,udp",
+					"clients": []interface{}{map[string]interface{}{"method": "aes-128-gcm", "password": "classic-password", "email": "admin", "level": 0}}, "network": "tcp,udp",
 				},
 			},
 		},
@@ -119,7 +119,7 @@ func TestManagedProtocolPresetsBuildWithPinnedXrayCore(t *testing.T) {
 			inbound: map[string]interface{}{
 				"tag": "ss-aes-256", "listen": "0.0.0.0", "port": 18445, "protocol": "shadowsocks",
 				"settings": map[string]interface{}{
-					"method": "aes-256-gcm", "password": "classic-password", "email": "admin", "network": "tcp,udp",
+					"clients": []interface{}{map[string]interface{}{"method": "aes-256-gcm", "password": "classic-password", "email": "admin", "level": 0}}, "network": "tcp,udp",
 				},
 			},
 		},

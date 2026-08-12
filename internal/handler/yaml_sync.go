@@ -316,6 +316,7 @@ func syncNodeToYAMLFiles(repo *storage.TrafficRepository, subscribeDir, oldNodeN
 	if err := json.Unmarshal([]byte(clashConfigJSON), &newClashConfig); err != nil {
 		return fmt.Errorf("parse new clash config: %w", err)
 	}
+	delete(newClashConfig, storage.ManagedShadowsocksMultiUserMarker)
 
 	// 将 nil 值转换为空字符串（例如，对于短 id 字段）
 	convertNilToEmptyString(newClashConfig)
@@ -621,6 +622,7 @@ func batchSyncNodesToYAMLFiles(repo *storage.TrafficRepository, subscribeDir str
 		if err := json.Unmarshal([]byte(update.ClashConfigJSON), &clashConfig); err != nil {
 			continue // 跳过无法解析的
 		}
+		delete(clashConfig, storage.ManagedShadowsocksMultiUserMarker)
 		convertNilToEmptyString(clashConfig)
 		parsedUpdates = append(parsedUpdates, parsedUpdate{
 			oldName:     update.OldName,

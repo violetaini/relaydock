@@ -61,7 +61,7 @@ func (s *TempSubscriptionStore) Create(proxies []any, maxAccess int, expireSecon
 
 	sub := &TempSubscription{
 		ID:          id,
-		Proxies:     proxies,
+		Proxies:     sanitizeTempSubscriptionProxies(proxies),
 		MaxAccess:   maxAccess,
 		AccessCount: 0,
 		ExpireAt:    time.Now().Add(time.Duration(expireSeconds) * time.Second),
@@ -70,6 +70,24 @@ func (s *TempSubscriptionStore) Create(proxies []any, maxAccess int, expireSecon
 
 	s.subscriptions[id] = sub
 	return sub
+}
+
+func sanitizeTempSubscriptionProxies(proxies []any) []any {
+	sanitized := make([]any, len(proxies))
+	for i, proxy := range proxies {
+		proxyMap, ok := proxy.(map[string]any)
+		if !ok {
+			sanitized[i] = proxy
+			continue
+		}
+		clone := make(map[string]any, len(proxyMap))
+		for key, value := range proxyMap {
+			clone[key] = value
+		}
+		delete(clone, storage.ManagedShadowsocksMultiUserMarker)
+		sanitized[i] = clone
+	}
+	return sanitized
 }
 
 // 通过 ID 检索临时订阅并增加访问计数
@@ -258,7 +276,7 @@ func (h *TempSubscriptionAccessHandler) ServeHTTP(w http.ResponseWriter, r *http
 	proxiesKeyNode := &yaml.Node{Kind: yaml.ScalarNode, Value: "proxies"}
 	proxiesListNode := &yaml.Node{Kind: yaml.SequenceNode}
 
-	for _, proxy := range sub.Proxies {
+	for _, proxy := range sanitizeTempSubscriptionProxies(sub.Proxies) {
 		if proxyMap, ok := proxy.(map[string]any); ok {
 			proxiesListNode.Content = append(proxiesListNode.Content, util.ReorderProxyFieldsToNode(proxyMap))
 		}

@@ -259,7 +259,7 @@ func validateSelfServiceNodeProtocol(node storage.Node) error {
 		return nil
 	}
 	if canonicalManagedProtocol(node.Protocol) == "shadowsocks" {
-		return fmt.Errorf("%w: Shadowsocks 2022 自助发布仅支持 2022-blake3-aes-128-gcm 或 2022-blake3-aes-256-gcm", storage.ErrManagedInvalidArgument)
+		return fmt.Errorf("%w: Shadowsocks 自助发布仅支持多用户 AES-128/256-GCM 或 2022 BLAKE3 AES-128/256-GCM", storage.ErrManagedInvalidArgument)
 	}
 	return fmt.Errorf("%w: 协议不支持独立的用户凭据，不能发布到用户自助目录", storage.ErrManagedInvalidArgument)
 }

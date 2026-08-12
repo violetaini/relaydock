@@ -43,6 +43,8 @@ const (
 	ManagedGrantExpired      = "expired"
 	ManagedGrantOverLimit    = "over_limit"
 	ManagedGrantUserDisabled = "user_disabled"
+
+	ManagedShadowsocksMultiUserMarker = "x-arcway-managed-users"
 )
 
 var (
@@ -456,7 +458,7 @@ var managedGrantProtocolProfileFamilies = map[string]string{
 	"vless-reality": "vless", "vless-tcp-tls": "vless", "vless-grpc-tls": "vless", "vless-wss": "vless", "vless-ws": "vless",
 	"vmess-tcp-none": "vmess", "vmess-tcp-tls": "vmess", "vmess-grpc-tls": "vmess", "vmess-wss": "vmess", "vmess-ws": "vmess",
 	"trojan-tcp-tls": "trojan", "trojan-reality": "trojan", "trojan-grpc-tls": "trojan", "trojan-wss": "trojan",
-	"shadowsocks-2022": "shadowsocks", "hysteria2": "hysteria", "socks5": "socks", "http": "http", "anytls": "anytls", "snell": "snell",
+	"shadowsocks-classic": "shadowsocks", "shadowsocks-2022": "shadowsocks", "hysteria2": "hysteria", "socks5": "socks", "http": "http", "anytls": "anytls", "snell": "snell",
 }
 
 func canonicalManagedGrantProtocol(protocol string) (string, bool) {
@@ -565,10 +567,7 @@ func SelfServiceNodeProtocolProfile(protocolName, clashConfig string) (string, b
 		return "", false
 	}
 	if protocol == "shadowsocks" {
-		if !SelfServiceNodeProtocolEligible(protocolName, clashConfig) {
-			return "", false
-		}
-		return "shadowsocks-2022", true
+		return managedShadowsocksProtocolProfile(config)
 	}
 	switch protocol {
 	case "hysteria":
@@ -626,11 +625,6 @@ func SelfServiceNodeProtocolProfile(protocolName, clashConfig string) (string, b
 	reality := security == "reality" || hasRealityOptions
 
 	switch protocol {
-	case "anytls":
-		if network == "tcp" && tls && !reality {
-			return "anytls", true
-		}
-		return "", false
 	case "snell":
 		version, valid := config["version"].(float64)
 		if network != "tcp" || !valid || version != 4 && version != 5 {
@@ -849,21 +843,39 @@ VALUES (?, ?, ?, 1, 0, ?, ?, ?)`, nodeID, serverID, inboundTag, createdBy, now, 
 func SelfServiceNodeProtocolEligible(protocolName, clashConfig string) bool {
 	protocolName = strings.ToLower(strings.TrimSpace(protocolName))
 	switch protocolName {
-	case "vless", "vmess", "trojan", "anytls", "snell", "socks", "socks5", "http", "hysteria", "hysteria2", "hy2":
+	case "vless", "vmess", "trojan", "snell", "socks", "socks5", "http", "hysteria", "hysteria2", "hy2":
 		return true
 	case "ss", "shadowsocks":
 		var config map[string]interface{}
 		if json.Unmarshal([]byte(clashConfig), &config) != nil {
 			return false
 		}
-		cipher, _ := config["cipher"].(string)
-		if strings.TrimSpace(cipher) == "" {
-			cipher, _ = config["method"].(string)
+		profile, ok := managedShadowsocksProtocolProfile(config)
+		if !ok {
+			return false
 		}
-		cipher = strings.ToLower(strings.TrimSpace(cipher))
-		return cipher == "2022-blake3-aes-128-gcm" || cipher == "2022-blake3-aes-256-gcm"
+		if profile != "shadowsocks-classic" {
+			return true
+		}
+		multiUser, ok := config[ManagedShadowsocksMultiUserMarker].(bool)
+		return ok && multiUser
 	default:
 		return false
+	}
+}
+
+func managedShadowsocksProtocolProfile(config map[string]interface{}) (string, bool) {
+	cipher, _ := config["cipher"].(string)
+	if strings.TrimSpace(cipher) == "" {
+		cipher, _ = config["method"].(string)
+	}
+	switch strings.ToLower(strings.TrimSpace(cipher)) {
+	case "aes-128-gcm", "aes-256-gcm":
+		return "shadowsocks-classic", true
+	case "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm":
+		return "shadowsocks-2022", true
+	default:
+		return "", false
 	}
 }
 

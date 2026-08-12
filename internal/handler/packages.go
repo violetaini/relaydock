@@ -1169,6 +1169,7 @@ func (h *PackageAssignHandler) autoGenerateSubscription(ctx context.Context, use
 		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
 			continue
 		}
+		delete(proxyConfig, storage.ManagedShadowsocksMultiUserMarker)
 		proxies = append(proxies, proxyConfig)
 	}
 
@@ -1340,14 +1341,25 @@ func getOrCreateInboundCredential(ctx context.Context, repo *storage.TrafficRepo
 		var cred map[string]interface{}
 		if json.Unmarshal([]byte(existing.CredentialJSON), &cred) == nil && cred != nil {
 			credJSON := existing.CredentialJSON
+			credentialChanged := false
 			if strings.EqualFold(protocol, "vless") && reconcileVLESSCredentialFlow(cred, settings) {
+				credentialChanged = true
+			}
+			if canonicalManagedProtocol(protocol) == "shadowsocks" {
+				methodChanged, err := reconcileClassicShadowsocksCredentialMethod(cred, settings)
+				if err != nil {
+					return nil, "", false, fmt.Errorf("reconcile classic Shadowsocks credential: %w", err)
+				}
+				credentialChanged = credentialChanged || methodChanged
+			}
+			if credentialChanged {
 				updated, err := json.Marshal(cred)
 				if err != nil {
-					return nil, "", false, fmt.Errorf("marshal reconciled VLESS credential: %w", err)
+					return nil, "", false, fmt.Errorf("marshal reconciled credential: %w", err)
 				}
 				credJSON = string(updated)
 				if err := repo.UpdateUserInboundCredentialJSONByID(ctx, existing.ID, credJSON); err != nil {
-					return nil, "", false, fmt.Errorf("persist reconciled VLESS credential: %w", err)
+					return nil, "", false, fmt.Errorf("persist reconciled credential: %w", err)
 				}
 			}
 			return cred, credJSON, true, nil
@@ -1358,6 +1370,11 @@ func getOrCreateInboundCredential(ctx context.Context, repo *storage.TrafficRepo
 
 	// 2) agent 已有同 email → 复用并回写 DB(主控与 agent 重新对齐,下次直接走步骤 1)
 	if reuse := extractClientByEmail(settings, email); reuse != nil {
+		if canonicalManagedProtocol(protocol) == "shadowsocks" {
+			if _, err := reconcileClassicShadowsocksCredentialMethod(reuse, settings); err != nil {
+				return nil, "", false, fmt.Errorf("validate live classic Shadowsocks credential: %w", err)
+			}
+		}
 		b, _ := json.Marshal(reuse)
 		credJSON := string(b)
 		if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
@@ -1371,10 +1388,7 @@ func getOrCreateInboundCredential(ctx context.Context, repo *storage.TrafficRepo
 
 	// 3) 生成新 + 立即写 DB(锁内)。后续 add-client / batch-apply 即便失败也没关系:凭据已 reserve,
 	// 下次复用同一份重发,agent 幂等 → 永不重复。
-	var method string
-	if settings != nil {
-		method, _ = settings["method"].(string)
-	}
+	method := shadowsocksInboundMethod(settings)
 	cred, credJSON, err := generateCredential(protocol, user, method, inboundTag)
 	if err != nil {
 		return nil, "", false, err
@@ -1392,6 +1406,109 @@ func getOrCreateInboundCredential(ctx context.Context, repo *storage.TrafficRepo
 		return nil, "", false, err
 	}
 	return cred, credJSON, false, nil
+}
+
+// shadowsocksInboundMethod supports both SS2022's top-level method and
+// classic multi-user inbounds, where Xray keeps the cipher on each client.
+func shadowsocksInboundMethod(settings map[string]interface{}) string {
+	if settings == nil {
+		return ""
+	}
+	if method, _ := settings["method"].(string); strings.TrimSpace(method) != "" {
+		return strings.ToLower(strings.TrimSpace(method))
+	}
+	clients, _ := settings["clients"].([]interface{})
+	for _, item := range clients {
+		client, _ := item.(map[string]interface{})
+		if method, _ := client["method"].(string); strings.TrimSpace(method) != "" {
+			return strings.ToLower(strings.TrimSpace(method))
+		}
+	}
+	return ""
+}
+
+// reconcileClassicShadowsocksCredentialMethod only backfills historical
+// credentials after the live inbound proves that the same client identity uses
+// the current cipher. A blind backfill can relabel an AES-128 password as
+// AES-256 after an inbound edit while the Agent still has the old client.
+func reconcileClassicShadowsocksCredentialMethod(credential, settings map[string]interface{}) (bool, error) {
+	method := shadowsocksInboundMethod(settings)
+	if method != "aes-128-gcm" && method != "aes-256-gcm" {
+		return false, nil
+	}
+	if credential == nil {
+		return false, errors.New("credential is missing")
+	}
+
+	if rawMethod, exists := credential["method"]; exists {
+		storedMethod, ok := rawMethod.(string)
+		storedMethod = strings.ToLower(strings.TrimSpace(storedMethod))
+		if !ok || storedMethod == "" {
+			return false, errors.New("stored credential method is invalid")
+		}
+		if storedMethod != method {
+			return false, fmt.Errorf("stored credential method %q does not match inbound method %q", storedMethod, method)
+		}
+		return false, nil
+	}
+
+	password, _ := credential["password"].(string)
+	email, _ := credential["email"].(string)
+	password = strings.TrimSpace(password)
+	email = strings.TrimSpace(email)
+	if password == "" && email == "" {
+		return false, errors.New("stored credential has no verifiable client identity")
+	}
+
+	clients, _ := settings["clients"].([]interface{})
+	for _, item := range clients {
+		client, _ := item.(map[string]interface{})
+		if client == nil {
+			continue
+		}
+		clientMethod, _ := client["method"].(string)
+		if strings.ToLower(strings.TrimSpace(clientMethod)) != method {
+			continue
+		}
+		clientPassword, _ := client["password"].(string)
+		clientEmail, _ := client["email"].(string)
+		if password != "" && strings.TrimSpace(clientPassword) != password {
+			continue
+		}
+		if email != "" && strings.TrimSpace(clientEmail) != email {
+			continue
+		}
+		credential["method"] = method
+		return true, nil
+	}
+
+	return false, errors.New("stored credential method is missing and no matching live client was found")
+}
+
+func validateClassicShadowsocksManagedSettings(protocol string, settings map[string]interface{}) error {
+	if canonicalManagedProtocol(protocol) != "shadowsocks" {
+		return nil
+	}
+	method := shadowsocksInboundMethod(settings)
+	if method != "aes-128-gcm" && method != "aes-256-gcm" {
+		return nil
+	}
+	if _, topLevelMethod := settings["method"]; topLevelMethod {
+		return errors.New("classic Shadowsocks managed access requires a per-user clients configuration")
+	}
+	clients, ok := settings["clients"].([]interface{})
+	if !ok || len(clients) == 0 {
+		return errors.New("classic Shadowsocks managed access requires a per-user clients configuration")
+	}
+	for _, item := range clients {
+		client, _ := item.(map[string]interface{})
+		clientMethod, _ := client["method"].(string)
+		clientPassword, _ := client["password"].(string)
+		if strings.EqualFold(strings.TrimSpace(clientMethod), method) && strings.TrimSpace(clientPassword) != "" {
+			return nil
+		}
+	}
+	return errors.New("classic Shadowsocks managed access requires AES-GCM method and password on each client")
 }
 
 // addUserToInbound 获取远程入站配置，添加用户凭据，然后重新提交
@@ -1473,6 +1590,9 @@ func prepareUserInboundCredential(ctx context.Context, rm *RemoteManageHandler, 
 
 	protocol, _ := targetInbound["protocol"].(string)
 	settings, _ := targetInbound["settings"].(map[string]interface{})
+	if err := validateClassicShadowsocksManagedSettings(protocol, settings); err != nil {
+		return nil, err
+	}
 
 	// 凭据统一走 getOrCreateInboundCredential:全局锁内查 DB 复用 / 按 email 复用 / 生成 + 立即写 DB。
 	// 根治跨操作并发时两条路径各自生成不同 uuid 的重复子账户;flow 继承 + 写 DB 都在其内部完成。
@@ -1857,6 +1977,10 @@ func generateCredential(protocol string, user storage.User, method, inboundTag s
 		key := make([]byte, keyLen)
 		rand.Read(key)
 		cred["password"] = base64.StdEncoding.EncodeToString(key)
+		method = strings.ToLower(strings.TrimSpace(method))
+		if method == "aes-128-gcm" || method == "aes-256-gcm" {
+			cred["method"] = method
+		}
 		cred["email"] = email
 		cred["level"] = 0
 	case "socks", "http":

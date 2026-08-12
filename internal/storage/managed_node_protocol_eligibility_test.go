@@ -34,9 +34,27 @@ func TestSelfServiceProtocolEligible(t *testing.T) {
 			want:        false,
 		},
 		{
-			name:        "legacy Shadowsocks rejected",
+			name:        "classic Shadowsocks AES 256 shared password rejected",
 			protocol:    "shadowsocks",
 			clashConfig: `{"cipher":"aes-256-gcm"}`,
+			want:        false,
+		},
+		{
+			name:        "classic Shadowsocks AES 128 managed users allowed",
+			protocol:    "ss",
+			clashConfig: `{"method":" AES-128-GCM ","x-arcway-managed-users":true}`,
+			want:        true,
+		},
+		{
+			name:        "classic Shadowsocks AES 256 managed users allowed",
+			protocol:    "shadowsocks",
+			clashConfig: `{"cipher":"aes-256-gcm","x-arcway-managed-users":true}`,
+			want:        true,
+		},
+		{
+			name:        "classic Shadowsocks marker must be boolean",
+			protocol:    "shadowsocks",
+			clashConfig: `{"cipher":"aes-128-gcm","x-arcway-managed-users":"true"}`,
 			want:        false,
 		},
 		{
@@ -59,6 +77,7 @@ func TestSelfServiceProtocolEligible(t *testing.T) {
 		},
 		{name: "Hysteria2 alias allowed", protocol: " HYSTERIA2 ", want: true},
 		{name: "VLESS allowed", protocol: "vless", want: true},
+		{name: "AnyTLS rejected", protocol: "anytls", clashConfig: `{"type":"anytls","tls":true}`, want: false},
 		{name: "TUIC rejected", protocol: "tuic", clashConfig: `{"type":"tuic"}`, want: false},
 		{name: "WireGuard rejected", protocol: "wireguard", want: false},
 		{name: "empty protocol rejected", protocol: "", want: false},

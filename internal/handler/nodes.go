@@ -384,10 +384,96 @@ func (h *nodesHandler) prepareImportedNode(_ context.Context, node *storage.Node
 	if node == nil {
 		return
 	}
+	node.ClashConfig, _, _, _ = sanitizeManagedShadowsocksConfig(node.ClashConfig)
+	node.ParsedConfig, _, _, _ = sanitizeManagedShadowsocksConfig(node.ParsedConfig)
 	node.OriginalServer = ""
 	node.InboundTag = ""
 	node.InboundMutationID = ""
 	node.ChainProxyNodeID = nil
+}
+
+func managedShadowsocksConfigCipher(config map[string]any) string {
+	cipher, _ := config["cipher"].(string)
+	if strings.TrimSpace(cipher) == "" {
+		cipher, _ = config["method"].(string)
+	}
+	return strings.ToLower(strings.TrimSpace(cipher))
+}
+
+func isClassicManagedShadowsocksCipher(cipher string) bool {
+	switch strings.ToLower(strings.TrimSpace(cipher)) {
+	case "aes-128-gcm", "aes-256-gcm":
+		return true
+	default:
+		return false
+	}
+}
+
+// sanitizeManagedShadowsocksConfig removes server-owned metadata from a JSON
+// config before it crosses an API trust boundary. The returned marker flag is
+// true only for the exact boolean value written by managed-node reconciliation.
+func sanitizeManagedShadowsocksConfig(raw string) (sanitized string, marker bool, cipher string, valid bool) {
+	var config map[string]any
+	if err := json.Unmarshal([]byte(raw), &config); err != nil || config == nil {
+		return raw, false, "", false
+	}
+
+	cipher = managedShadowsocksConfigCipher(config)
+	markerValue, markerPresent := config[storage.ManagedShadowsocksMultiUserMarker]
+	marker, _ = markerValue.(bool)
+	if !markerPresent {
+		return raw, marker, cipher, true
+	}
+
+	delete(config, storage.ManagedShadowsocksMultiUserMarker)
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		return raw, false, cipher, false
+	}
+	return string(encoded), marker, cipher, true
+}
+
+func setManagedShadowsocksMarker(raw string) string {
+	var config map[string]any
+	if err := json.Unmarshal([]byte(raw), &config); err != nil || config == nil {
+		return raw
+	}
+	config[storage.ManagedShadowsocksMultiUserMarker] = true
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		return raw
+	}
+	return string(encoded)
+}
+
+func hasTrustedManagedShadowsocksCapability(node storage.Node) bool {
+	_, marker, cipher, valid := sanitizeManagedShadowsocksConfig(node.ClashConfig)
+	nodeType := strings.ToLower(strings.TrimSpace(node.NodeType))
+	if nodeType == "" {
+		nodeType = "physical"
+	}
+	return valid && marker && isClassicManagedShadowsocksCipher(cipher) &&
+		canonicalManagedProtocol(node.Protocol) == "shadowsocks" &&
+		nodeType == "physical" && isDatabaseManagedNode(&node)
+}
+
+// prepareManagedNodeConfigUpdate strips any client-supplied marker. A trusted
+// marker survives only when a server-bound physical classic-AES node keeps the
+// same cipher.
+func prepareManagedNodeConfigUpdate(existing storage.Node, incomingClash, incomingParsed string) (string, string) {
+	_, _, oldCipher, oldValid := sanitizeManagedShadowsocksConfig(existing.ClashConfig)
+	cleanClash, _, newCipher, newValid := sanitizeManagedShadowsocksConfig(incomingClash)
+	cleanParsed, _, parsedCipher, parsedValid := sanitizeManagedShadowsocksConfig(incomingParsed)
+
+	preserve := hasTrustedManagedShadowsocksCapability(existing) && oldValid && newValid &&
+		isClassicManagedShadowsocksCipher(oldCipher) && oldCipher == newCipher
+	if preserve {
+		cleanClash = setManagedShadowsocksMarker(cleanClash)
+		if parsedValid && parsedCipher == oldCipher {
+			cleanParsed = setManagedShadowsocksMarker(cleanParsed)
+		}
+	}
+	return cleanClash, cleanParsed
 }
 
 func isDatabaseManagedNode(node *storage.Node) bool {
@@ -736,6 +822,33 @@ func (h *nodesHandler) handleUpdate(w http.ResponseWriter, r *http.Request, idSe
 	// 节点取不到 → 404)。强制只保留 NodeName、其余字段沿用原节点,防止越权改配置/协议/标签/启用状态。
 	if !isAdmin {
 		req = nodeRequest{NodeName: req.NodeName, Enabled: existing.Enabled}
+	}
+
+	if isAdmin && (req.ClashConfig != "" || req.ParsedConfig != "") {
+		effectiveClash := req.ClashConfig
+		if effectiveClash == "" {
+			effectiveClash = existing.ClashConfig
+		}
+		effectiveParsed := req.ParsedConfig
+		if effectiveParsed == "" {
+			effectiveParsed = existing.ParsedConfig
+		}
+
+		preparedClash, preparedParsed := prepareManagedNodeConfigUpdate(
+			existing,
+			effectiveClash,
+			effectiveParsed,
+		)
+		if req.ClashConfig != "" {
+			req.ClashConfig = preparedClash
+		}
+		if req.ParsedConfig != "" {
+			req.ParsedConfig = preparedParsed
+		} else if req.ClashConfig != "" {
+			// A cipher change must also clear the capability marker from the
+			// stored parsed mirror, even when the request omitted that field.
+			existing.ParsedConfig = preparedParsed
+		}
 	}
 
 	// 如果节点名称被修改，需要校验新名称
@@ -1232,9 +1345,11 @@ func (h *nodesHandler) handleUpdateConfig(w http.ResponseWriter, r *http.Request
 
 	oldNodeName := node.NodeName
 
-	// 更新节点的 ClashConfig 和 ParsedConfig
-	node.ClashConfig = req.ClashConfig
-	node.ParsedConfig = req.ClashConfig
+	// The raw editor receives marker-free JSON. Preserve the server-owned
+	// capability only for a same-cipher edit of the same managed physical node.
+	preparedClash, preparedParsed := prepareManagedNodeConfigUpdate(node, req.ClashConfig, req.ClashConfig)
+	node.ClashConfig = preparedClash
+	node.ParsedConfig = preparedParsed
 
 	// 如果更改，请从配置中更新节点名称
 	if nameValue, ok := clashConfigMap["name"]; ok {
@@ -2101,13 +2216,14 @@ func (r *nodeRequest) parseChainProxyNodeID() {
 }
 
 type nodeDTO struct {
-	ID           int64  `json:"id"`
-	RawURL       string `json:"raw_url"`
-	NodeName     string `json:"node_name"`
-	Protocol     string `json:"protocol"`
-	ParsedConfig string `json:"parsed_config"`
-	ClashConfig  string `json:"clash_config"`
-	Enabled      bool   `json:"enabled"`
+	ID               int64  `json:"id"`
+	RawURL           string `json:"raw_url"`
+	NodeName         string `json:"node_name"`
+	Protocol         string `json:"protocol"`
+	ParsedConfig     string `json:"parsed_config"`
+	ClashConfig      string `json:"clash_config"`
+	ManagedMultiUser bool   `json:"managed_multi_user"`
+	Enabled          bool   `json:"enabled"`
 	// Tag 是用户自定义分类标签(VIP / Asia / 测试),前端节点页用它做过滤、分组显示、批量更新。
 	// 必须下发,否则前端改了 tag 拉回来缺字段,显示永远是原状态,等同"修改不起作用"。
 	Tag string `json:"tag"`
@@ -2146,8 +2262,9 @@ func makeNodeURIItem(username string, node storage.Node, producer *substore.URIP
 	if strings.TrimSpace(node.ClashConfig) == "" {
 		return nodeURIItem{}, errors.New("当前节点没有可用于生成二维码的客户端配置")
 	}
+	clashConfig, _, _, _ := sanitizeManagedShadowsocksConfig(node.ClashConfig)
 	var proxy map[string]any
-	if err := json.Unmarshal([]byte(node.ClashConfig), &proxy); err != nil {
+	if err := json.Unmarshal([]byte(clashConfig), &proxy); err != nil {
 		return nodeURIItem{}, errors.New("当前节点的客户端配置格式无效")
 	}
 	protocol, _ := proxy["type"].(string)
@@ -2224,13 +2341,17 @@ func NewNodeURIsHandler(repo *storage.TrafficRepository) http.Handler {
 }
 
 func convertNode(node storage.Node) nodeDTO {
+	clashConfig, _, _, _ := sanitizeManagedShadowsocksConfig(node.ClashConfig)
+	parsedConfig, _, _, _ := sanitizeManagedShadowsocksConfig(node.ParsedConfig)
+	managedMultiUser := hasTrustedManagedShadowsocksCapability(node)
 	return nodeDTO{
 		ID:                node.ID,
 		RawURL:            node.RawURL,
 		NodeName:          node.NodeName,
 		Protocol:          node.Protocol,
-		ParsedConfig:      node.ParsedConfig,
-		ClashConfig:       node.ClashConfig,
+		ParsedConfig:      parsedConfig,
+		ClashConfig:       clashConfig,
+		ManagedMultiUser:  managedMultiUser,
 		Enabled:           node.Enabled,
 		Tag:               node.Tag,
 		Tags:              node.Tags,
@@ -2256,6 +2377,19 @@ func convertNodes(nodes []storage.Node) []nodeDTO {
 		result = append(result, convertNode(node))
 	}
 	return result
+}
+
+func sanitizeRoutedNodeDetailForExternal(detail storage.RoutedNodeDetail) storage.RoutedNodeDetail {
+	detail.ClashConfig, _, _, _ = sanitizeManagedShadowsocksConfig(detail.ClashConfig)
+	detail.ParsedConfig, _, _, _ = sanitizeManagedShadowsocksConfig(detail.ParsedConfig)
+	return detail
+}
+
+func sanitizeRoutedNodeDetailsForExternal(details []storage.RoutedNodeDetail) []storage.RoutedNodeDetail {
+	for index := range details {
+		details[index] = sanitizeRoutedNodeDetailForExternal(details[index])
+	}
+	return details
 }
 
 func (h *nodesHandler) handleFetchSubscription(w http.ResponseWriter, r *http.Request) {

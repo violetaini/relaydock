@@ -9,12 +9,12 @@ import (
 
 func TestNormalizeManagedGrantAllowedProtocolProfiles(t *testing.T) {
 	got, err := NormalizeManagedGrantAllowedProtocolProfiles([]string{
-		" VLESS-REALITY ", "shadowsocks-2022", "vless-reality", "HYSTERIA2",
+		" VLESS-REALITY ", "shadowsocks-classic", "shadowsocks-2022", "vless-reality", "HYSTERIA2", "ANYTLS",
 	})
 	if err != nil {
 		t.Fatalf("NormalizeManagedGrantAllowedProtocolProfiles: %v", err)
 	}
-	want := []string{"vless-reality", "shadowsocks-2022", "hysteria2"}
+	want := []string{"vless-reality", "shadowsocks-classic", "shadowsocks-2022", "hysteria2", "anytls"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("normalized profiles = %#v, want %#v", got, want)
 	}
@@ -39,6 +39,7 @@ func TestManagedGrantProtocolProfileFamiliesMustMatch(t *testing.T) {
 	}{
 		{name: "legacy family whitelist", protocols: []string{"vless"}},
 		{name: "matching exact profiles", protocols: []string{"SS", "vless"}, profiles: []string{"vless-wss", "shadowsocks-2022"}},
+		{name: "matching classic shadowsocks profile", protocols: []string{"shadowsocks"}, profiles: []string{"shadowsocks-classic"}},
 		{name: "profiles require families", profiles: []string{"shadowsocks-2022"}, wantErr: true},
 		{name: "profile family omitted", protocols: []string{"vless"}, profiles: []string{"vless-wss", "shadowsocks-2022"}, wantErr: true},
 		{name: "unused family", protocols: []string{"vless", "vmess"}, profiles: []string{"vless-wss"}, wantErr: true},
@@ -59,8 +60,11 @@ func TestManagedGrantProtocolProfileFamiliesMustMatch(t *testing.T) {
 			if err != nil {
 				t.Fatalf("normalizeGrant: %v", err)
 			}
-			if len(tt.profiles) > 0 && !normalized.AllowsNodeProtocol("shadowsocks", `{"type":"ss","cipher":"2022-blake3-aes-128-gcm"}`) {
-				t.Fatal("normalized matching profile was not allowed")
+			if tt.name == "matching exact profiles" && !normalized.AllowsNodeProtocol("shadowsocks", `{"type":"ss","cipher":"2022-blake3-aes-128-gcm"}`) {
+				t.Fatal("normalized Shadowsocks 2022 profile was not allowed")
+			}
+			if tt.name == "matching classic shadowsocks profile" && !normalized.AllowsNodeProtocol("shadowsocks", `{"type":"ss","cipher":"aes-128-gcm"}`) {
+				t.Fatal("normalized classic Shadowsocks profile was not allowed")
 			}
 		})
 	}
@@ -85,11 +89,14 @@ func TestSelfServiceNodeProtocolProfile(t *testing.T) {
 		{name: "trojan reality", protocol: "trojan", config: `{"type":"trojan","reality-opts":{}}`, want: "trojan-reality", ok: true},
 		{name: "trojan grpc tls", protocol: "trojan", config: `{"type":"trojan","network":"grpc","tls":true}`, want: "trojan-grpc-tls", ok: true},
 		{name: "trojan wss", protocol: "trojan", config: `{"type":"trojan","network":"ws","tls":true}`, want: "trojan-wss", ok: true},
+		{name: "classic ss aes 128", protocol: "shadowsocks", config: `{"type":"ss","cipher":"aes-128-gcm"}`, want: "shadowsocks-classic", ok: true},
+		{name: "classic ss aes 256", protocol: "ss", config: `{"type":"shadowsocks","cipher":"AES-256-GCM"}`, want: "shadowsocks-classic", ok: true},
+		{name: "classic ss method", protocol: "shadowsocks", config: `{"type":"ss","method":"aes-128-gcm"}`, want: "shadowsocks-classic", ok: true},
 		{name: "ss2022", protocol: "shadowsocks", config: `{"type":"ss","cipher":"2022-blake3-aes-256-gcm"}`, want: "shadowsocks-2022", ok: true},
 		{name: "hysteria2", protocol: "hysteria", config: `{"type":"hysteria2"}`, want: "hysteria2", ok: true},
 		{name: "socks5", protocol: "socks", config: `{"type":"socks"}`, want: "socks5", ok: true},
 		{name: "http", protocol: "http", config: `{"type":"http"}`, want: "http", ok: true},
-		{name: "anytls", protocol: "anytls", config: `{"type":"anytls","tls":true}`, want: "anytls", ok: true},
+		{name: "anytls removed from self service", protocol: "anytls", config: `{"type":"anytls","tls":true}`},
 		{name: "snell v4", protocol: "snell", config: `{"type":"snell","version":4}`, want: "snell", ok: true},
 		{name: "malformed", protocol: "vless", config: `{"type":`},
 		{name: "missing type", protocol: "vless", config: `{"network":"ws"}`},
@@ -97,6 +104,8 @@ func TestSelfServiceNodeProtocolProfile(t *testing.T) {
 		{name: "reality is not wss", protocol: "vless", config: `{"type":"vless","network":"ws","tls":true,"reality-opts":{}}`},
 		{name: "vmess reality unsupported", protocol: "vmess", config: `{"type":"vmess","tls":true,"reality-opts":{}}`},
 		{name: "anytls without tls", protocol: "anytls", config: `{"type":"anytls"}`},
+		{name: "classic ss chacha unsupported", protocol: "shadowsocks", config: `{"type":"ss","cipher":"chacha20-ietf-poly1305"}`},
+		{name: "ss2022 chacha unsupported", protocol: "shadowsocks", config: `{"type":"ss","cipher":"2022-blake3-chacha20-poly1305"}`},
 		{name: "snell v6 isolated credentials unsupported", protocol: "snell", config: `{"type":"snell","version":6}`},
 		{name: "invalid network field", protocol: "vless", config: `{"type":"vless","network":1,"tls":true}`},
 		{name: "invalid reality options", protocol: "vless", config: `{"type":"vless","reality-opts":true}`},

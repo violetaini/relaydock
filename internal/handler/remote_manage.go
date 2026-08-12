@@ -5373,24 +5373,31 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 	case "shadowsocks":
 		proxy["type"] = "ss"
 		method, _ := settings["method"].(string)
+		if strings.TrimSpace(method) == "" && client != nil {
+			method, _ = client["method"].(string)
+		}
+		method = strings.ToLower(strings.TrimSpace(method))
 		if method != "" {
 			proxy["cipher"] = method
+		}
+		if _, topLevelMethod := settings["method"]; !topLevelMethod && client != nil &&
+			(method == "aes-128-gcm" || method == "aes-256-gcm") {
+			proxy[storage.ManagedShadowsocksMultiUserMarker] = true
 		}
 		// SS2022(method 以 "2022-" 开头)需要 `master:userPass` 双段密码。
 		// 节点 clash_config 是 admin 视角(也用作直接订阅 / routed 出站模板):
 		//   - 有 client → 拼 `master:firstClient.password`(jimlee 等 admin 自用此节点能直接订阅)
 		//   - 无 client → 只放 master(空 inbound,后续 user override 时再拼)
 		// 订阅生成时 appendUserCredentialOverride 会兜底剥掉冒号后段重拼当前用户密码,所以多用户场景不会三段叠加。
-		// 老 SS(非 2022)单段密码,直接 master 就够,client password 跟 master 必须相同 → 不拼。
+		// 经典 AES 多用户的 method/password 都在选中的 client 上，直接下发该 client 密码。
+		// 老式顶层共享密码格式仍可转换供管理员使用，但不会通过自助发布资格检查。
 		nodePass, _ := settings["password"].(string)
 		if strings.HasPrefix(method, "2022-") {
-			if clients, ok := settings["clients"].([]interface{}); ok && len(clients) > 0 {
-				if first, ok := clients[0].(map[string]interface{}); ok {
-					if clientPass, ok := first["password"].(string); ok && clientPass != "" {
-						nodePass = nodePass + ":" + clientPass
-					}
-				}
+			if clientPass, ok := client["password"].(string); ok && clientPass != "" {
+				nodePass = nodePass + ":" + clientPass
 			}
+		} else if client != nil && (method == "aes-128-gcm" || method == "aes-256-gcm") {
+			nodePass, _ = client["password"].(string)
 		}
 		if nodePass != "" {
 			proxy["password"] = nodePass
