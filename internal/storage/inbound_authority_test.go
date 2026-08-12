@@ -305,6 +305,20 @@ func TestDesiredInboundBackfillPreservesOnlyProtocolSpecificNodeCredential(t *te
 			owner:        map[string]interface{}{"password": "owner-user-secret", "email": "admin"},
 			untrusted:    []interface{}{map[string]interface{}{"password": "injected-user-secret", "email": "attacker"}},
 		},
+		{
+			name: "classic shadowsocks per-client method", protocol: "shadowsocks", nodeProtocol: "shadowsocks",
+			nodeClash: map[string]interface{}{
+				"type": "ss", "cipher": "aes-128-gcm", "password": "owner-secret",
+			},
+			listKey: "clients",
+			owner: map[string]interface{}{
+				"method": "aes-128-gcm", "password": "owner-secret", "email": "admin",
+			},
+			untrusted: []interface{}{
+				map[string]interface{}{"method": "aes-256-gcm", "password": "owner-secret", "email": "wrong-method"},
+				map[string]interface{}{"method": "aes-128-gcm", "password": "injected-secret", "email": "attacker"},
+			},
+		},
 	}
 
 	for _, test := range tests {

@@ -228,7 +228,8 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 	// ====== 执行 ======
 	// 用户子账号 email = `<username>__<short>__<label>`,cred 按父 inbound 协议正确生成主字段(参见 generateRoutedClientCred)
 	userEmail := fmt.Sprintf("%s__%s__%s", username, shortID, labelSlug)
-	userCred, _, err := generateRoutedClientCred(parent.Protocol, routedShadowsocksMethod(parent), userEmail)
+	shadowsocksMethod := routedShadowsocksMethod(parent)
+	userCred, _, err := generateRoutedClientCred(parent.Protocol, shadowsocksMethod, userEmail)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("生成 client 凭据失败: %v", err))
 		return
@@ -251,7 +252,11 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 	// 同 routed_outbound.go Step 1:agent matchClientCredential 现在只看 primary key,
 	// 同 email 不同 uuid 不再被去重 → 重复 add 后 xray "User already exists" 启动失败。
 	pkField := primaryKeyFieldForProtocol(parent.Protocol)
-	if existingUUID, existingFlow, perr := peekInboundClientByEmail(ctx, h.remoteManage, serverID, parent.InboundTag, userEmail); perr == nil && existingUUID != "" {
+	if existingUUID, existingFlow, existingMethod, perr := peekInboundClientByEmail(ctx, h.remoteManage, serverID, parent.InboundTag, userEmail); perr == nil && existingUUID != "" {
+		if err := reconcileRoutedShadowsocksLiveMethod(parent.Protocol, shadowsocksMethod, existingMethod, userCred); err != nil {
+			writeJSONError(w, http.StatusConflict, fmt.Sprintf("复用 client 失败: %v", err))
+			return
+		}
 		log.Printf("[UserRoutedCreate] inbound %s already has client email=%s pk=%s — reusing", parent.InboundTag, userEmail, existingUUID)
 		userCred[pkField] = existingUUID
 		if existingFlow != "" {
@@ -302,7 +307,7 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 		nodeName = fmt.Sprintf("%s-%s", parent.NodeName, rawLabel)
 	}
 	clashWithUser := cloneClashWithCredential(parent.ClashConfig, parent.Protocol, userCred, nodeName)
-	parsedWithUser, _, _, _ := sanitizeManagedShadowsocksConfig(parent.ParsedConfig)
+	parsedWithUser := clashWithUser
 	outboundJSONBytes, _ := json.Marshal(outboundCopy)
 	credBytes, _ := json.Marshal(userCred)
 	detail := storage.RoutedNodeDetail{
@@ -657,9 +662,32 @@ func resumeUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo 
 				log.Printf("[ResumeUserRouted] parse credential for node %d failed: %v", n.ID, err)
 				return
 			}
+			method := routedExpectedShadowsocksMethod(leasedCtx, repo, current)
+			var changed bool
+			var credentialJSON string
+			if canonicalManagedProtocol(current.Protocol) == "shadowsocks" && isClassicManagedShadowsocksCipher(method) {
+				var clientMissing bool
+				cred, credentialJSON, changed, clientMissing, err = reconcileRoutedClassicCredential(
+					leasedCtx, rm, serverID, current.InboundTag, current.Protocol, method, sa.Email, cred,
+				)
+				if err != nil {
+					log.Printf("[ResumeUserRouted] reconcile classic Shadowsocks node %d failed: %v", n.ID, err)
+					return
+				}
+				_ = clientMissing
+			}
 			if err := addClientToInbound(leasedCtx, rm, serverID, current.InboundTag, cred); err != nil {
 				log.Printf("[ResumeUserRouted] addClient node %d failed (continue): %v", n.ID, err)
 				return
+			}
+			if canonicalManagedProtocol(current.Protocol) == "shadowsocks" && isClassicManagedShadowsocksCipher(method) && changed {
+				if _, err := repo.UpsertUserSubaccount(leasedCtx, storage.UserSubaccount{
+					ID: sa.ID, Username: sa.Username, RoutedNodeID: sa.RoutedNodeID,
+					Email: sa.Email, CredentialJSON: credentialJSON, IsActive: sa.IsActive,
+				}); err != nil {
+					log.Printf("[ResumeUserRouted] persist classic Shadowsocks credential node %d failed: %v", n.ID, err)
+					return
+				}
 			}
 			rule := map[string]interface{}{
 				"type":        "field",

@@ -381,6 +381,31 @@ func (r *TrafficRepository) CreateNode(ctx context.Context, node Node) (Node, er
 	return r.GetNode(ctx, id, node.Username)
 }
 
+// MarkNodeForwarded records trusted provenance assigned by the tunnel workflow.
+// Generic node create/update APIs intentionally do not persist caller-controlled
+// node types.
+func (r *TrafficRepository) MarkNodeForwarded(ctx context.Context, nodeID int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if nodeID <= 0 {
+		return errors.New("node id is required")
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE nodes SET node_type = 'forwarded', updated_at = CURRENT_TIMESTAMP WHERE id = ?`, nodeID)
+	if err != nil {
+		return fmt.Errorf("mark node forwarded: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark node forwarded rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNodeNotFound
+	}
+	r.invalidateTrafficBillingCache()
+	return nil
+}
+
 // 更新现有的代理节点。
 func (r *TrafficRepository) UpdateNode(ctx context.Context, node Node) (Node, error) {
 	if r == nil || r.db == nil {

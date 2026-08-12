@@ -146,12 +146,13 @@ func supplementAuthorizedObservedInbounds(
 // durable base listener definitions. The base definitions may contain their
 // creation-time owner credential; every subsequently provisioned credential
 // must have both a user_inbound_configs row and a currently effective access
-// source. Agent inventory and snapshots are observation only and are never
-// consulted here.
+// source. Agent inventory is observation only: it can prove a legacy classic
+// Shadowsocks credential's missing cipher, but can never create authorization.
 func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 	ctx context.Context,
 	serverID int64,
 	desired map[string]map[string]interface{},
+	observed map[string]map[string]interface{},
 ) error {
 	configs, err := h.repo.GetUserInboundConfigsByServer(ctx, serverID)
 	if err != nil {
@@ -181,6 +182,22 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 			nodeOwners[ref.InboundTag] = make(map[string]struct{})
 		}
 		nodeOwners[ref.InboundTag][node.Username] = struct{}{}
+	}
+	loadObserved := func() (map[string]map[string]interface{}, error) {
+		if observed != nil {
+			return observed, nil
+		}
+		inventory, inventoryErr := h.fetchAgentInboundInventory(ctx, serverID)
+		if inventoryErr != nil {
+			return nil, inventoryErr
+		}
+		observed = make(map[string]map[string]interface{}, len(inventory.Inbounds))
+		for _, inbound := range inventory.Inbounds {
+			if tag := strings.TrimSpace(wireGuardStringValue(inbound["tag"])); tag != "" {
+				observed[tag] = inbound
+			}
+		}
+		return observed, nil
 	}
 	now := time.Now().UTC()
 	for _, config := range configs {
@@ -257,10 +274,76 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 			hasAccess = hasManaged || hasPackage
 		}
 		if hasAccess {
+			if protocol == "shadowsocks" && isClassicManagedShadowsocksCipher(shadowsocksInboundMethod(settings)) {
+				_, hasStoredMethod := credential["method"]
+				if hasStoredMethod {
+					if _, methodErr := reconcileClassicShadowsocksCredentialMethod(credential, settings); methodErr != nil {
+						return fmt.Errorf("validate database classic Shadowsocks credential for %s/%s: %w", config.Username, config.InboundTag, methodErr)
+					}
+				} else {
+					liveInbounds, inventoryErr := loadObserved()
+					if inventoryErr != nil {
+						return fmt.Errorf("read live inbound credentials: %w", inventoryErr)
+					}
+					liveInbound := liveInbounds[strings.TrimSpace(config.InboundTag)]
+					liveSettings, _ := liveInbound["settings"].(map[string]interface{})
+					if liveSettings == nil {
+						return fmt.Errorf("validate database classic Shadowsocks credential for %s/%s: live inbound is unavailable", config.Username, config.InboundTag)
+					}
+					var methodErr error
+					_, methodErr = reconcileClassicShadowsocksCredentialMethod(credential, liveSettings)
+					if methodErr != nil {
+						return fmt.Errorf("validate database classic Shadowsocks credential for %s/%s: %w", config.Username, config.InboundTag, methodErr)
+					}
+					if methodErr = validateDatabaseClassicShadowsocksLiveClient(credential, liveSettings); methodErr != nil {
+						return fmt.Errorf("validate database classic Shadowsocks credential for %s/%s: %w", config.Username, config.InboundTag, methodErr)
+					}
+				}
+				storedMethod := strings.ToLower(strings.TrimSpace(wireGuardStringValue(credential["method"])))
+				if desiredMethod := shadowsocksInboundMethod(settings); storedMethod != desiredMethod {
+					return fmt.Errorf("validate database classic Shadowsocks credential for %s/%s: live method %q does not match desired method %q", config.Username, config.InboundTag, storedMethod, desiredMethod)
+				}
+				if !hasStoredMethod {
+					credentialJSON, marshalErr := json.Marshal(credential)
+					if marshalErr != nil {
+						return fmt.Errorf("encode database classic Shadowsocks credential for %s/%s: %w", config.Username, config.InboundTag, marshalErr)
+					}
+					if persistErr := h.repo.UpdateUserInboundCredentialJSONByID(ctx, config.ID, string(credentialJSON)); persistErr != nil {
+						return fmt.Errorf("persist database classic Shadowsocks credential for %s/%s: %w", config.Username, config.InboundTag, persistErr)
+					}
+				}
+			}
 			settings[listKey] = append(clients, credential)
 		}
 	}
 	return nil
+}
+
+func validateDatabaseClassicShadowsocksLiveClient(credential, liveSettings map[string]interface{}) error {
+	method := strings.ToLower(strings.TrimSpace(wireGuardStringValue(credential["method"])))
+	if !isClassicManagedShadowsocksCipher(method) {
+		return errors.New("credential has no valid classic Shadowsocks method")
+	}
+	password := strings.TrimSpace(wireGuardStringValue(credential["password"]))
+	email := strings.TrimSpace(wireGuardStringValue(credential["email"]))
+	if password == "" && email == "" {
+		return errors.New("credential has no verifiable client identity")
+	}
+	clients, _ := liveSettings["clients"].([]interface{})
+	for _, item := range clients {
+		client, _ := item.(map[string]interface{})
+		if client == nil || !strings.EqualFold(strings.TrimSpace(wireGuardStringValue(client["method"])), method) {
+			continue
+		}
+		if password != "" && strings.TrimSpace(wireGuardStringValue(client["password"])) != password {
+			continue
+		}
+		if email != "" && strings.TrimSpace(wireGuardStringValue(client["email"])) != email {
+			continue
+		}
+		return nil
+	}
+	return errors.New("credential has no matching live classic Shadowsocks client")
 }
 
 func sameInboundConfig(left, right map[string]interface{}) bool {
@@ -588,7 +671,7 @@ func (h *RemoteManageHandler) canonicalizeDatabaseInbounds(ctx context.Context, 
 		}
 		desired[row.InboundTag] = inbound
 	}
-	if err := h.rebuildDatabaseAuthorizedInboundClients(ctx, serverID, desired); err != nil {
+	if err := h.rebuildDatabaseAuthorizedInboundClients(ctx, serverID, desired, nil); err != nil {
 		return "", err
 	}
 	forwardInbounds, err := h.activeForwardInbounds(ctx, serverID)
@@ -775,7 +858,7 @@ func (h *RemoteManageHandler) reconcileDatabaseOwnedInboundsLeased(
 			return result, fmt.Errorf("database-authorized inbound %s has no complete desired definition", tag)
 		}
 	}
-	if err := h.rebuildDatabaseAuthorizedInboundClients(ctx, serverID, desired); err != nil {
+	if err := h.rebuildDatabaseAuthorizedInboundClients(ctx, serverID, desired, observed); err != nil {
 		return result, err
 	}
 	forwardInbounds, err := h.activeForwardInbounds(ctx, serverID)

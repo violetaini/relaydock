@@ -534,7 +534,7 @@ type Node struct {
 	InboundTag        string // 关联入站标签（用于将节点链接到入站）
 	InboundMutationID string // 创建该远端入站的 mutation_id；删除时作为所有权 fencing token
 	ChainProxyNodeID  *int64 // 链式代理目标节点 ID
-	NodeType          string // 'physical' (默认) 或 'routed' (路由出站虚拟节点)
+	NodeType          string // 'physical' (默认)、'routed' (路由出站) 或 'forwarded' (转发克隆)
 	ParentNodeID      *int64 // routed 节点指向其父物理节点
 	RoutedOutboundTag string // routed 节点专用:绑定的 outbound tag(空 = 非 routed 节点);常用查询展示
 	RoutedOwner       string // routed 节点专用:'shared'(默认,admin 创建,进入套餐池) | 'user'(用户私有路由出站)
@@ -1477,7 +1477,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_enabled ON nodes(enabled);
 
 	// 路由出站(routed node)字段:把一条 routing rule + 一个 outbound 当作虚拟节点
 	// 挂在物理父节点下,被套餐绑定后自动给用户开子账号并加入 rule.user 数组。
-	// node_type = 'physical' (默认) | 'routed'
+	// node_type = 'physical' (默认) | 'routed' | 'forwarded'
 	if err := r.ensureNodeColumn("node_type", "TEXT NOT NULL DEFAULT 'physical'"); err != nil {
 		return err
 	}

@@ -318,6 +318,110 @@ CREATE INDEX IF NOT EXISTS idx_tunnel_audit_entity ON tunnel_audit_events(entity
 	if _, err := r.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_forward_hops_resource_id ON user_forward_hops(resource_id) WHERE resource_id != ''`); err != nil {
 		return fmt.Errorf("migrate user_forward_hops.resource_id index: %w", err)
 	}
+	if err := r.migrateLegacyForwardedNodes(context.Background()); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateLegacyForwardedNodes classifies tunnel clones created before nodes
+// persisted their provenance in node_type. The active desired inbound is the
+// database's authoritative definition for the remote listener. The source
+// endpoint and cloned config fingerprint prove the node was derived from that
+// tunnel target, without relying on a mutable name, primary tag, or tag prefix.
+func (r *TrafficRepository) migrateLegacyForwardedNodes(ctx context.Context) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin legacy forwarded node migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	const legacyForwardedPredicate = `
+LOWER(COALESCE(NULLIF(TRIM(COALESCE(nodes.node_type, '')), ''), 'physical')) = 'physical'
+AND nodes.parent_node_id IS NULL
+AND LOWER(TRIM(COALESCE(nodes.protocol, ''))) NOT IN ('tunnel', 'dokodemo-door')
+AND TRIM(COALESCE(nodes.original_server, '')) != ''
+AND TRIM(COALESCE(nodes.inbound_tag, '')) != ''
+AND EXISTS (
+    SELECT 1
+    FROM remote_servers AS server
+    JOIN remote_inbound_desired AS desired ON desired.server_id = server.id
+    WHERE server.name = TRIM(nodes.original_server)
+      AND desired.inbound_tag = TRIM(nodes.inbound_tag)
+      AND desired.desired_state = 'active'
+      AND json_valid(desired.inbound_json) = 1
+      AND json_valid(nodes.clash_config) = 1
+      AND json_type(nodes.clash_config, '$.server') = 'text'
+      AND TRIM(json_extract(nodes.clash_config, '$.server')) != ''
+      AND TRIM(json_extract(nodes.clash_config, '$.server')) IN (
+          TRIM(COALESCE(server.domain, '')),
+          TRIM(COALESCE(server.pull_address, '')),
+          TRIM(COALESCE(server.ip_address, ''))
+      )
+      AND json_type(nodes.clash_config, '$.port') = 'integer'
+      AND json_type(desired.inbound_json, '$.port') = 'integer'
+      AND CAST(json_extract(desired.inbound_json, '$.port') AS INTEGER) BETWEEN 1 AND 65535
+      AND CAST(json_extract(nodes.clash_config, '$.port') AS INTEGER) =
+          CAST(json_extract(desired.inbound_json, '$.port') AS INTEGER)
+      AND (
+          SELECT COUNT(*)
+          FROM nodes AS same_inbound
+          WHERE same_inbound.original_server = nodes.original_server
+            AND same_inbound.inbound_tag = nodes.inbound_tag
+            AND LOWER(COALESCE(NULLIF(TRIM(COALESCE(same_inbound.node_type, '')), ''), 'physical')) = 'physical'
+            AND same_inbound.parent_node_id IS NULL
+            AND LOWER(TRIM(COALESCE(same_inbound.protocol, ''))) NOT IN ('tunnel', 'dokodemo-door')
+      ) = 1
+      AND LOWER(TRIM(COALESCE(CASE
+          WHEN json_valid(desired.inbound_json) = 1
+          THEN json_extract(desired.inbound_json, '$.protocol')
+      END, '')))
+          IN ('tunnel', 'dokodemo-door')
+      AND json_type(desired.inbound_json, '$.settings.address') = 'text'
+      AND TRIM(json_extract(desired.inbound_json, '$.settings.address')) != ''
+      AND json_type(desired.inbound_json, '$.settings.port') = 'integer'
+      AND CAST(json_extract(desired.inbound_json, '$.settings.port') AS INTEGER) BETWEEN 1 AND 65535
+      AND EXISTS (
+          SELECT 1
+          FROM nodes AS source
+          WHERE source.id != nodes.id
+            AND LOWER(TRIM(COALESCE(source.protocol, ''))) = LOWER(TRIM(COALESCE(nodes.protocol, '')))
+            AND json_valid(source.clash_config) = 1
+            AND json_type(source.clash_config, '$.server') = 'text'
+            AND TRIM(json_extract(source.clash_config, '$.server')) =
+                TRIM(json_extract(desired.inbound_json, '$.settings.address'))
+            AND json_type(source.clash_config, '$.port') = 'integer'
+            AND CAST(json_extract(source.clash_config, '$.port') AS INTEGER) =
+                CAST(json_extract(desired.inbound_json, '$.settings.port') AS INTEGER)
+            AND json_remove(source.clash_config, '$.name', '$.server', '$.port') =
+                json_remove(nodes.clash_config, '$.name', '$.server', '$.port')
+      )
+)`
+
+	// An offer created while the clone still looked physical must stop granting
+	// access in the same transaction that records the corrected provenance.
+	if _, err := tx.ExecContext(ctx, `UPDATE self_service_node_offers
+SET enabled = 0, updated_at = CURRENT_TIMESTAMP
+WHERE enabled = 1
+  AND node_id IN (SELECT nodes.id FROM nodes WHERE `+legacyForwardedPredicate+`)`); err != nil {
+		return fmt.Errorf("disable legacy forwarded node offers: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE nodes
+SET node_type = 'forwarded', updated_at = CURRENT_TIMESTAMP
+WHERE `+legacyForwardedPredicate)
+	if err != nil {
+		return fmt.Errorf("backfill legacy forwarded node provenance: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read legacy forwarded node migration count: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit legacy forwarded node migration: %w", err)
+	}
+	if changed > 0 {
+		r.invalidateTrafficBillingCache()
+	}
 	return nil
 }
 

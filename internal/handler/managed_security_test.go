@@ -287,6 +287,37 @@ func TestSubstituteNodesForUserDropsManagedNodeWithCorruptCredential(t *testing.
 	}
 }
 
+func TestSubstituteNodesForUserReplacesBothManagedConfigFields(t *testing.T) {
+	ctx := context.Background()
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "alice", storage.RoleUser)
+	server := &storage.RemoteServer{Name: "edge-1", Token: "token", IPAddress: "203.0.113.10", XrayMode: "embedded"}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+		Username: "alice", ServerID: server.ID, InboundTag: "vless-in", Protocol: "vless",
+		CredentialJSON: `{"id":"alice-uuid"}`,
+	}); err != nil {
+		t.Fatalf("save inbound credential: %v", err)
+	}
+	ownerConfig := `{"name":"managed","type":"vless","uuid":"owner-uuid"}`
+	nodes := []storage.Node{{
+		ID: 1, NodeName: "managed", Protocol: "vless", OriginalServer: "edge-1", InboundTag: "vless-in",
+		ClashConfig: ownerConfig, ParsedConfig: ownerConfig,
+	}}
+
+	got := substituteNodesForUser(ctx, repo, "alice", nodes)
+	if len(got) != 1 {
+		t.Fatalf("managed node was dropped: %#v", got)
+	}
+	for field, raw := range map[string]string{"clash_config": got[0].ClashConfig, "parsed_config": got[0].ParsedConfig} {
+		if strings.Contains(raw, "owner-uuid") || !strings.Contains(raw, "alice-uuid") {
+			t.Fatalf("%s retained the owner credential: %s", field, raw)
+		}
+	}
+}
+
 func TestSubscriptionCreatorIsolationFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	repo := newManagedSecurityTestRepo(t)
@@ -335,6 +366,78 @@ func TestBuildRoutedProxyForUserRejectsCorruptCredential(t *testing.T) {
 	routed.NodeType = "routed"
 	if proxy, ok := buildRoutedProxyForUser(ctx, repo, routed, "alice"); ok || proxy != nil {
 		t.Fatalf("corrupt routed credential was published: %#v", proxy)
+	}
+}
+
+func TestBuildRoutedClassicProxyRepairsOnlyMatchingLegacySnapshot(t *testing.T) {
+	ctx := context.Background()
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "owner", storage.RoleAdmin)
+	createManagedSecurityTestUser(t, repo, "alice", storage.RoleUser)
+	server := &storage.RemoteServer{
+		Name: "legacy-route-edge", Token: "token", Status: storage.RemoteServerStatusConnected,
+		IPAddress: "203.0.113.40", XrayMode: "embedded",
+	}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	parent, err := repo.CreateNode(ctx, storage.Node{
+		Username: "owner", NodeName: "classic-parent", Protocol: "shadowsocks", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "classic-in",
+		ClashConfig: `{"name":"classic-parent","type":"ss","server":"203.0.113.40","port":443,"cipher":"aes-128-gcm","password":"owner-password"}`,
+	})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+	parentID := parent.ID
+	routed, err := repo.CreateRoutedNode(ctx, storage.RoutedNodeDetail{
+		Node: storage.Node{
+			Username: "owner", NodeName: "classic-route", Protocol: "shadowsocks", Enabled: true,
+			OriginalServer: server.Name, InboundTag: "classic-in", ParentNodeID: &parentID,
+			ClashConfig: parent.ClashConfig, ParsedConfig: parent.ClashConfig,
+		},
+		RoutedOutboundTag: "classic-out", RoutedRuleMarktag: "classic-rule",
+	})
+	if err != nil {
+		t.Fatalf("create routed node: %v", err)
+	}
+	if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
+		Username: "alice", RoutedNodeID: routed.ID, Email: "alice__route",
+		CredentialJSON: `{"email":"alice__route","password":"legacy-password"}`, IsActive: true,
+	}); err != nil {
+		t.Fatalf("save legacy credential: %v", err)
+	}
+	snapshot := `{"inbounds":[{"tag":"classic-in","protocol":"shadowsocks","settings":{"clients":[{"email":"alice__route","password":"legacy-password","method":"aes-128-gcm"}]}}]}`
+	if _, err := repo.UpsertCurrentXraySnapshot(ctx, server.ID, snapshot, storage.XraySnapshotSourceMasterWrite); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+
+	proxy, ok := buildRoutedProxyForUser(ctx, repo, routed.Node, "alice")
+	if !ok || proxy["password"] != "legacy-password" {
+		t.Fatalf("repaired proxy = %#v, ok=%v", proxy, ok)
+	}
+	stored, err := repo.GetUserSubaccount(ctx, routed.ID, "alice")
+	if err != nil || stored == nil || !strings.Contains(stored.CredentialJSON, `"method":"aes-128-gcm"`) {
+		t.Fatalf("stored repaired credential = %#v, err=%v", stored, err)
+	}
+
+	if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
+		Username: "alice", RoutedNodeID: routed.ID, Email: "alice__route",
+		CredentialJSON: `{"email":"alice__route","password":"different-password"}`, IsActive: true,
+	}); err != nil {
+		t.Fatalf("save mismatched legacy credential: %v", err)
+	}
+	if proxy, ok := buildRoutedProxyForUser(ctx, repo, routed.Node, "alice"); ok || proxy != nil {
+		t.Fatalf("mismatched legacy credential was published: %#v", proxy)
+	}
+	if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
+		Username: "alice", RoutedNodeID: routed.ID, Email: "alice__route",
+		CredentialJSON: `{"email":"alice__route","password":"different-password","method":"aes-128-gcm"}`, IsActive: true,
+	}); err != nil {
+		t.Fatalf("save mismatched method-bearing credential: %v", err)
+	}
+	if proxy, ok := buildRoutedProxyForUser(ctx, repo, routed.Node, "alice"); ok || proxy != nil {
+		t.Fatalf("method-bearing mismatched credential was published: %#v", proxy)
 	}
 }
 

@@ -450,7 +450,7 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 		n := &existingNodes[i]
 		takenNames[n.NodeName] = true
 		if existingClone == nil && n.OriginalServer == server.Name && n.InboundTag == event.Tag &&
-			(n.NodeType == "" || n.NodeType == "physical") {
+			(n.NodeType == "" || n.NodeType == "physical" || n.NodeType == "forwarded") {
 			existingClone = n
 		}
 	}
@@ -472,6 +472,10 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 		log.Printf("[NodeSync] forward-tunnel: 解析源节点 clash 配置失败: %v", err)
 		return fmt.Errorf("解析转发源节点配置失败: %w", err)
 	}
+	// A forwarding clone represents the tunnel listener, not the source
+	// Shadowsocks inbound. It must never inherit the source's private proof that
+	// per-user credentials can be provisioned on that inbound.
+	delete(clashMap, storage.ManagedShadowsocksMultiUserMarker)
 	clashMap["name"] = nodeName
 	clashMap["server"] = serverHost
 	clashMap["port"] = event.Port
@@ -493,12 +497,17 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 		node.OriginalServer = server.Name
 		node.InboundTag = event.Tag
 		node.InboundMutationID = event.MutationID
+		node.NodeType = "forwarded"
+		// Mark provenance before updating the mutable config. If the latter fails,
+		// the stale clone remains ineligible for self-service publication.
+		if err := l.repo.MarkNodeForwarded(ctx, node.ID); err != nil {
+			return fmt.Errorf("记录转发配套节点来源失败: %w", err)
+		}
 		if _, err := l.repo.UpdateNode(ctx, node); err != nil {
 			log.Printf("[NodeSync] forward-tunnel: 更新配套节点失败: %v", err)
 			return fmt.Errorf("更新转发配套节点失败: %w", err)
-		} else {
-			log.Printf("[NodeSync] forward-tunnel: 已更新配套节点: %s (-> %s:%d)", nodeName, serverHost, event.Port)
 		}
+		log.Printf("[NodeSync] forward-tunnel: 已更新配套节点: %s (-> %s:%d)", nodeName, serverHost, event.Port)
 		return nil
 	}
 	node := storage.Node{
@@ -512,13 +521,20 @@ func (l *NodeSyncListener) createForwardTunnelNode(ctx context.Context, event In
 		OriginalServer:    server.Name,
 		InboundTag:        event.Tag,
 		InboundMutationID: event.MutationID,
+		NodeType:          "forwarded",
 	}
-	if _, err := l.repo.CreateNode(ctx, node); err != nil {
+	created, err := l.repo.CreateNode(ctx, node)
+	if err != nil {
 		log.Printf("[NodeSync] forward-tunnel: 创建配套节点失败: %v", err)
 		return fmt.Errorf("创建转发配套节点失败: %w", err)
-	} else {
-		log.Printf("[NodeSync] forward-tunnel: 已创建配套节点: %s (-> %s:%d)", nodeName, serverHost, event.Port)
 	}
+	if err := l.repo.MarkNodeForwarded(ctx, created.ID); err != nil {
+		if deleteErr := l.repo.DeleteNode(ctx, created.ID, created.Username); deleteErr != nil {
+			log.Printf("[NodeSync] forward-tunnel: 记录来源失败且回滚节点 %d 失败: %v", created.ID, deleteErr)
+		}
+		return fmt.Errorf("记录转发配套节点来源失败: %w", err)
+	}
+	log.Printf("[NodeSync] forward-tunnel: 已创建配套节点: %s (-> %s:%d)", nodeName, serverHost, event.Port)
 	return nil
 }
 

@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/violetaini/relaydock/internal/storage"
@@ -40,6 +43,88 @@ func TestRoutedShadowsocksCredentialUsesNodeCipher(t *testing.T) {
 				t.Fatalf("credential method = %#v, want %q", credential["method"], tt.cipher)
 			}
 		})
+	}
+}
+
+func TestReconcileRoutedShadowsocksLiveMethod(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		protocol       string
+		expectedMethod string
+		liveMethod     string
+		wantError      bool
+	}{
+		{name: "matching classic", protocol: "shadowsocks", expectedMethod: "aes-128-gcm", liveMethod: "AES-128-GCM"},
+		{name: "mismatched classic", protocol: "ss", expectedMethod: "aes-128-gcm", liveMethod: "aes-256-gcm", wantError: true},
+		{name: "missing classic method", protocol: "shadowsocks", expectedMethod: "aes-256-gcm", wantError: true},
+		{name: "2022 uses top-level method", protocol: "shadowsocks", expectedMethod: "2022-blake3-aes-256-gcm"},
+		{name: "unrelated protocol", protocol: "vless", expectedMethod: "aes-128-gcm"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			credential := map[string]interface{}{"password": "existing-password"}
+			err := reconcileRoutedShadowsocksLiveMethod(tt.protocol, tt.expectedMethod, tt.liveMethod, credential)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("error = %v, wantError=%v", err, tt.wantError)
+			}
+			if !tt.wantError && isClassicManagedShadowsocksCipher(tt.expectedMethod) && canonicalManagedProtocol(tt.protocol) == "shadowsocks" {
+				if credential["method"] != strings.ToLower(tt.expectedMethod) {
+					t.Fatalf("credential method = %#v, want %q", credential["method"], strings.ToLower(tt.expectedMethod))
+				}
+			}
+		})
+	}
+}
+
+func TestReconcileRoutedClassicCredentialUsesMatchingLiveClient(t *testing.T) {
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/child/inbounds" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"inbounds": []any{map[string]any{
+				"tag": "classic-in",
+				"settings": map[string]any{"clients": []any{map[string]any{
+					"email": "alice__route", "password": "live-password", "method": "aes-128-gcm",
+				}}},
+			}},
+		})
+	}))
+	t.Cleanup(agent.Close)
+
+	repo := newRemoteHandlerTestRepo(t)
+	server := createRemoteHandlerTestServer(t, repo, "classic-route-edge", agent.URL)
+	rm := NewRemoteManageHandler(repo, nil)
+
+	credential, credentialJSON, changed, missing, err := reconcileRoutedClassicCredential(
+		context.Background(), rm, server.ID, "classic-in", "shadowsocks", "aes-128-gcm", "alice__route",
+		map[string]interface{}{"password": "live-password", "email": "alice__route"},
+	)
+	if err != nil {
+		t.Fatalf("reconcile matching client: %v", err)
+	}
+	if !changed || missing || credential["method"] != "aes-128-gcm" || credential["password"] != "live-password" {
+		t.Fatalf("reconciled credential = %#v, changed=%v, missing=%v", credential, changed, missing)
+	}
+	if !strings.Contains(credentialJSON, `"method":"aes-128-gcm"`) {
+		t.Fatalf("credential JSON = %s", credentialJSON)
+	}
+
+	_, _, _, _, err = reconcileRoutedClassicCredential(
+		context.Background(), rm, server.ID, "classic-in", "shadowsocks", "aes-128-gcm", "alice__route",
+		map[string]interface{}{"password": "different-password", "email": "alice__route"},
+	)
+	if err == nil {
+		t.Fatal("mismatched stored password was relabeled from the live client")
+	}
+
+	_, _, _, _, err = reconcileRoutedClassicCredential(
+		context.Background(), rm, server.ID, "classic-in", "shadowsocks", "aes-256-gcm", "alice__route",
+		map[string]interface{}{"password": "live-password", "email": "alice__route"},
+	)
+	if err == nil {
+		t.Fatal("mismatched live cipher was accepted")
 	}
 }
 

@@ -3430,7 +3430,7 @@ func (h *RemoteManageHandler) HandleCreateManagedNode(w http.ResponseWriter, r *
 		"success": true,
 		"message": "受管节点已创建",
 		"node_id": node.ID,
-		"node":    node,
+		"node":    convertNode(node),
 	})
 }
 

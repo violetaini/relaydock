@@ -69,7 +69,7 @@ func TestForwardNodeTunnelAliasesCloneSourceWithResolvedServerHost(t *testing.T)
 				t.Fatalf("create owner: %v", err)
 			}
 			server := createTunnelListenerServer(t, repo)
-			sourceConfig := `{"name":"source","type":"vless","server":"origin.example.test","port":443,"uuid":"source-uuid"}`
+			sourceConfig := `{"name":"source","type":"vless","server":"origin.example.test","port":443,"uuid":"source-uuid","x-arcway-managed-users":true}`
 			source, err := repo.CreateNode(ctx, storage.Node{
 				Username: "owner", NodeName: "source", Protocol: "vless",
 				ClashConfig: sourceConfig, ParsedConfig: sourceConfig, Enabled: true,
@@ -105,6 +105,9 @@ func TestForwardNodeTunnelAliasesCloneSourceWithResolvedServerHost(t *testing.T)
 			if clone.OriginalServer != server.Name || clone.InboundTag != "forward-source" || clone.Protocol != source.Protocol {
 				t.Fatalf("unexpected clone metadata: %#v", clone)
 			}
+			if clone.NodeType != "forwarded" {
+				t.Fatalf("forwarding clone node type = %q, want forwarded", clone.NodeType)
+			}
 			if clone.NodeName != "custom tunnel" {
 				t.Fatalf("clone name = %q, want trimmed event name", clone.NodeName)
 			}
@@ -115,6 +118,9 @@ func TestForwardNodeTunnelAliasesCloneSourceWithResolvedServerHost(t *testing.T)
 			if config["name"] != "custom tunnel" || config["server"] != server.Domain ||
 				int(config["port"].(float64)) != 2033 || config["uuid"] != "source-uuid" {
 				t.Fatalf("unexpected cloned config: %#v", config)
+			}
+			if _, exists := config[storage.ManagedShadowsocksMultiUserMarker]; exists {
+				t.Fatalf("forwarding clone inherited managed Shadowsocks capability: %#v", config)
 			}
 			chainTargetID := source.ID
 			clone.NodeName = "administrator-renamed-tunnel"
@@ -148,6 +154,7 @@ func TestForwardNodeTunnelAliasesCloneSourceWithResolvedServerHost(t *testing.T)
 			}
 			if updated.Enabled || updated.Tag != "custom-primary" || len(updated.Tags) != 2 ||
 				updated.NodeName != "administrator-renamed-tunnel" ||
+				updated.NodeType != "forwarded" ||
 				updated.RawURL != clone.RawURL || updated.OriginalDomain != clone.OriginalDomain ||
 				updated.ChainProxyNodeID == nil || *updated.ChainProxyNodeID != chainTargetID ||
 				updated.RelayOrigServer != clone.RelayOrigServer || updated.RelayOrigPort != clone.RelayOrigPort {

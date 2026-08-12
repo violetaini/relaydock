@@ -581,27 +581,38 @@ func backfilledCredentialMatchesNode(protocol string, settings map[string]interf
 				return true
 			}
 		case "shadowsocks":
-			method := strings.ToLower(strings.TrimSpace(backfillCredentialString(settings, "method")))
-			if !strings.HasPrefix(method, "2022-") {
-				continue
-			}
 			nodeMethod := strings.ToLower(strings.TrimSpace(backfillCredentialString(node.clash, "cipher")))
 			if nodeMethod == "" {
 				nodeMethod = strings.ToLower(strings.TrimSpace(backfillCredentialString(node.clash, "method")))
-			}
-			if nodeMethod != method || !strings.HasPrefix(nodeMethod, "2022-") {
-				continue
 			}
 			password := backfillCredentialString(item, "password")
 			nodePassword := backfillCredentialString(node.clash, "password")
 			if password == "" || nodePassword == "" {
 				continue
 			}
-			if password == nodePassword {
-				return true
+
+			method := strings.ToLower(strings.TrimSpace(backfillCredentialString(settings, "method")))
+			if strings.HasPrefix(method, "2022-") {
+				if nodeMethod != method || !strings.HasPrefix(nodeMethod, "2022-") {
+					continue
+				}
+				if password == nodePassword {
+					return true
+				}
+				separator := strings.LastIndex(nodePassword, ":")
+				if separator > 0 && separator < len(nodePassword)-1 && nodePassword[separator+1:] == password {
+					return true
+				}
+				continue
 			}
-			separator := strings.LastIndex(nodePassword, ":")
-			if separator > 0 && separator < len(nodePassword)-1 && nodePassword[separator+1:] == password {
+
+			// Xray classic multi-user Shadowsocks stores the cipher on each
+			// client rather than settings.method. The node's database binding is
+			// already the authority here; require its exact cipher and per-client
+			// password so pre-marker managed nodes remain upgrade-compatible.
+			clientMethod := strings.ToLower(strings.TrimSpace(backfillCredentialString(item, "method")))
+			if (clientMethod == "aes-128-gcm" || clientMethod == "aes-256-gcm") &&
+				nodeMethod == clientMethod && nodePassword == password {
 				return true
 			}
 		}

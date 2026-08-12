@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -181,5 +182,106 @@ func TestDatabaseInboundReconcileRestoresEffectiveDatabaseCredential(t *testing.
 	credential, _ := clients[0].(map[string]interface{})
 	if wireGuardStringValue(credential["id"]) != "alice-id" || wireGuardStringValue(credential["email"]) != "alice__database-owned" {
 		t.Fatalf("restored credential = %#v", credential)
+	}
+}
+
+func classicDatabaseAuthorityFixture(t *testing.T, liveClient map[string]interface{}) (*storage.TrafficRepository, *storage.RemoteServer, map[string]map[string]interface{}, map[string]map[string]interface{}) {
+	t.Helper()
+	ctx := context.Background()
+	repo, server := newDatabaseAuthorityHandlerRepo(t, "http://127.0.0.1:1")
+	if err := repo.CreateUser(ctx, "owner", "owner@example.test", "Owner", "hash", storage.RoleAdmin, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateUser(ctx, "alice", "alice@example.test", "Alice", "hash", storage.RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	marker := storage.ManagedShadowsocksMultiUserMarker
+	clashJSON, err := json.Marshal(map[string]interface{}{
+		"type": "ss", "cipher": "aes-128-gcm", "password": "owner-password", marker: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "owner", RawURL: "ss://owner@example.test:8388", NodeName: "Classic database authority node",
+		Protocol: "shadowsocks", ClashConfig: string(clashJSON), ParsedConfig: string(clashJSON), Enabled: true,
+		OriginalServer: server.Name, InboundTag: "database-owned", InboundMutationID: "database-generation",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{Name: "Classic database authority package", CycleDays: 30, Nodes: []int64{node.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, now.Add(-time.Hour), now.Add(time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+		Username: "alice", ServerID: server.ID, InboundTag: "database-owned", Protocol: "shadowsocks",
+		CredentialJSON: `{"password":"alice-password","email":"alice__database-owned","level":0}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	owner := map[string]interface{}{"method": "aes-128-gcm", "password": "owner-password", "email": "owner__database-owned"}
+	desiredInbound := map[string]interface{}{
+		"tag": "database-owned", "listen": "0.0.0.0", "port": float64(8388), "protocol": "shadowsocks",
+		"settings": map[string]interface{}{"clients": []interface{}{owner}},
+	}
+	liveInbound := cloneInboundMap(desiredInbound)
+	liveSettings := liveInbound["settings"].(map[string]interface{})
+	liveSettings["clients"] = append(liveSettings["clients"].([]interface{}), liveClient)
+	return repo, server,
+		map[string]map[string]interface{}{"database-owned": desiredInbound},
+		map[string]map[string]interface{}{"database-owned": liveInbound}
+}
+
+func TestDatabaseInboundRebuildBackfillsClassicMethodFromMatchingLiveClient(t *testing.T) {
+	liveClient := map[string]interface{}{
+		"method": "aes-128-gcm", "password": "alice-password", "email": "alice__database-owned", "level": float64(0),
+	}
+	repo, server, desired, observed := classicDatabaseAuthorityFixture(t, liveClient)
+	if err := NewRemoteManageHandler(repo, nil).rebuildDatabaseAuthorizedInboundClients(context.Background(), server.ID, desired, observed); err != nil {
+		t.Fatalf("rebuild database clients: %v", err)
+	}
+	settings := desired["database-owned"]["settings"].(map[string]interface{})
+	clients := settings["clients"].([]interface{})
+	if len(clients) != 2 || wireGuardStringValue(clients[1].(map[string]interface{})["method"]) != "aes-128-gcm" {
+		t.Fatalf("rebuilt classic clients = %#v", clients)
+	}
+	stored, err := repo.GetUserInboundConfig(context.Background(), "alice", server.ID, "database-owned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]interface{}
+	if err := json.Unmarshal([]byte(stored.CredentialJSON), &persisted); err != nil || persisted["method"] != "aes-128-gcm" {
+		t.Fatalf("persisted credential = %#v, err=%v", persisted, err)
+	}
+}
+
+func TestDatabaseInboundRebuildRejectsUnverifiedClassicMethodBackfill(t *testing.T) {
+	liveClient := map[string]interface{}{
+		"method": "aes-256-gcm", "password": "alice-password", "email": "alice__database-owned", "level": float64(0),
+	}
+	repo, server, desired, observed := classicDatabaseAuthorityFixture(t, liveClient)
+	err := NewRemoteManageHandler(repo, nil).rebuildDatabaseAuthorizedInboundClients(context.Background(), server.ID, desired, observed)
+	if err == nil {
+		t.Fatal("mismatched live classic cipher was accepted")
+	}
+	settings := desired["database-owned"]["settings"].(map[string]interface{})
+	if clients := settings["clients"].([]interface{}); len(clients) != 1 {
+		t.Fatalf("unverified classic credential was appended: %#v", clients)
+	}
+	stored, getErr := repo.GetUserInboundConfig(context.Background(), "alice", server.ID, "database-owned")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	var persisted map[string]interface{}
+	if decodeErr := json.Unmarshal([]byte(stored.CredentialJSON), &persisted); decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if _, exists := persisted["method"]; exists {
+		t.Fatalf("unverified method was persisted: %#v", persisted)
 	}
 }

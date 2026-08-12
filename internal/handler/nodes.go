@@ -586,9 +586,12 @@ func substituteNodesForUser(ctx context.Context, repo *storage.TrafficRepository
 			if !ok {
 				continue
 			}
-			if raw, err := json.Marshal(proxy); err == nil {
-				n.ClashConfig = string(raw)
+			raw, err := json.Marshal(proxy)
+			if err != nil {
+				continue
 			}
+			n.ClashConfig = string(raw)
+			n.ParsedConfig = string(raw)
 			out = append(out, n)
 			continue
 		}
@@ -616,6 +619,12 @@ func substituteNodesForUser(ctx context.Context, repo *storage.TrafficRepository
 			continue
 		}
 		n.ClashConfig = string(raw)
+		// Managed nodes persist the owner proxy in both fields. Keep the user
+		// response internally consistent so parsed_config cannot expose the owner
+		// credential after clash_config has been replaced.
+		if strings.TrimSpace(n.OriginalServer) != "" || strings.TrimSpace(n.InboundTag) != "" {
+			n.ParsedConfig = string(raw)
+		}
 		out = append(out, n)
 	}
 	return out
@@ -2233,7 +2242,7 @@ type nodeDTO struct {
 	OriginalDomain    string   `json:"original_domain"`
 	InboundTag        string   `json:"inbound_tag"`
 	ChainProxyNodeID  *int64   `json:"chain_proxy_node_id"`
-	NodeType          string   `json:"node_type"`              // 'physical' | 'routed'
+	NodeType          string   `json:"node_type"`              // 'physical' | 'routed' | 'forwarded'
 	ParentNodeID      *int64   `json:"parent_node_id"`         // routed 节点指向其父物理节点
 	RoutedOutboundTag string   `json:"routed_outbound_tag"`    // routed 节点专用:绑定的出站 tag(便于 UI 直接展示)
 	RoutedOwner       string   `json:"routed_owner,omitempty"` // routed 节点专用:'shared'(admin 套餐分配) | 'user'(用户私有)

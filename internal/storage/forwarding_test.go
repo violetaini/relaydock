@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -10,6 +11,141 @@ import (
 
 	"github.com/violetaini/relaydock/internal/tunnelidentity"
 )
+
+func TestLegacyForwardedNodeMigrationUsesDesiredTunnelProvenance(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy-forwarded.db")
+	repo, err := NewTrafficRepository(path)
+	if err != nil {
+		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	if err := repo.CreateUser(ctx, "admin", "admin@example.test", "Admin", "hash", RoleAdmin, ""); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	server := RemoteServer{
+		Name: "legacy-forward-edge", Token: "legacy-forward-token", Status: RemoteServerStatusConnected,
+		IPAddress: "203.0.113.80", XrayMode: "embedded",
+	}
+	if err := repo.CreateRemoteServer(ctx, &server); err != nil {
+		t.Fatalf("CreateRemoteServer: %v", err)
+	}
+	originServer := RemoteServer{
+		Name: "legacy-forward-origin", Token: "legacy-origin-token", Status: RemoteServerStatusConnected,
+		IPAddress: "198.51.100.80", XrayMode: "embedded",
+	}
+	if err := repo.CreateRemoteServer(ctx, &originServer); err != nil {
+		t.Fatalf("CreateRemoteServer(origin): %v", err)
+	}
+	originConfig := `{"name":"origin-source","port":443,"server":"origin.example.test","type":"vless","uuid":"shared-source-uuid"}`
+	if _, err := repo.CreateNode(ctx, Node{
+		Username: "admin", NodeName: "origin-source", Protocol: "vless", ClashConfig: originConfig,
+		ParsedConfig: originConfig, Enabled: true, Tag: "origin", OriginalServer: originServer.Name,
+		InboundTag: "origin-vless",
+	}); err != nil {
+		t.Fatalf("CreateNode(origin source): %v", err)
+	}
+
+	createBoundNode := func(name, inboundTag string, port int, host, uuid string) Node {
+		t.Helper()
+		config, marshalErr := json.Marshal(map[string]any{
+			"name": name, "type": "vless", "server": host,
+			"port": port, "uuid": uuid,
+		})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		node, createErr := repo.CreateNode(ctx, Node{
+			Username: "admin", NodeName: name, Protocol: "vless", ClashConfig: string(config),
+			ParsedConfig: string(config), Enabled: true, Tag: "administrator-custom-label",
+			OriginalServer: server.Name, InboundTag: inboundTag,
+		})
+		if createErr != nil {
+			t.Fatalf("CreateNode(%s): %v", name, createErr)
+		}
+		return node
+	}
+	legacyClone := createBoundNode("legacy-clone", "customer-chosen-entry", 2443, server.IPAddress, "shared-source-uuid")
+	ordinaryNode := createBoundNode("ordinary-node", "ordinary-vless", 2443, server.IPAddress, "ordinary-uuid")
+	deletedTunnelNode := createBoundNode("deleted-tunnel-node", "removed-custom-entry", 2444, server.IPAddress, "shared-source-uuid")
+	coincidentNode := createBoundNode("coincident-node", "coincident-custom-entry", 2555, server.IPAddress, "unrelated-import-uuid")
+	wrongListenerNode := createBoundNode("wrong-listener-node", "wrong-listener-entry", 2666, "unrelated.example.test", "shared-source-uuid")
+
+	tunnelJSON := json.RawMessage(`{"tag":"customer-chosen-entry","listen":"0.0.0.0","port":2443,"protocol":"tunnel","settings":{"address":"origin.example.test","port":443,"network":"tcp,udp"}}`)
+	ordinaryJSON := json.RawMessage(`{"tag":"ordinary-vless","listen":"0.0.0.0","port":2443,"protocol":"vless","settings":{"clients":[]}}`)
+	deletedTunnelJSON := json.RawMessage(`{"tag":"removed-custom-entry","listen":"0.0.0.0","port":2444,"protocol":"dokodemo-door","settings":{"address":"origin.example.test","port":443,"network":"tcp,udp"}}`)
+	coincidentJSON := json.RawMessage(`{"tag":"coincident-custom-entry","listen":"0.0.0.0","port":2555,"protocol":"tunnel","settings":{"address":"origin.example.test","port":443,"network":"tcp,udp"}}`)
+	wrongListenerJSON := json.RawMessage(`{"tag":"wrong-listener-entry","listen":"0.0.0.0","port":2666,"protocol":"tunnel","settings":{"address":"origin.example.test","port":443,"network":"tcp,udp"}}`)
+	if _, err := repo.UpsertActiveDesiredInbound(ctx, server.ID, deletedTunnelNode.InboundTag, "deleted-generation",
+		deletedTunnelJSON); err != nil {
+		t.Fatalf("UpsertActiveDesiredInbound(deleted tunnel): %v", err)
+	}
+	if _, err := repo.MarkDesiredInboundDeleted(ctx, server.ID, deletedTunnelNode.InboundTag, "deleted-generation"); err != nil {
+		t.Fatalf("MarkDesiredInboundDeleted: %v", err)
+	}
+	snapshot, err := json.Marshal(map[string]any{
+		"inbounds":  []any{tunnelJSON, ordinaryJSON, deletedTunnelJSON, coincidentJSON, wrongListenerJSON},
+		"outbounds": []any{},
+	})
+	if err != nil {
+		t.Fatalf("marshal legacy Xray snapshot: %v", err)
+	}
+	if _, err := repo.UpsertCurrentXraySnapshot(ctx, server.ID, string(snapshot), XraySnapshotSourceMasterWrite); err != nil {
+		t.Fatalf("UpsertCurrentXraySnapshot: %v", err)
+	}
+	offer, err := repo.CreateSelfServiceNodeOffer(ctx, legacyClone.ID, server.ID, "admin")
+	if err != nil {
+		t.Fatalf("CreateSelfServiceNodeOffer: %v", err)
+	}
+	ordinaryOffer, err := repo.CreateSelfServiceNodeOffer(ctx, ordinaryNode.ID, server.ID, "admin")
+	if err != nil {
+		t.Fatalf("CreateSelfServiceNodeOffer(ordinary): %v", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close seed repository: %v", err)
+	}
+
+	repo, err = NewTrafficRepository(path)
+	if err != nil {
+		t.Fatalf("reopen repository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	assertNodeType := func(nodeID int64, want string) {
+		t.Helper()
+		node, getErr := repo.GetNodeByID(ctx, nodeID)
+		if getErr != nil {
+			t.Fatalf("GetNodeByID(%d): %v", nodeID, getErr)
+		}
+		if node.NodeType != want {
+			t.Fatalf("node %d type = %q, want %q", nodeID, node.NodeType, want)
+		}
+		if node.Tag != "administrator-custom-label" {
+			t.Fatalf("node %d tag = %q, migration changed mutable metadata", nodeID, node.Tag)
+		}
+	}
+	assertNodeType(legacyClone.ID, "forwarded")
+	assertNodeType(ordinaryNode.ID, "physical")
+	assertNodeType(deletedTunnelNode.ID, "physical")
+	assertNodeType(coincidentNode.ID, "physical")
+	assertNodeType(wrongListenerNode.ID, "physical")
+	storedOffer, err := repo.GetSelfServiceNodeOffer(ctx, offer.ID)
+	if err != nil {
+		t.Fatalf("GetSelfServiceNodeOffer: %v", err)
+	}
+	if storedOffer.Enabled {
+		t.Fatal("legacy forwarded node offer remained enabled")
+	}
+	storedOrdinaryOffer, err := repo.GetSelfServiceNodeOffer(ctx, ordinaryOffer.ID)
+	if err != nil {
+		t.Fatalf("GetSelfServiceNodeOffer(ordinary): %v", err)
+	}
+	if !storedOrdinaryOffer.Enabled {
+		t.Fatal("ordinary physical node offer was disabled")
+	}
+	if err := repo.migrateLegacyForwardedNodes(ctx); err != nil {
+		t.Fatalf("idempotent migrateLegacyForwardedNodes: %v", err)
+	}
+	assertNodeType(legacyClone.ID, "forwarded")
+}
 
 type forwardingStorageFixture struct {
 	repo    *TrafficRepository

@@ -65,6 +65,44 @@ func createManagedGrantForTest(t *testing.T, repo *TrafficRepository, ctx contex
 	return grant
 }
 
+func TestForwardedNodeCannotBecomeSelfServiceOffer(t *testing.T) {
+	repo, _ := newManagedNodesTestRepository(t)
+	ctx := context.Background()
+	server := RemoteServer{
+		Name: "forwarded-edge", Token: "forwarded-token", Status: RemoteServerStatusConnected,
+		XrayMode: "embedded", ConnectionMode: ConnectionModePush,
+	}
+	if err := repo.CreateRemoteServer(ctx, &server); err != nil {
+		t.Fatalf("CreateRemoteServer: %v", err)
+	}
+	node, err := repo.CreateNode(ctx, Node{
+		Username: "admin", RawURL: "vless://forwarded", NodeName: "Forwarded VLESS",
+		Protocol: "vless", ParsedConfig: `{}`, ClashConfig: `{}`, Enabled: true,
+		OriginalServer: server.Name, InboundTag: "forwarded-in",
+	})
+	if err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+	if err := repo.MarkNodeForwarded(ctx, node.ID); err != nil {
+		t.Fatalf("MarkNodeForwarded: %v", err)
+	}
+	forwarded, err := repo.GetNodeByID(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("GetNodeByID: %v", err)
+	}
+	if forwarded.NodeType != "forwarded" {
+		t.Fatalf("node type = %q, want forwarded", forwarded.NodeType)
+	}
+	if SelfServiceNodeOfferStructureValid(SelfServiceNodeOffer{
+		NodeID: node.ID, ServerID: server.ID, InboundTag: node.InboundTag,
+	}, forwarded, server) {
+		t.Fatal("forwarded node passed self-service structure validation")
+	}
+	if _, err := repo.CreateSelfServiceNodeOffer(ctx, node.ID, server.ID, "admin"); !errors.Is(err, ErrManagedServerMismatch) {
+		t.Fatalf("CreateSelfServiceNodeOffer error = %v, want %v", err, ErrManagedServerMismatch)
+	}
+}
+
 func TestManagedNodeLifecycleAndGenerationCAS(t *testing.T) {
 	repo, _ := newManagedNodesTestRepository(t)
 	ctx, server, _, offer := seedManagedNodesTest(t, repo)

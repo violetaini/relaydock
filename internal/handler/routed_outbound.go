@@ -181,7 +181,8 @@ func (h *RoutedOutboundHandler) create(w http.ResponseWriter, r *http.Request) {
 	// / hy=auth / ss=password+method 长度),然后把 email 覆盖成 _admin__ 占位。
 	// 之前这里直接硬编码 {id: uuid},导致 trojan/ss/hy routed 节点的 admin 占位 client 字段名错位,
 	// xray reload 失败 + 客户端连不上。
-	adminCred, _, err := generateRoutedClientCred(parent.Protocol, routedShadowsocksMethod(parent), adminEmail)
+	shadowsocksMethod := routedShadowsocksMethod(parent)
+	adminCred, _, err := generateRoutedClientCred(parent.Protocol, shadowsocksMethod, adminEmail)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("生成 admin client 凭据失败: %v", err))
 		return
@@ -199,7 +200,11 @@ func (h *RoutedOutboundHandler) create(w http.ResponseWriter, r *http.Request) {
 	// 先 peek 看 agent 端是否已有同 email 的 client(历史残留 / 同 label 重试 / 主控 DB 被清但 agent 没清),
 	// 命中 → 复用其 primary key + flow,避免 xray "User already exists" 启动失败。
 	pkField := primaryKeyFieldForProtocol(parent.Protocol)
-	if existingUUID, existingFlow, perr := peekInboundClientByEmail(ctx, h.remoteManage, serverID, parent.InboundTag, adminEmail); perr == nil && existingUUID != "" {
+	if existingUUID, existingFlow, existingMethod, perr := peekInboundClientByEmail(ctx, h.remoteManage, serverID, parent.InboundTag, adminEmail); perr == nil && existingUUID != "" {
+		if err := reconcileRoutedShadowsocksLiveMethod(parent.Protocol, shadowsocksMethod, existingMethod, adminCred); err != nil {
+			writeJSONError(w, http.StatusConflict, fmt.Sprintf("复用 admin client 失败: %v", err))
+			return
+		}
 		log.Printf("[RoutedCreate] inbound %s already has admin client email=%s pk=%s — reusing", parent.InboundTag, adminEmail, existingUUID)
 		adminCred[pkField] = existingUUID
 		if existingFlow != "" {
@@ -271,8 +276,7 @@ func (h *RoutedOutboundHandler) create(w http.ResponseWriter, r *http.Request) {
 		nodeName = fmt.Sprintf("%s-%s", parent.NodeName, req.Label)
 	}
 	clashWithAdmin := cloneClashWithCredential(parent.ClashConfig, parent.Protocol, adminCred, nodeName)
-	parsedWithAdmin := parent.ParsedConfig // parsed_config 是 xray inbound 结构,与凭据无关,直接继承
-	parsedWithAdmin, _, _, _ = sanitizeManagedShadowsocksConfig(parsedWithAdmin)
+	parsedWithAdmin := clashWithAdmin
 	outboundJSONBytes, _ := json.Marshal(outboundCopy)
 	credBytes, _ := json.Marshal(adminCred)
 	detail := storage.RoutedNodeDetail{
@@ -695,23 +699,34 @@ func routedShadowsocksMethod(node storage.Node) string {
 	return strings.ToLower(strings.TrimSpace(method))
 }
 
+func routedExpectedShadowsocksMethod(ctx context.Context, repo *storage.TrafficRepository, routed storage.RoutedNodeDetail) string {
+	if routed.ParentNodeID != nil && *routed.ParentNodeID > 0 {
+		if parent, err := repo.GetNodeByID(ctx, *routed.ParentNodeID); err == nil {
+			if method := routedShadowsocksMethod(parent); method != "" {
+				return method
+			}
+		}
+	}
+	return routedShadowsocksMethod(routed.Node)
+}
+
 // peekInboundClientByEmail 在 agent 上的某 inbound 里按 email 查现存 client。
-// 命中返回该 client 的 uuid + flow;不存在返回空字符串(err==nil)。
+// 命中返回该 client 的 primary key + flow + method;不存在返回空字符串(err==nil)。
 // 用途:routed 创建 Step 1 add admin client 之前做幂等检查 —
 // agent matchClientCredential 现在只看 primary key(id),不再 fallback email,
 // 直接 add 同 email 不同 uuid 的 client 会被 agent 接受,但 xray 实际启动时会拒绝
 // "User already exists" 导致 routing 改完但 xray 无法 restart。
-func peekInboundClientByEmail(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag, email string) (uuid, flow string, err error) {
+func peekInboundClientByEmail(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag, email string) (primaryKey, flow, method string, err error) {
 	result, ferr := rm.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/inbounds", nil)
 	if ferr != nil {
-		return "", "", ferr
+		return "", "", "", ferr
 	}
 	var resp struct {
 		Success  bool                     `json:"success"`
 		Inbounds []map[string]interface{} `json:"inbounds"`
 	}
 	if jerr := json.Unmarshal(result, &resp); jerr != nil {
-		return "", "", jerr
+		return "", "", "", jerr
 	}
 	for _, ib := range resp.Inbounds {
 		if tag, _ := ib["tag"].(string); tag != inboundTag {
@@ -719,7 +734,7 @@ func peekInboundClientByEmail(ctx context.Context, rm *RemoteManageHandler, serv
 		}
 		settings, _ := ib["settings"].(map[string]interface{})
 		if settings == nil {
-			return "", "", nil
+			return "", "", "", nil
 		}
 		clients, _ := settings["clients"].([]interface{})
 		for _, c := range clients {
@@ -733,12 +748,88 @@ func peekInboundClientByEmail(ctx context.Context, rm *RemoteManageHandler, serv
 					id, _ = cm["password"].(string) // trojan/ss fallback
 				}
 				fl, _ := cm["flow"].(string)
-				return id, fl, nil
+				method, _ := cm["method"].(string)
+				return id, fl, strings.ToLower(strings.TrimSpace(method)), nil
 			}
 		}
-		return "", "", nil // inbound found, email 不在
+		return "", "", "", nil // inbound found, email 不在
 	}
-	return "", "", fmt.Errorf("inbound %s not found", inboundTag)
+	return "", "", "", fmt.Errorf("inbound %s not found", inboundTag)
+}
+
+func reconcileRoutedShadowsocksLiveMethod(protocol, expectedMethod, liveMethod string, credential map[string]interface{}) error {
+	if canonicalManagedProtocol(protocol) != "shadowsocks" || !isClassicManagedShadowsocksCipher(expectedMethod) {
+		return nil
+	}
+	expectedMethod = strings.ToLower(strings.TrimSpace(expectedMethod))
+	liveMethod = strings.ToLower(strings.TrimSpace(liveMethod))
+	if liveMethod == "" || liveMethod != expectedMethod {
+		return fmt.Errorf("在线 Shadowsocks client cipher %q 与父节点 cipher %q 不一致", liveMethod, expectedMethod)
+	}
+	credential["method"] = expectedMethod
+	return nil
+}
+
+// reconcileRoutedClassicCredential upgrades a stored routed credential only
+// when the live inbound proves which cipher and password belong to its email.
+// If the client is absent, provisioning can safely create a fresh credential.
+func reconcileRoutedClassicCredential(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag, protocol, expectedMethod, email string, credential map[string]interface{}) (map[string]interface{}, string, bool, bool, error) {
+	primaryKey, _, liveMethod, err := peekInboundClientByEmail(ctx, rm, serverID, inboundTag, email)
+	if err != nil {
+		return nil, "", false, false, fmt.Errorf("核验 routed Shadowsocks client 失败: %w", err)
+	}
+	if primaryKey == "" {
+		wantMethod := strings.ToLower(strings.TrimSpace(expectedMethod))
+		password, _ := credential["password"].(string)
+		if credential == nil || strings.TrimSpace(password) == "" {
+			fresh, freshJSON, genErr := generateRoutedClientCred(protocol, expectedMethod, email)
+			if genErr != nil {
+				return nil, "", false, false, fmt.Errorf("重建 routed Shadowsocks 凭据失败: %w", genErr)
+			}
+			return fresh, freshJSON, true, true, nil
+		}
+		oldMethod, _ := credential["method"].(string)
+		oldEmail, _ := credential["email"].(string)
+		credential["method"] = wantMethod
+		credential["email"] = email
+		b, marshalErr := json.Marshal(credential)
+		if marshalErr != nil {
+			return nil, "", false, false, fmt.Errorf("序列化 routed Shadowsocks 凭据失败: %w", marshalErr)
+		}
+		changed := strings.ToLower(strings.TrimSpace(oldMethod)) != wantMethod ||
+			strings.TrimSpace(oldEmail) != strings.TrimSpace(email)
+		return credential, string(b), changed, true, nil
+	}
+	if strings.ToLower(strings.TrimSpace(liveMethod)) != strings.ToLower(strings.TrimSpace(expectedMethod)) {
+		return nil, "", false, false, fmt.Errorf("在线 Shadowsocks client cipher %q 与父节点 cipher %q 不一致", liveMethod, expectedMethod)
+	}
+	if credential == nil {
+		credential = make(map[string]interface{})
+	}
+	wantMethod := strings.ToLower(strings.TrimSpace(expectedMethod))
+	oldPassword, _ := credential["password"].(string)
+	oldMethod, _ := credential["method"].(string)
+	oldEmail, _ := credential["email"].(string)
+	if strings.TrimSpace(oldMethod) != "" && strings.ToLower(strings.TrimSpace(oldMethod)) != wantMethod {
+		return nil, "", false, false, fmt.Errorf("已存 Shadowsocks client cipher %q 与父节点 cipher %q 不一致", oldMethod, wantMethod)
+	}
+	if strings.TrimSpace(oldPassword) != "" && strings.TrimSpace(oldPassword) != primaryKey {
+		return nil, "", false, false, errors.New("已存 Shadowsocks client password 与在线 client 不一致")
+	}
+	if strings.TrimSpace(oldEmail) != "" && strings.TrimSpace(oldEmail) != strings.TrimSpace(email) {
+		return nil, "", false, false, errors.New("已存 Shadowsocks client email 与在线 client 不一致")
+	}
+	changed := strings.TrimSpace(oldPassword) != primaryKey ||
+		strings.ToLower(strings.TrimSpace(oldMethod)) != wantMethod ||
+		strings.TrimSpace(oldEmail) != strings.TrimSpace(email)
+	credential["password"] = primaryKey
+	credential["method"] = wantMethod
+	credential["email"] = email
+	b, err := json.Marshal(credential)
+	if err != nil {
+		return nil, "", false, false, fmt.Errorf("序列化 routed Shadowsocks 凭据失败: %w", err)
+	}
+	return credential, string(b), changed, false, nil
 }
 
 // 给目标 inbound 加一个 client — 走 agent 原子 add-client,在 inboundsMu 锁内完成 read-modify-write。
@@ -949,15 +1040,16 @@ func removeRuleByMarktag(ctx context.Context, rm *RemoteManageHandler, serverID 
 // routingRuleAddition 描述"给某条 routing rule 加一个 user email"的待办,
 // 由 prepareRoutedNodeForUser 产出,applyRoutingAdditionsBatch 在 per-server 锁内一次性应用。
 type routingRuleAddition struct {
-	ServerID        int64
-	Marktag         string // 优先匹配
-	OutboundTag     string // marktag 空时 fallback
-	InboundTag      string
-	UserEmail       string
-	CredentialJSON  string
-	Username        string
-	RoutedNodeID    int64
-	NeedsActivation bool
+	ServerID          int64
+	Marktag           string // 优先匹配
+	OutboundTag       string // marktag 空时 fallback
+	InboundTag        string
+	UserEmail         string
+	CredentialJSON    string
+	Username          string
+	RoutedNodeID      int64
+	NeedsActivation   bool
+	CredentialChanged bool
 }
 
 type routedClientCompensation struct {
@@ -1026,15 +1118,17 @@ func compensatePendingRoutingAdditions(ctx context.Context, rm *RemoteManageHand
 
 // routedNodeUserCred 包含算 cred 后的所有上下文,供 add-client(单点 / batch)和 routing rule 改动复用。
 type routedNodeUserCred struct {
-	ServerID       int64
-	InboundTag     string
-	Marktag        string
-	OutboundTag    string
-	UserEmail      string
-	Credential     map[string]interface{}
-	CredentialJSON string
-	Username       string
-	RoutedNodeID   int64
+	ServerID          int64
+	InboundTag        string
+	Marktag           string
+	OutboundTag       string
+	UserEmail         string
+	Credential        map[string]interface{}
+	CredentialJSON    string
+	Username          string
+	RoutedNodeID      int64
+	CredentialChanged bool
+	ClientMissing     bool
 }
 
 // computeRoutedNodeUserCred 解析 routed 节点 + 算 email/credential(复用已存或新建)。
@@ -1077,11 +1171,28 @@ func computeRoutedNodeUserCred(ctx context.Context, rm *RemoteManageHandler, rep
 	// 复用已存子账号凭据(续费/恢复路径) or 新建
 	var credJSON string
 	var credential map[string]interface{}
+	credentialChanged := false
+	clientMissing := false
 	existing, _ := repo.GetUserSubaccount(ctx, routedNodeID, user.Username)
 	if existing != nil {
-		json.Unmarshal([]byte(existing.CredentialJSON), &credential)
 		credJSON = existing.CredentialJSON
+		if json.Unmarshal([]byte(existing.CredentialJSON), &credential) != nil || credential == nil {
+			credential = nil
+		}
 		userEmail = existing.Email // saved 优先,避免命名规则变动导致 email 漂移
+		method := routedExpectedShadowsocksMethod(ctx, repo, routed)
+		if canonicalManagedProtocol(routed.Protocol) == "shadowsocks" && isClassicManagedShadowsocksCipher(method) {
+			credential, credJSON, credentialChanged, clientMissing, err = reconcileRoutedClassicCredential(
+				ctx, rm, serverID, routed.InboundTag, routed.Protocol, method, userEmail, credential,
+			)
+			if err != nil {
+				return nil, err
+			}
+		} else if credential != nil {
+			if b, merr := json.Marshal(credential); merr == nil {
+				credJSON = string(b)
+			}
+		}
 		// 修复历史存量:VLESS Reality 复用旧子账户凭据时,若缺 flow 就从父 inbound 稳健补上并回写,
 		// 否则历史无 flow 的子账户重新绑定/加节点时会一直复用无 flow 的凭据 → 客户端连不上。
 		if strings.EqualFold(routed.Protocol, "vless") && credential != nil {
@@ -1090,6 +1201,7 @@ func computeRoutedNodeUserCred(ctx context.Context, rm *RemoteManageHandler, rep
 					credential["flow"] = flow
 					if b, merr := json.Marshal(credential); merr == nil {
 						credJSON = string(b)
+						credentialChanged = true
 					}
 				}
 			}
@@ -1126,15 +1238,17 @@ func computeRoutedNodeUserCred(ctx context.Context, rm *RemoteManageHandler, rep
 	}
 
 	return &routedNodeUserCred{
-		ServerID:       serverID,
-		InboundTag:     routed.InboundTag,
-		Marktag:        routed.RoutedRuleMarktag,
-		OutboundTag:    routed.RoutedOutboundTag,
-		UserEmail:      userEmail,
-		Credential:     credential,
-		CredentialJSON: credJSON,
-		Username:       user.Username,
-		RoutedNodeID:   routedNodeID,
+		ServerID:          serverID,
+		InboundTag:        routed.InboundTag,
+		Marktag:           routed.RoutedRuleMarktag,
+		OutboundTag:       routed.RoutedOutboundTag,
+		UserEmail:         userEmail,
+		Credential:        credential,
+		CredentialJSON:    credJSON,
+		Username:          user.Username,
+		RoutedNodeID:      routedNodeID,
+		CredentialChanged: credentialChanged,
+		ClientMissing:     clientMissing,
 	}, nil
 }
 
@@ -1186,7 +1300,7 @@ func prepareRoutedNodeForUserLocked(ctx context.Context, rm *RemoteManageHandler
 	if err != nil {
 		return nil, fmt.Errorf("read routed subaccount: %w", err)
 	}
-	needsActivation := existing == nil || !existing.IsActive
+	needsActivation := existing == nil || !existing.IsActive || info.ClientMissing
 	if err := repo.ReserveUserSubaccount(ctx, storage.UserSubaccount{
 		Username: info.Username, RoutedNodeID: info.RoutedNodeID,
 		Email: info.UserEmail, CredentialJSON: info.CredentialJSON,
@@ -1200,32 +1314,34 @@ func prepareRoutedNodeForUserLocked(ctx context.Context, rm *RemoteManageHandler
 	if clientOutcome.RuntimeDeferred {
 		log.Printf("[RoutedClientAdd] server=%d Agent deferred runtime inbound replacement; preserving its retry path without restarting the core", info.ServerID)
 	}
-
 	return &routingRuleAddition{
-		ServerID:        info.ServerID,
-		Marktag:         info.Marktag,
-		OutboundTag:     info.OutboundTag,
-		InboundTag:      info.InboundTag,
-		UserEmail:       info.UserEmail,
-		CredentialJSON:  info.CredentialJSON,
-		Username:        info.Username,
-		RoutedNodeID:    info.RoutedNodeID,
-		NeedsActivation: needsActivation,
+		ServerID:          info.ServerID,
+		Marktag:           info.Marktag,
+		OutboundTag:       info.OutboundTag,
+		InboundTag:        info.InboundTag,
+		UserEmail:         info.UserEmail,
+		CredentialJSON:    info.CredentialJSON,
+		Username:          info.Username,
+		RoutedNodeID:      info.RoutedNodeID,
+		NeedsActivation:   needsActivation,
+		CredentialChanged: info.CredentialChanged,
 	}, nil
 }
 
 // routedBatchItem 批量套餐绑定路径专用:不调 agent、不写 DB,只算 cred + 描述 batch 操作。
 // 调用方收集 per-server → 一次 POST /api/child/batch-apply → 全成功后批量 UpsertUserSubaccount。
 type routedBatchItem struct {
-	ServerID       int64
-	InboundTag     string
-	Marktag        string
-	OutboundTag    string
-	UserEmail      string
-	Credential     map[string]interface{}
-	CredentialJSON string
-	Username       string
-	RoutedNodeID   int64
+	ServerID          int64
+	InboundTag        string
+	Marktag           string
+	OutboundTag       string
+	UserEmail         string
+	Credential        map[string]interface{}
+	CredentialJSON    string
+	Username          string
+	RoutedNodeID      int64
+	CredentialChanged bool
+	ClientMissing     bool
 }
 
 // collectRoutedBatchItem 算 cred,**不调 agent、不写 DB**,返回 batch 描述。
@@ -1247,15 +1363,17 @@ func collectRoutedBatchItem(ctx context.Context, rm *RemoteManageHandler, repo *
 		return nil, errors.New("routed node server changed while collecting batch item; retry required")
 	}
 	return &routedBatchItem{
-		ServerID:       info.ServerID,
-		InboundTag:     info.InboundTag,
-		Marktag:        info.Marktag,
-		OutboundTag:    info.OutboundTag,
-		UserEmail:      info.UserEmail,
-		Credential:     info.Credential,
-		CredentialJSON: info.CredentialJSON,
-		Username:       info.Username,
-		RoutedNodeID:   info.RoutedNodeID,
+		ServerID:          info.ServerID,
+		InboundTag:        info.InboundTag,
+		Marktag:           info.Marktag,
+		OutboundTag:       info.OutboundTag,
+		UserEmail:         info.UserEmail,
+		Credential:        info.Credential,
+		CredentialJSON:    info.CredentialJSON,
+		Username:          info.Username,
+		RoutedNodeID:      info.RoutedNodeID,
+		CredentialChanged: info.CredentialChanged,
+		ClientMissing:     info.ClientMissing,
 	}, nil
 }
 
@@ -1389,7 +1507,7 @@ func applyRoutedBatchToAgentLocked(ctx context.Context, rm *RemoteManageHandler,
 		if err != nil {
 			return outcome, fmt.Errorf("read routed subaccount user=%s node=%d: %w", it.Username, it.RoutedNodeID, err)
 		}
-		if existing == nil || !existing.IsActive {
+		if existing == nil || !existing.IsActive || it.ClientMissing {
 			pendingActivation = true
 			pendingItems[i] = true
 		}
@@ -1561,19 +1679,25 @@ func applyRoutingAdditionsBatch(ctx context.Context, rm *RemoteManageHandler, re
 		}
 		rules[matched] = rule
 	}
-	if !changed && !pendingActivation {
+	credentialChanged := false
+	for _, addition := range additions {
+		credentialChanged = credentialChanged || addition.CredentialChanged
+	}
+	if !changed && !pendingActivation && !credentialChanged {
 		return false, nil
 	}
 	if pendingActivation && repo == nil {
 		cause := errors.New("routed subaccount repository is unavailable")
 		return false, withRoutedClientCompensation(cause, compensatePendingRoutingAdditions(ctx, rm, serverID, additions, 0))
 	}
-	routing["rules"] = rules
-	if err := setRoutedRoutingHot(ctx, rm, serverID, routing); err != nil {
-		return false, withRoutedClientCompensation(err, compensatePendingRoutingAdditions(ctx, rm, serverID, additions, 0))
+	if changed || pendingActivation {
+		routing["rules"] = rules
+		if err := setRoutedRoutingHot(ctx, rm, serverID, routing); err != nil {
+			return false, withRoutedClientCompensation(err, compensatePendingRoutingAdditions(ctx, rm, serverID, additions, 0))
+		}
 	}
 	for i, addition := range additions {
-		if !addition.NeedsActivation {
+		if !addition.NeedsActivation && !addition.CredentialChanged {
 			continue
 		}
 		if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{

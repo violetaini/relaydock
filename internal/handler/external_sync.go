@@ -545,13 +545,14 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 	}
 
 	logger.Info("[外部订阅同步] 数据库中已有节点", "count", len(existingNodes))
+	syncCandidates := externalSubscriptionSyncCandidates(existingNodes)
 
 	// 清理此订阅中匹配当前过滤规则的历史节点
 	if filterRegex != nil {
-		remainingNodes := make([]storage.Node, 0, len(existingNodes))
+		remainingNodes := make([]storage.Node, 0, len(syncCandidates))
 		removedByFilterCount := 0
 
-		for _, existing := range existingNodes {
+		for _, existing := range syncCandidates {
 			if existing.RawURL == sub.URL && filterRegex.MatchString(existing.NodeName) {
 				if delErr := repo.DeleteNodeForSync(ctx, existing.ID, username); delErr != nil {
 					logger.Info("[外部订阅同步] 删除已过滤历史节点失败", "node_name", existing.NodeName, "id", existing.ID, "error", delErr)
@@ -568,7 +569,7 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 		if removedByFilterCount > 0 {
 			logger.Info("[外部订阅同步] 清理历史过滤节点完成", "removed_count", removedByFilterCount)
 		}
-		existingNodes = remainingNodes
+		syncCandidates = remainingNodes
 	}
 
 	// 将节点同步到数据库（根据匹配规则替换节点）
@@ -595,18 +596,15 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 		case "type_server_port":
 			matchKey := fmt.Sprintf("%s:%s:%v", newType, newServer, newPort)
 			if newServer != "" && newPort != nil && newType != "" {
-				for i := range existingNodes {
+				for i := range syncCandidates {
 					var existingClashConfig map[string]any
-					if err := json.Unmarshal([]byte(existingNodes[i].ClashConfig), &existingClashConfig); err == nil {
+					if err := json.Unmarshal([]byte(syncCandidates[i].ClashConfig), &existingClashConfig); err == nil {
 						existingServer, _ := existingClashConfig["server"].(string)
-						if existingNodes[i].OriginalServer != "" {
-							existingServer = existingNodes[i].OriginalServer
-						}
 						existingPort := existingClashConfig["port"]
 						existingType, _ := existingClashConfig["type"].(string)
 
 						if existingType == newType && existingServer == newServer && fmt.Sprintf("%v", existingPort) == fmt.Sprintf("%v", newPort) {
-							existingNode = &existingNodes[i]
+							existingNode = &syncCandidates[i]
 							logger.Info("[外部订阅同步] 节点 按 type:server:port 匹配成功 -> 已有节点", "node_name", node.NodeName, "param", matchKey, "node_name", existingNode.NodeName)
 							break
 						}
@@ -619,17 +617,14 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 		case "server_port":
 			matchKey := fmt.Sprintf("%s:%v", newServer, newPort)
 			if newServer != "" && newPort != nil {
-				for i := range existingNodes {
+				for i := range syncCandidates {
 					var existingClashConfig map[string]any
-					if err := json.Unmarshal([]byte(existingNodes[i].ClashConfig), &existingClashConfig); err == nil {
+					if err := json.Unmarshal([]byte(syncCandidates[i].ClashConfig), &existingClashConfig); err == nil {
 						existingServer, _ := existingClashConfig["server"].(string)
-						if existingNodes[i].OriginalServer != "" {
-							existingServer = existingNodes[i].OriginalServer
-						}
 						existingPort := existingClashConfig["port"]
 
 						if existingServer == newServer && fmt.Sprintf("%v", existingPort) == fmt.Sprintf("%v", newPort) {
-							existingNode = &existingNodes[i]
+							existingNode = &syncCandidates[i]
 							logger.Info("[外部订阅同步] 节点 按 server:port 匹配成功 -> 已有节点", "node_name", node.NodeName, "param", matchKey, "node_name", existingNode.NodeName)
 							break
 						}
@@ -641,7 +636,7 @@ func syncSingleExternalSubscription(ctx context.Context, client *http.Client, re
 			}
 		default:
 			// 默认：按节点名称匹配
-			existingNode = matchExternalNodeByName(existingNodes, sub.URL, node.NodeName)
+			existingNode = matchExternalNodeByName(syncCandidates, sub.URL, node.NodeName)
 			if existingNode != nil {
 				logger.Info("[外部订阅同步] 节点 按名称匹配成功", "node_name", node.NodeName)
 			}
@@ -1118,16 +1113,32 @@ func preserveExternalNodeName(existingName, incomingName, currentSuffix string) 
 	return refreshExternalNodeName(existingName, currentSuffix)
 }
 
+func isExternalSubscriptionSyncCandidate(node storage.Node) bool {
+	return !strings.EqualFold(strings.TrimSpace(node.NodeType), "routed") &&
+		strings.TrimSpace(node.OriginalServer) == "" &&
+		strings.TrimSpace(node.InboundTag) == ""
+}
+
+func externalSubscriptionSyncCandidates(nodes []storage.Node) []storage.Node {
+	candidates := make([]storage.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if isExternalSubscriptionSyncCandidate(node) {
+			candidates = append(candidates, node)
+		}
+	}
+	return candidates
+}
+
 func matchExternalNodeByName(nodes []storage.Node, sourceURL, incomingName string) *storage.Node {
 	for i := range nodes {
-		if nodes[i].RawURL == sourceURL && nodes[i].NodeName == incomingName {
+		if isExternalSubscriptionSyncCandidate(nodes[i]) && nodes[i].RawURL == sourceURL && nodes[i].NodeName == incomingName {
 			return &nodes[i]
 		}
 	}
 
 	incomingBase := stripGeneratedSubInfoSuffix(incomingName)
 	for i := range nodes {
-		if nodes[i].RawURL == sourceURL && stripGeneratedSubInfoSuffix(nodes[i].NodeName) == incomingBase {
+		if isExternalSubscriptionSyncCandidate(nodes[i]) && nodes[i].RawURL == sourceURL && stripGeneratedSubInfoSuffix(nodes[i].NodeName) == incomingBase {
 			return &nodes[i]
 		}
 	}

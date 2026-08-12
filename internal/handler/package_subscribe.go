@@ -742,9 +742,91 @@ func buildRoutedProxyForUser(ctx context.Context, repo *storage.TrafficRepositor
 	if err := json.Unmarshal([]byte(sa.CredentialJSON), &cred); err != nil {
 		return nil, false
 	}
+	if canonicalManagedProtocol(routedNode.Protocol) == "shadowsocks" {
+		cipher, _ := proxy["cipher"].(string)
+		if isClassicManagedShadowsocksCipher(cipher) {
+			if !reconcileRoutedClassicCredentialFromSnapshot(ctx, repo, routedNode, sa, cred, cipher) {
+				return nil, false
+			}
+		}
+	}
 	if !applyCredToProxy(proxy, routedNode.Protocol, cred) {
 		return nil, false
 	}
 	proxy["name"] = routedNode.NodeName
 	return proxy, true
+}
+
+// reconcileRoutedClassicCredentialFromSnapshot validates and, when necessary,
+// upgrades routed classic-SS credentials against the latest persisted Agent
+// snapshot. The database row is not authoritative for a live password or
+// cipher: even rows that already contain method must match the live client,
+// otherwise subscription generation fails closed instead of exporting a
+// relabeled credential.
+func reconcileRoutedClassicCredentialFromSnapshot(ctx context.Context, repo *storage.TrafficRepository, node storage.Node, sa *storage.UserSubaccount, credential map[string]any, cipher string) bool {
+	if repo == nil || sa == nil || credential == nil {
+		return false
+	}
+	wantCipher := strings.ToLower(strings.TrimSpace(cipher))
+	server, err := repo.GetRemoteServerByName(ctx, node.OriginalServer)
+	if err != nil || server == nil {
+		return false
+	}
+	snapshot, err := repo.GetCurrentXraySnapshot(ctx, server.ID)
+	if err != nil || snapshot == nil {
+		return false
+	}
+	inbounds, err := xrayConfigInbounds(snapshot.ConfigJSON)
+	if err != nil {
+		return false
+	}
+	inbound := inbounds[strings.TrimSpace(node.InboundTag)]
+	settings, _ := inbound["settings"].(map[string]interface{})
+	clients, _ := settings["clients"].([]interface{})
+	for _, raw := range clients {
+		client, _ := raw.(map[string]interface{})
+		if client == nil || strings.TrimSpace(fmt.Sprint(client["email"])) != strings.TrimSpace(sa.Email) {
+			continue
+		}
+		liveMethod := strings.ToLower(strings.TrimSpace(fmt.Sprint(client["method"])))
+		livePassword := strings.TrimSpace(fmt.Sprint(client["password"]))
+		if liveMethod != wantCipher || livePassword == "" || livePassword == "<nil>" {
+			continue
+		}
+		oldMethod, methodPresent := credential["method"]
+		if methodPresent {
+			method, ok := oldMethod.(string)
+			if !ok || strings.ToLower(strings.TrimSpace(method)) != wantCipher {
+				return false
+			}
+		}
+		oldPassword := strings.TrimSpace(fmt.Sprint(credential["password"]))
+		oldEmail, _ := credential["email"].(string)
+		oldEmail = strings.TrimSpace(oldEmail)
+		if oldPassword == "<nil>" {
+			oldPassword = ""
+		}
+		if (oldPassword != "" && oldPassword != livePassword) ||
+			(oldEmail != "" && oldEmail != strings.TrimSpace(sa.Email)) {
+			return false
+		}
+		original, _ := json.Marshal(credential)
+		credential["password"] = livePassword
+		credential["method"] = wantCipher
+		credential["email"] = sa.Email
+		encoded, err := json.Marshal(credential)
+		if err != nil {
+			return false
+		}
+		if string(original) != string(encoded) {
+			if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
+				ID: sa.ID, Username: sa.Username, RoutedNodeID: sa.RoutedNodeID,
+				Email: sa.Email, CredentialJSON: string(encoded), IsActive: sa.IsActive,
+			}); err != nil {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
