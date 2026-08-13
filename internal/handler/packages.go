@@ -951,10 +951,106 @@ func (h *PackageAssignHandler) reconcileAssignments(ctx context.Context) {
 		}
 		warnings, reconcileErr := h.AssignAndProvision(ctx, user.Username, user.PackageID,
 			*user.PackageStartDate, *user.PackageEndDate, user.IsReset, user.ResetDay)
-		if reconcileErr != nil || len(warnings) > 0 {
-			log.Printf("[PackageReconcile] user=%s package=%d warnings=%v err=%v", user.Username, user.PackageID, warnings, reconcileErr)
+		cleanupErr := h.reconcileStalePackageNodeAccess(ctx, user.Username)
+		if reconcileErr != nil || cleanupErr != nil || len(warnings) > 0 {
+			log.Printf("[PackageReconcile] user=%s package=%d warnings=%v provision_err=%v cleanup_err=%v",
+				user.Username, user.PackageID, warnings, reconcileErr, cleanupErr)
 		}
 	}
+}
+
+// reconcileStalePackageNodeAccess makes template removal durable. The update
+// request performs the same cleanup eagerly, while this pass repairs a crash or
+// transient Agent failure between the package commit and that remote cleanup.
+func (h *PackageAssignHandler) reconcileStalePackageNodeAccess(ctx context.Context, username string) error {
+	configs, err := h.repo.GetUserInboundConfigs(ctx, username)
+	if err != nil {
+		return fmt.Errorf("list package inbound credentials: %w", err)
+	}
+	var cleanupErrs []error
+	now := time.Now().UTC()
+	for _, cfg := range configs {
+		hasPackageTemplateAccess, accessErr := hasPackageTemplateInboundAccess(
+			ctx, h.repo, username, cfg.ServerID, cfg.InboundTag, now,
+		)
+		if accessErr != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("resolve inbound %d/%s package template: %w",
+				cfg.ServerID, cfg.InboundTag, accessErr))
+			continue
+		}
+		if hasPackageTemplateAccess {
+			continue
+		}
+		if _, removeErr := removePackageUserInboundConfig(ctx, h.remoteManage, h.repo, cfg); removeErr != nil && !isInboundNotFoundErr(removeErr) {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove stale inbound %d/%s: %w",
+				cfg.ServerID, cfg.InboundTag, removeErr))
+		}
+	}
+
+	packageRoutedNodes, err := packageRoutedNodeIDsForUser(ctx, h.repo, username)
+	if err != nil {
+		cleanupErrs = append(cleanupErrs, err)
+		return errors.Join(cleanupErrs...)
+	}
+	subaccounts, err := h.repo.ListUserSubaccounts(ctx, username)
+	if err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("list routed subaccounts: %w", err))
+		return errors.Join(cleanupErrs...)
+	}
+	for _, subaccount := range subaccounts {
+		if !subaccount.IsActive || packageRoutedNodes[subaccount.RoutedNodeID] {
+			continue
+		}
+		node, nodeErr := h.repo.GetNodeByID(ctx, subaccount.RoutedNodeID)
+		if nodeErr != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("load routed node %d: %w", subaccount.RoutedNodeID, nodeErr))
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(node.NodeType), "routed") ||
+			strings.EqualFold(strings.TrimSpace(node.RoutedOwner), "user") {
+			continue
+		}
+		if _, removeErr := removeUserFromRoutedNode(ctx, h.remoteManage, h.repo, username, node.ID); removeErr != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove stale routed node %d: %w", node.ID, removeErr))
+		}
+	}
+	return errors.Join(cleanupErrs...)
+}
+
+// hasPackageTemplateInboundAccess answers only the durable template question.
+// It intentionally does not apply traffic-limit or Agent-observed state: an
+// over-limit user still owns the package credential and the normal enforcer
+// must be able to retry it later.
+func hasPackageTemplateInboundAccess(ctx context.Context, repo *storage.TrafficRepository, username string, serverID int64, inboundTag string, now time.Time) (bool, error) {
+	user, err := repo.GetUser(ctx, username)
+	if err != nil {
+		return false, err
+	}
+	if !packageAssignmentActive(user, now) {
+		return false, nil
+	}
+	pkg, err := repo.GetPackage(ctx, user.PackageID)
+	if err != nil {
+		return false, err
+	}
+	server, err := repo.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	for _, nodeID := range pkg.Nodes {
+		node, nodeErr := repo.GetNodeByID(ctx, nodeID)
+		if nodeErr != nil {
+			if errors.Is(nodeErr, storage.ErrNodeNotFound) {
+				continue
+			}
+			return false, nodeErr
+		}
+		if node.Enabled && !strings.EqualFold(strings.TrimSpace(node.NodeType), "routed") &&
+			node.OriginalServer == server.Name && node.InboundTag == inboundTag {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 type assignPackageRequest struct {

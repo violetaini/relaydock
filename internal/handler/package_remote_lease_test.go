@@ -246,6 +246,177 @@ func TestSamePackageAssignmentRepairsMissingInboundCredential(t *testing.T) {
 	}
 }
 
+func TestPackageReconcilerRevokesInboundRemovedFromTemplate(t *testing.T) {
+	agent := &packageLeaseAgent{}
+	repo, server, remote := newPackageLeaseFixture(t, agent)
+	ctx := context.Background()
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "removed", Protocol: "vless", OriginalServer: server.Name, InboundTag: "vless-in",
+		ClashConfig: `{"name":"removed","type":"vless","server":"edge.example.test","port":443,"uuid":"owner-id"}`, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "cleanup-package", TrafficLimitBytes: 1024, CycleDays: 30, Nodes: []int64{node.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, start, end, false, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+		Username: "alice", ServerID: server.ID, InboundTag: "vless-in", Protocol: "vless",
+		CredentialJSON: `{"id":"alice-id","email":"alice__vless-in"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := repo.GetPackage(ctx, packageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Nodes = nil
+	if err := repo.UpdatePackage(ctx, *pkg); err != nil {
+		t.Fatal(err)
+	}
+
+	NewPackageAssignHandler(repo, remote, nil).reconcileAssignments(ctx)
+
+	if got := agent.removeClientCalls.Load(); got != 1 {
+		t.Fatalf("reconciler made %d remove-client calls, want 1", got)
+	}
+	if config, _ := repo.GetUserInboundConfig(ctx, "alice", server.ID, "vless-in"); config != nil {
+		t.Fatalf("credential removed from package template remains: %+v", config)
+	}
+}
+
+func TestPackageReconcilerPreservesDirectCredentialRemovedFromTemplate(t *testing.T) {
+	agent := &packageLeaseAgent{}
+	repo, server, remote := newPackageLeaseFixture(t, agent)
+	ctx := context.Background()
+	if err := repo.UpdateRemoteServerXrayMode(ctx, server.ID, "embedded"); err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "direct", Protocol: "vless", OriginalServer: server.Name, InboundTag: "vless-in",
+		ClashConfig: `{"name":"direct","type":"vless","server":"edge.example.test","port":443,"uuid":"owner-id"}`, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "direct-cleanup-package", TrafficLimitBytes: 1024, CycleDays: 30, Nodes: []int64{node.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, start, end, false, 1); err != nil {
+		t.Fatal(err)
+	}
+	credentialJSON := `{"id":"alice-id","email":"alice__vless-in"}`
+	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+		Username: "alice", ServerID: server.ID, InboundTag: "vless-in", Protocol: "vless", CredentialJSON: credentialJSON,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	config, err := repo.GetUserInboundConfig(ctx, "alice", server.ID, "vless-in")
+	if err != nil || config == nil {
+		t.Fatalf("load retained credential: config=%+v err=%v", config, err)
+	}
+	grant, _, err := repo.UpsertManualUserNodeGrant(ctx, "alice", node.ID, nil, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetUserNodeGrantCredential(ctx, grant.Grant.ID, config.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.MarkUserInboundAccessSourceApplied(ctx, grant.Source.ID, grant.Source.Generation, storage.ManagedObservedActive, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := repo.GetPackage(ctx, packageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Nodes = nil
+	if err := repo.UpdatePackage(ctx, *pkg); err != nil {
+		t.Fatal(err)
+	}
+
+	NewPackageAssignHandler(repo, remote, nil).reconcileAssignments(ctx)
+
+	if got := agent.removeClientCalls.Load(); got != 0 {
+		t.Fatalf("reconciler removed direct credential %d time(s)", got)
+	}
+	stored, err := repo.GetUserInboundConfig(ctx, "alice", server.ID, "vless-in")
+	if err != nil || stored == nil || stored.CredentialJSON != credentialJSON {
+		t.Fatalf("direct credential was not retained: config=%+v err=%v", stored, err)
+	}
+}
+
+func TestPackageReconcilerRevokesSharedRoutedAndPreservesUserOwned(t *testing.T) {
+	agent := newRoutedHotAgent()
+	repo, _, remote, shared := newRoutedHotNode(t, agent)
+	ctx := context.Background()
+	private, err := repo.CreateRoutedNode(ctx, storage.RoutedNodeDetail{
+		Node: storage.Node{
+			Username: "alice", NodeName: "Private routed", Protocol: "vless", Enabled: true,
+			OriginalServer: shared.OriginalServer, InboundTag: shared.InboundTag,
+			ParentNodeID: shared.ParentNodeID, RoutedOwner: "user",
+		},
+		RoutedOutboundTag: "private-out", RoutedRuleMarktag: "private-rule",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
+		Username: "alice", RoutedNodeID: shared.ID, Email: "alice__shared",
+		CredentialJSON: `{"id":"shared-id","email":"alice__shared"}`, IsActive: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
+		Username: "alice", RoutedNodeID: private.ID, Email: "alice__private",
+		CredentialJSON: `{"id":"private-id","email":"alice__private"}`, IsActive: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "routed-cleanup-package", TrafficLimitBytes: 1024, CycleDays: 30, Nodes: []int64{shared.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, start, end, false, 1); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := repo.GetPackage(ctx, packageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Nodes = nil
+	if err := repo.UpdatePackage(ctx, *pkg); err != nil {
+		t.Fatal(err)
+	}
+
+	NewPackageAssignHandler(repo, remote, nil).reconcileAssignments(ctx)
+
+	sharedAccount, err := repo.GetUserSubaccount(ctx, shared.ID, "alice")
+	if err != nil || sharedAccount == nil || sharedAccount.IsActive {
+		t.Fatalf("shared routed subaccount was not revoked: account=%+v err=%v", sharedAccount, err)
+	}
+	privateAccount, err := repo.GetUserSubaccount(ctx, private.ID, "alice")
+	if err != nil || privateAccount == nil || !privateAccount.IsActive {
+		t.Fatalf("user-owned routed subaccount was not preserved: account=%+v err=%v", privateAccount, err)
+	}
+	if _, removes := agent.inboundCounts(); removes != 1 {
+		t.Fatalf("reconciler made %d routed inbound removals, want 1", removes)
+	}
+}
+
 func TestPackageSwitchRevokesOldExclusiveInboundCredential(t *testing.T) {
 	agent := &packageLeaseAgent{}
 	repo, server, remote := newPackageLeaseFixture(t, agent)
