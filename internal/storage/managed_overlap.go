@@ -91,14 +91,14 @@ func managedPackageNodes(ctx context.Context, q managedSQLQueryer, packageID int
 
 func userPackageContainsManagedInbound(ctx context.Context, q managedSQLQueryer, username string, serverID int64, inboundTag string, now time.Time) (bool, error) {
 	var packageID int64
-	var packageEnd sql.NullTime
-	if err := q.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0), package_end_date
-FROM users WHERE username = ?`, username).Scan(&packageID, &packageEnd); errors.Is(err, sql.ErrNoRows) {
+	var packageStart, packageEnd sql.NullTime
+	if err := q.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0), package_start_date, package_end_date
+FROM users WHERE username = ?`, username).Scan(&packageID, &packageStart, &packageEnd); errors.Is(err, sql.ErrNoRows) {
 		return false, ErrUserNotFound
 	} else if err != nil {
 		return false, fmt.Errorf("read user package for managed overlap: %w", err)
 	}
-	if packageID <= 0 || packageEnd.Valid && !now.Before(packageEnd.Time) {
+	if packageID <= 0 || packageStart.Valid && now.Before(packageStart.Time) || packageEnd.Valid && !now.Before(packageEnd.Time) {
 		return false, nil
 	}
 	nodes, err := managedPackageNodes(ctx, q, packageID)
@@ -115,14 +115,14 @@ FROM users WHERE username = ?`, username).Scan(&packageID, &packageEnd); errors.
 
 func currentUserPackageConflictsWithManagedSelections(ctx context.Context, q managedSQLQueryer, username string, grantID int64, now time.Time) error {
 	var packageID int64
-	var packageEnd sql.NullTime
-	if err := q.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0), package_end_date
-FROM users WHERE username = ?`, username).Scan(&packageID, &packageEnd); errors.Is(err, sql.ErrNoRows) {
+	var packageStart, packageEnd sql.NullTime
+	if err := q.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0), package_start_date, package_end_date
+FROM users WHERE username = ?`, username).Scan(&packageID, &packageStart, &packageEnd); errors.Is(err, sql.ErrNoRows) {
 		return ErrUserNotFound
 	} else if err != nil {
 		return fmt.Errorf("read user package for managed overlap: %w", err)
 	}
-	if packageID <= 0 || packageEnd.Valid && !now.Before(packageEnd.Time) {
+	if packageID <= 0 || packageStart.Valid && now.Before(packageStart.Time) || packageEnd.Valid && !now.Before(packageEnd.Time) {
 		return nil
 	}
 	nodes, err := managedPackageNodes(ctx, q, packageID)
@@ -165,6 +165,33 @@ WHERE g.username = ? AND s.desired_enabled = 1`
 	return rows.Err()
 }
 
+func packageNodesConflictWithManualSelections(ctx context.Context, q managedSQLQueryer, username string, nodeIDs []int64) error {
+	keys, err := managedPackageInboundKeys(ctx, q, nodeIDs)
+	if err != nil || len(keys) == 0 {
+		return err
+	}
+	rows, err := q.QueryContext(ctx, `SELECT o.server_id, o.inbound_tag
+FROM user_node_selections s
+JOIN user_server_grants g ON g.id = s.grant_id
+JOIN self_service_node_offers o ON o.id = s.offer_id
+WHERE g.username = ? AND s.desired_enabled = 1 AND COALESCE(g.source_type, 'manual') != 'package'`, username)
+	if err != nil {
+		return fmt.Errorf("list manual selections for package overlap: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key managedInboundKey
+		if err := rows.Scan(&key.serverID, &key.inboundTag); err != nil {
+			return err
+		}
+		key.inboundTag = strings.TrimSpace(key.inboundTag)
+		if _, exists := keys[key]; exists {
+			return fmt.Errorf("%w: server=%d inbound=%s", ErrManagedAccessConflict, key.serverID, key.inboundTag)
+		}
+	}
+	return rows.Err()
+}
+
 func (r *TrafficRepository) packageUpdateConflictsWithManagedSelections(ctx context.Context, packageID int64, nodeIDs []int64) error {
 	rows, err := r.db.QueryContext(ctx, `SELECT username FROM users WHERE package_id = ?`, packageID)
 	if err != nil {
@@ -185,7 +212,7 @@ func (r *TrafficRepository) packageUpdateConflictsWithManagedSelections(ctx cont
 	}
 	_ = rows.Close()
 	for _, username := range usernames {
-		if err := packageNodesConflictWithManagedSelections(ctx, r.db, username, nodeIDs, 0); err != nil {
+		if err := packageNodesConflictWithManualSelections(ctx, r.db, username, nodeIDs); err != nil {
 			return err
 		}
 	}

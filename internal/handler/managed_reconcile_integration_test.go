@@ -24,6 +24,7 @@ type managedFakeAgent struct {
 	limiterHit chan struct{}
 	limiterACK chan struct{}
 	limiterOK  *bool
+	inboundOK  *bool
 	inboundTag string
 	token      string
 	addRequest struct {
@@ -88,12 +89,16 @@ func (a *managedFakeAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		a.calls = append(a.calls, "add-client")
 		err := json.NewDecoder(r.Body).Decode(&a.addRequest)
+		success := true
+		if a.inboundOK != nil {
+			success = *a.inboundOK
+		}
 		a.mu.Unlock()
 		if err != nil {
 			http.Error(w, "invalid inbound payload", http.StatusBadRequest)
 			return
 		}
-		_, _ = w.Write([]byte(`{"success":true}`))
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": success})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/child/xray/config":
 		// A shared managed-client transaction must not try to upgrade itself into
 		// a full database-authority reconcile.
@@ -410,6 +415,109 @@ func TestManagedReconcileReloadsStaleGenerationBeforeRemoteMutation(t *testing.T
 	if applied.Generation != latest.Generation || applied.AppliedGeneration != latest.Generation ||
 		applied.DesiredState != storage.ManagedDesiredInactive || applied.ObservedState != storage.ManagedObservedInactive {
 		t.Fatalf("latest revoke was not applied: %#v", applied)
+	}
+}
+
+func TestManagedReconcilerExpiresDirectGrantAndRetriesRemoteRevoke(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "owner", storage.RoleAdmin)
+	createManagedSecurityTestUser(t, repo, "alice", storage.RoleUser)
+
+	inboundOK := false
+	fakeAgent := &managedFakeAgent{snapshotHit: make(chan struct{}, 1), inboundOK: &inboundOK}
+	agentServer := httptest.NewServer(fakeAgent)
+	t.Cleanup(agentServer.Close)
+	agentURL, err := url.Parse(agentServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(agentURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := net.LookupPort("tcp", portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &storage.RemoteServer{
+		Name: "edge-direct-expiry", Token: "agent-token", Status: storage.RemoteServerStatusConnected,
+		IPAddress: host, ListenPort: port, XrayMode: "embedded",
+	}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "owner", NodeName: "direct-expiry", Protocol: "vless", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "vless-in",
+		ClashConfig: `{"name":"direct-expiry","type":"vless","server":"203.0.113.43","port":443,"uuid":"owner-uuid"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := time.Now().UTC().Add(100 * time.Millisecond)
+	item, _, err := repo.UpsertManualUserNodeGrant(ctx, "alice", node.ID, &expiresAt, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+		Username: "alice", ServerID: server.ID, InboundTag: node.InboundTag, Protocol: node.Protocol,
+		CredentialJSON: `{"id":"alice-direct-uuid","email":"alice__vless-in"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	credential, err := repo.GetUserInboundConfig(ctx, "alice", server.ID, node.InboundTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetUserNodeGrantCredential(ctx, item.Grant.ID, credential.ID); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := repo.MarkUserInboundAccessSourceApplied(ctx, item.Source.ID, item.Source.Generation,
+		storage.ManagedObservedActive, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delay := time.Until(expiresAt) + 20*time.Millisecond; delay > 0 {
+		time.Sleep(delay)
+	}
+
+	remote := managedRemoteWithCapabilities(repo, server.ID, managedReadyAgentCapabilities())
+	handler := NewManagedNodesHandler(repo, remote, nil)
+	handler.reconcileAll(ctx)
+
+	current, err := repo.GetUserInboundAccessSource(ctx, applied.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.DesiredState != storage.ManagedDesiredInactive || current.ObservedState != storage.ManagedObservedActive ||
+		current.SuspendReason != storage.ManagedSuspendExpired || current.Generation == current.AppliedGeneration ||
+		current.LastError == "" || current.NextRetryAt == nil {
+		t.Fatalf("failed expiry revoke was not queued for retry: %+v", current)
+	}
+	fakeAgent.mu.Lock()
+	inboundOK = true
+	fakeAgent.mu.Unlock()
+	if _, err := repo.MarkUserInboundAccessSourceFailed(ctx, current.ID, current.Generation,
+		"retry test", time.Now().UTC().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	handler.reconcileAll(ctx)
+	current, err = repo.GetUserInboundAccessSource(ctx, applied.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.DesiredState != storage.ManagedDesiredInactive || current.ObservedState != storage.ManagedObservedInactive ||
+		current.SuspendReason != storage.ManagedSuspendExpired || current.Generation != current.AppliedGeneration || current.LastError != "" {
+		t.Fatalf("expired direct grant retry did not converge: %+v", current)
+	}
+	fakeAgent.mu.Lock()
+	calls := append([]string(nil), fakeAgent.calls...)
+	removeAction := fakeAgent.addRequest.Action
+	fakeAgent.mu.Unlock()
+	if len(calls) != 2 || calls[0] != "add-client" || calls[1] != "add-client" || removeAction != "remove-client" {
+		t.Fatalf("remote revoke calls=%v request=%#v", calls, fakeAgent.addRequest)
 	}
 }
 

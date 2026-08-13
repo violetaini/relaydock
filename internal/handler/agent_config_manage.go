@@ -1843,6 +1843,26 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		return
 	}
 	oldEffectiveNodeHost, newEffectiveNodeHost := normalizeRemoteServerAddressUpdate(oldServer, &req)
+	identityOrEndpointChanged := strings.TrimSpace(req.Name) != oldServer.Name ||
+		(newEffectiveNodeHost != "" && newEffectiveNodeHost != oldEffectiveNodeHost)
+	if identityOrEndpointChanged {
+		hasDirectGrants, grantErr := h.repo.HasActiveDirectNodeGrantsForServer(ctx, req.ID)
+		if grantErr != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "检查固定节点授权失败"})
+			return
+		}
+		if hasDirectGrants {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusConflict)
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{
+				Success: false,
+				Message: "服务器存在生效中的个性化固定节点授权；请先撤销授权，再修改名称或节点地址",
+			})
+			return
+		}
+	}
 
 	if req.XrayMode == "embedded" && oldServer.XrayMode != "embedded" && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureEmbeddedXray) {
 		w.Header().Set("Content-Type", "application/json")

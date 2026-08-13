@@ -53,7 +53,7 @@ func (h *UserNodesHandler) HandleListNodes(w http.ResponseWriter, r *http.Reques
 	}
 	nodeIDs := make([]int64, 0)
 	seen := make(map[int64]bool)
-	packageAllowed := user.IsActive && user.PackageID > 0 && (user.PackageEndDate == nil || time.Now().Before(*user.PackageEndDate))
+	packageAllowed := packageAssignmentActive(user, time.Now())
 	if packageAllowed {
 		if overLimit, limitErr := h.repo.IsUserOverLimit(ctx, username); limitErr != nil || overLimit {
 			packageAllowed = false
@@ -76,6 +76,17 @@ func (h *UserNodesHandler) HandleListNodes(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	for _, nodeID := range managedNodeIDs {
+		if !seen[nodeID] {
+			nodeIDs = append(nodeIDs, nodeID)
+			seen[nodeID] = true
+		}
+	}
+	directNodeIDs, err := h.repo.ListEffectiveDirectNodeIDs(ctx, username, time.Now().UTC())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "获取固定授权节点失败")
+		return
+	}
+	for _, nodeID := range directNodeIDs {
 		if !seen[nodeID] {
 			nodeIDs = append(nodeIDs, nodeID)
 			seen[nodeID] = true
@@ -396,7 +407,7 @@ func (h *UserNodesHandler) validateNodeAccess(ctx context.Context, username stri
 		return storage.Node{}, 0, fmt.Errorf("获取用户失败")
 	}
 	found := false
-	packageAllowed := user.IsActive && user.PackageID > 0 && (user.PackageEndDate == nil || time.Now().Before(*user.PackageEndDate))
+	packageAllowed := packageAssignmentActive(user, time.Now())
 	if packageAllowed {
 		if overLimit, limitErr := h.repo.IsUserOverLimit(ctx, username); limitErr != nil || overLimit {
 			packageAllowed = false
@@ -414,6 +425,18 @@ func (h *UserNodesHandler) validateNodeAccess(ctx context.Context, username stri
 	}
 	if !found {
 		found = hasEffectiveManagedNodeAccess(ctx, h.repo, username, nodeID)
+	}
+	if !found {
+		directNodeIDs, directErr := h.repo.ListEffectiveDirectNodeIDs(ctx, username, time.Now().UTC())
+		if directErr != nil {
+			return storage.Node{}, 0, fmt.Errorf("获取固定授权节点失败")
+		}
+		for _, directNodeID := range directNodeIDs {
+			if directNodeID == nodeID {
+				found = true
+				break
+			}
+		}
 	}
 	if !found {
 		return storage.Node{}, 0, fmt.Errorf("您无权使用该节点")

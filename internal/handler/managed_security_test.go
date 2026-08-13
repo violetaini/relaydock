@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/proxyparser/substore"
@@ -194,6 +195,56 @@ func TestApplyUserCredentialsFailsClosed(t *testing.T) {
 	delete(wireGuardProxy, "private-key")
 	if applyUserCredentials(wireGuardProxy, wireGuardNode, nil) {
 		t.Fatal("managed WireGuard config without a hydrated private key passed")
+	}
+}
+
+func TestUserNodeListKeepsAuthorizedNodePendingWithoutOwnerCredential(t *testing.T) {
+	ctx := context.Background()
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "admin", storage.RoleAdmin)
+	createManagedSecurityTestUser(t, repo, "alice", storage.RoleUser)
+
+	ownerConfig := `{"name":"managed","type":"vless","server":"edge.example.test","port":443,"uuid":"owner-secret"}`
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "managed", Protocol: "vless", OriginalServer: "edge-1", InboundTag: "vless-in",
+		ClashConfig: ownerConfig, ParsedConfig: ownerConfig, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "pending-node", TrafficLimitBytes: 1024, CycleDays: 30, Nodes: []int64{node.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := &nodesHandler{repo: repo}
+	req := httptest.NewRequest(http.MethodGet, "/api/nodes", nil)
+	req = req.WithContext(auth.ContextWithUsername(req.Context(), "alice"))
+	rec := httptest.NewRecorder()
+	handler.handleList(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Nodes []nodeDTO `json:"nodes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Nodes) != 1 || response.Nodes[0].ID != node.ID {
+		t.Fatalf("authorized pending node missing: %#v", response.Nodes)
+	}
+	got := response.Nodes[0]
+	if got.CredentialState != "pending" || got.ClashConfig != "" || got.ParsedConfig != "" || got.RawURL != "" {
+		t.Fatalf("pending node leaked configuration or state is wrong: %#v", got)
+	}
+	if strings.Contains(rec.Body.String(), "owner-secret") {
+		t.Fatalf("owner credential leaked in pending response: %s", rec.Body.String())
 	}
 }
 

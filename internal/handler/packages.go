@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -83,21 +84,23 @@ func hasNonZeroIntLimit(m map[int64]int) bool {
 }
 
 type createPackageRequest struct {
-	Name             string                       `json:"name"`
-	Description      string                       `json:"description"`
-	TrafficLimitGB   float64                      `json:"traffic_limit_gb"`
-	CycleDays        int                          `json:"cycle_days"`
-	IsReset          bool                         `json:"is_reset"`
-	ResetDay         int                          `json:"reset_day"`
-	Nodes            []int64                      `json:"nodes"`
-	NodeMultipliers  map[int64]float64            `json:"node_multipliers"`   // node_id → 倍率
-	NodeSpeedLimits  map[int64]float64            `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeDeviceLimits map[int64]int                `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
-	SpeedLimitMbps   float64                      `json:"speed_limit_mbps"`
-	DeviceLimit      int                          `json:"device_limit"`
-	AutoSpeedRules   []storage.AutoSpeedLimitRule `json:"auto_speed_rules"`
-	TrafficMode      string                       `json:"traffic_mode"`
-	TemplateFilename string                       `json:"template_filename"` // 空 = 走系统默认
+	Name             string                           `json:"name"`
+	Description      string                           `json:"description"`
+	TrafficLimitGB   float64                          `json:"traffic_limit_gb"`
+	CycleDays        int                              `json:"cycle_days"`
+	IsReset          bool                             `json:"is_reset"`
+	ResetDay         int                              `json:"reset_day"`
+	Nodes            []int64                          `json:"nodes"`
+	NodeMultipliers  map[int64]float64                `json:"node_multipliers"`   // node_id → 倍率
+	NodeSpeedLimits  map[int64]float64                `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeDeviceLimits map[int64]int                    `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	SpeedLimitMbps   float64                          `json:"speed_limit_mbps"`
+	DeviceLimit      int                              `json:"device_limit"`
+	AutoSpeedRules   []storage.AutoSpeedLimitRule     `json:"auto_speed_rules"`
+	ServerGrants     []storage.PackageServerGrant     `json:"server_grants"`
+	ForwardingGrants []storage.PackageForwardingGrant `json:"forwarding_grants"`
+	TrafficMode      string                           `json:"traffic_mode"`
+	TemplateFilename string                           `json:"template_filename"` // 空 = 走系统默认
 }
 
 // validatePackageTemplateFilename 非空时校验 rule_templates 下文件存在。空字符串直接通过(表示用系统默认)。
@@ -137,8 +140,8 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if req.TrafficLimitGB <= 0 {
-		http.Error(w, "Traffic limit must be greater than 0", http.StatusBadRequest)
+	if req.TrafficLimitGB < 0 {
+		http.Error(w, "Traffic limit cannot be negative", http.StatusBadRequest)
 		return
 	}
 
@@ -188,6 +191,8 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		SpeedLimitMbps:    req.SpeedLimitMbps,
 		DeviceLimit:       req.DeviceLimit,
 		AutoSpeedRules:    req.AutoSpeedRules,
+		ServerGrants:      req.ServerGrants,
+		ForwardingGrants:  req.ForwardingGrants,
 		TrafficMode:       trafficMode,
 		TemplateFilename:  strings.TrimSpace(req.TemplateFilename),
 	}
@@ -227,22 +232,24 @@ func NewPackageUpdateHandler(repo *storage.TrafficRepository, remoteManage *Remo
 }
 
 type updatePackageRequest struct {
-	ID               int64                        `json:"id"`
-	Name             string                       `json:"name"`
-	Description      string                       `json:"description"`
-	TrafficLimitGB   float64                      `json:"traffic_limit_gb"`
-	CycleDays        int                          `json:"cycle_days"`
-	IsReset          *bool                        `json:"is_reset"`  // 指针:请求未携带时保留库中旧值,不按零值覆盖
-	ResetDay         *int                         `json:"reset_day"` // 同上
-	Nodes            []int64                      `json:"nodes"`
-	NodeMultipliers  map[int64]float64            `json:"node_multipliers"`   // node_id → 倍率
-	NodeSpeedLimits  map[int64]float64            `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeDeviceLimits map[int64]int                `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
-	SpeedLimitMbps   float64                      `json:"speed_limit_mbps"`
-	DeviceLimit      int                          `json:"device_limit"`
-	AutoSpeedRules   []storage.AutoSpeedLimitRule `json:"auto_speed_rules"`
-	TrafficMode      string                       `json:"traffic_mode"`
-	TemplateFilename string                       `json:"template_filename"` // 空 = 走系统默认
+	ID               int64                            `json:"id"`
+	Name             string                           `json:"name"`
+	Description      string                           `json:"description"`
+	TrafficLimitGB   float64                          `json:"traffic_limit_gb"`
+	CycleDays        int                              `json:"cycle_days"`
+	IsReset          *bool                            `json:"is_reset"`  // 指针:请求未携带时保留库中旧值,不按零值覆盖
+	ResetDay         *int                             `json:"reset_day"` // 同上
+	Nodes            []int64                          `json:"nodes"`
+	NodeMultipliers  map[int64]float64                `json:"node_multipliers"`   // node_id → 倍率
+	NodeSpeedLimits  map[int64]float64                `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeDeviceLimits map[int64]int                    `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	SpeedLimitMbps   float64                          `json:"speed_limit_mbps"`
+	DeviceLimit      int                              `json:"device_limit"`
+	AutoSpeedRules   []storage.AutoSpeedLimitRule     `json:"auto_speed_rules"`
+	ServerGrants     []storage.PackageServerGrant     `json:"server_grants"`
+	ForwardingGrants []storage.PackageForwardingGrant `json:"forwarding_grants"`
+	TrafficMode      string                           `json:"traffic_mode"`
+	TemplateFilename string                           `json:"template_filename"` // 空 = 走系统默认
 }
 
 func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -268,8 +275,8 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if req.TrafficLimitGB <= 0 {
-		http.Error(w, "Traffic limit must be greater than 0", http.StatusBadRequest)
+	if req.TrafficLimitGB < 0 {
+		http.Error(w, "Traffic limit cannot be negative", http.StatusBadRequest)
 		return
 	}
 
@@ -340,11 +347,14 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		SpeedLimitMbps:    req.SpeedLimitMbps,
 		DeviceLimit:       req.DeviceLimit,
 		AutoSpeedRules:    req.AutoSpeedRules,
+		ServerGrants:      req.ServerGrants,
+		ForwardingGrants:  req.ForwardingGrants,
 		TrafficMode:       trafficMode,
 		TemplateFilename:  strings.TrimSpace(req.TemplateFilename),
 	}
 
-	if err := h.repo.UpdatePackage(r.Context(), pkg); err != nil {
+	bundleWarnings, err := h.repo.UpdatePackageBundle(r.Context(), pkg)
+	if err != nil {
 		if errors.Is(err, storage.ErrPackageNotFound) {
 			http.Error(w, "Package not found", http.StatusNotFound)
 			return
@@ -356,7 +366,6 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	if h.pusher != nil {
 		go h.pusher.PushToAllServersForPackage(context.Background(), req.ID)
 	}
@@ -366,7 +375,8 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message": "Package updated successfully",
+		"message":  "Package updated successfully",
+		"warnings": bundleWarnings,
 	})
 }
 
@@ -621,13 +631,18 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 		}(cfg)
 	}
 
-	// 子账号路径:从所有 active routed 节点下线(凭据保留,续费可恢复)
+	packageRoutedNodes, packageErr := packageRoutedNodeIDsForUser(ctx, repo, username)
+	if packageErr != nil {
+		mutationErrs = append(mutationErrs, packageErr)
+	}
+	// 只下线当前套餐直接授权的 shared routed 节点。用户基于手工固定节点或
+	// 服务器授权创建的私有转发不属于套餐生命周期，解绑不能误停它们。
 	subaccs, subaccountErr := repo.ListUserSubaccounts(ctx, username)
 	if subaccountErr != nil {
 		mutationErrs = append(mutationErrs, fmt.Errorf("获取用户 %s 路由子账号失败: %w", username, subaccountErr))
 	}
 	for _, sa := range subaccs {
-		if !sa.IsActive {
+		if !sa.IsActive || !packageRoutedNodes[sa.RoutedNodeID] {
 			continue
 		}
 		wg.Add(1)
@@ -660,6 +675,35 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 		}
 	}
 	return nil
+}
+
+func packageRoutedNodeIDsForUser(ctx context.Context, repo *storage.TrafficRepository, username string) (map[int64]bool, error) {
+	result := make(map[int64]bool)
+	user, err := repo.GetUser(ctx, username)
+	if err != nil {
+		return result, fmt.Errorf("获取用户 %s 套餐失败: %w", username, err)
+	}
+	if user.PackageID <= 0 {
+		return result, nil
+	}
+	pkg, err := repo.GetPackage(ctx, user.PackageID)
+	if err != nil {
+		return result, fmt.Errorf("获取用户 %s 套餐模板失败: %w", username, err)
+	}
+	for _, nodeID := range pkg.Nodes {
+		node, nodeErr := repo.GetNodeByID(ctx, nodeID)
+		if nodeErr != nil {
+			if errors.Is(nodeErr, storage.ErrNodeNotFound) {
+				continue
+			}
+			return result, nodeErr
+		}
+		if strings.EqualFold(strings.TrimSpace(node.NodeType), "routed") &&
+			!strings.EqualFold(strings.TrimSpace(node.RoutedOwner), "user") {
+			result[node.ID] = true
+		}
+	}
+	return result, nil
 }
 
 func (h *PackageDeleteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -769,6 +813,11 @@ func (h *PackageUnassignHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 
 	ctx := r.Context()
+	packageRoutedNodes, packageErr := packageRoutedNodeIDsForUser(ctx, h.repo, req.Username)
+	if packageErr != nil {
+		http.Error(w, packageErr.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	// 先从入站中移除用户凭据
 	configs, err := h.repo.GetUserInboundConfigs(ctx, req.Username)
@@ -794,7 +843,7 @@ func (h *PackageUnassignHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	for _, sa := range subaccs {
-		if !sa.IsActive {
+		if !sa.IsActive || !packageRoutedNodes[sa.RoutedNodeID] {
 			continue
 		}
 		_, removeErr := removeUserFromRoutedNode(ctx, h.remoteManage, h.repo, req.Username, sa.RoutedNodeID)
@@ -836,10 +885,76 @@ type PackageAssignHandler struct {
 	repo         *storage.TrafficRepository
 	remoteManage *RemoteManageHandler
 	pusher       *LimiterConfigPusher
+	reconcileMu  sync.Mutex
+	reconcileWG  sync.WaitGroup
 }
 
 func NewPackageAssignHandler(repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher) *PackageAssignHandler {
 	return &PackageAssignHandler{repo: repo, remoteManage: remoteManage, pusher: pusher}
+}
+
+// StartReconciler continuously derives package credentials from the current
+// assignment state. This closes the failure window left by an Agent being
+// offline during assignment/template update and also repairs it after restart.
+func (h *PackageAssignHandler) StartReconciler(ctx context.Context) {
+	if h == nil || h.repo == nil {
+		return
+	}
+	h.reconcileWG.Add(1)
+	go func() {
+		defer h.reconcileWG.Done()
+		startup := time.NewTimer(20 * time.Second)
+		defer startup.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-startup.C:
+		}
+		h.reconcileAssignments(ctx)
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				h.reconcileAssignments(ctx)
+			}
+		}
+	}()
+}
+
+func (h *PackageAssignHandler) WaitForReconciler() {
+	if h != nil {
+		h.reconcileWG.Wait()
+	}
+}
+
+func (h *PackageAssignHandler) reconcileAssignments(ctx context.Context) {
+	if !h.reconcileMu.TryLock() {
+		return
+	}
+	defer h.reconcileMu.Unlock()
+	users, err := h.repo.ListUsersWithPackage(ctx)
+	if err != nil {
+		log.Printf("[PackageReconcile] list users failed: %v", err)
+		return
+	}
+	now := time.Now()
+	for _, user := range users {
+		if ctx.Err() != nil {
+			return
+		}
+		if !user.IsActive || user.PackageID <= 0 || user.PackageStartDate == nil || user.PackageEndDate == nil ||
+			now.Before(*user.PackageStartDate) || !now.Before(*user.PackageEndDate) {
+			continue
+		}
+		warnings, reconcileErr := h.AssignAndProvision(ctx, user.Username, user.PackageID,
+			*user.PackageStartDate, *user.PackageEndDate, user.IsReset, user.ResetDay)
+		if reconcileErr != nil || len(warnings) > 0 {
+			log.Printf("[PackageReconcile] user=%s package=%d warnings=%v err=%v", user.Username, user.PackageID, warnings, reconcileErr)
+		}
+	}
 }
 
 type assignPackageRequest struct {
@@ -852,6 +967,8 @@ type assignPackageRequest struct {
 	IsReset  *bool `json:"is_reset"`
 	ResetDay *int  `json:"reset_day"`
 }
+
+var errInvalidPackageWindow = errors.New("invalid package assignment window")
 
 func (h *PackageAssignHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -906,7 +1023,7 @@ func (h *PackageAssignHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	var startDate time.Time
 	if req.StartDate != "" {
-		parsed, err := time.Parse("2006-01-02", req.StartDate)
+		parsed, err := time.ParseInLocation("2006-01-02", req.StartDate, time.Local)
 		if err != nil {
 			http.Error(w, "Invalid start_date format, expected YYYY-MM-DD", http.StatusBadRequest)
 			return
@@ -915,11 +1032,15 @@ func (h *PackageAssignHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	} else {
 		startDate = time.Now()
 	}
+	if startDate.After(time.Now().Add(time.Minute)) {
+		http.Error(w, "Future package start dates are not supported", http.StatusBadRequest)
+		return
+	}
 
 	// 计算到期时间：优先使用前端传入的 expire_date，否则默认 start + CycleDays 天
 	var endDate time.Time
 	if req.ExpireDate != "" {
-		parsed, err := time.Parse("2006-01-02", req.ExpireDate)
+		parsed, err := time.ParseInLocation("2006-01-02", req.ExpireDate, time.Local)
 		if err != nil {
 			http.Error(w, "Invalid expire_date format, expected YYYY-MM-DD", http.StatusBadRequest)
 			return
@@ -929,6 +1050,10 @@ func (h *PackageAssignHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		endDate = startDate.AddDate(0, 0, pkg.CycleDays)
 	} else {
 		endDate = startDate.AddDate(0, 1, 0)
+	}
+	if !endDate.After(startDate) || !endDate.After(time.Now()) {
+		http.Error(w, "expire_date must be later than the package start time", http.StatusBadRequest)
+		return
 	}
 
 	warnings, perr := h.AssignAndProvision(ctx, req.Username, req.PackageID, startDate, endDate, isReset, resetDay)
@@ -943,6 +1068,10 @@ func (h *PackageAssignHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		}
 		if errors.Is(perr, storage.ErrManagedAccessConflict) {
 			http.Error(w, perr.Error(), http.StatusConflict)
+			return
+		}
+		if errors.Is(perr, errInvalidPackageWindow) {
+			http.Error(w, perr.Error(), http.StatusBadRequest)
 			return
 		}
 		http.Error(w, perr.Error(), http.StatusInternalServerError)
@@ -961,47 +1090,57 @@ func (h *PackageAssignHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 // 抽自 ServeHTTP,供 web /api/admin/packages/assign 与 TGBOT 注册/兑换共用,确保两条路都生效。
 func (h *PackageAssignHandler) AssignAndProvision(ctx context.Context, username string, packageID int64, startDate, endDate time.Time, isReset bool, resetDay int) ([]string, error) {
 	var warnings []string
-
-	// "套餐未变"的纯续期 / 改到期路径:用户当前就绑着这个 package,client 早已下发到各节点入站,
-	// 调整到期时间(以及 reset 设置)只是 DB 变更 —— 到期由 TrafficLimitEnforcer 在 PackageEndDate
-	// 过后统一摘除 client,有效期内不按日期动 xray。因此这里无需重新下发 client。
-	// 跳过重下发还能避免 GetUserInboundConfig 与 agent 实际 client 漂移时,generateCredential 生成
-	// "同 email(username__tag)不同 uuid" 的重复 client(agent matchClientCredential 按 uuid 判重不按 email)。
-	// 注意:用户套餐到期后 enforcer 会清空 package_id,故"过期后续费"是 prev.PackageID(0)≠packageID,
-	// 仍走下面的重新下发分支,client 会被正常加回。
-	samePackage := false
-	if prev, perr := h.repo.GetUser(ctx, username); perr == nil && prev.PackageID == packageID {
-		samePackage = true
+	var revokedPreviousAccess []packageNodeRevocation
+	if startDate.After(time.Now().Add(time.Minute)) || !endDate.After(startDate) || !endDate.After(time.Now()) {
+		return nil, errInvalidPackageWindow
 	}
-
-	if err := h.repo.AssignPackageToUser(ctx, username, packageID, startDate, endDate, isReset, resetDay); err != nil {
+	currentUser, err := h.repo.GetUser(ctx, username)
+	if err != nil {
 		return nil, err
 	}
-
-	if samePackage {
-		// Renewal changes the effective Agent-side deadline. Re-send every saved
-		// credential idempotently so shortening or extending the package takes
-		// effect even though the UUID/password itself is unchanged.
-		configs, configErr := h.repo.GetUserInboundConfigs(ctx, username)
-		if configErr != nil {
-			warnings = append(warnings, "读取现有入站凭据失败")
-		} else if user, userErr := h.repo.GetUser(ctx, username); userErr != nil {
-			warnings = append(warnings, "读取用户信息失败")
-		} else {
-			for _, cfg := range configs {
-				if refreshErr := addUserToInbound(ctx, h.remoteManage, h.repo, user, cfg.ServerID, cfg.InboundTag); refreshErr != nil {
-					log.Printf("[PackageAssign] refresh deadline user=%s server=%d tag=%s failed: %v", username, cfg.ServerID, cfg.InboundTag, refreshErr)
-					warnings = append(warnings, fmt.Sprintf("入站 %s 有效期刷新失败", cfg.InboundTag))
-				}
+	targetPackage, err := h.repo.GetPackage(ctx, packageID)
+	if err != nil {
+		return nil, err
+	}
+	if currentUser.PackageID > 0 && currentUser.PackageID != packageID {
+		currentPackage, currentErr := h.repo.GetPackage(ctx, currentUser.PackageID)
+		if currentErr != nil {
+			return nil, fmt.Errorf("load current package before switch: %w", currentErr)
+		}
+		revokedPreviousAccess, err = h.revokePackageNodeDifference(ctx, username, currentPackage, targetPackage)
+		if err != nil {
+			revokeErr := fmt.Errorf("revoke previous package access before switch: %w", err)
+			if compensateErr := h.restorePackageNodeRevocations(ctx, currentUser, revokedPreviousAccess); compensateErr != nil {
+				return nil, errors.Join(revokeErr, fmt.Errorf("restore previous package access: %w", compensateErr))
 			}
+			return nil, revokeErr
 		}
-		if h.pusher != nil {
-			go h.pusher.PushToAllServersForUser(context.Background(), username)
-		}
-		return warnings, nil
 	}
 
-	// 获取套餐关联的节点，为每个节点的入站添加用户凭据
+	bundleWarnings, err := h.repo.AssignPackageBundleToUser(ctx, username, packageID, startDate, endDate, isReset, resetDay)
+	if err != nil {
+		// Storage validation and transaction failures normally leave the old
+		// assignment authoritative. Confirm that state before restoring the old
+		// remote access: if commit status were ever uncertain, restoring without
+		// this check could grant both packages at once.
+		if len(revokedPreviousAccess) > 0 {
+			persisted, readErr := h.repo.GetUser(ctx, username)
+			if readErr == nil && persisted.PackageID == currentUser.PackageID {
+				if compensateErr := h.restorePackageNodeRevocations(ctx, currentUser, revokedPreviousAccess); compensateErr != nil {
+					return nil, errors.Join(err, fmt.Errorf("restore previous package access: %w", compensateErr))
+				}
+			} else if readErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("verify package state before compensation: %w", readErr))
+			}
+		}
+		return nil, err
+	}
+	warnings = append(warnings, bundleWarnings...)
+
+	// Always reconcile every package node, including same-package renewal. This
+	// refreshes deadlines and repairs a partial previous assignment where a
+	// credential or routed subaccount was never created. The lower-level Agent
+	// mutations are idempotent and reuse the persisted credential identity.
 	pkg, err := h.repo.GetPackage(ctx, packageID)
 	if err != nil {
 		log.Printf("[PackageAssign] Failed to get package: %v", err)
@@ -1144,6 +1283,121 @@ func (h *PackageAssignHandler) AssignAndProvision(ctx context.Context, username 
 		go h.pusher.PushToAllServersForUser(context.Background(), username)
 	}
 	return warnings, nil
+}
+
+type packageNodeRevocation struct {
+	routedNodeID int64
+	inbound      *storage.UserInboundConfig
+}
+
+// revokePackageNodeDifference removes old-package-only credentials before the
+// database assignment changes. A failed Agent mutation therefore leaves the
+// old package authoritative and makes the switch retryable instead of granting
+// the new package while stale old access remains live.
+func (h *PackageAssignHandler) revokePackageNodeDifference(ctx context.Context, username string, current, target *storage.Package) ([]packageNodeRevocation, error) {
+	if current == nil || target == nil {
+		return nil, errors.New("package template is unavailable")
+	}
+	revoked := make([]packageNodeRevocation, 0)
+	targetNodes := make(map[int64]struct{}, len(target.Nodes))
+	targetInbounds := make(map[string]struct{}, len(target.Nodes))
+	for _, nodeID := range target.Nodes {
+		targetNodes[nodeID] = struct{}{}
+		node, err := h.repo.GetNodeByID(ctx, nodeID)
+		if err != nil || node.NodeType == "routed" || node.OriginalServer == "" || node.InboundTag == "" {
+			continue
+		}
+		server, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer)
+		if err == nil {
+			targetInbounds[fmt.Sprintf("%d|%s", server.ID, node.InboundTag)] = struct{}{}
+		}
+	}
+	seenInbound := make(map[string]struct{})
+	for _, nodeID := range current.Nodes {
+		if _, keep := targetNodes[nodeID]; keep {
+			continue
+		}
+		node, err := h.repo.GetNodeByID(ctx, nodeID)
+		if err != nil {
+			continue
+		}
+		if node.NodeType == "routed" {
+			subaccount, err := h.repo.GetUserSubaccount(ctx, node.ID, username)
+			if err != nil {
+				return revoked, err
+			}
+			wasActive := subaccount != nil && subaccount.IsActive
+			if wasActive {
+				revoked = append(revoked, packageNodeRevocation{routedNodeID: node.ID})
+			}
+			if _, err := removeUserFromRoutedNode(ctx, h.remoteManage, h.repo, username, node.ID); err != nil {
+				return revoked, err
+			}
+			continue
+		}
+		if node.OriginalServer == "" || node.InboundTag == "" {
+			continue
+		}
+		server, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer)
+		if err != nil {
+			return revoked, err
+		}
+		key := fmt.Sprintf("%d|%s", server.ID, node.InboundTag)
+		if _, keep := targetInbounds[key]; keep {
+			continue
+		}
+		if _, duplicate := seenInbound[key]; duplicate {
+			continue
+		}
+		seenInbound[key] = struct{}{}
+		cfg, err := h.repo.GetUserInboundConfig(ctx, username, server.ID, node.InboundTag)
+		if errors.Is(err, sql.ErrNoRows) || cfg == nil {
+			continue
+		}
+		if err != nil {
+			return revoked, err
+		}
+		copy := *cfg
+		revoked = append(revoked, packageNodeRevocation{inbound: &copy})
+		retained, err := removePackageUserInboundConfig(ctx, h.remoteManage, h.repo, *cfg)
+		if err != nil && !isInboundNotFoundErr(err) {
+			return revoked, err
+		}
+		if retained {
+			revoked = revoked[:len(revoked)-1]
+		}
+	}
+	return revoked, nil
+}
+
+func (h *PackageAssignHandler) restorePackageNodeRevocations(ctx context.Context, user storage.User, revoked []packageNodeRevocation) error {
+	var restoreErrors []error
+	for i := len(revoked) - 1; i >= 0; i-- {
+		action := revoked[i]
+		if action.routedNodeID > 0 {
+			if err := addUserToRoutedNode(ctx, h.remoteManage, h.repo, user, action.routedNodeID); err != nil {
+				restoreErrors = append(restoreErrors, fmt.Errorf("routed node %d: %w", action.routedNodeID, err))
+			}
+			continue
+		}
+		if action.inbound == nil {
+			continue
+		}
+		cfg := *action.inbound
+		var credential map[string]interface{}
+		if err := json.Unmarshal([]byte(cfg.CredentialJSON), &credential); err != nil || credential == nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("inbound %d/%s credential: %v", cfg.ServerID, cfg.InboundTag, err))
+			continue
+		}
+		if err := h.repo.SaveUserInboundConfig(ctx, cfg); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("inbound %d/%s state: %w", cfg.ServerID, cfg.InboundTag, err))
+			continue
+		}
+		if err := applyPreparedInboundCredentialForUser(ctx, h.remoteManage, h.repo, user.Username, cfg.ServerID, cfg.InboundTag, credential, user.PackageEndDate); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("inbound %d/%s remote: %w", cfg.ServerID, cfg.InboundTag, err))
+		}
+	}
+	return errors.Join(restoreErrors...)
 }
 
 func (h *PackageAssignHandler) autoGenerateSubscription(ctx context.Context, username string, packageID int64) {
@@ -1518,15 +1772,30 @@ func addUserToInbound(ctx context.Context, rm *RemoteManageHandler, repo *storag
 	if err != nil {
 		return fmt.Errorf("resolve managed inbound access: %w", err)
 	}
+	hasDirect, directExpiry, err := repo.HasEffectiveDirectUserInboundAccess(ctx, user.Username, serverID, inboundTag, 0, now)
+	if err != nil {
+		return fmt.Errorf("resolve direct inbound access: %w", err)
+	}
+	hasIndependent, independentExpiry := laterOptionalExpiry(hasManaged, managedExpiry, hasDirect, directExpiry)
 	hasPackage, packageExpiry, err := hasLegacyPackageInboundAccess(ctx, repo, user.Username, serverID, inboundTag, now)
 	if err != nil {
 		return fmt.Errorf("resolve package inbound access: %w", err)
 	}
-	hasAccess, notAfter := laterOptionalExpiry(hasManaged, managedExpiry, hasPackage, packageExpiry)
+	hasAccess, notAfter := laterOptionalExpiry(hasIndependent, independentExpiry, hasPackage, packageExpiry)
 	if !hasAccess {
 		return errors.New("no active authorization for inbound")
 	}
 	return addUserToInboundWithExpiry(ctx, rm, repo, user, serverID, inboundTag, notAfter)
+}
+
+func packageAssignmentActive(user storage.User, now time.Time) bool {
+	if !user.IsActive || user.PackageID <= 0 {
+		return false
+	}
+	if user.PackageStartDate != nil && now.Before(*user.PackageStartDate) {
+		return false
+	}
+	return user.PackageEndDate == nil || now.Before(*user.PackageEndDate)
 }
 
 func addUserToInboundWithExpiry(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, user storage.User, serverID int64, inboundTag string, notAfter *time.Time) error {
@@ -1794,6 +2063,11 @@ func removePackageUserFromInbound(ctx context.Context, rm *RemoteManageHandler, 
 	if err != nil {
 		return false, fmt.Errorf("resolve managed access before package cleanup: %w", err)
 	}
+	hasDirectAccess, directExpiry, err := rm.repo.HasEffectiveDirectUserInboundAccess(ctx, cfg.Username, cfg.ServerID, cfg.InboundTag, 0, time.Now().UTC())
+	if err != nil {
+		return false, fmt.Errorf("resolve direct access before package cleanup: %w", err)
+	}
+	hasManagedAccess, notAfter = laterOptionalExpiry(hasManagedAccess, notAfter, hasDirectAccess, directExpiry)
 	if hasManagedAccess {
 		user, userErr := rm.repo.GetUser(ctx, cfg.Username)
 		if userErr != nil {
@@ -1831,6 +2105,13 @@ func removePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHandler
 		if err != nil {
 			return fmt.Errorf("resolve managed access before package cleanup: %w", err)
 		}
+		hasDirectAccess, directExpiry, err := repo.HasEffectiveDirectUserInboundAccess(
+			leasedCtx, cfg.Username, cfg.ServerID, cfg.InboundTag, 0, time.Now().UTC(),
+		)
+		if err != nil {
+			return fmt.Errorf("resolve direct access before package cleanup: %w", err)
+		}
+		hasManagedAccess, notAfter = laterOptionalExpiry(hasManagedAccess, notAfter, hasDirectAccess, directExpiry)
 		if hasManagedAccess {
 			var credential map[string]interface{}
 			if err := json.Unmarshal([]byte(cfg.CredentialJSON), &credential); err != nil || credential == nil {
@@ -1882,7 +2163,7 @@ func hasLegacyPackageInboundAccess(ctx context.Context, repo *storage.TrafficRep
 	if err != nil {
 		return false, nil, err
 	}
-	if !user.IsActive || user.PackageID <= 0 || (user.PackageEndDate != nil && !now.Before(*user.PackageEndDate)) {
+	if !packageAssignmentActive(user, now) {
 		return false, nil, nil
 	}
 	overLimit, err := repo.IsUserOverLimit(ctx, username)

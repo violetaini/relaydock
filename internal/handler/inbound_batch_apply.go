@@ -45,11 +45,19 @@ func collectInboundClientAddItem(ctx context.Context, cache *InboundCache, repo 
 	if err != nil {
 		return nil, false, err
 	}
+	hasDirect, directExpiry, err := repo.HasEffectiveDirectUserInboundAccess(ctx, user.Username, serverID, inboundTag, 0, now)
+	if err != nil {
+		return nil, false, err
+	}
+	hasIndependent, independentExpiry := laterOptionalExpiry(hasManaged, managedExpiry, hasDirect, directExpiry)
 	hasPackage, packageExpiry, err := hasLegacyPackageInboundAccess(ctx, repo, user.Username, serverID, inboundTag, now)
 	if err != nil {
 		return nil, false, err
 	}
-	_, notAfter := laterOptionalExpiry(hasManaged, managedExpiry, hasPackage, packageExpiry)
+	hasAccess, notAfter := laterOptionalExpiry(hasIndependent, independentExpiry, hasPackage, packageExpiry)
+	if !hasAccess {
+		return nil, false, errors.New("no active authorization for inbound")
+	}
 	if notAfter != nil {
 		return nil, false, fmt.Errorf("expiring credential requires atomic add-client")
 	}

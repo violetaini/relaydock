@@ -629,6 +629,47 @@ func TestResolveManagedForwardTargetRejectsPackageOnlyVisibility(t *testing.T) {
 	}
 }
 
+func TestResolveManagedForwardTargetAcceptsDirectOnlyAccess(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	ctx := context.Background()
+	result, err := fixture.repo.DeactivateUserNodeSelection(ctx, "alice", fixture.selectionID, "alice",
+		storage.ManagedSuspendUserDisabled, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.MarkUserInboundAccessSourceApplied(ctx, result.Source.ID, result.Source.Generation,
+		storage.ManagedObservedInactive, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := time.Now().UTC().Add(90 * time.Minute)
+	direct, _, err := fixture.repo.UpsertManualUserNodeGrant(ctx, "alice", fixture.nodeID, &expiresAt, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := fixture.repo.GetUserInboundConfig(ctx, "alice", direct.Source.ServerID, direct.Source.InboundTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.repo.SetUserNodeGrantCredential(ctx, direct.Grant.ID, credential.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.MarkUserInboundAccessSourceApplied(ctx, direct.Source.ID, direct.Source.Generation,
+		storage.ManagedObservedActive, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	node, host, port, expiry, err := fixture.handler.resolveManagedForwardTarget(ctx, "alice", fixture.nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.ID != fixture.nodeID || host != "198.51.100.20" || port != 443 {
+		t.Fatalf("resolved target=%d %s:%d", node.ID, host, port)
+	}
+	if expiry == nil || !expiry.Equal(expiresAt) {
+		t.Fatalf("expiry=%v want=%v", expiry, expiresAt)
+	}
+}
+
 func TestTunnelSpecNormalizesPreviousHopHostCIDRs(t *testing.T) {
 	fixture := newForwardingHandlerFixture(t)
 	ctx := context.Background()

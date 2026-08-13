@@ -143,11 +143,16 @@ func (h *ManagedNodesHandler) effectiveInboundExpiry(ctx context.Context, source
 	if err != nil {
 		return false, nil, err
 	}
+	hasDirect, directExpiry, err := h.repo.HasEffectiveDirectUserInboundAccess(ctx, source.Username, source.ServerID, source.InboundTag, 0, now)
+	if err != nil {
+		return false, nil, err
+	}
+	hasIndependent, independentExpiry := laterOptionalExpiry(hasManaged, managedExpiry, hasDirect, directExpiry)
 	hasPackage, packageExpiry, err := hasLegacyPackageInboundAccess(ctx, h.repo, source.Username, source.ServerID, source.InboundTag, now)
 	if err != nil {
 		return false, nil, err
 	}
-	hasAccess, expiry := laterOptionalExpiry(hasManaged, managedExpiry, hasPackage, packageExpiry)
+	hasAccess, expiry := laterOptionalExpiry(hasIndependent, independentExpiry, hasPackage, packageExpiry)
 	return hasAccess, expiry, nil
 }
 
@@ -356,6 +361,7 @@ func (h *ManagedNodesHandler) reconcileSourceCurrentLocked(ctx context.Context, 
 
 func (h *ManagedNodesHandler) reconcileSourceLocked(ctx context.Context, source storage.UserInboundAccessSource) error {
 	recycleCredential := false
+	var directGrant *storage.UserNodeGrant
 	if source.SourceType == storage.ManagedSourceSelection {
 		selection, err := h.repo.GetUserNodeSelection(ctx, source.SourceID)
 		if err != nil {
@@ -429,12 +435,53 @@ func (h *ManagedNodesHandler) reconcileSourceLocked(ctx context.Context, source 
 				source = *updated
 			}
 		}
+	} else if source.SourceType == storage.ManagedSourceDirect {
+		item, err := h.repo.GetUserNodeGrant(ctx, source.SourceID)
+		if err != nil {
+			return err
+		}
+		directGrant = &item.Grant
+		if item.Grant.AccessSourceID != source.ID || item.Grant.Username != source.Username ||
+			item.Grant.NodeID != source.NodeID || item.Grant.SourceType != storage.GrantSourceManual {
+			return storage.ErrManagedServerMismatch
+		}
+		if item.Grant.CredentialConfigID != nil {
+			credential, credentialErr := h.repo.GetUserInboundConfig(ctx, source.Username, source.ServerID, source.InboundTag)
+			switch {
+			case errors.Is(credentialErr, sql.ErrNoRows):
+				recycleCredential = true
+			case credentialErr != nil:
+				return credentialErr
+			case credential.ID != *item.Grant.CredentialConfigID:
+				recycleCredential = true
+			}
+		} else if source.AppliedGeneration != 0 || source.ObservedState == storage.ManagedObservedActive {
+			recycleCredential = true
+		}
+		if source.DesiredState == storage.ManagedDesiredActive {
+			node, nodeErr := h.repo.GetNodeByID(ctx, source.NodeID)
+			server, serverErr := h.repo.GetRemoteServer(ctx, source.ServerID)
+			structureValid := nodeErr == nil && serverErr == nil && node.Enabled &&
+				strings.EqualFold(strings.TrimSpace(server.XrayMode), "embedded") &&
+				node.OriginalServer == server.Name && node.InboundTag == source.InboundTag &&
+				strings.EqualFold(strings.TrimSpace(node.NodeType), "physical") &&
+				storage.SelfServiceNodeProtocolEligible(node.Protocol, node.ClashConfig) &&
+				!strings.HasPrefix(strings.ToLower(strings.TrimSpace(node.InboundTag)), "anydoor-")
+			if recycleCredential || !structureValid {
+				updated, updateErr := h.repo.SetUserNodeGrantDesiredState(ctx, item.Grant.ID,
+					source.Username, storage.ManagedDesiredInactive, "reconciler")
+				if updateErr != nil {
+					return updateErr
+				}
+				source = updated.Source
+			}
+		}
 	}
 	if h.remoteManage == nil {
 		return errors.New("remote manager is not available")
 	}
 	return h.repo.WithRemoteServerMutationLease(ctx, source.ServerID, func(leasedCtx context.Context) error {
-		return h.reconcileSourceMutationLocked(leasedCtx, source, recycleCredential)
+		return h.reconcileSourceMutationLocked(leasedCtx, source, recycleCredential, directGrant)
 	})
 }
 
@@ -442,7 +489,7 @@ func (h *ManagedNodesHandler) reconcileSourceLocked(ctx context.Context, source 
 // and client add/remove in one server mutation transaction. Nested remote
 // helpers reuse the lease through ctx, so an installation Begin cannot split
 // the policy update from the credential mutation.
-func (h *ManagedNodesHandler) reconcileSourceMutationLocked(ctx context.Context, source storage.UserInboundAccessSource, recycleCredential bool) error {
+func (h *ManagedNodesHandler) reconcileSourceMutationLocked(ctx context.Context, source storage.UserInboundAccessSource, recycleCredential bool, directGrant *storage.UserNodeGrant) error {
 	now := time.Now().UTC()
 	if source.DesiredState == storage.ManagedDesiredActive && source.ExpiresAt != nil && !now.Before(*source.ExpiresAt) {
 		updated, err := h.repo.SetUserInboundAccessSourceState(ctx, source.ID, source.Generation,
@@ -498,12 +545,19 @@ func (h *ManagedNodesHandler) reconcileSourceMutationLocked(ctx context.Context,
 			credential, err := h.repo.GetUserInboundConfig(ctx, source.Username, source.ServerID, source.InboundTag)
 			if err != nil {
 				applyErr = err
-			} else if credential != nil && source.SourceType == storage.ManagedSourceSelection {
-				selection, selectionErr := h.repo.GetUserNodeSelection(ctx, source.SourceID)
-				if selectionErr != nil {
-					applyErr = selectionErr
-				} else if selection.CredentialConfigID == nil {
-					applyErr = h.repo.SetUserNodeSelectionCredential(ctx, selection.ID, credential.ID)
+			} else if credential != nil {
+				switch source.SourceType {
+				case storage.ManagedSourceSelection:
+					selection, selectionErr := h.repo.GetUserNodeSelection(ctx, source.SourceID)
+					if selectionErr != nil {
+						applyErr = selectionErr
+					} else if selection.CredentialConfigID == nil {
+						applyErr = h.repo.SetUserNodeSelectionCredential(ctx, selection.ID, credential.ID)
+					}
+				case storage.ManagedSourceDirect:
+					if directGrant != nil && directGrant.CredentialConfigID == nil {
+						applyErr = h.repo.SetUserNodeGrantCredential(ctx, directGrant.ID, credential.ID)
+					}
 				}
 			}
 		}
@@ -562,6 +616,13 @@ func (h *ManagedNodesHandler) reconcileSourceMutationLocked(ctx context.Context,
 					} else if selection.CredentialConfigID != nil {
 						applyErr = h.repo.ClearUserNodeSelectionCredential(ctx, selection.ID, *selection.CredentialConfigID)
 					}
+				}
+			} else if applyErr == nil && recycleCredential && source.SourceType == storage.ManagedSourceDirect {
+				if credential != nil {
+					applyErr = h.repo.DeleteUserInboundConfig(ctx, source.Username, source.ServerID, source.InboundTag)
+				}
+				if applyErr == nil && directGrant != nil && directGrant.CredentialConfigID != nil {
+					applyErr = h.repo.ClearUserNodeGrantCredential(ctx, directGrant.ID, *directGrant.CredentialConfigID)
 				}
 			}
 		}
@@ -674,6 +735,9 @@ func (h *ManagedNodesHandler) reconcileAll(ctx context.Context) {
 			}
 		}
 	}
+	if _, err := h.repo.ExpireDirectUserInboundAccessSources(ctx, now, 200); err != nil {
+		log.Printf("[ManagedNodes] expire direct sources failed: %v", err)
+	}
 
 	pending, err := h.repo.ListPendingUserInboundAccessSources(ctx, now, 200, 0)
 	if err != nil {
@@ -682,6 +746,16 @@ func (h *ManagedNodesHandler) reconcileAll(ctx context.Context) {
 	}
 	for _, source := range pending {
 		if err := h.reconcileSourceCurrentLocked(ctx, source.ID); err != nil {
+			// User deletion materializes legacy-review revocations for every
+			// credential. A direct source may therefore be deleted first; missing
+			// source metadata must not block the legacy cleanup job.
+			if errors.Is(err, storage.ErrUserNodeGrantNotFound) &&
+				source.SourceType == storage.ManagedSourceDirect &&
+				(source.DesiredState == storage.ManagedDesiredInactive || source.DesiredState == storage.ManagedDesiredDeleted) {
+				_, _ = h.repo.MarkUserInboundAccessSourceApplied(ctx, source.ID, source.Generation,
+					storage.ManagedObservedInactive, time.Now().UTC())
+				continue
+			}
 			log.Printf("[ManagedNodes] reconcile source=%d server=%d failed: %v", source.ID, source.ServerID, err)
 		}
 	}
@@ -1025,6 +1099,7 @@ func (request managedGrantRequest) grant(username, actor string, existing *stora
 		ResetDay:          request.ResetDay,
 		BillingTimezone:   "Asia/Shanghai",
 		CreatedBy:         actor,
+		SourceType:        storage.GrantSourceManual,
 	}
 	if request.AllowedProtocols != nil {
 		grant.AllowedProtocols = append([]string(nil), (*request.AllowedProtocols)...)
@@ -1043,6 +1118,8 @@ func (request managedGrantRequest) grant(username, actor string, existing *stora
 		grant.BillingTimezone = existing.BillingTimezone
 		grant.NextResetAt = existing.NextResetAt
 		grant.CreatedBy = existing.CreatedBy
+		grant.SourceType = existing.SourceType
+		grant.SourcePackageID = existing.SourcePackageID
 		grant.CreatedAt = existing.CreatedAt
 		grant.Version = existing.Version
 		if request.AllowedProtocols == nil {
@@ -1199,6 +1276,10 @@ func (h *ManagedNodesHandler) HandleAdminGrants(w http.ResponseWriter, r *http.R
 			writeManagedError(w, err)
 			return
 		}
+		if existing, existingErr := h.repo.GetUserServerGrantByUserAndServer(r.Context(), username, request.ServerID); existingErr == nil && existing.SourceType == storage.GrantSourcePackage && existing.Enabled {
+			writeManagedError(w, storage.ErrUserServerGrantExists)
+			return
+		}
 		grant, err := h.repo.CreateUserServerGrant(r.Context(), request.grant(username, managedActor(r), nil))
 		if err != nil {
 			writeManagedError(w, err)
@@ -1224,6 +1305,10 @@ func (h *ManagedNodesHandler) HandleAdminGrant(w http.ResponseWriter, r *http.Re
 	}
 	if existing.Username != username {
 		writeManagedError(w, storage.ErrUserServerGrantNotFound)
+		return
+	}
+	if existing.SourceType == storage.GrantSourcePackage && existing.Enabled {
+		writeManagedError(w, storage.ErrManagedInvalidArgument)
 		return
 	}
 

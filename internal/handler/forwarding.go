@@ -384,6 +384,18 @@ func (h *ForwardingHandler) grantModel(ctx context.Context, username string, req
 		PerForwardConnectionLimit: req.PerForwardConnectionLimit,
 		TrafficLimitBytes:         req.TrafficLimitBytes, BillingModeOverride: req.BillingModeOverride,
 		AllowManagedTarget: true, CreatedBy: actor,
+		SourceType: func() string {
+			if existing != nil {
+				return existing.SourceType
+			}
+			return storage.GrantSourceManual
+		}(),
+		SourcePackageID: func() *int64 {
+			if existing != nil {
+				return existing.SourcePackageID
+			}
+			return nil
+		}(),
 	}, nil
 }
 
@@ -438,6 +450,10 @@ func (h *ForwardingHandler) HandleAdminUserTunnelGrant(w http.ResponseWriter, r 
 		writeForwardingError(w, err)
 		return
 	}
+	if current.SourceType == storage.GrantSourcePackage && current.Enabled {
+		writeForwardingError(w, storage.ErrForwardingForbidden)
+		return
+	}
 	switch r.Method {
 	case http.MethodPut:
 		var req tunnelGrantRequest
@@ -481,6 +497,10 @@ func (h *ForwardingHandler) HandleAdminUserTunnelGrantAction(w http.ResponseWrit
 	current, err := h.repo.GetUserTunnelGrant(r.Context(), id, username)
 	if err != nil {
 		writeForwardingError(w, err)
+		return
+	}
+	if current.SourceType == storage.GrantSourcePackage && current.Enabled {
+		writeForwardingError(w, storage.ErrForwardingForbidden)
 		return
 	}
 	var body struct {
@@ -674,7 +694,20 @@ func (h *ForwardingHandler) userForwardDTO(ctx context.Context, f storage.UserFo
 }
 
 func (h *ForwardingHandler) resolveManagedForwardTarget(ctx context.Context, username string, nodeID int64) (storage.Node, string, int, *time.Time, error) {
-	if !hasEffectiveManagedNodeAccess(ctx, h.repo, username, nodeID) {
+	hasNodeAccess := hasEffectiveManagedNodeAccess(ctx, h.repo, username, nodeID)
+	if !hasNodeAccess {
+		directNodeIDs, err := h.repo.ListEffectiveDirectNodeIDs(ctx, username, time.Now().UTC())
+		if err != nil {
+			return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
+		}
+		for _, directNodeID := range directNodeIDs {
+			if directNodeID == nodeID {
+				hasNodeAccess = true
+				break
+			}
+		}
+	}
+	if !hasNodeAccess {
 		return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
 	}
 	raw, err := h.repo.GetNodeByID(ctx, nodeID)
@@ -717,7 +750,15 @@ func (h *ForwardingHandler) resolveManagedForwardTarget(ctx context.Context, use
 		return storage.Node{}, "", 0, nil, storage.ErrForwardingInvalid
 	}
 	hasAccess, expiry, err := h.repo.HasEffectiveUserInboundAccess(ctx, username, server.ID, node.InboundTag, 0, time.Now().UTC())
-	if err != nil || !hasAccess {
+	if err != nil {
+		return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
+	}
+	hasDirectAccess, directExpiry, err := h.repo.HasEffectiveDirectUserInboundAccess(ctx, username, server.ID, node.InboundTag, 0, time.Now().UTC())
+	if err != nil {
+		return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
+	}
+	hasAccess, expiry = laterOptionalExpiry(hasAccess, expiry, hasDirectAccess, directExpiry)
+	if !hasAccess {
 		return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
 	}
 	return node, host, port, expiry, nil

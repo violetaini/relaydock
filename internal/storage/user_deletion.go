@@ -408,6 +408,7 @@ func (r *TrafficRepository) FinalizeUserDeletion(ctx context.Context, username, 
 		args  []any
 	}{
 		{name: "managed usage", query: `DELETE FROM user_node_selection_usage WHERE grant_id IN (SELECT id FROM user_server_grants WHERE username = ?)`, args: []any{username}},
+		{name: "direct node grants", query: `DELETE FROM user_node_grants WHERE username = ?`, args: []any{username}},
 		{name: "managed sources", query: `DELETE FROM user_inbound_access_sources WHERE username = ?`, args: []any{username}},
 		{name: "managed selections", query: `DELETE FROM user_node_selections WHERE grant_id IN (SELECT id FROM user_server_grants WHERE username = ?)`, args: []any{username}},
 		{name: "managed grants", query: `DELETE FROM user_server_grants WHERE username = ?`, args: []any{username}},

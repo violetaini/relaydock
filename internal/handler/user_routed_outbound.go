@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/storage"
@@ -505,16 +506,45 @@ func (h *UserRoutedOutboundHandler) userCanSeeNode(ctx context.Context, username
 	if _, err := h.repo.GetNode(ctx, nodeID, username); err == nil {
 		return true
 	}
-	// 2. 套餐分配的节点
+	// 2. 当前有效套餐分配的节点。套餐过期、尚未生效或超额时必须
+	// 与节点列表/订阅保持一致，否则这里会成为创建路由出站的授权绕过。
 	u, err := h.repo.GetUser(ctx, username)
-	if err != nil || u.PackageID == 0 {
+	if err != nil {
 		return false
 	}
-	pkg, err := h.repo.GetPackage(ctx, u.PackageID)
-	if err != nil || pkg == nil {
+	if packageAssignmentActive(u, time.Now()) {
+		overLimit, limitErr := h.repo.IsUserOverLimit(ctx, username)
+		if limitErr != nil {
+			return false
+		}
+		if !overLimit {
+			pkg, packageErr := h.repo.GetPackage(ctx, u.PackageID)
+			if packageErr != nil {
+				return false
+			}
+			for _, id := range pkg.Nodes {
+				if id == nodeID {
+					return true
+				}
+			}
+		}
+	}
+
+	// 3. 个性化服务器授权和固定节点授权。
+	managedNodeIDs, err := effectiveManagedNodeIDs(ctx, h.repo, username)
+	if err != nil {
 		return false
 	}
-	for _, id := range pkg.Nodes {
+	for _, id := range managedNodeIDs {
+		if id == nodeID {
+			return true
+		}
+	}
+	directNodeIDs, err := h.repo.ListEffectiveDirectNodeIDs(ctx, username, time.Now().UTC())
+	if err != nil {
+		return false
+	}
+	for _, id := range directNodeIDs {
 		if id == nodeID {
 			return true
 		}

@@ -55,9 +55,14 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	directNodeIDs, err := h.repo.ListEffectiveDirectNodeIDs(r.Context(), username, time.Now().UTC())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 
 	var pkg *storage.Package
-	packageActive := user.IsActive && user.PackageID > 0 && (user.PackageEndDate == nil || time.Now().Before(*user.PackageEndDate))
+	packageActive := packageAssignmentActive(user, time.Now())
 	if packageActive {
 		if overLimit, limitErr := h.repo.IsUserOverLimit(r.Context(), username); limitErr != nil {
 			writeError(w, http.StatusInternalServerError, limitErr)
@@ -76,13 +81,13 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 			pkg = nil
 		}
 	}
-	if pkg == nil && len(managedNodeIDs) == 0 {
-		writeError(w, http.StatusNotFound, errors.New("无有效套餐或自选节点"))
+	if pkg == nil && len(managedNodeIDs) == 0 && len(directNodeIDs) == 0 {
+		writeError(w, http.StatusNotFound, errors.New("无有效套餐或授权节点"))
 		return
 	}
 	renderPackage := pkg
 	if renderPackage == nil {
-		renderPackage = &storage.Package{Name: "managed-nodes"}
+		renderPackage = &storage.Package{Name: "authorized-nodes"}
 	}
 
 	// Build user credential lookup for per-user proxy configs
@@ -113,6 +118,12 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	for _, nodeID := range managedNodeIDs {
+		if !seenNodeIDs[nodeID] {
+			orderedNodeIDs = append(orderedNodeIDs, nodeID)
+			seenNodeIDs[nodeID] = true
+		}
+	}
+	for _, nodeID := range directNodeIDs {
 		if !seenNodeIDs[nodeID] {
 			orderedNodeIDs = append(orderedNodeIDs, nodeID)
 			seenNodeIDs[nodeID] = true

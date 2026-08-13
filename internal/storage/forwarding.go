@@ -92,6 +92,8 @@ type UserTunnelGrant struct {
 	BillingModeOverride       *string         `json:"billing_mode_override,omitempty"`
 	AllowManagedTarget        bool            `json:"allow_managed_target"`
 	AllowCustomPublicTarget   bool            `json:"allow_custom_public_target"`
+	SourceType                string          `json:"source_type"`
+	SourcePackageID           *int64          `json:"source_package_id,omitempty"`
 	Version                   int64           `json:"version"`
 	CreatedBy                 string          `json:"created_by"`
 	CreatedAt                 time.Time       `json:"created_at"`
@@ -314,6 +316,15 @@ CREATE INDEX IF NOT EXISTS idx_tunnel_audit_entity ON tunnel_audit_events(entity
 	}
 	if err := r.ensureTableColumn("user_forward_hops", "resource_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("migrate user_forward_hops.resource_id: %w", err)
+	}
+	if err := r.ensureTableColumn("user_tunnel_grants", "source_type", "TEXT NOT NULL DEFAULT 'manual'"); err != nil {
+		return fmt.Errorf("migrate tunnel grant source type: %w", err)
+	}
+	if err := r.ensureTableColumn("user_tunnel_grants", "source_package_id", "INTEGER"); err != nil {
+		return fmt.Errorf("migrate tunnel grant source package: %w", err)
+	}
+	if _, err := r.db.Exec(`CREATE INDEX IF NOT EXISTS idx_tunnel_grants_package_source ON user_tunnel_grants(username, source_package_id) WHERE source_type = 'package'`); err != nil {
+		return fmt.Errorf("migrate tunnel grant source index: %w", err)
 	}
 	if _, err := r.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_forward_hops_resource_id ON user_forward_hops(resource_id) WHERE resource_id != ''`); err != nil {
 		return fmt.Errorf("migrate user_forward_hops.resource_id index: %w", err)
@@ -852,6 +863,15 @@ func (r *TrafficRepository) DeleteTunnelTemplate(ctx context.Context, publicID, 
 	if n > 0 {
 		return ErrForwardingConflict
 	}
+	var packageRefs int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM packages
+WHERE EXISTS(SELECT 1 FROM json_each(COALESCE(forwarding_grants, '[]')) entry
+WHERE CAST(json_extract(entry.value, '$.tunnel_id') AS INTEGER)=?)`, t.ID).Scan(&packageRefs); err != nil {
+		return err
+	}
+	if packageRefs > 0 {
+		return ErrForwardingConflict
+	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM user_tunnel_grants WHERE tunnel_id=?`, t.ID); err != nil {
 		return err
 	}
@@ -896,6 +916,10 @@ func (r *TrafficRepository) SetTunnelTemplateState(ctx context.Context, publicID
 
 func normalizeTunnelGrant(g *UserTunnelGrant) error {
 	g.Username = strings.TrimSpace(g.Username)
+	g.SourceType = strings.ToLower(strings.TrimSpace(g.SourceType))
+	if g.SourceType == "" {
+		g.SourceType = GrantSourceManual
+	}
 	if g.Username == "" || g.TunnelID <= 0 || g.MaxActiveForwards < 0 || g.PerForwardSpeedMbps < 0 || g.PerForwardConnectionLimit < 0 || g.TrafficLimitBytes < 0 || g.StartsAt.IsZero() || g.AllowCustomPublicTarget {
 		return ErrForwardingInvalid
 	}
@@ -910,22 +934,39 @@ func normalizeTunnelGrant(g *UserTunnelGrant) error {
 	if g.BillingModeOverride != nil && *g.BillingModeOverride != ManagedBillingBoth && *g.BillingModeOverride != ManagedBillingDownload {
 		return ErrForwardingInvalid
 	}
+	if g.SourceType != GrantSourceManual && g.SourceType != GrantSourcePackage {
+		return ErrForwardingInvalid
+	}
+	if g.SourceType == GrantSourcePackage {
+		if g.SourcePackageID == nil || *g.SourcePackageID <= 0 {
+			return ErrForwardingInvalid
+		}
+	} else {
+		if g.SourcePackageID != nil {
+			return ErrForwardingInvalid
+		}
+	}
 	return nil
 }
 
-const selectTunnelGrant = `SELECT id,public_id,username,tunnel_id,enabled,starts_at,expires_at,max_active_forwards,per_forward_speed_mbps,per_forward_connection_limit,traffic_limit_bytes,billing_mode_override,allow_managed_target,allow_custom_public_target,version,created_by,created_at,updated_at FROM user_tunnel_grants`
+const selectTunnelGrant = `SELECT id,public_id,username,tunnel_id,enabled,starts_at,expires_at,max_active_forwards,per_forward_speed_mbps,per_forward_connection_limit,traffic_limit_bytes,billing_mode_override,allow_managed_target,allow_custom_public_target,COALESCE(source_type,'manual'),source_package_id,version,created_by,created_at,updated_at FROM user_tunnel_grants`
 
 func scanTunnelGrant(s rowScanner) (UserTunnelGrant, error) {
 	var g UserTunnelGrant
 	var enabled, managed, custom int
 	var expires, billing sql.NullString
-	err := s.Scan(&g.ID, &g.PublicID, &g.Username, &g.TunnelID, &enabled, &g.StartsAt, &expires, &g.MaxActiveForwards, &g.PerForwardSpeedMbps, &g.PerForwardConnectionLimit, &g.TrafficLimitBytes, &billing, &managed, &custom, &g.Version, &g.CreatedBy, &g.CreatedAt, &g.UpdatedAt)
+	var sourcePackageID sql.NullInt64
+	err := s.Scan(&g.ID, &g.PublicID, &g.Username, &g.TunnelID, &enabled, &g.StartsAt, &expires, &g.MaxActiveForwards, &g.PerForwardSpeedMbps, &g.PerForwardConnectionLimit, &g.TrafficLimitBytes, &billing, &managed, &custom, &g.SourceType, &sourcePackageID, &g.Version, &g.CreatedBy, &g.CreatedAt, &g.UpdatedAt)
 	g.Enabled = enabled != 0
 	g.AllowManagedTarget = managed != 0
 	g.AllowCustomPublicTarget = custom != 0
 	g.ExpiresAt = managedParseNullTime(expires)
 	if billing.Valid {
 		g.BillingModeOverride = &billing.String
+	}
+	if sourcePackageID.Valid {
+		id := sourcePackageID.Int64
+		g.SourcePackageID = &id
 	}
 	return g, err
 }
@@ -944,7 +985,37 @@ func (r *TrafficRepository) CreateUserTunnelGrant(ctx context.Context, g UserTun
 	}
 	var created *UserTunnelGrant
 	err := r.WithUserProvisioningLease(ctx, g.Username, func() error {
-		res, err := r.db.ExecContext(ctx, `INSERT INTO user_tunnel_grants(public_id,username,tunnel_id,enabled,starts_at,expires_at,max_active_forwards,per_forward_speed_mbps,per_forward_connection_limit,traffic_limit_bytes,billing_mode_override,allow_managed_target,allow_custom_public_target,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, g.PublicID, g.Username, g.TunnelID, forwardingBoolInt(g.Enabled), g.StartsAt.UTC(), g.ExpiresAt, g.MaxActiveForwards, g.PerForwardSpeedMbps, g.PerForwardConnectionLimit, g.TrafficLimitBytes, g.BillingModeOverride, 1, 0, g.CreatedBy)
+		if g.SourceType == GrantSourceManual {
+			var tombstoneID int64
+			var tombstoneVersion int64
+			tombstoneErr := r.db.QueryRowContext(ctx, `SELECT id,version FROM user_tunnel_grants
+WHERE username=? AND tunnel_id=? AND source_type='package' AND enabled=0`, g.Username, g.TunnelID).Scan(&tombstoneID, &tombstoneVersion)
+			if tombstoneErr != nil && !errors.Is(tombstoneErr, sql.ErrNoRows) {
+				return tombstoneErr
+			}
+			if tombstoneErr == nil {
+				res, updateErr := r.db.ExecContext(ctx, `UPDATE user_tunnel_grants SET public_id=?,enabled=?,starts_at=?,expires_at=?,
+max_active_forwards=?,per_forward_speed_mbps=?,per_forward_connection_limit=?,traffic_limit_bytes=?,billing_mode_override=?,
+allow_managed_target=1,allow_custom_public_target=0,source_type='manual',source_package_id=NULL,version=version+1,
+created_by=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=? AND source_type='package' AND enabled=0`,
+					g.PublicID, forwardingBoolInt(g.Enabled), g.StartsAt.UTC(), g.ExpiresAt, g.MaxActiveForwards,
+					g.PerForwardSpeedMbps, g.PerForwardConnectionLimit, g.TrafficLimitBytes, g.BillingModeOverride,
+					g.CreatedBy, tombstoneID, tombstoneVersion)
+				if updateErr != nil {
+					return updateErr
+				}
+				if affected, _ := res.RowsAffected(); affected != 1 {
+					return ErrForwardingConflict
+				}
+				g.ID = tombstoneID
+				if _, updateErr = r.db.ExecContext(ctx, `INSERT INTO tunnel_audit_events(actor,action,entity_type,entity_id,username) VALUES(?,?,?,?,?)`, g.CreatedBy, "grant.adopted_from_package", "tunnel_grant", g.ID, g.Username); updateErr != nil {
+					return updateErr
+				}
+				created, updateErr = r.GetUserTunnelGrant(ctx, g.PublicID, g.Username)
+				return updateErr
+			}
+		}
+		res, err := r.db.ExecContext(ctx, `INSERT INTO user_tunnel_grants(public_id,username,tunnel_id,enabled,starts_at,expires_at,max_active_forwards,per_forward_speed_mbps,per_forward_connection_limit,traffic_limit_bytes,billing_mode_override,allow_managed_target,allow_custom_public_target,source_type,source_package_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, g.PublicID, g.Username, g.TunnelID, forwardingBoolInt(g.Enabled), g.StartsAt.UTC(), g.ExpiresAt, g.MaxActiveForwards, g.PerForwardSpeedMbps, g.PerForwardConnectionLimit, g.TrafficLimitBytes, g.BillingModeOverride, 1, 0, g.SourceType, g.SourcePackageID, g.CreatedBy)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") {
 				return ErrForwardingConflict
@@ -1042,6 +1113,8 @@ func (r *TrafficRepository) UpdateUserTunnelGrant(ctx context.Context, publicID,
 		}
 		in.Username = current.Username
 		in.TunnelID = current.TunnelID
+		in.SourceType = current.SourceType
+		in.SourcePackageID = current.SourcePackageID
 		if err := normalizeTunnelGrant(&in); err != nil {
 			return err
 		}

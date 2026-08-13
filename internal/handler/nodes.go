@@ -157,6 +157,19 @@ func (h *nodesHandler) deleteNodeForAccess(ctx context.Context, id int64, userna
 	return h.repo.DeleteNodeIfMutation(ctx, id, username, expectedMutationID)
 }
 
+func (h *nodesHandler) acquireNodeDeletionLease(w http.ResponseWriter, r *http.Request, nodeIDs []int64) (func(), bool) {
+	release, err := h.repo.AcquireNodeDeletionLease(r.Context(), nodeIDs)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, storage.ErrNodeHasActiveDirectGrant) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err)
+		return nil, false
+	}
+	return release, true
+}
+
 func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/admin/nodes")
 	path = strings.Trim(path, "/")
@@ -322,7 +335,7 @@ func (h *nodesHandler) handleList(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.URL.Query().Get("include_private") == "1" {
-			respondJSON(w, http.StatusOK, map[string]any{"nodes": convertNodes(nodes)})
+			respondJSON(w, http.StatusOK, map[string]any{"nodes": convertAdminNodes(r.Context(), h.repo, nodes)})
 			return
 		}
 		nonAdmins, err := h.repo.ListNonAdminUsernames(r.Context())
@@ -337,7 +350,7 @@ func (h *nodesHandler) handleList(w http.ResponseWriter, r *http.Request) {
 			}
 			filtered = append(filtered, n)
 		}
-		respondJSON(w, http.StatusOK, map[string]any{"nodes": convertNodes(filtered)})
+		respondJSON(w, http.StatusOK, map[string]any{"nodes": convertAdminNodes(r.Context(), h.repo, filtered)})
 		return
 	}
 
@@ -348,10 +361,15 @@ func (h *nodesHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 安全:把每个节点的 clash_config 里 admin uuid/password 等凭据替换为本用户的凭据。
-	// 不替换 = 把 admin 凭据原样下发给所有能看到节点的普通用户(节点管理眼睛图标会显示)。
-	// routed 节点没有用户子账号的 → 完全过滤掉(用户无访问权,不该出现在列表)。
-	nodes = substituteNodesForUser(r.Context(), h.repo, username, nodes)
+	// Keep authorization and credential readiness separate. An authorized node
+	// stays visible while provisioning is pending, but its owner credential is
+	// never returned. Ready nodes carry the user's substituted credential.
+	authorizedNodes := nodes
+	nodes = substituteNodesForUser(r.Context(), h.repo, username, authorizedNodes)
+	readyByID := make(map[int64]bool, len(nodes))
+	for _, node := range nodes {
+		readyByID[node.ID] = true
+	}
 
 	// 节点级倍率:根据用户绑定套餐查 multiplier(routed 子节点用 parent 回退),仅当 != 1 时写入响应
 	dto := convertNodes(nodes)
@@ -359,13 +377,30 @@ func (h *nodesHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	// relay_orig_*(被中转替换掉的真实地址)只供 admin 管理/取消中转。剥离后前端 relay_orig_server
 	// 为空 → 不显示"原服务器"行,只显示中转地址。
 	for i := range dto {
+		dto[i].CredentialState = "ready"
 		dto[i].RelayOrigServer = ""
 		dto[i].RelayOrigPort = 0
 	}
-	if user, uerr := h.repo.GetUser(r.Context(), username); uerr == nil && user.PackageID > 0 {
+	for _, node := range authorizedNodes {
+		if readyByID[node.ID] {
+			continue
+		}
+		// Preserve only non-secret inventory metadata. Empty configs also keep
+		// QR/config/subscription paths fail closed until provisioning succeeds.
+		node.RawURL = ""
+		node.ClashConfig = ""
+		node.ParsedConfig = ""
+		node.RelayOrigServer = ""
+		node.RelayOrigPort = 0
+		pending := convertNode(node)
+		pending.ManagedMultiUser = false
+		pending.CredentialState = "pending"
+		dto = append(dto, pending)
+	}
+	if user, uerr := h.repo.GetUser(r.Context(), username); uerr == nil && packageAssignmentActive(user, time.Now()) {
 		if pkg, perr := h.repo.GetPackage(r.Context(), user.PackageID); perr == nil && pkg != nil && len(pkg.NodeMultipliers) > 0 {
-			for i, n := range nodes {
-				m := pkg.MultiplierForNode(n.ID)
+			for i := range dto {
+				m := pkg.MultiplierForNode(dto[i].ID)
 				if m != 1.0 {
 					dto[i].Multiplier = m
 				}
@@ -526,8 +561,7 @@ func collectUserVisibleNodes(ctx context.Context, repo *storage.TrafficRepositor
 	for _, n := range nodes {
 		seen[n.ID] = true
 	}
-	if user, uerr := repo.GetUser(ctx, username); uerr == nil && user.IsActive && user.PackageID > 0 &&
-		(user.PackageEndDate == nil || time.Now().Before(*user.PackageEndDate)) {
+	if user, uerr := repo.GetUser(ctx, username); uerr == nil && packageAssignmentActive(user, time.Now()) {
 		overLimit, limitErr := repo.IsUserOverLimit(ctx, username)
 		if limitErr == nil && !overLimit {
 			if pkg, perr := repo.GetPackage(ctx, user.PackageID); perr == nil && pkg != nil {
@@ -558,6 +592,19 @@ func collectUserVisibleNodes(ctx context.Context, repo *storage.TrafficRepositor
 		return nil, managedErr
 	}
 	for _, nodeID := range managedNodeIDs {
+		if seen[nodeID] {
+			continue
+		}
+		if node, nodeErr := repo.GetNodeByID(ctx, nodeID); nodeErr == nil {
+			nodes = append(nodes, node)
+			seen[nodeID] = true
+		}
+	}
+	directNodeIDs, directErr := repo.ListAuthorizedDirectNodeIDs(ctx, username, time.Now().UTC())
+	if directErr != nil {
+		return nil, directErr
+	}
+	for _, nodeID := range directNodeIDs {
 		if seen[nodeID] {
 			continue
 		}
@@ -1417,6 +1464,11 @@ func (h *nodesHandler) handleDelete(w http.ResponseWriter, r *http.Request, idSe
 
 	// 远程闭环:routed 清 rule+outbound+client,physical 清 inbound(并兜底刷 nginx)。单删 / 批删共用 helper。
 	if !nodeNotFound {
+		release, ok := h.acquireNodeDeletionLease(w, r, []int64{node.ID})
+		if !ok {
+			return
+		}
+		defer release()
 		if err := h.cleanupRemoteForNode(r.Context(), &node); err != nil {
 			writeError(w, http.StatusBadGateway, fmt.Errorf("远程入站清理失败，已保留本地节点和加密凭据: %w", err))
 			return
@@ -1529,6 +1581,15 @@ func (h *nodesHandler) handleClearAll(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	nodeIDs := make([]int64, 0, len(nodes))
+	for i := range nodes {
+		nodeIDs = append(nodeIDs, nodes[i].ID)
+	}
+	release, ok := h.acquireNodeDeletionLease(w, r, nodeIDs)
+	if !ok {
+		return
+	}
+	defer release()
 	ready := make([]storage.Node, 0, len(nodes))
 	failed := make([]string, 0)
 	for i := range nodes {
@@ -1611,6 +1672,11 @@ func (h *nodesHandler) handleBatchDelete(w http.ResponseWriter, r *http.Request)
 		accessibleIDs = append(accessibleIDs, id)
 		nodes = append(nodes, node)
 	}
+	release, ok := h.acquireNodeDeletionLease(w, r, accessibleIDs)
+	if !ok {
+		return
+	}
+	defer release()
 
 	// Clear each node's own remote inbound before cleaning shared outbound
 	// references. Failed managed inbound cleanup retains its local node/secret;
@@ -2225,14 +2291,16 @@ func (r *nodeRequest) parseChainProxyNodeID() {
 }
 
 type nodeDTO struct {
-	ID               int64  `json:"id"`
-	RawURL           string `json:"raw_url"`
-	NodeName         string `json:"node_name"`
-	Protocol         string `json:"protocol"`
-	ParsedConfig     string `json:"parsed_config"`
-	ClashConfig      string `json:"clash_config"`
-	ManagedMultiUser bool   `json:"managed_multi_user"`
-	Enabled          bool   `json:"enabled"`
+	ID                  int64  `json:"id"`
+	RawURL              string `json:"raw_url"`
+	NodeName            string `json:"node_name"`
+	Protocol            string `json:"protocol"`
+	ParsedConfig        string `json:"parsed_config"`
+	ClashConfig         string `json:"clash_config"`
+	ManagedMultiUser    bool   `json:"managed_multi_user"`
+	DirectGrantEligible bool   `json:"direct_grant_eligible"`
+	CredentialState     string `json:"credential_state,omitempty"`
+	Enabled             bool   `json:"enabled"`
 	// Tag 是用户自定义分类标签(VIP / Asia / 测试),前端节点页用它做过滤、分组显示、批量更新。
 	// 必须下发,否则前端改了 tag 拉回来缺字段,显示永远是原状态,等同"修改不起作用"。
 	Tag string `json:"tag"`
@@ -2378,6 +2446,23 @@ func convertNode(node storage.Node) nodeDTO {
 		CreatedAt:         node.CreatedAt,
 		UpdatedAt:         node.UpdatedAt,
 	}
+}
+
+func convertAdminNodes(ctx context.Context, repo *storage.TrafficRepository, nodes []storage.Node) []nodeDTO {
+	result := convertNodes(nodes)
+	servers, err := repo.ListRemoteServers(ctx)
+	if err != nil {
+		return result
+	}
+	byName := make(map[string]storage.RemoteServer, len(servers))
+	for _, server := range servers {
+		byName[server.Name] = server
+	}
+	for i, node := range nodes {
+		server, ok := byName[node.OriginalServer]
+		result[i].DirectGrantEligible = ok && storage.DirectNodeGrantEligible(node, server)
+	}
+	return result
 }
 
 func convertNodes(nodes []storage.Node) []nodeDTO {

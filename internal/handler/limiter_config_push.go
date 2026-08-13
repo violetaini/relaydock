@@ -341,11 +341,15 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if err != nil {
 			return nil, fmt.Errorf("resolve managed limiter access for %s/%s: %w", c.Username, c.InboundTag, err)
 		}
+		hasDirectAccess, _, err := p.repo.HasEffectiveDirectUserInboundAccess(ctx, c.Username, serverID, c.InboundTag, 0, now)
+		if err != nil {
+			return nil, fmt.Errorf("resolve direct limiter access for %s/%s: %w", c.Username, c.InboundTag, err)
+		}
 		hasPackageAccess, _, err := hasLegacyPackageInboundAccess(ctx, p.repo, c.Username, serverID, c.InboundTag, now)
 		if err != nil {
 			return nil, fmt.Errorf("resolve package limiter access for %s/%s: %w", c.Username, c.InboundTag, err)
 		}
-		if !hasManagedAccess && !hasPackageAccess {
+		if !hasManagedAccess && !hasDirectAccess && !hasPackageAccess {
 			continue
 		}
 		var pkg *storage.Package
@@ -364,7 +368,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 				speedMbps = strictestPositiveFloat(speedMbps, packageSpeed)
 				deviceLimit = strictestPositiveInt(deviceLimit, packageDevices)
 			}
-		} else if hasPackageAccess {
+		} else if hasPackageAccess || hasDirectAccess {
 			speedMbps, deviceLimit = resolveLimit(user, pkg, ref.NodeID, ref.ParentID)
 		} else {
 			// A desired source can briefly outlive its grant state until the

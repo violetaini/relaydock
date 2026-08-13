@@ -851,6 +851,81 @@ AND (next_retry_at IS NULL OR next_retry_at <= ?)`
 	return sources, rows.Err()
 }
 
+// ExpireDirectUserInboundAccessSources atomically moves applied direct grants
+// past their deadline into the existing desired-state reconciliation queue.
+// Failed remote cleanup is then retried by ListPendingUserInboundAccessSources.
+func (r *TrafficRepository) ExpireDirectUserInboundAccessSources(ctx context.Context, now time.Time, limit int) (int, error) {
+	if err := managedInitialized(r); err != nil {
+		return 0, err
+	}
+	if now.IsZero() {
+		return 0, ErrManagedInvalidArgument
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	now = now.UTC()
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin expire direct access sources: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, `SELECT id, username, server_id FROM user_inbound_access_sources
+WHERE source_type = ? AND desired_state = ? AND expires_at IS NOT NULL AND expires_at <= ?
+ORDER BY expires_at ASC, id ASC LIMIT ?`, ManagedSourceDirect, ManagedDesiredActive, now, limit)
+	if err != nil {
+		return 0, fmt.Errorf("list expired direct access sources: %w", err)
+	}
+	type expiredDirectSource struct {
+		id       int64
+		username string
+		serverID int64
+	}
+	sources := make([]expiredDirectSource, 0, limit)
+	for rows.Next() {
+		var source expiredDirectSource
+		if err := rows.Scan(&source.id, &source.username, &source.serverID); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("scan expired direct access source: %w", err)
+		}
+		sources = append(sources, source)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(sources) == 0 {
+		return 0, nil
+	}
+	updated := 0
+	for _, source := range sources {
+		result, err := tx.ExecContext(ctx, `UPDATE user_inbound_access_sources SET
+    desired_state = ?, suspend_reason = ?, generation = generation + 1,
+    retry_count = 0, next_retry_at = NULL, last_error = '', updated_at = ?
+WHERE id = ? AND source_type = ? AND desired_state = ?
+  AND expires_at IS NOT NULL AND expires_at <= ?`, ManagedDesiredInactive, ManagedSuspendExpired,
+			now, source.id, ManagedSourceDirect, ManagedDesiredActive, now)
+		if err != nil {
+			return 0, fmt.Errorf("expire direct access source %d: %w", source.id, err)
+		}
+		affected, _ := result.RowsAffected()
+		if affected == 0 {
+			continue
+		}
+		updated++
+		if err := appendManagedAccessAuditTx(ctx, tx, ManagedAccessAudit{
+			Actor: "reconciler", Action: "access_source.desired_changed", EntityType: "access_source",
+			EntityID: source.id, Username: source.username, ServerID: source.serverID,
+			Details: map[string]any{"desired_state": ManagedDesiredInactive, "reason": ManagedSuspendExpired},
+		}); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit expire direct access sources: %w", err)
+	}
+	return updated, nil
+}
+
 func (r *TrafficRepository) HasEffectiveUserInboundAccess(ctx context.Context, username string, serverID int64, inboundTag string, excludeSourceID int64, now time.Time) (bool, *time.Time, error) {
 	if err := managedInitialized(r); err != nil {
 		return false, nil, err

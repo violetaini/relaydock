@@ -549,6 +549,23 @@ func TestDeleteRemoteServerRejectsFederatedAndForwardingConflictsBeforeAgentCall
 			t.Fatalf("status=%d calls=%d body=%s", response.Code, calls, response.Body.String())
 		}
 	})
+	t.Run("package server grant", func(t *testing.T) {
+		var calls int
+		capabilities := AgentCapabilities{AgentUninstallV2: true}
+		handler, repo, server := newAgentUninstallHandler(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }), &capabilities)
+		if _, err := repo.CreatePackage(context.Background(), storage.Package{
+			Name: "package-server-reference",
+			ServerGrants: []storage.PackageServerGrant{{
+				ServerID: server.ID,
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		response := requestRemoteServerDelete(t, handler, server.ID, true)
+		if response.Code != http.StatusConflict || calls != 0 {
+			t.Fatalf("status=%d calls=%d body=%s", response.Code, calls, response.Body.String())
+		}
+	})
 }
 
 func TestDeleteOwnedRemoteServerWithoutUninstallIsRejected(t *testing.T) {

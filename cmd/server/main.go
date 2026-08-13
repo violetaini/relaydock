@@ -634,6 +634,9 @@ func main() {
 	mux.Handle("/api/admin/users/{username}/managed-nodes", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleAdminManagedNodes)))
 	mux.Handle("/api/admin/users/{username}/managed-nodes/{id}/limits", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleAdminManagedNodeLimits)))
 	mux.Handle("/api/admin/users/{username}/managed-nodes/{id}/retry", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleAdminManagedNodeRetry)))
+	mux.Handle("/api/admin/users/{username}/node-grants", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleAdminUserNodeGrants)))
+	mux.Handle("/api/admin/users/{username}/node-grants/{id}", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleAdminUserNodeGrant)))
+	mux.Handle("/api/admin/users/{username}/node-grants/{id}/retry", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleAdminUserNodeGrantRetry)))
 	mux.Handle("/api/user/managed-nodes", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodes)))
 	mux.Handle("/api/user/managed-nodes/{id}", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNode)))
 	mux.Handle("/api/user/managed-nodes/{id}/retry", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeRetry)))
@@ -690,6 +693,8 @@ func main() {
 	packageUpdateHandler.SetCapabilityManager(capabilityManager)
 	mux.Handle("/api/admin/packages/update", auth.RequireAdmin(tokenStore, userRepo, packageUpdateHandler))
 	packageAssignHandler := handler.NewPackageAssignHandler(repo, remoteManageHandler, limiterPusher)
+	packageReconcileCtx, stopPackageReconciler := context.WithCancel(context.Background())
+	packageAssignHandler.StartReconciler(packageReconcileCtx)
 	tgbotAPIHandler.SetPackageAssign(packageAssignHandler) // 让 TGBOT 注册/兑换的套餐走同一套下发
 	mux.Handle("/api/admin/packages/assign", auth.RequireAdmin(tokenStore, userRepo, packageAssignHandler))
 	// 快捷续期:复用 packageAssignHandler 的 AssignAndProvision(samePackage 快路径),只延长 package_end_date
@@ -1489,9 +1494,10 @@ func main() {
 		}
 	}()
 
-	waitForShutdown(srv, stopCollector, stopManagedReconciler, stopForwardingReconciler)
+	waitForShutdown(srv, stopCollector, stopManagedReconciler, stopForwardingReconciler, stopPackageReconciler)
 	managedNodesHandler.WaitForReconciler()
 	forwardingHandler.WaitForReconciler()
+	packageAssignHandler.WaitForReconciler()
 }
 
 func getAddr(config *ServerConfig, repo *storage.TrafficRepository) string {

@@ -265,13 +265,19 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 			if managedErr != nil {
 				return fmt.Errorf("resolve managed inbound access for %s/%s: %w", config.Username, config.InboundTag, managedErr)
 			}
+			hasDirect, _, directErr := h.repo.HasEffectiveDirectUserInboundAccess(
+				ctx, config.Username, serverID, config.InboundTag, 0, now,
+			)
+			if directErr != nil {
+				return fmt.Errorf("resolve direct inbound access for %s/%s: %w", config.Username, config.InboundTag, directErr)
+			}
 			hasPackage, _, packageErr := hasLegacyPackageInboundAccess(
 				ctx, h.repo, config.Username, serverID, config.InboundTag, now,
 			)
 			if packageErr != nil {
 				return fmt.Errorf("resolve package inbound access for %s/%s: %w", config.Username, config.InboundTag, packageErr)
 			}
-			hasAccess = hasManaged || hasPackage
+			hasAccess = hasManaged || hasDirect || hasPackage
 		}
 		if hasAccess {
 			if protocol == "shadowsocks" && isClassicManagedShadowsocksCipher(shadowsocksInboundMethod(settings)) {

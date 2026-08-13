@@ -287,7 +287,9 @@ const (
 	TrafficMethodBoth = "both"
 )
 
-// Package代表流量包模板
+// Package is an optional entitlement bundle template. Nodes are granted
+// directly, while server and forwarding entries materialize as source-tracked
+// grants when the package is assigned to a user.
 type Package struct {
 	ID                int64             `json:"id"`
 	Name              string            `json:"name"`
@@ -304,13 +306,43 @@ type Package struct {
 	// 套餐级 per-node 限速覆盖。map 含 key 即生效:0 = 显式不限速,>0 = 该值;不含 key = 继承 SpeedLimitMbps。
 	NodeSpeedLimits map[int64]float64 `json:"node_speed_limits,omitempty"`
 	// 套餐级 per-node 客户端数覆盖。语义同上。
-	NodeDeviceLimits map[int64]int        `json:"node_device_limits,omitempty"`
-	AutoSpeedRules   []AutoSpeedLimitRule `json:"auto_speed_rules,omitempty"`
-	ShortCode        string               `json:"short_code"`
-	TrafficMode      string               `json:"traffic_mode"`
-	TemplateFilename string               `json:"template_filename"` // 套餐绑的 V3 模板;空 = 走系统默认模板
-	CreatedAt        time.Time            `json:"created_at"`
-	UpdatedAt        time.Time            `json:"updated_at"`
+	NodeDeviceLimits map[int64]int            `json:"node_device_limits,omitempty"`
+	AutoSpeedRules   []AutoSpeedLimitRule     `json:"auto_speed_rules,omitempty"`
+	ServerGrants     []PackageServerGrant     `json:"server_grants"`
+	ForwardingGrants []PackageForwardingGrant `json:"forwarding_grants"`
+	ShortCode        string                   `json:"short_code"`
+	TrafficMode      string                   `json:"traffic_mode"`
+	TemplateFilename string                   `json:"template_filename"` // 套餐绑的 V3 模板;空 = 走系统默认模板
+	CreatedAt        time.Time                `json:"created_at"`
+	UpdatedAt        time.Time                `json:"updated_at"`
+}
+
+// PackageServerGrant describes the self-service node authorization created by
+// a package. The assignment window is the grant window, so dates deliberately
+// do not live in the template entry.
+type PackageServerGrant struct {
+	ServerID                int64    `json:"server_id"`
+	MaxActiveNodes          int      `json:"max_active_nodes"`
+	SpeedLimitMbps          float64  `json:"speed_limit_mbps"`
+	ConnectionLimit         int      `json:"connection_limit"`
+	TrafficLimitBytes       int64    `json:"traffic_limit_bytes"`
+	BillingMode             string   `json:"billing_mode"`
+	ResetPolicy             string   `json:"reset_policy"`
+	ResetDay                int      `json:"reset_day"`
+	AllowedProtocols        []string `json:"allowed_protocols"`
+	AllowedProtocolProfiles []string `json:"allowed_protocol_profiles"`
+}
+
+// PackageForwardingGrant describes the forwarding authorization created by a
+// package. TunnelID is the stable database id; tunnel APIs also expose it next
+// to their public id.
+type PackageForwardingGrant struct {
+	TunnelID                  int64   `json:"tunnel_id"`
+	MaxActiveForwards         int     `json:"max_active_forwards"`
+	PerForwardSpeedMbps       float64 `json:"per_forward_speed_mbps"`
+	PerForwardConnectionLimit int     `json:"per_forward_connection_limit"`
+	TrafficLimitBytes         int64   `json:"traffic_limit_bytes"`
+	BillingModeOverride       *string `json:"billing_mode_override,omitempty"`
 }
 
 func (p *Package) TrafficMultiplier() int64 {
@@ -2069,6 +2101,13 @@ CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(name);
 
 	// 如果不存在，则将 short_code 列添加到包表中
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN short_code TEXT DEFAULT ''")
+	// Optional entitlement bundle entries. Existing packages remain node-only.
+	if err := r.ensureTableColumn("packages", "server_grants", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return fmt.Errorf("migrate package server grants: %w", err)
+	}
+	if err := r.ensureTableColumn("packages", "forwarding_grants", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return fmt.Errorf("migrate package forwarding grants: %w", err)
+	}
 
 	// 节点倍率(套餐级 per-node):JSON {"<node_id>": multiplier}。空 = 全部按 1.0
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN node_multipliers TEXT DEFAULT '{}'")
@@ -3105,6 +3144,9 @@ CREATE TABLE IF NOT EXISTS announcement_bot_deliveries (
 		return fmt.Errorf("migrate federated_servers: %w", err)
 	}
 	if err := r.migrateManagedNodes(); err != nil {
+		return err
+	}
+	if err := r.migrateDirectNodeGrants(); err != nil {
 		return err
 	}
 	if err := r.migrateManagedInboundResources(); err != nil {
@@ -5180,6 +5222,7 @@ type User struct {
 	// CheckAll 用它做"本月是否已重置"判定,避免 enforcer 每 5 min 跑一次时同一天反复 reset。
 	// 空 = 从未重置过(刚装 / 刚分配套餐),CheckAll 在 reset_day 到了之后会触发首次 reset。
 	LastResetAt         *time.Time
+	PackageStartDate    *time.Time
 	PackageEndDate      *time.Time
 	SpeedLimitOverride  *float64
 	DeviceLimitOverride *int
@@ -5288,14 +5331,14 @@ func (r *TrafficRepository) GetUser(ctx context.Context, username string) (User,
 		return user, errors.New("username is required")
 	}
 
-	row := r.db.QueryRowContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(package_id, 0), COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), COALESCE(totp_secret, ''), COALESCE(totp_enabled, 0), COALESCE(recovery_codes, '[]'), created_at, updated_at FROM users WHERE username = ? LIMIT 1`, username)
+	row := r.db.QueryRowContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(package_id, 0), COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), COALESCE(totp_secret, ''), COALESCE(totp_enabled, 0), COALESCE(recovery_codes, '[]'), created_at, updated_at FROM users WHERE username = ? LIMIT 1`, username)
 	var active, isReset, totpEnabled int
-	var endDate sql.NullTime
+	var startDate, endDate sql.NullTime
 	var speedOverride sql.NullFloat64
 	var deviceOverride sql.NullInt64
 	var trafficOverride sql.NullInt64
 	var nodeSpeedJSON, nodeDeviceJSON string
-	if err := row.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.PackageID, &isReset, &user.ResetDay, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &user.TOTPSecret, &totpEnabled, &user.RecoveryCodes, &user.CreatedAt, &user.UpdatedAt); err != nil {
+	if err := row.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.PackageID, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &user.TOTPSecret, &totpEnabled, &user.RecoveryCodes, &user.CreatedAt, &user.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return user, ErrUserNotFound
 		}
@@ -5310,6 +5353,9 @@ func (r *TrafficRepository) GetUser(ctx context.Context, username string) (User,
 	user.IsActive = active != 0
 	user.IsReset = isReset != 0
 	user.TOTPEnabled = totpEnabled != 0
+	if startDate.Valid {
+		user.PackageStartDate = &startDate.Time
+	}
 	if endDate.Valid {
 		user.PackageEndDate = &endDate.Time
 	}
@@ -5345,7 +5391,7 @@ func (r *TrafficRepository) ListUsers(ctx context.Context, limit int) ([]User, e
 		limit = 10
 	}
 
-	rows, err := r.db.QueryContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users ORDER BY created_at ASC LIMIT ?`, limit)
+	rows, err := r.db.QueryContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users ORDER BY created_at ASC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}
@@ -5355,12 +5401,12 @@ func (r *TrafficRepository) ListUsers(ctx context.Context, limit int) ([]User, e
 	for rows.Next() {
 		var user User
 		var active, isReset int
-		var endDate sql.NullTime
+		var startDate, endDate sql.NullTime
 		var speedOverride sql.NullFloat64
 		var deviceOverride sql.NullInt64
 		var trafficOverride sql.NullInt64
 		var nodeSpeedJSON, nodeDeviceJSON string
-		if err := rows.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.Remark, &user.PackageID, &isReset, &user.ResetDay, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &user.CreatedAt, &user.UpdatedAt); err != nil {
+		if err := rows.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.Remark, &user.PackageID, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &user.CreatedAt, &user.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		if user.Nickname == "" {
@@ -5371,6 +5417,9 @@ func (r *TrafficRepository) ListUsers(ctx context.Context, limit int) ([]User, e
 		}
 		user.IsActive = active != 0
 		user.IsReset = isReset != 0
+		if startDate.Valid {
+			user.PackageStartDate = &startDate.Time
+		}
 		if endDate.Valid {
 			user.PackageEndDate = &endDate.Time
 		}
@@ -8496,6 +8545,40 @@ func (r *TrafficRepository) filterAliveNodeIDs(ctx context.Context, ids []int64)
 	return out
 }
 
+func decodePackageBundle(rawServers, rawForwarding string, pkg *Package) error {
+	pkg.ServerGrants = []PackageServerGrant{}
+	pkg.ForwardingGrants = []PackageForwardingGrant{}
+	if strings.TrimSpace(rawServers) != "" {
+		if err := json.Unmarshal([]byte(rawServers), &pkg.ServerGrants); err != nil {
+			return fmt.Errorf("decode package server grants: %w", err)
+		}
+	}
+	if strings.TrimSpace(rawForwarding) != "" {
+		if err := json.Unmarshal([]byte(rawForwarding), &pkg.ForwardingGrants); err != nil {
+			return fmt.Errorf("decode package forwarding grants: %w", err)
+		}
+	}
+	if pkg.ServerGrants == nil {
+		pkg.ServerGrants = []PackageServerGrant{}
+	}
+	if pkg.ForwardingGrants == nil {
+		pkg.ForwardingGrants = []PackageForwardingGrant{}
+	}
+	return nil
+}
+
+func encodePackageBundle(pkg Package) (string, string, error) {
+	servers, err := json.Marshal(pkg.ServerGrants)
+	if err != nil {
+		return "", "", fmt.Errorf("serialize package server grants: %w", err)
+	}
+	forwarding, err := json.Marshal(pkg.ForwardingGrants)
+	if err != nil {
+		return "", "", fmt.Errorf("serialize package forwarding grants: %w", err)
+	}
+	return string(servers), string(forwarding), nil
+}
+
 func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
@@ -8504,7 +8587,7 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
 		       is_reset, reset_day, COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
-		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_device_limits, '{}'), created_at, updated_at
+		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		ORDER BY created_at DESC
 	`
@@ -8519,10 +8602,10 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 	for rows.Next() {
 		var pkg Package
 		var isReset int
-		var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON string
+		var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 		err := rows.Scan(&pkg.ID, &pkg.Name, &pkg.Description, &pkg.TrafficLimitBytes,
 			&pkg.CycleDays, &isReset, &pkg.ResetDay, &nodesJSON, &pkg.SpeedLimitMbps, &pkg.DeviceLimit,
-			&autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode, &pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeDeviceJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
+			&autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode, &pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("scan package: %w", err)
 		}
@@ -8546,6 +8629,9 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 		}
 		if nodeDeviceJSON != "" && nodeDeviceJSON != "{}" {
 			unmarshalStringKeyedIntMap(nodeDeviceJSON, &pkg.NodeDeviceLimits)
+		}
+		if err := decodePackageBundle(serverGrantsJSON, forwardingGrantsJSON, &pkg); err != nil {
+			return nil, fmt.Errorf("package %d: %w", pkg.ID, err)
 		}
 
 		packages = append(packages, pkg)
@@ -8596,18 +8682,18 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
 		       is_reset, reset_day, COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
-		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_device_limits, '{}'), created_at, updated_at
+		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		WHERE id = ?
 	`
 
 	var pkg Package
 	var isReset int
-	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON string
+	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 	err := r.db.QueryRowContext(ctx, query, id).Scan(&pkg.ID, &pkg.Name, &pkg.Description,
 		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &nodesJSON,
 		&pkg.SpeedLimitMbps, &pkg.DeviceLimit, &autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode,
-		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeDeviceJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
+		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPackageNotFound
@@ -8636,6 +8722,9 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 	if nodeDeviceJSON != "" && nodeDeviceJSON != "{}" {
 		unmarshalStringKeyedIntMap(nodeDeviceJSON, &pkg.NodeDeviceLimits)
 	}
+	if err := decodePackageBundle(serverGrantsJSON, forwardingGrantsJSON, &pkg); err != nil {
+		return nil, err
+	}
 
 	// 静默过滤孤儿 node id(同 ListPackages,query 失败时不过滤保活)
 	pkg.Nodes = r.filterAliveNodeIDs(ctx, pkg.Nodes)
@@ -8657,18 +8746,18 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
 		       is_reset, reset_day, COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
-		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_device_limits, '{}'), created_at, updated_at
+		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		WHERE name = ?
 	`
 
 	var pkg Package
 	var isReset int
-	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON string
+	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 	err := r.db.QueryRowContext(ctx, query, name).Scan(&pkg.ID, &pkg.Name, &pkg.Description,
 		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &nodesJSON,
 		&pkg.SpeedLimitMbps, &pkg.DeviceLimit, &autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode,
-		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeDeviceJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
+		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPackageNotFound
@@ -8697,6 +8786,9 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 	if nodeDeviceJSON != "" && nodeDeviceJSON != "{}" {
 		unmarshalStringKeyedIntMap(nodeDeviceJSON, &pkg.NodeDeviceLimits)
 	}
+	if err := decodePackageBundle(serverGrantsJSON, forwardingGrantsJSON, &pkg); err != nil {
+		return nil, err
+	}
 	return &pkg, nil
 }
 
@@ -8714,6 +8806,9 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	// 检查同名的包是否已经存在
 	if existing, err := r.GetPackageByName(ctx, name); err == nil && existing != nil {
 		return 0, ErrPackageExists
+	}
+	if err := r.validateAndNormalizePackageBundle(ctx, &pkg); err != nil {
+		return 0, err
 	}
 
 	// 将节点序列化为 JSON
@@ -8733,6 +8828,10 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	// per-node 限速 / 客户端数:跟 nodes 白名单过滤,0 值保留(显式不限速)
 	nodeSpeedJSON := serializeNodeFloatMap(pkg.NodeSpeedLimits, pkg.Nodes)
 	nodeDeviceJSON := serializeNodeIntMap(pkg.NodeDeviceLimits, pkg.Nodes)
+	serverGrantsJSON, forwardingGrantsJSON, err := encodePackageBundle(pkg)
+	if err != nil {
+		return 0, err
+	}
 
 	// 生成短码
 	shortCode, err := generatePackageShortCode()
@@ -8741,8 +8840,8 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	}
 
 	const query = `
-		INSERT INTO packages (name, description, traffic_limit_bytes, cycle_days, is_reset, reset_day, nodes, speed_limit_mbps, device_limit, auto_speed_limit_json, short_code, traffic_mode, template_filename, node_multipliers, node_speed_limits, node_device_limits)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO packages (name, description, traffic_limit_bytes, cycle_days, is_reset, reset_day, nodes, speed_limit_mbps, device_limit, auto_speed_limit_json, short_code, traffic_mode, template_filename, node_multipliers, node_speed_limits, node_device_limits, server_grants, forwarding_grants)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	isReset := 0
@@ -8756,7 +8855,7 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	}
 
 	result, err := r.db.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
-		pkg.CycleDays, isReset, pkg.ResetDay, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, shortCode, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON)
+		pkg.CycleDays, isReset, pkg.ResetDay, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, shortCode, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON)
 	if err != nil {
 		return 0, fmt.Errorf("create package: %w", err)
 	}
@@ -8772,28 +8871,38 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 
 // 更新现有包模板
 func (r *TrafficRepository) UpdatePackage(ctx context.Context, pkg Package) error {
+	_, err := r.UpdatePackageBundle(ctx, pkg)
+	return err
+}
+
+// UpdatePackageBundle stores the template and atomically synchronizes its
+// materialized server/forwarding grants for every currently assigned user.
+func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package) (map[string][]string, error) {
 	if r == nil || r.db == nil {
-		return errors.New("traffic repository not initialized")
+		return nil, errors.New("traffic repository not initialized")
 	}
 
 	if pkg.ID <= 0 {
-		return errors.New("package ID is required")
+		return nil, errors.New("package ID is required")
 	}
 
 	name := strings.TrimSpace(pkg.Name)
 	if name == "" {
-		return errors.New("package name is required")
+		return nil, errors.New("package name is required")
+	}
+	if err := r.validateAndNormalizePackageBundle(ctx, &pkg); err != nil {
+		return nil, err
 	}
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	if err := r.packageUpdateConflictsWithManagedSelections(ctx, pkg.ID, pkg.Nodes); err != nil {
-		return err
+		return nil, err
 	}
 
 	// 将节点序列化为 JSON
 	nodesJSON, err := json.Marshal(pkg.Nodes)
 	if err != nil {
-		return fmt.Errorf("serialize nodes: %w", err)
+		return nil, fmt.Errorf("serialize nodes: %w", err)
 	}
 
 	var autoSpeedJSON string
@@ -8805,13 +8914,17 @@ func (r *TrafficRepository) UpdatePackage(ctx context.Context, pkg Package) erro
 	nodeMultJSON := serializeNodeMultipliers(pkg.NodeMultipliers, pkg.Nodes)
 	nodeSpeedJSON := serializeNodeFloatMap(pkg.NodeSpeedLimits, pkg.Nodes)
 	nodeDeviceJSON := serializeNodeIntMap(pkg.NodeDeviceLimits, pkg.Nodes)
+	serverGrantsJSON, forwardingGrantsJSON, err := encodePackageBundle(pkg)
+	if err != nil {
+		return nil, err
+	}
 
 	const query = `
 		UPDATE packages
 		SET name = ?, description = ?, traffic_limit_bytes = ?, cycle_days = ?,
 		    is_reset = ?, reset_day = ?, nodes = ?, speed_limit_mbps = ?, device_limit = ?,
 		    auto_speed_limit_json = ?, traffic_mode = ?, template_filename = ?, node_multipliers = ?,
-		    node_speed_limits = ?, node_device_limits = ?, updated_at = CURRENT_TIMESTAMP
+		    node_speed_limits = ?, node_device_limits = ?, server_grants = ?, forwarding_grants = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
 	`
 
@@ -8825,23 +8938,91 @@ func (r *TrafficRepository) UpdatePackage(ctx context.Context, pkg Package) erro
 		trafficMode = "oneway"
 	}
 
-	result, err := r.db.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
-		pkg.CycleDays, isReset, pkg.ResetDay, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, pkg.ID)
+	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("update package: %w", err)
+		return nil, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
+		pkg.CycleDays, isReset, pkg.ResetDay, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON, pkg.ID)
+	if err != nil {
+		return nil, fmt.Errorf("update package: %w", err)
 	}
 
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("rows affected: %w", err)
+		return nil, fmt.Errorf("rows affected: %w", err)
 	}
 
 	if affected == 0 {
-		return ErrPackageNotFound
+		return nil, ErrPackageNotFound
+	}
+	warnings := make(map[string][]string)
+	rows, err := tx.QueryContext(ctx, `SELECT username, package_start_date, package_end_date FROM users WHERE package_id=?`, pkg.ID)
+	if err != nil {
+		return nil, err
+	}
+	type packageUserWindow struct {
+		username string
+		startsAt time.Time
+		endsAt   time.Time
+	}
+	var assigned []packageUserWindow
+	windowBackfillAt := time.Now().UTC()
+	for rows.Next() {
+		var item packageUserWindow
+		var starts, ends sql.NullTime
+		if err := rows.Scan(&item.username, &starts, &ends); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		switch {
+		case starts.Valid:
+			item.startsAt = starts.Time
+		case ends.Valid:
+			item.startsAt = ends.Time.AddDate(0, 0, -pkg.CycleDays)
+		default:
+			item.startsAt = windowBackfillAt
+		}
+		if ends.Valid {
+			item.endsAt = ends.Time
+		} else {
+			item.endsAt = item.startsAt.AddDate(0, 0, pkg.CycleDays)
+		}
+		assigned = append(assigned, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, item := range assigned {
+		// Legacy assignments could predate package windows. Persist the same
+		// synthesized window used by materialized grants so fixed nodes and bundle
+		// children cannot acquire different lifetimes after a template update.
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET
+    package_start_date = COALESCE(package_start_date, ?),
+    package_end_date = COALESCE(package_end_date, ?),
+    updated_at = CURRENT_TIMESTAMP
+WHERE username = ? AND package_id = ?`, item.startsAt, item.endsAt, item.username, pkg.ID); err != nil {
+			return nil, fmt.Errorf("backfill package assignment window for %s: %w", item.username, err)
+		}
+		ws, syncErr := r.syncPackageBundleGrantsTx(ctx, tx, item.username, pkg.ID, &pkg, item.startsAt, item.endsAt)
+		if syncErr != nil {
+			return nil, syncErr
+		}
+		if len(ws) > 0 {
+			warnings[item.username] = ws
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 
 	r.invalidateTrafficBillingCache()
-	return nil
+	return warnings, nil
 }
 
 // 根据 ID 删除包模板
@@ -8853,10 +9034,39 @@ func (r *TrafficRepository) DeletePackage(ctx context.Context, id int64) error {
 	if id <= 0 {
 		return errors.New("package ID is required")
 	}
-
-	const query = `DELETE FROM packages WHERE id = ?`
-
-	result, err := r.db.ExecContext(ctx, query, id)
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin delete package: %w", err)
+	}
+	defer tx.Rollback()
+	var assignedUsers int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE package_id=?`, id).Scan(&assignedUsers); err != nil {
+		return fmt.Errorf("check package assignments before delete: %w", err)
+	}
+	if assignedUsers > 0 {
+		return fmt.Errorf("package is still assigned to %d users", assignedUsers)
+	}
+	// Disabled package-sourced rows are reconciliation tombstones. Delete the
+	// package only after proving no enabled source remains, then detach those
+	// tombstones from the soon-to-be-deleted template without granting access.
+	var enabledSources int
+	if err := tx.QueryRowContext(ctx, `SELECT
+(SELECT COUNT(*) FROM user_server_grants WHERE source_type='package' AND source_package_id=? AND enabled=1) +
+(SELECT COUNT(*) FROM user_tunnel_grants WHERE source_type='package' AND source_package_id=? AND enabled=1)`, id, id).Scan(&enabledSources); err != nil {
+		return fmt.Errorf("check package bundle grants before delete: %w", err)
+	}
+	if enabledSources > 0 {
+		return fmt.Errorf("package still has %d enabled materialized grants", enabledSources)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE user_server_grants SET source_type='manual',source_package_id=NULL,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE source_type='package' AND source_package_id=? AND enabled=0`, id); err != nil {
+		return fmt.Errorf("detach package server tombstones: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE user_tunnel_grants SET source_type='manual',source_package_id=NULL,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE source_type='package' AND source_package_id=? AND enabled=0`, id); err != nil {
+		return fmt.Errorf("detach package forwarding tombstones: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM packages WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete package: %w", err)
 	}
@@ -8869,6 +9079,9 @@ func (r *TrafficRepository) DeletePackage(ctx context.Context, id int64) error {
 	if affected == 0 {
 		return ErrPackageNotFound
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete package: %w", err)
+	}
 
 	r.invalidateTrafficBillingCache()
 	return nil
@@ -8876,30 +9089,43 @@ func (r *TrafficRepository) DeletePackage(ctx context.Context, id int64) error {
 
 // 将包分配给用户
 func (r *TrafficRepository) AssignPackageToUser(ctx context.Context, username string, packageID int64, startDate time.Time, endDate time.Time, isReset bool, resetDay int) error {
+	_, err := r.AssignPackageBundleToUser(ctx, username, packageID, startDate, endDate, isReset, resetDay)
+	return err
+}
+
+// AssignPackageBundleToUser atomically updates the package assignment and all
+// source-tracked grants materialized from the bundle.
+func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, username string, packageID int64, startDate time.Time, endDate time.Time, isReset bool, resetDay int) ([]string, error) {
 	if r == nil || r.db == nil {
-		return errors.New("traffic repository not initialized")
+		return nil, errors.New("traffic repository not initialized")
 	}
 
 	username = strings.TrimSpace(username)
 	if username == "" {
-		return errors.New("username is required")
+		return nil, errors.New("username is required")
 	}
 
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	if pending, err := r.IsUserDeletionPending(ctx, username); err != nil {
-		return err
+		return nil, err
 	} else if pending {
-		return ErrUserDeletionPending
+		return nil, ErrUserDeletionPending
 	}
 
 	// 验证套餐存在，并拒绝与用户自选节点重复授权同一物理入站。
 	pkg, err := r.GetPackage(ctx, packageID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := packageNodesConflictWithManagedSelections(ctx, r.db, username, pkg.Nodes, 0); err != nil {
-		return err
+	if err := packageNodesConflictWithManualSelections(ctx, r.db, username, pkg.Nodes); err != nil {
+		return nil, err
+	}
+	var oldPackageID int64
+	if err := r.db.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0) FROM users WHERE username = ?`, username).Scan(&oldPackageID); errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUserNotFound
+	} else if err != nil {
+		return nil, err
 	}
 
 	var isResetInt int
@@ -8916,22 +9142,34 @@ func (r *TrafficRepository) AssignPackageToUser(ctx context.Context, username st
 		WHERE username = ?
 	`
 
-	result, err := r.db.ExecContext(ctx, query, packageID, packageID, startDate, endDate, isResetInt, resetDay, username)
+	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("assign package to user: %w", err)
+		return nil, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, query, packageID, packageID, startDate, endDate, isResetInt, resetDay, username)
+	if err != nil {
+		return nil, fmt.Errorf("assign package to user: %w", err)
 	}
 
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("rows affected: %w", err)
+		return nil, fmt.Errorf("rows affected: %w", err)
 	}
 
 	if affected == 0 {
-		return ErrUserNotFound
+		return nil, ErrUserNotFound
+	}
+	warnings, err := r.syncPackageBundleGrantsTx(ctx, tx, username, oldPackageID, pkg, startDate, endDate)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 
 	r.invalidateTrafficBillingCache()
-	return nil
+	return warnings, nil
 }
 
 // 删除用户的包分配
@@ -8944,7 +9182,20 @@ func (r *TrafficRepository) RemovePackageFromUser(ctx context.Context, username 
 	if username == "" {
 		return errors.New("username is required")
 	}
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
 
+	var packageID int64
+	if err := r.db.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0) FROM users WHERE username = ?`, username).Scan(&packageID); errors.Is(err, sql.ErrNoRows) {
+		return ErrUserNotFound
+	} else if err != nil {
+		return err
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	const query = `
 		UPDATE users
 		SET package_id = NULL, package_start_date = NULL, package_end_date = NULL, is_reset = 0, reset_day = 1,
@@ -8952,7 +9203,7 @@ func (r *TrafficRepository) RemovePackageFromUser(ctx context.Context, username 
 		WHERE username = ?
 	`
 
-	result, err := r.db.ExecContext(ctx, query, username)
+	result, err := tx.ExecContext(ctx, query, username)
 	if err != nil {
 		return fmt.Errorf("remove package from user: %w", err)
 	}
@@ -8964,6 +9215,14 @@ func (r *TrafficRepository) RemovePackageFromUser(ctx context.Context, username 
 
 	if affected == 0 {
 		return ErrUserNotFound
+	}
+	if packageID > 0 {
+		if err := revokePackageBundleGrantsTx(ctx, tx, username, packageID, time.Now().UTC()); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 
 	r.invalidateTrafficBillingCache()
@@ -10193,7 +10452,7 @@ func (r *TrafficRepository) ResolveNodeNameByEmail(ctx context.Context, serverNa
 
 func (r *TrafficRepository) ListUsersWithPackage(ctx context.Context) ([]User, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), COALESCE(is_reset, 0), COALESCE(reset_day, 1), last_reset_at, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users WHERE package_id IS NOT NULL AND package_id > 0`)
+		`SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), COALESCE(is_reset, 0), COALESCE(reset_day, 1), last_reset_at, package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users WHERE package_id IS NOT NULL AND package_id > 0`)
 	if err != nil {
 		return nil, err
 	}
@@ -10202,18 +10461,21 @@ func (r *TrafficRepository) ListUsersWithPackage(ctx context.Context) ([]User, e
 	for rows.Next() {
 		var u User
 		var active, isReset int
-		var lastResetAt, endDate sql.NullTime
+		var lastResetAt, startDate, endDate sql.NullTime
 		var speedOverride sql.NullFloat64
 		var deviceOverride sql.NullInt64
 		var trafficOverride sql.NullInt64
 		var nodeSpeedJSON, nodeDeviceJSON string
-		if err := rows.Scan(&u.Username, &u.PasswordHash, &u.Email, &u.Nickname, &u.AvatarURL, &u.Role, &active, &u.Remark, &u.PackageID, &isReset, &u.ResetDay, &lastResetAt, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		if err := rows.Scan(&u.Username, &u.PasswordHash, &u.Email, &u.Nickname, &u.AvatarURL, &u.Role, &active, &u.Remark, &u.PackageID, &isReset, &u.ResetDay, &lastResetAt, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, err
 		}
 		u.IsActive = active != 0
 		u.IsReset = isReset != 0
 		if lastResetAt.Valid {
 			u.LastResetAt = &lastResetAt.Time
+		}
+		if startDate.Valid {
+			u.PackageStartDate = &startDate.Time
 		}
 		if endDate.Valid {
 			u.PackageEndDate = &endDate.Time
@@ -13291,6 +13553,67 @@ func validateRemoteServerDeletion(ctx context.Context, querier remoteServerDelet
 	if forwardingReferenced != 0 {
 		return "", ErrForwardingConflict
 	}
+
+	// Package templates are durable references, even when no user currently
+	// has the package. Reject them in the common preflight so an owned-server
+	// uninstall never reaches the Agent before discovering the conflict.
+	var packageServerRefs int
+	if err := querier.QueryRowContext(ctx, `SELECT COUNT(*) FROM packages
+WHERE EXISTS(SELECT 1 FROM json_each(COALESCE(server_grants, '[]')) entry
+WHERE CAST(json_extract(entry.value, '$.server_id') AS INTEGER)=?)`, id).Scan(&packageServerRefs); err != nil {
+		return "", fmt.Errorf("check package server references: %w", err)
+	}
+	if packageServerRefs > 0 {
+		return "", fmt.Errorf("remote server is referenced by %d package templates", packageServerRefs)
+	}
+	var packageNodeRefs int
+	if err := querier.QueryRowContext(ctx, `SELECT COUNT(*) FROM packages p
+WHERE EXISTS(
+    SELECT 1 FROM json_each(COALESCE(p.nodes, '[]')) entry
+    JOIN nodes n ON n.id = CAST(entry.value AS INTEGER)
+    WHERE COALESCE(n.original_server, '') = ?
+)`, name).Scan(&packageNodeRefs); err != nil {
+		return "", fmt.Errorf("check package node references: %w", err)
+	}
+	if packageNodeRefs > 0 {
+		return "", fmt.Errorf("remote server nodes are referenced by %d package templates", packageNodeRefs)
+	}
+
+	// An inactive direct grant is deletable only after remote reconciliation
+	// has confirmed the same generation inactive. Missing or mismatched source
+	// rows fail closed rather than being silently discarded.
+	var unsafeDirectGrant int
+	if err := querier.QueryRowContext(ctx, `SELECT EXISTS(
+	    SELECT 1 FROM user_node_grants g
+	    JOIN nodes n ON n.id = g.node_id
+	    LEFT JOIN user_inbound_access_sources s ON s.id = g.access_source_id
+	    WHERE COALESCE(n.original_server, '') = ? AND (
+	        s.id IS NULL OR s.source_type != 'direct'
+	        OR s.server_id != ? OR s.node_id != g.node_id OR s.source_id != g.id
+	        OR s.desired_state != 'inactive'
+	        OR s.observed_state != 'inactive'
+	        OR s.applied_generation != s.generation
+	    )
+	    UNION ALL
+	    SELECT 1 FROM user_inbound_access_sources s
+	    WHERE s.server_id = ? AND s.source_type = 'direct' AND (
+	        s.desired_state != 'inactive'
+	        OR s.observed_state != 'inactive'
+	        OR s.applied_generation != s.generation
+	        OR NOT EXISTS(
+	            SELECT 1 FROM user_node_grants g
+	            JOIN nodes n ON n.id = g.node_id
+	            WHERE g.id = s.source_id AND g.access_source_id = s.id
+	              AND g.node_id = s.node_id
+	              AND COALESCE(n.original_server, '') = ?
+	        )
+	    )
+	)`, name, id, id, name).Scan(&unsafeDirectGrant); err != nil {
+		return "", fmt.Errorf("check direct node grant server references: %w", err)
+	}
+	if unsafeDirectGrant != 0 {
+		return "", errors.New("remote server has active or unreconciled direct node grants; revoke them before deletion")
+	}
 	return name, nil
 }
 
@@ -13366,6 +13689,40 @@ func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) er
 		grant_id IN (SELECT id FROM user_server_grants WHERE server_id = ?)
 		OR offer_id IN (SELECT id FROM self_service_node_offers WHERE server_id = ?)`, id, id); err != nil {
 		return fmt.Errorf("delete user_node_selections: %w", err)
+	}
+	// Reconciled inactive direct grants are tombstones, not live entitlement.
+	// Remove their grant rows before nodes, then their access sources. Keeping
+	// both operations inside this transaction prevents either orphan shape.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_inbound_configs WHERE id IN (
+		SELECT g.credential_config_id FROM user_node_grants g
+		JOIN nodes n ON n.id = g.node_id
+		JOIN user_inbound_access_sources s ON s.id = g.access_source_id
+		WHERE COALESCE(n.original_server, '') = ?
+		  AND s.source_type = 'direct'
+		  AND s.desired_state = 'inactive'
+		  AND s.observed_state = 'inactive'
+		  AND s.applied_generation = s.generation
+		  AND g.credential_config_id IS NOT NULL
+	)`, name); err != nil {
+		return fmt.Errorf("delete inactive direct credential tombstones: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_node_grants WHERE id IN (
+		SELECT g.id FROM user_node_grants g
+		JOIN nodes n ON n.id = g.node_id
+		JOIN user_inbound_access_sources s ON s.id = g.access_source_id
+		WHERE COALESCE(n.original_server, '') = ?
+		  AND s.source_type = 'direct'
+		  AND s.desired_state = 'inactive'
+		  AND s.observed_state = 'inactive'
+		  AND s.applied_generation = s.generation
+	)`, name); err != nil {
+		return fmt.Errorf("delete inactive direct node grant tombstones: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_inbound_access_sources
+		WHERE server_id = ? AND source_type = 'direct'
+		  AND desired_state = 'inactive' AND observed_state = 'inactive'
+		  AND applied_generation = generation`, id); err != nil {
+		return fmt.Errorf("delete inactive direct access source tombstones: %w", err)
 	}
 	// 2) 该服务器入站同步出来的所有节点(普通 + routed),按 original_server 名字。
 	if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE original_server = ?`, name); err != nil {

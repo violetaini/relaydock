@@ -22,6 +22,8 @@ const (
 	ManagedSourcePackage      = "package"
 	ManagedSourceSelection    = "selection"
 	ManagedSourceLegacyReview = "legacy_review"
+	GrantSourceManual         = "manual"
+	GrantSourcePackage        = "package"
 
 	ManagedDesiredActive   = "active"
 	ManagedDesiredInactive = "inactive"
@@ -97,6 +99,8 @@ type UserServerGrant struct {
 	NextResetAt             *time.Time `json:"next_reset_at,omitempty"`
 	AllowedProtocols        []string   `json:"allowed_protocols"`
 	AllowedProtocolProfiles []string   `json:"allowed_protocol_profiles"`
+	SourceType              string     `json:"source_type"`
+	SourcePackageID         *int64     `json:"source_package_id,omitempty"`
 	Version                 int64      `json:"version"`
 	CreatedBy               string     `json:"created_by"`
 	CreatedAt               time.Time  `json:"created_at"`
@@ -328,6 +332,15 @@ CREATE TABLE IF NOT EXISTS remote_server_guard_secrets (
 	}
 	if err := r.ensureTableColumn("user_server_grants", "allowed_protocol_profiles_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return fmt.Errorf("migrate managed grant protocol profile whitelist: %w", err)
+	}
+	if err := r.ensureTableColumn("user_server_grants", "source_type", "TEXT NOT NULL DEFAULT 'manual'"); err != nil {
+		return fmt.Errorf("migrate managed grant source type: %w", err)
+	}
+	if err := r.ensureTableColumn("user_server_grants", "source_package_id", "INTEGER"); err != nil {
+		return fmt.Errorf("migrate managed grant source package: %w", err)
+	}
+	if _, err := r.db.Exec(`CREATE INDEX IF NOT EXISTS idx_user_server_grants_package_source ON user_server_grants(username, source_package_id) WHERE source_type = 'package'`); err != nil {
+		return fmt.Errorf("migrate managed grant source index: %w", err)
 	}
 
 	// Existing credentials cannot be safely attributed to a package or a user selection.
@@ -702,6 +715,10 @@ func normalizeGrant(g UserServerGrant) (UserServerGrant, error) {
 	g.BillingMode = strings.ToLower(strings.TrimSpace(g.BillingMode))
 	g.ResetPolicy = strings.ToLower(strings.TrimSpace(g.ResetPolicy))
 	g.BillingTimezone = strings.TrimSpace(g.BillingTimezone)
+	g.SourceType = strings.ToLower(strings.TrimSpace(g.SourceType))
+	if g.SourceType == "" {
+		g.SourceType = GrantSourceManual
+	}
 	if g.BillingMode == "" {
 		g.BillingMode = ManagedBillingDownload
 	}
@@ -738,6 +755,18 @@ func normalizeGrant(g UserServerGrant) (UserServerGrant, error) {
 	}
 	if g.Username == "" || g.ServerID <= 0 || g.CreatedBy == "" || g.StartsAt.IsZero() {
 		return g, ErrManagedInvalidArgument
+	}
+	if g.SourceType != GrantSourceManual && g.SourceType != GrantSourcePackage {
+		return g, ErrManagedInvalidArgument
+	}
+	if g.SourceType == GrantSourcePackage {
+		if g.SourcePackageID == nil || *g.SourcePackageID <= 0 {
+			return g, ErrManagedInvalidArgument
+		}
+	} else {
+		if g.SourcePackageID != nil {
+			return g, ErrManagedInvalidArgument
+		}
 	}
 	if g.ExpiresAt != nil && !g.ExpiresAt.After(g.StartsAt) {
 		return g, fmt.Errorf("%w: expires_at must be after starts_at", ErrManagedInvalidArgument)
@@ -1023,17 +1052,22 @@ func scanUserServerGrant(s rowScanner) (UserServerGrant, error) {
 	var grant UserServerGrant
 	var enabled int
 	var expires, nextReset sql.NullString
+	var sourcePackageID sql.NullInt64
 	var allowedProtocolsJSON, allowedProtocolProfilesJSON string
 	err := s.Scan(&grant.ID, &grant.Username, &grant.ServerID, &enabled, &grant.StartsAt, &expires,
 		&grant.MaxActiveNodes, &grant.SpeedLimitMbps, &grant.ConnectionLimit, &grant.TrafficLimitBytes,
 		&grant.BillingMode, &grant.ResetPolicy, &grant.ResetDay, &grant.BillingTimezone, &nextReset,
-		&allowedProtocolsJSON, &allowedProtocolProfilesJSON, &grant.Version, &grant.CreatedBy, &grant.CreatedAt, &grant.UpdatedAt)
+		&allowedProtocolsJSON, &allowedProtocolProfilesJSON, &grant.SourceType, &sourcePackageID, &grant.Version, &grant.CreatedBy, &grant.CreatedAt, &grant.UpdatedAt)
 	if err != nil {
 		return grant, err
 	}
 	grant.Enabled = enabled != 0
 	grant.ExpiresAt = managedParseNullTime(expires)
 	grant.NextResetAt = managedParseNullTime(nextReset)
+	if sourcePackageID.Valid {
+		id := sourcePackageID.Int64
+		grant.SourcePackageID = &id
+	}
 	if err := json.Unmarshal([]byte(allowedProtocolsJSON), &grant.AllowedProtocols); err != nil {
 		return grant, fmt.Errorf("decode managed grant allowed protocols: %w", err)
 	}
@@ -1059,7 +1093,7 @@ func scanUserServerGrant(s rowScanner) (UserServerGrant, error) {
 const selectUserServerGrant = `SELECT id, username, server_id, enabled, starts_at, expires_at,
        max_active_nodes, speed_limit_mbps, connection_limit, traffic_limit_bytes,
        billing_mode, reset_policy, reset_day, billing_timezone, next_reset_at,
-       allowed_protocols_json, allowed_protocol_profiles_json, version, created_by, created_at, updated_at
+	   allowed_protocols_json, allowed_protocol_profiles_json, COALESCE(source_type, 'manual'), source_package_id, version, created_by, created_at, updated_at
 FROM user_server_grants`
 
 func (r *TrafficRepository) CreateUserServerGrant(ctx context.Context, grant UserServerGrant) (*UserServerGrant, error) {
@@ -1105,18 +1139,57 @@ EXISTS(SELECT 1 FROM remote_servers WHERE id = ?)`, grant.Username, grant.Server
 	if err != nil {
 		return nil, fmt.Errorf("encode managed grant allowed protocol profiles: %w", err)
 	}
+	// A revoked package grant with historical selections is retained as an
+	// inactive tombstone because those children still need reconciliation. A
+	// subsequent explicit admin grant for the same user/server may safely adopt
+	// that row without reviving any old package selection.
+	if grant.SourceType == GrantSourceManual {
+		var tombstoneID int64
+		var tombstoneVersion int64
+		tombstoneErr := tx.QueryRowContext(ctx, `SELECT id,version FROM user_server_grants
+WHERE username=? AND server_id=? AND source_type='package' AND enabled=0`, grant.Username, grant.ServerID).Scan(&tombstoneID, &tombstoneVersion)
+		if tombstoneErr != nil && !errors.Is(tombstoneErr, sql.ErrNoRows) {
+			return nil, fmt.Errorf("read package grant tombstone: %w", tombstoneErr)
+		}
+		if tombstoneErr == nil {
+			result, updateErr := tx.ExecContext(ctx, `UPDATE user_server_grants SET enabled=?,starts_at=?,expires_at=?,max_active_nodes=?,
+speed_limit_mbps=?,connection_limit=?,traffic_limit_bytes=?,billing_mode=?,reset_policy=?,reset_day=?,billing_timezone=?,
+next_reset_at=?,allowed_protocols_json=?,allowed_protocol_profiles_json=?,source_type='manual',source_package_id=NULL,
+version=version+1,created_by=?,updated_at=? WHERE id=? AND version=? AND source_type='package' AND enabled=0`,
+				boolInt(grant.Enabled), grant.StartsAt, managedNullTime(grant.ExpiresAt), grant.MaxActiveNodes,
+				grant.SpeedLimitMbps, grant.ConnectionLimit, grant.TrafficLimitBytes, grant.BillingMode,
+				grant.ResetPolicy, grant.ResetDay, grant.BillingTimezone, managedNullTime(grant.NextResetAt),
+				string(allowedProtocolsJSON), string(allowedProtocolProfilesJSON), grant.CreatedBy, now, tombstoneID, tombstoneVersion)
+			if updateErr != nil {
+				return nil, fmt.Errorf("adopt package grant tombstone: %w", updateErr)
+			}
+			if affected, _ := result.RowsAffected(); affected != 1 {
+				return nil, ErrManagedVersionConflict
+			}
+			if err := appendManagedAccessAuditTx(ctx, tx, ManagedAccessAudit{
+				Actor: grant.CreatedBy, Action: "grant.adopted_from_package", EntityType: "server_grant", EntityID: tombstoneID,
+				Username: grant.Username, ServerID: grant.ServerID,
+			}); err != nil {
+				return nil, err
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, fmt.Errorf("commit package grant tombstone adoption: %w", err)
+			}
+			return r.GetUserServerGrant(ctx, tombstoneID)
+		}
+	}
 	result, err := tx.ExecContext(ctx, `
 INSERT INTO user_server_grants (
     username, server_id, enabled, starts_at, expires_at, max_active_nodes,
     speed_limit_mbps, connection_limit, traffic_limit_bytes, billing_mode,
     reset_policy, reset_day, billing_timezone, next_reset_at, allowed_protocols_json,
-    allowed_protocol_profiles_json, version,
-    created_by, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+	    allowed_protocol_profiles_json, source_type, source_package_id, version,
+	    created_by, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
 		grant.Username, grant.ServerID, boolInt(grant.Enabled), grant.StartsAt, managedNullTime(grant.ExpiresAt),
 		grant.MaxActiveNodes, grant.SpeedLimitMbps, grant.ConnectionLimit, grant.TrafficLimitBytes,
 		grant.BillingMode, grant.ResetPolicy, grant.ResetDay, grant.BillingTimezone,
-		managedNullTime(grant.NextResetAt), string(allowedProtocolsJSON), string(allowedProtocolProfilesJSON), grant.CreatedBy, now, now)
+		managedNullTime(grant.NextResetAt), string(allowedProtocolsJSON), string(allowedProtocolProfilesJSON), grant.SourceType, grant.SourcePackageID, grant.CreatedBy, now, now)
 	if managedUniqueViolation(err) {
 		return nil, ErrUserServerGrantExists
 	}
@@ -1235,6 +1308,8 @@ func (r *TrafficRepository) UpdateUserServerGrant(ctx context.Context, grant Use
 	grant.Username = existing.Username
 	grant.ServerID = existing.ServerID
 	grant.CreatedBy = existing.CreatedBy
+	grant.SourceType = existing.SourceType
+	grant.SourcePackageID = existing.SourcePackageID
 	grant, err = normalizeGrant(grant)
 	if err != nil {
 		return nil, err

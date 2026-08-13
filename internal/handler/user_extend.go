@@ -8,7 +8,7 @@ import (
 
 // UserExtendHandler 处理 POST /api/admin/users/extend:给已绑套餐的用户快捷延长有效期(+N 天)。
 // 只改 package_end_date,不触碰流量周期(续期与流量重置是完全独立的两套流程)。
-// 复用 PackageAssignHandler.AssignAndProvision:套餐未变时命中 samePackage 快路径,只同步 limiter、不重下发 xray client。
+// 复用 PackageAssignHandler.AssignAndProvision:同套餐续期也会幂等刷新并补齐缺失凭据。
 type UserExtendHandler struct {
 	assign *PackageAssignHandler
 }

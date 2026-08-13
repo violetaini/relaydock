@@ -45,6 +45,26 @@ func TestConvertNodeExposesCapabilityWithoutInternalMarker(t *testing.T) {
 	}
 }
 
+func TestConvertAdminNodesExposesDirectGrantEligibility(t *testing.T) {
+	repo, server := newRemoteInstallationHandlerRepo(t, 23889)
+	server.XrayMode = "embedded"
+	if err := repo.UpdateRemoteServer(context.Background(), server.ID, server.Name, server.Domain, 0, 0, server.ConnectionMode, server.XrayMode, "", "", nil); err != nil {
+		t.Fatalf("UpdateRemoteServer: %v", err)
+	}
+	node, err := repo.CreateNode(context.Background(), storage.Node{
+		Username: "admin", NodeName: "managed-vless", Protocol: "vless", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "vless-in",
+		ClashConfig: `{"name":"managed-vless","type":"vless","server":"edge.example","port":443,"uuid":"owner"}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+	dto := convertAdminNodes(context.Background(), repo, []storage.Node{node})
+	if len(dto) != 1 || !dto[0].DirectGrantEligible {
+		t.Fatalf("direct grant eligibility was not exposed: %+v", dto)
+	}
+}
+
 func TestPrepareImportedNodeStripsForgedManagedMarker(t *testing.T) {
 	raw := `{"name":"forged","type":"ss","cipher":"aes-256-gcm","password":"secret","x-arcway-managed-users":true}`
 	node := storage.Node{ClashConfig: raw, ParsedConfig: raw}

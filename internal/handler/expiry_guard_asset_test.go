@@ -1970,6 +1970,66 @@ func TestUpdateRemoteServerValidatesDDNSBeforeMainUpdate(t *testing.T) {
 	}
 }
 
+func TestUpdateRemoteServerRejectsIdentityChangeWithActiveDirectGrant(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+	server := &storage.RemoteServer{
+		Name: "direct-edge", Token: "direct-edge-token", Status: storage.RemoteServerStatusConnected,
+		XrayMode: "embedded", ConnectionMode: storage.ConnectionModePush, PullAddress: "old.example.com",
+	}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateUser(ctx, "alice", "alice@example.test", "Alice", "hash", storage.RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "Direct", Protocol: "vless", ParsedConfig: `{}`,
+		ClashConfig: `{"name":"Direct","type":"vless","server":"old.example.com","port":443,"uuid":"owner-secret"}`,
+		Enabled:     true, OriginalServer: server.Name, InboundTag: "vless-in",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repo.UpsertManualUserNodeGrant(ctx, "alice", node.ID, nil, "admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, update := range []RemoteServerUpdateRequest{
+		{ID: server.ID, Name: "renamed-edge", PullAddress: server.PullAddress, ConnectionMode: server.ConnectionMode},
+		{ID: server.ID, Name: server.Name, PullAddress: "new.example.com", ConnectionMode: server.ConnectionMode},
+	} {
+		body, err := json.Marshal(update)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodPut, "/api/admin/remote-servers/update", strings.NewReader(string(body)))
+		response := httptest.NewRecorder()
+		NewXrayServerHandler(repo, nil, nil).UpdateRemoteServer(response, request)
+		if response.Code != http.StatusConflict {
+			t.Fatalf("update=%+v status=%d body=%s", update, response.Code, response.Body.String())
+		}
+		stored, err := repo.GetRemoteServer(ctx, server.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.Name != server.Name || stored.PullAddress != server.PullAddress {
+			t.Fatalf("blocked update partially changed server: %+v", stored)
+		}
+		storedNode, err := repo.GetNodeByID(ctx, node.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if storedNode.OriginalServer != server.Name || !strings.Contains(storedNode.ClashConfig, "old.example.com") {
+			t.Fatalf("blocked update partially changed node: %+v", storedNode)
+		}
+	}
+}
+
 func TestCreateRemoteServerRejectsInvalidManagementPortPair(t *testing.T) {
 	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
 	if err != nil {

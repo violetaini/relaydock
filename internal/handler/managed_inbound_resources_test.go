@@ -1114,6 +1114,71 @@ func TestManagedWireGuardOrdinaryNodeDeleteRetainsEncryptedNodeWhenRemoteCleanup
 	}
 }
 
+func TestNodeDeleteEndpointsRejectActiveDirectGrantBeforeAgentCleanup(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   func(int64) string
+		body   func(int64) interface{}
+	}{
+		{
+			name: "single", method: http.MethodDelete,
+			path: func(id int64) string { return "/api/admin/nodes/" + strconv.FormatInt(id, 10) },
+		},
+		{
+			name: "batch", method: http.MethodPost,
+			path: func(int64) string { return "/api/admin/nodes/batch-delete" },
+			body: func(id int64) interface{} { return map[string]interface{}{"node_ids": []int64{id}} },
+		},
+		{
+			name: "clear", method: http.MethodPost,
+			path: func(int64) string { return "/api/admin/nodes/clear" },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			remoteHandler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+			ctx := context.Background()
+			if err := repo.UpdateRemoteServerXrayMode(ctx, server.ID, "embedded"); err != nil {
+				t.Fatal(err)
+			}
+			if err := repo.CreateUser(ctx, "alice", "alice@example.test", "Alice", "hash", storage.RoleUser, ""); err != nil {
+				t.Fatal(err)
+			}
+			node, err := repo.CreateNode(ctx, storage.Node{
+				Username: "admin", RawURL: "vless://owner-secret@managed-edge",
+				NodeName: "Granted VLESS", Protocol: "vless", ParsedConfig: `{}`,
+				ClashConfig: `{"name":"Granted VLESS","type":"vless","server":"edge.example","port":443,"uuid":"owner-secret"}`,
+				Enabled:     true, OriginalServer: server.Name, InboundTag: "granted-vless-in",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := repo.UpsertManualUserNodeGrant(ctx, "alice", node.ID, nil, "admin"); err != nil {
+				t.Fatal(err)
+			}
+
+			handler := NewNodesHandler(repo, t.TempDir(), remoteHandler)
+			var body interface{}
+			if test.body != nil {
+				body = test.body(node.ID)
+			}
+			request := managedWireGuardRequest(t, test.method, test.path(node.ID), body)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusConflict {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if actions := agent.actionSnapshot(); len(actions) != 0 {
+				t.Fatalf("active direct grant reached Agent cleanup: %v", actions)
+			}
+			if _, err := repo.GetNodeByID(ctx, node.ID); err != nil {
+				t.Fatalf("blocked deletion removed local node: %v", err)
+			}
+		})
+	}
+}
+
 func TestManagedWireGuardRejectsMismatchedClientKeysBeforeAgent(t *testing.T) {
 	handler, _, server, agent, _ := newManagedInboundHandlerTest(t, nil)
 	body := managedWireGuardCreateBody(t, "Mismatched WG")
