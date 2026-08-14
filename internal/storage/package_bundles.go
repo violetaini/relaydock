@@ -302,8 +302,9 @@ WHERE username = ? AND source_type = 'package' AND source_package_id = ?`, usern
 		var id int64
 		var sourceType string
 		var sourcePackageID sql.NullInt64
-		err := tx.QueryRowContext(ctx, `SELECT id, COALESCE(source_type, 'manual'), source_package_id FROM user_tunnel_grants
-WHERE username=? AND tunnel_id=?`, username, entry.TunnelID).Scan(&id, &sourceType, &sourcePackageID)
+		var currentBillingMode sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT id, COALESCE(source_type, 'manual'), source_package_id, billing_mode_override FROM user_tunnel_grants
+WHERE username=? AND tunnel_id=?`, username, entry.TunnelID).Scan(&id, &sourceType, &sourcePackageID, &currentBillingMode)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("read existing forwarding grant: %w", err)
 		}
@@ -321,12 +322,22 @@ per_forward_connection_limit,traffic_limit_bytes,billing_mode_override,allow_man
 allow_custom_public_target,source_type,source_package_id,version,created_by)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'package')`, publicID, username, entry.TunnelID, 1, startsAt.UTC(), endsAt.UTC(),
 				entry.MaxActiveForwards, entry.PerForwardSpeedMbps, entry.PerForwardConnectionLimit,
-				entry.TrafficLimitBytes, entry.BillingModeOverride, 1, 0, GrantSourcePackage, pkg.ID)
+				entry.TrafficLimitBytes, *entry.BillingModeOverride, 1, 0, GrantSourcePackage, pkg.ID)
 			if insertErr != nil {
 				return nil, fmt.Errorf("create package forwarding grant: %w", insertErr)
 			}
 			id, _ = result.LastInsertId()
 		} else {
+			billingChanged := !currentBillingMode.Valid || currentBillingMode.String != *entry.BillingModeOverride
+			if billingChanged {
+				recorded, err := recordedTunnelGrantTrafficTx(ctx, tx, id)
+				if err != nil {
+					return nil, fmt.Errorf("read package forwarding usage: %w", err)
+				}
+				if recorded > 0 {
+					return nil, ErrForwardingBillingModeConflict
+				}
+			}
 			var activeForwards int
 			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_forward_rules WHERE grant_id=? AND desired_state='active'`, id).Scan(&activeForwards); err != nil {
 				return nil, err
@@ -339,11 +350,15 @@ max_active_forwards=?,per_forward_speed_mbps=?,per_forward_connection_limit=?,tr
 billing_mode_override=?,source_package_id=?,version=version+1,updated_at=CURRENT_TIMESTAMP
 WHERE id=? AND source_type='package'`, startsAt.UTC(), endsAt.UTC(), entry.MaxActiveForwards,
 				entry.PerForwardSpeedMbps, entry.PerForwardConnectionLimit, entry.TrafficLimitBytes,
-				entry.BillingModeOverride, pkg.ID, id)
+				*entry.BillingModeOverride, pkg.ID, id)
 			if updateErr != nil {
 				return nil, fmt.Errorf("update package forwarding grant: %w", updateErr)
 			}
-			if _, updateErr := tx.ExecContext(ctx, `UPDATE user_forward_rules SET effective_expires_at=?,generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE grant_id=? AND desired_state!='deleted'`, endsAt.UTC(), id); updateErr != nil {
+			if billingChanged {
+				if _, updateErr := tx.ExecContext(ctx, `UPDATE user_forward_rules SET effective_expires_at=?,billing_mode_snapshot=?,generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE grant_id=? AND desired_state!='deleted'`, endsAt.UTC(), *entry.BillingModeOverride, id); updateErr != nil {
+					return nil, fmt.Errorf("refresh package forwarding rules: %w", updateErr)
+				}
+			} else if _, updateErr := tx.ExecContext(ctx, `UPDATE user_forward_rules SET effective_expires_at=?,generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE grant_id=? AND desired_state!='deleted'`, endsAt.UTC(), id); updateErr != nil {
 				return nil, fmt.Errorf("refresh package forwarding rules: %w", updateErr)
 			}
 			if _, updateErr := tx.ExecContext(ctx, `UPDATE user_forward_hops SET generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE forward_id IN(SELECT id FROM user_forward_rules WHERE grant_id=? AND desired_state!='deleted')`, id); updateErr != nil {

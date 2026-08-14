@@ -14,6 +14,7 @@ import (
 
 const (
 	ManagedBillingDownload = "download"
+	ManagedBillingUpload   = "upload"
 	ManagedBillingBoth     = "both"
 
 	ManagedResetNone    = "none"

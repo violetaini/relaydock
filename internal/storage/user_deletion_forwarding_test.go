@@ -25,7 +25,8 @@ func TestTunnelGrantCreationSerializesWithUserDeletion(t *testing.T) {
 	grantInput := UserTunnelGrant{
 		Username: "bob", TunnelID: fixture.tunnel.ID, Enabled: true,
 		StartsAt: time.Now().UTC().Add(-time.Hour), MaxActiveForwards: 1,
-		AllowManagedTarget: true, CreatedBy: "admin",
+		BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth),
+		AllowManagedTarget:  true, CreatedBy: "admin",
 	}
 	grantDone := make(chan struct {
 		grant *UserTunnelGrant

@@ -548,9 +548,10 @@ func TestDatabaseInboundReconcileRemovesForwardWithDatabaseShapeMismatch(t *test
 	}
 	now := time.Now().UTC()
 	expires := now.Add(time.Hour)
+	billingMode := storage.ManagedBillingDownload
 	grant, err := repo.CreateUserTunnelGrant(ctx, storage.UserTunnelGrant{
 		Username: "alice", TunnelID: tunnel.ID, Enabled: true, StartsAt: now.Add(-time.Hour), ExpiresAt: &expires,
-		MaxActiveForwards: 1, AllowManagedTarget: true, CreatedBy: "admin",
+		MaxActiveForwards: 1, BillingModeOverride: &billingMode, AllowManagedTarget: true, CreatedBy: "admin",
 	})
 	if err != nil {
 		t.Fatal(err)

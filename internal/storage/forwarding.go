@@ -37,14 +37,23 @@ const (
 )
 
 var (
-	ErrTunnelTemplateNotFound = errors.New("tunnel template not found")
-	ErrTunnelGrantNotFound    = errors.New("tunnel grant not found")
-	ErrUserForwardNotFound    = errors.New("forward not found")
-	ErrForwardingConflict     = errors.New("forwarding resource conflict")
-	ErrForwardingForbidden    = errors.New("forwarding operation is not allowed")
-	ErrForwardingLimit        = errors.New("forwarding limit reached")
-	ErrForwardingInvalid      = errors.New("invalid forwarding argument")
+	ErrTunnelTemplateNotFound        = errors.New("tunnel template not found")
+	ErrTunnelGrantNotFound           = errors.New("tunnel grant not found")
+	ErrUserForwardNotFound           = errors.New("forward not found")
+	ErrForwardingConflict            = errors.New("forwarding resource conflict")
+	ErrForwardingForbidden           = errors.New("forwarding operation is not allowed")
+	ErrForwardingLimit               = errors.New("forwarding limit reached")
+	ErrForwardingInvalid             = errors.New("invalid forwarding argument")
+	ErrForwardingBillingModeConflict = fmt.Errorf(
+		"%w: billing mode cannot change after usage is recorded", ErrForwardingConflict,
+	)
 )
+
+const forwardBilledUsageExpression = `(CASE f.billing_mode_snapshot
+ WHEN 'both' THEN u.uplink_bytes + u.downlink_bytes
+ WHEN 'upload' THEN u.uplink_bytes
+ WHEN 'download' THEN u.downlink_bytes
+ ELSE 0 END) * f.traffic_multiplier_milli_snapshot / 1000`
 
 type TunnelTemplate struct {
 	ID                      int64               `json:"id"`
@@ -214,7 +223,7 @@ CREATE TABLE IF NOT EXISTS tunnel_templates (
  name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
  state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','draining','suspended')),
  network TEXT NOT NULL DEFAULT 'tcp_udp' CHECK(network IN ('tcp','tcp_udp')),
- billing_mode TEXT NOT NULL DEFAULT 'both' CHECK(billing_mode IN ('download','both')),
+ billing_mode TEXT NOT NULL DEFAULT 'both' CHECK(billing_mode IN ('download','upload','both')),
  traffic_multiplier_milli INTEGER NOT NULL DEFAULT 1000 CHECK(traffic_multiplier_milli > 0),
  max_total_forwards INTEGER NOT NULL DEFAULT 0 CHECK(max_total_forwards >= 0),
  allow_managed_target INTEGER NOT NULL DEFAULT 1 CHECK(allow_managed_target IN (0,1)),
@@ -241,9 +250,10 @@ CREATE TABLE IF NOT EXISTS user_tunnel_grants (
  per_forward_speed_mbps REAL NOT NULL DEFAULT 0 CHECK(per_forward_speed_mbps >= 0),
  per_forward_connection_limit INTEGER NOT NULL DEFAULT 0 CHECK(per_forward_connection_limit >= 0),
  traffic_limit_bytes INTEGER NOT NULL DEFAULT 0 CHECK(traffic_limit_bytes >= 0),
- billing_mode_override TEXT CHECK(billing_mode_override IS NULL OR billing_mode_override IN ('download','both')),
+ billing_mode_override TEXT NOT NULL CHECK(billing_mode_override IN ('download','upload','both')),
  allow_managed_target INTEGER NOT NULL DEFAULT 1,
  allow_custom_public_target INTEGER NOT NULL DEFAULT 0 CHECK(allow_custom_public_target = 0),
+ source_type TEXT NOT NULL DEFAULT 'manual', source_package_id INTEGER,
  version INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL,
  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -263,7 +273,8 @@ CREATE TABLE IF NOT EXISTS user_forward_rules (
  observed_state TEXT NOT NULL DEFAULT 'pending' CHECK(observed_state IN ('pending','provisioning','active','suspended','cleanup_pending','error')),
  suspend_reason TEXT NOT NULL DEFAULT 'none', generation INTEGER NOT NULL DEFAULT 1,
  applied_generation INTEGER NOT NULL DEFAULT 0, effective_expires_at TIMESTAMP,
- billing_mode_snapshot TEXT NOT NULL, traffic_multiplier_milli_snapshot INTEGER NOT NULL,
+ billing_mode_snapshot TEXT NOT NULL CHECK(billing_mode_snapshot IN ('download','upload','both')),
+ traffic_multiplier_milli_snapshot INTEGER NOT NULL,
  last_error_code TEXT NOT NULL DEFAULT '', last_error_detail TEXT NOT NULL DEFAULT '',
  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -311,17 +322,19 @@ CREATE INDEX IF NOT EXISTS idx_tunnel_audit_entity ON tunnel_audit_events(entity
 	if err := r.ensureTableColumn("user_forward_rules", "source_cidrs", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return fmt.Errorf("migrate user_forward_rules.source_cidrs: %w", err)
 	}
-	if err := r.migrateForwardingChecks(); err != nil {
-		return err
-	}
-	if err := r.ensureTableColumn("user_forward_hops", "resource_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return fmt.Errorf("migrate user_forward_hops.resource_id: %w", err)
-	}
+	// These columns must exist before the constraint rebuild copies the grant
+	// table. Fresh databases already have them; older databases gain them here.
 	if err := r.ensureTableColumn("user_tunnel_grants", "source_type", "TEXT NOT NULL DEFAULT 'manual'"); err != nil {
 		return fmt.Errorf("migrate tunnel grant source type: %w", err)
 	}
 	if err := r.ensureTableColumn("user_tunnel_grants", "source_package_id", "INTEGER"); err != nil {
 		return fmt.Errorf("migrate tunnel grant source package: %w", err)
+	}
+	if err := r.migrateForwardingChecks(); err != nil {
+		return err
+	}
+	if err := r.ensureTableColumn("user_forward_hops", "resource_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate user_forward_hops.resource_id: %w", err)
 	}
 	if _, err := r.db.Exec(`CREATE INDEX IF NOT EXISTS idx_tunnel_grants_package_source ON user_tunnel_grants(username, source_package_id) WHERE source_type = 'package'`); err != nil {
 		return fmt.Errorf("migrate tunnel grant source index: %w", err)
@@ -453,18 +466,26 @@ func (r *TrafficRepository) migrateForwardingChecks() error {
 		}
 	}()
 
-	var templateSQL, forwardSQL string
+	var templateSQL, grantSQL, forwardSQL string
 	if err := conn.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='tunnel_templates'`).Scan(&templateSQL); err != nil {
 		return fmt.Errorf("inspect tunnel_templates: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='user_tunnel_grants'`).Scan(&grantSQL); err != nil {
+		return fmt.Errorf("inspect user_tunnel_grants: %w", err)
 	}
 	if err := conn.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='user_forward_rules'`).Scan(&forwardSQL); err != nil {
 		return fmt.Errorf("inspect user_forward_rules: %w", err)
 	}
 	templateSQL = strings.ToLower(templateSQL)
+	grantSQL = strings.ToLower(grantSQL)
 	forwardSQL = strings.ToLower(forwardSQL)
-	needsTemplateRebuild := !strings.Contains(templateSQL, ForwardNetworkTCPUDP) || strings.Contains(templateSQL, "between 39000 and 40000")
+	needsTemplateRebuild := !strings.Contains(templateSQL, ForwardNetworkTCPUDP) ||
+		strings.Contains(templateSQL, "between 39000 and 40000") || !strings.Contains(templateSQL, "'upload'")
+	needsGrantRebuild := !strings.Contains(grantSQL, "'upload'") ||
+		!strings.Contains(grantSQL, "billing_mode_override text not null")
 	hasRequestedEntryPort := strings.Contains(forwardSQL, "requested_entry_port")
-	needsForwardRebuild := !strings.Contains(forwardSQL, ForwardNetworkTCPUDP) || !hasRequestedEntryPort
+	needsForwardRebuild := !strings.Contains(forwardSQL, ForwardNetworkTCPUDP) ||
+		!hasRequestedEntryPort || !strings.Contains(forwardSQL, "'upload'")
 
 	if needsTemplateRebuild {
 		if _, err := conn.ExecContext(ctx, `DROP TABLE IF EXISTS tunnel_templates_forwarding_new;
@@ -473,7 +494,7 @@ CREATE TABLE tunnel_templates_forwarding_new (
  name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
  state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','draining','suspended')),
  network TEXT NOT NULL DEFAULT 'tcp_udp' CHECK(network IN ('tcp','tcp_udp')),
- billing_mode TEXT NOT NULL DEFAULT 'both' CHECK(billing_mode IN ('download','both')),
+ billing_mode TEXT NOT NULL DEFAULT 'both' CHECK(billing_mode IN ('download','upload','both')),
  traffic_multiplier_milli INTEGER NOT NULL DEFAULT 1000 CHECK(traffic_multiplier_milli > 0),
  max_total_forwards INTEGER NOT NULL DEFAULT 0 CHECK(max_total_forwards >= 0),
  allow_managed_target INTEGER NOT NULL DEFAULT 1 CHECK(allow_managed_target IN (0,1)),
@@ -491,6 +512,46 @@ DROP TABLE tunnel_templates;
 ALTER TABLE tunnel_templates_forwarding_new RENAME TO tunnel_templates;`); err != nil {
 			return fmt.Errorf("rebuild tunnel_templates constraints: %w", err)
 		}
+	}
+
+	if needsGrantRebuild {
+		if _, err := conn.ExecContext(ctx, `DROP TABLE IF EXISTS user_tunnel_grants_forwarding_new;
+CREATE TABLE user_tunnel_grants_forwarding_new (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, public_id TEXT NOT NULL UNIQUE,
+ username TEXT NOT NULL, tunnel_id INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+ starts_at TIMESTAMP NOT NULL, expires_at TIMESTAMP,
+ max_active_forwards INTEGER NOT NULL DEFAULT 1 CHECK(max_active_forwards >= 0),
+ per_forward_speed_mbps REAL NOT NULL DEFAULT 0 CHECK(per_forward_speed_mbps >= 0),
+ per_forward_connection_limit INTEGER NOT NULL DEFAULT 0 CHECK(per_forward_connection_limit >= 0),
+ traffic_limit_bytes INTEGER NOT NULL DEFAULT 0 CHECK(traffic_limit_bytes >= 0),
+ billing_mode_override TEXT NOT NULL CHECK(billing_mode_override IN ('download','upload','both')),
+ allow_managed_target INTEGER NOT NULL DEFAULT 1,
+ allow_custom_public_target INTEGER NOT NULL DEFAULT 0 CHECK(allow_custom_public_target = 0),
+ source_type TEXT NOT NULL DEFAULT 'manual', source_package_id INTEGER,
+ version INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL,
+ created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE(username, tunnel_id)
+);
+INSERT INTO user_tunnel_grants_forwarding_new(
+ id,public_id,username,tunnel_id,enabled,starts_at,expires_at,max_active_forwards,
+ per_forward_speed_mbps,per_forward_connection_limit,traffic_limit_bytes,billing_mode_override,
+ allow_managed_target,allow_custom_public_target,source_type,source_package_id,version,created_by,created_at,updated_at)
+SELECT g.id,g.public_id,g.username,g.tunnel_id,g.enabled,g.starts_at,g.expires_at,g.max_active_forwards,
+ g.per_forward_speed_mbps,g.per_forward_connection_limit,g.traffic_limit_bytes,
+ COALESCE(NULLIF(LOWER(TRIM(g.billing_mode_override)),''),t.billing_mode,'both'),
+ g.allow_managed_target,g.allow_custom_public_target,COALESCE(NULLIF(g.source_type,''),'manual'),
+ g.source_package_id,g.version,g.created_by,g.created_at,g.updated_at
+FROM user_tunnel_grants g LEFT JOIN tunnel_templates t ON t.id=g.tunnel_id;
+DROP TABLE user_tunnel_grants;
+ALTER TABLE user_tunnel_grants_forwarding_new RENAME TO user_tunnel_grants;
+CREATE INDEX IF NOT EXISTS idx_tunnel_grants_user ON user_tunnel_grants(username, enabled);`); err != nil {
+			return fmt.Errorf("rebuild user_tunnel_grants billing constraints: %w", err)
+		}
+	}
+
+	if err := materializePackageForwardingBillingModes(ctx, conn); err != nil {
+		return err
 	}
 
 	if needsForwardRebuild {
@@ -512,7 +573,8 @@ CREATE TABLE user_forward_rules_forwarding_new (
  observed_state TEXT NOT NULL DEFAULT 'pending' CHECK(observed_state IN ('pending','provisioning','active','suspended','cleanup_pending','error')),
  suspend_reason TEXT NOT NULL DEFAULT 'none', generation INTEGER NOT NULL DEFAULT 1,
  applied_generation INTEGER NOT NULL DEFAULT 0, effective_expires_at TIMESTAMP,
- billing_mode_snapshot TEXT NOT NULL, traffic_multiplier_milli_snapshot INTEGER NOT NULL,
+ billing_mode_snapshot TEXT NOT NULL CHECK(billing_mode_snapshot IN ('download','upload','both')),
+ traffic_multiplier_milli_snapshot INTEGER NOT NULL,
  last_error_code TEXT NOT NULL DEFAULT '', last_error_detail TEXT NOT NULL DEFAULT '',
  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -569,6 +631,118 @@ WHERE f.network=?
 	return nil
 }
 
+// materializePackageForwardingBillingModes upgrades the former nullable
+// "inherit tunnel" package setting into an explicit snapshot of the tunnel's
+// current mode. It runs in the same immediate transaction as the table
+// constraint migration, so package templates and materialized grants cannot
+// temporarily disagree during startup.
+func materializePackageForwardingBillingModes(ctx context.Context, conn *sql.Conn) error {
+	tunnelModes := make(map[int64]string)
+	rows, err := conn.QueryContext(ctx, `SELECT id,billing_mode FROM tunnel_templates`)
+	if err != nil {
+		return fmt.Errorf("list tunnel billing modes for package migration: %w", err)
+	}
+	for rows.Next() {
+		var id int64
+		var mode string
+		if err := rows.Scan(&id, &mode); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan tunnel billing mode for package migration: %w", err)
+		}
+		tunnelModes[id] = mode
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close tunnel billing modes for package migration: %w", err)
+	}
+
+	type packageBillingUpdate struct {
+		id  int64
+		raw string
+	}
+	rows, err = conn.QueryContext(ctx, `SELECT id,COALESCE(forwarding_grants,'[]') FROM packages`)
+	if err != nil {
+		return fmt.Errorf("list package forwarding grants for billing migration: %w", err)
+	}
+	updates := make([]packageBillingUpdate, 0)
+	for rows.Next() {
+		var packageID int64
+		var raw string
+		if err := rows.Scan(&packageID, &raw); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan package forwarding grants for billing migration: %w", err)
+		}
+		if strings.TrimSpace(raw) == "" || strings.TrimSpace(raw) == "null" {
+			updates = append(updates, packageBillingUpdate{id: packageID, raw: "[]"})
+			continue
+		}
+		var entries []map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("decode package %d forwarding grants for billing migration: %w", packageID, err)
+		}
+		changed := false
+		for i, entry := range entries {
+			if entry == nil {
+				_ = rows.Close()
+				return fmt.Errorf("package %d forwarding grant %d is not an object", packageID, i)
+			}
+			var mode string
+			rawMode, hasMode := entry["billing_mode_override"]
+			if hasMode && string(rawMode) != "null" {
+				if err := json.Unmarshal(rawMode, &mode); err != nil {
+					_ = rows.Close()
+					return fmt.Errorf("decode package %d forwarding grant %d billing mode: %w", packageID, i, err)
+				}
+			}
+			mode = strings.ToLower(strings.TrimSpace(mode))
+			if mode == "" {
+				var tunnelID int64
+				if err := json.Unmarshal(entry["tunnel_id"], &tunnelID); err != nil || tunnelID <= 0 {
+					_ = rows.Close()
+					return fmt.Errorf("package %d forwarding grant %d has invalid tunnel id", packageID, i)
+				}
+				var ok bool
+				mode, ok = tunnelModes[tunnelID]
+				if !ok {
+					_ = rows.Close()
+					return fmt.Errorf("package %d forwarding grant references missing tunnel %d", packageID, tunnelID)
+				}
+				changed = true
+			}
+			if !isForwardingBillingMode(mode) {
+				_ = rows.Close()
+				return fmt.Errorf("package %d forwarding grant %d has invalid billing mode %q", packageID, i, mode)
+			}
+			normalized, err := json.Marshal(mode)
+			if err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("encode package %d forwarding grant %d billing mode: %w", packageID, i, err)
+			}
+			if !hasMode || string(rawMode) != string(normalized) {
+				entry["billing_mode_override"] = normalized
+				changed = true
+			}
+		}
+		if changed {
+			normalized, err := json.Marshal(entries)
+			if err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("encode package %d forwarding grants after billing migration: %w", packageID, err)
+			}
+			updates = append(updates, packageBillingUpdate{id: packageID, raw: string(normalized)})
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close package forwarding grants for billing migration: %w", err)
+	}
+	for _, update := range updates {
+		if _, err := conn.ExecContext(ctx, `UPDATE packages SET forwarding_grants=? WHERE id=?`, update.raw, update.id); err != nil {
+			return fmt.Errorf("materialize package %d forwarding billing modes: %w", update.id, err)
+		}
+	}
+	return nil
+}
+
 func beginForwardingImmediate(ctx context.Context, conn *sql.Conn) error {
 	var err error
 	for attempt := 0; attempt < 5; attempt++ {
@@ -598,6 +772,27 @@ func forwardingInitialized(r *TrafficRepository) error {
 	return nil
 }
 
+func isForwardingBillingMode(mode string) bool {
+	switch mode {
+	case ManagedBillingBoth, ManagedBillingUpload, ManagedBillingDownload:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeForwardingBillingMode(mode *string) error {
+	if mode == nil {
+		return ErrForwardingInvalid
+	}
+	normalized := strings.ToLower(strings.TrimSpace(*mode))
+	if !isForwardingBillingMode(normalized) {
+		return ErrForwardingInvalid
+	}
+	*mode = normalized
+	return nil
+}
+
 func normalizeTemplate(t *TunnelTemplate) error {
 	t.Name = strings.TrimSpace(t.Name)
 	t.Description = strings.TrimSpace(t.Description)
@@ -610,6 +805,7 @@ func normalizeTemplate(t *TunnelTemplate) error {
 	if t.Network == "" || t.Network == ForwardNetworkTCP {
 		t.Network = ForwardNetworkTCPUDP
 	}
+	t.BillingMode = strings.ToLower(strings.TrimSpace(t.BillingMode))
 	if t.BillingMode == "" {
 		t.BillingMode = ManagedBillingBoth
 	}
@@ -623,7 +819,7 @@ func normalizeTemplate(t *TunnelTemplate) error {
 		t.PortRangeEnd = 65535
 	}
 	if t.State != TunnelStateActive && t.State != TunnelStateDraining && t.State != TunnelStateSuspended ||
-		t.Network != ForwardNetworkTCPUDP || (t.BillingMode != ManagedBillingDownload && t.BillingMode != ManagedBillingBoth) ||
+		t.Network != ForwardNetworkTCPUDP || !isForwardingBillingMode(t.BillingMode) ||
 		t.TrafficMultiplierMilli <= 0 || t.MaxTotalForwards < 0 || t.PortRangeStart < 1024 ||
 		t.PortRangeEnd > 65535 || t.PortRangeStart > t.PortRangeEnd || t.AllowCustomPublicTarget {
 		return ErrForwardingInvalid
@@ -931,7 +1127,7 @@ func normalizeTunnelGrant(g *UserTunnelGrant) error {
 			return ErrForwardingInvalid
 		}
 	}
-	if g.BillingModeOverride != nil && *g.BillingModeOverride != ManagedBillingBoth && *g.BillingModeOverride != ManagedBillingDownload {
+	if err := normalizeForwardingBillingMode(g.BillingModeOverride); err != nil {
 		return ErrForwardingInvalid
 	}
 	if g.SourceType != GrantSourceManual && g.SourceType != GrantSourcePackage {
@@ -971,6 +1167,16 @@ func scanTunnelGrant(s rowScanner) (UserTunnelGrant, error) {
 	return g, err
 }
 
+func recordedTunnelGrantTrafficTx(ctx context.Context, tx *sql.Tx, grantID int64) (int64, error) {
+	var recorded int64
+	err := tx.QueryRowContext(ctx, `SELECT
+COALESCE((SELECT billed_bytes FROM user_tunnel_grant_usage_archive WHERE grant_id=?),0)+
+COALESCE((SELECT SUM(u.uplink_bytes+u.downlink_bytes)
+ FROM user_forward_usage u JOIN user_forward_rules f ON f.id=u.forward_id
+ WHERE f.grant_id=?),0)`, grantID, grantID).Scan(&recorded)
+	return recorded, err
+}
+
 func (r *TrafficRepository) CreateUserTunnelGrant(ctx context.Context, g UserTunnelGrant) (*UserTunnelGrant, error) {
 	if err := normalizeTunnelGrant(&g); err != nil {
 		return nil, err
@@ -999,7 +1205,7 @@ max_active_forwards=?,per_forward_speed_mbps=?,per_forward_connection_limit=?,tr
 allow_managed_target=1,allow_custom_public_target=0,source_type='manual',source_package_id=NULL,version=version+1,
 created_by=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=? AND source_type='package' AND enabled=0`,
 					g.PublicID, forwardingBoolInt(g.Enabled), g.StartsAt.UTC(), g.ExpiresAt, g.MaxActiveForwards,
-					g.PerForwardSpeedMbps, g.PerForwardConnectionLimit, g.TrafficLimitBytes, g.BillingModeOverride,
+					g.PerForwardSpeedMbps, g.PerForwardConnectionLimit, g.TrafficLimitBytes, *g.BillingModeOverride,
 					g.CreatedBy, tombstoneID, tombstoneVersion)
 				if updateErr != nil {
 					return updateErr
@@ -1015,7 +1221,7 @@ created_by=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=? AND source_ty
 				return updateErr
 			}
 		}
-		res, err := r.db.ExecContext(ctx, `INSERT INTO user_tunnel_grants(public_id,username,tunnel_id,enabled,starts_at,expires_at,max_active_forwards,per_forward_speed_mbps,per_forward_connection_limit,traffic_limit_bytes,billing_mode_override,allow_managed_target,allow_custom_public_target,source_type,source_package_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, g.PublicID, g.Username, g.TunnelID, forwardingBoolInt(g.Enabled), g.StartsAt.UTC(), g.ExpiresAt, g.MaxActiveForwards, g.PerForwardSpeedMbps, g.PerForwardConnectionLimit, g.TrafficLimitBytes, g.BillingModeOverride, 1, 0, g.SourceType, g.SourcePackageID, g.CreatedBy)
+		res, err := r.db.ExecContext(ctx, `INSERT INTO user_tunnel_grants(public_id,username,tunnel_id,enabled,starts_at,expires_at,max_active_forwards,per_forward_speed_mbps,per_forward_connection_limit,traffic_limit_bytes,billing_mode_override,allow_managed_target,allow_custom_public_target,source_type,source_package_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, g.PublicID, g.Username, g.TunnelID, forwardingBoolInt(g.Enabled), g.StartsAt.UTC(), g.ExpiresAt, g.MaxActiveForwards, g.PerForwardSpeedMbps, g.PerForwardConnectionLimit, g.TrafficLimitBytes, *g.BillingModeOverride, 1, 0, g.SourceType, g.SourcePackageID, g.CreatedBy)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") {
 				return ErrForwardingConflict
@@ -1089,7 +1295,7 @@ func (r *TrafficRepository) ListUserTunnelGrants(ctx context.Context, username s
 		}
 		_ = r.db.QueryRowContext(ctx, `SELECT
 COALESCE((SELECT billed_bytes FROM user_tunnel_grant_usage_archive WHERE grant_id=?),0)+
-COALESCE((SELECT SUM((CASE WHEN f.billing_mode_snapshot='both' THEN u.uplink_bytes+u.downlink_bytes ELSE u.downlink_bytes END)*f.traffic_multiplier_milli_snapshot/1000) FROM user_forward_usage u JOIN user_forward_rules f ON f.id=u.forward_id WHERE f.grant_id=?),0)`, g.ID, g.ID).Scan(&g.UsedBytes)
+COALESCE((SELECT SUM(`+forwardBilledUsageExpression+`) FROM user_forward_usage u JOIN user_forward_rules f ON f.id=u.forward_id WHERE f.grant_id=?),0)`, g.ID, g.ID).Scan(&g.UsedBytes)
 		_ = r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_forward_rules WHERE grant_id=? AND desired_state='active'`, g.ID).Scan(&g.ActiveForwardCount)
 		g.Tunnel, _ = r.GetTunnelTemplateByID(ctx, g.TunnelID)
 		var active int
@@ -1118,6 +1324,8 @@ func (r *TrafficRepository) UpdateUserTunnelGrant(ctx context.Context, publicID,
 		if err := normalizeTunnelGrant(&in); err != nil {
 			return err
 		}
+		billingChanged := current.BillingModeOverride == nil ||
+			*current.BillingModeOverride != *in.BillingModeOverride
 		if in.MaxActiveForwards > 0 {
 			var active int
 			_ = r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_forward_rules WHERE grant_id=? AND desired_state='active'`, current.ID).Scan(&active)
@@ -1130,7 +1338,16 @@ func (r *TrafficRepository) UpdateUserTunnelGrant(ctx context.Context, publicID,
 			return err
 		}
 		defer tx.Rollback()
-		res, err := tx.ExecContext(ctx, `UPDATE user_tunnel_grants SET enabled=?,starts_at=?,expires_at=?,max_active_forwards=?,per_forward_speed_mbps=?,per_forward_connection_limit=?,traffic_limit_bytes=?,billing_mode_override=?,allow_managed_target=1,allow_custom_public_target=0,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=?`, forwardingBoolInt(in.Enabled), in.StartsAt.UTC(), in.ExpiresAt, in.MaxActiveForwards, in.PerForwardSpeedMbps, in.PerForwardConnectionLimit, in.TrafficLimitBytes, in.BillingModeOverride, current.ID, expectedVersion)
+		if billingChanged {
+			recorded, err := recordedTunnelGrantTrafficTx(ctx, tx, current.ID)
+			if err != nil {
+				return err
+			}
+			if recorded > 0 {
+				return ErrForwardingBillingModeConflict
+			}
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE user_tunnel_grants SET enabled=?,starts_at=?,expires_at=?,max_active_forwards=?,per_forward_speed_mbps=?,per_forward_connection_limit=?,traffic_limit_bytes=?,billing_mode_override=?,allow_managed_target=1,allow_custom_public_target=0,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=?`, forwardingBoolInt(in.Enabled), in.StartsAt.UTC(), in.ExpiresAt, in.MaxActiveForwards, in.PerForwardSpeedMbps, in.PerForwardConnectionLimit, in.TrafficLimitBytes, *in.BillingModeOverride, current.ID, expectedVersion)
 		if err != nil {
 			return err
 		}
@@ -1138,7 +1355,11 @@ func (r *TrafficRepository) UpdateUserTunnelGrant(ctx context.Context, publicID,
 		if n != 1 {
 			return ErrForwardingConflict
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE user_forward_rules SET effective_expires_at=?,generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE grant_id=? AND desired_state!='deleted'`, in.ExpiresAt, current.ID); err != nil {
+		if billingChanged {
+			if _, err := tx.ExecContext(ctx, `UPDATE user_forward_rules SET effective_expires_at=?,billing_mode_snapshot=?,generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE grant_id=? AND desired_state!='deleted'`, in.ExpiresAt, *in.BillingModeOverride, current.ID); err != nil {
+				return err
+			}
+		} else if _, err := tx.ExecContext(ctx, `UPDATE user_forward_rules SET effective_expires_at=?,generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE grant_id=? AND desired_state!='deleted'`, in.ExpiresAt, current.ID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE user_forward_hops SET generation=generation+1,updated_at=CURRENT_TIMESTAMP WHERE forward_id IN(SELECT id FROM user_forward_rules WHERE grant_id=? AND desired_state!='deleted')`, current.ID); err != nil {
@@ -1234,7 +1455,7 @@ func (r *TrafficRepository) CreateUserForward(ctx context.Context, in CreateUser
 	var used int64
 	_ = tx.QueryRowContext(ctx, `SELECT
 COALESCE((SELECT billed_bytes FROM user_tunnel_grant_usage_archive WHERE grant_id=?),0)+
-COALESCE((SELECT SUM((CASE WHEN f.billing_mode_snapshot='both' THEN u.uplink_bytes+u.downlink_bytes ELSE u.downlink_bytes END)*f.traffic_multiplier_milli_snapshot/1000) FROM user_forward_usage u JOIN user_forward_rules f ON f.id=u.forward_id WHERE f.grant_id=?),0)`, g.ID, g.ID).Scan(&used)
+COALESCE((SELECT SUM(`+forwardBilledUsageExpression+`) FROM user_forward_usage u JOIN user_forward_rules f ON f.id=u.forward_id WHERE f.grant_id=?),0)`, g.ID, g.ID).Scan(&used)
 	if g.StateAt(time.Now().UTC(), userEnabled != 0, t.State, used) != "active" {
 		return nil, ErrForwardingForbidden
 	}
@@ -1287,10 +1508,10 @@ COALESCE((SELECT SUM((CASE WHEN f.billing_mode_snapshot='both' THEN u.uplink_byt
 	if len(seeds) < 1 || len(seeds) > 8 || len(seeds) != expectedHops {
 		return nil, ErrForwardingInvalid
 	}
-	billing := t.BillingMode
-	if g.BillingModeOverride != nil {
-		billing = *g.BillingModeOverride
+	if err := normalizeForwardingBillingMode(g.BillingModeOverride); err != nil {
+		return nil, err
 	}
+	billing := *g.BillingModeOverride
 	publicID := forwardingID("fwd_")
 	sourceCIDRs, err := json.Marshal(in.SourceCIDRs)
 	if err != nil {
@@ -1669,6 +1890,8 @@ func (r *TrafficRepository) ListForwardReconcileCandidates(ctx context.Context) 
 // forwarding ledger. Only position 0 is billed, so a multi-hop route is never
 // charged once per server.
 func (r *TrafficRepository) SyncUserForwardUsage(ctx context.Context) error {
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
 	rows, err := r.db.QueryContext(ctx, `SELECT f.id, COALESCE(nt.uplink,0), COALESCE(nt.downlink,0)
 FROM user_forward_rules f
 JOIN user_forward_hops h ON h.forward_id=f.id AND h.position=0
@@ -1848,7 +2071,7 @@ func (r *TrafficRepository) FinalizeUserForwardDelete(ctx context.Context, id in
 	defer tx.Rollback()
 	if _, err = tx.ExecContext(ctx, `INSERT INTO user_tunnel_grant_usage_archive(grant_id,billed_bytes,updated_at)
 SELECT f.grant_id,
-       (CASE WHEN f.billing_mode_snapshot='both' THEN u.uplink_bytes+u.downlink_bytes ELSE u.downlink_bytes END)*f.traffic_multiplier_milli_snapshot/1000,
+       `+forwardBilledUsageExpression+`,
        CURRENT_TIMESTAMP
 FROM user_forward_rules f JOIN user_forward_usage u ON u.forward_id=f.id
 WHERE f.id=?

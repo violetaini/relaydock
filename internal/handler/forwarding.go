@@ -676,9 +676,13 @@ func (h *ForwardingHandler) userForwardDTO(ctx context.Context, f storage.UserFo
 	}
 	if usage, err := h.repo.GetUserForwardUsage(ctx, f.ID); err == nil {
 		out.UplinkBytes, out.DownlinkBytes = usage.UplinkBytes, usage.DownlinkBytes
-		out.BilledBytes = usage.DownlinkBytes
-		if f.BillingModeSnapshot == storage.ManagedBillingBoth {
-			out.BilledBytes += usage.UplinkBytes
+		switch f.BillingModeSnapshot {
+		case storage.ManagedBillingBoth:
+			out.BilledBytes = usage.UplinkBytes + usage.DownlinkBytes
+		case storage.ManagedBillingUpload:
+			out.BilledBytes = usage.UplinkBytes
+		case storage.ManagedBillingDownload:
+			out.BilledBytes = usage.DownlinkBytes
 		}
 		out.BilledBytes = out.BilledBytes * int64(f.TrafficMultiplierMilliSnapshot) / 1000
 	}

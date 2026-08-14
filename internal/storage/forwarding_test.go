@@ -155,6 +155,10 @@ type forwardingStorageFixture struct {
 	servers []RemoteServer
 }
 
+func forwardingBillingModePtr(mode string) *string {
+	return &mode
+}
+
 func newForwardingStorageFixture(t *testing.T) forwardingStorageFixture {
 	t.Helper()
 	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "forwarding.db"))
@@ -194,8 +198,9 @@ func newForwardingStorageFixture(t *testing.T) forwardingStorageFixture {
 	expires := now.Add(24 * time.Hour)
 	grant, err := repo.CreateUserTunnelGrant(ctx, UserTunnelGrant{
 		Username: "alice", TunnelID: tunnel.ID, Enabled: true, StartsAt: now.Add(-time.Hour),
-		ExpiresAt: &expires, MaxActiveForwards: 100, BillingModeOverride: nil,
-		AllowManagedTarget: true, CreatedBy: "admin",
+		ExpiresAt: &expires, MaxActiveForwards: 100,
+		BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth),
+		AllowManagedTarget:  true, CreatedBy: "admin",
 	})
 	if err != nil {
 		t.Fatalf("CreateUserTunnelGrant: %v", err)
@@ -247,6 +252,31 @@ func TestForwardingStorageOwnershipPortsAndIdentity(t *testing.T) {
 	audits, err := fixture.repo.ListForwardAudit(fixture.ctx, "alice", "user_forward", first.ID, 10)
 	if err != nil || len(audits) != 1 || audits[0].Action != "create" {
 		t.Fatalf("unexpected audit: %+v err=%v", audits, err)
+	}
+}
+
+func TestTunnelGrantRequiresExplicitBillingMode(t *testing.T) {
+	fixture := newForwardingStorageFixture(t)
+	now := time.Now().UTC()
+	base := UserTunnelGrant{
+		Username: "bob", TunnelID: fixture.tunnel.ID, Enabled: true, StartsAt: now,
+		MaxActiveForwards: 1, AllowManagedTarget: true, CreatedBy: "admin",
+	}
+	if _, err := fixture.repo.CreateUserTunnelGrant(fixture.ctx, base); !errors.Is(err, ErrForwardingInvalid) {
+		t.Fatalf("nil billing mode error=%v want=%v", err, ErrForwardingInvalid)
+	}
+	empty := " "
+	base.BillingModeOverride = &empty
+	if _, err := fixture.repo.CreateUserTunnelGrant(fixture.ctx, base); !errors.Is(err, ErrForwardingInvalid) {
+		t.Fatalf("empty billing mode error=%v want=%v", err, ErrForwardingInvalid)
+	}
+	base.BillingModeOverride = forwardingBillingModePtr(ManagedBillingUpload)
+	grant, err := fixture.repo.CreateUserTunnelGrant(fixture.ctx, base)
+	if err != nil {
+		t.Fatalf("upload billing mode: %v", err)
+	}
+	if grant.BillingModeOverride == nil || *grant.BillingModeOverride != ManagedBillingUpload {
+		t.Fatalf("stored upload billing mode=%v", grant.BillingModeOverride)
 	}
 }
 
@@ -342,7 +372,9 @@ func TestForwardingTCPUDPExplicitCommonPortAndAtomicConflict(t *testing.T) {
 	expires := now.Add(24 * time.Hour)
 	grant, err := fixture.repo.CreateUserTunnelGrant(fixture.ctx, UserTunnelGrant{
 		Username: "alice", TunnelID: tunnel.ID, Enabled: true, StartsAt: now.Add(-time.Hour),
-		ExpiresAt: &expires, MaxActiveForwards: 10, AllowManagedTarget: true, CreatedBy: "admin",
+		ExpiresAt: &expires, MaxActiveForwards: 10,
+		BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth),
+		AllowManagedTarget:  true, CreatedBy: "admin",
 	})
 	if err != nil {
 		t.Fatalf("CreateUserTunnelGrant: %v", err)
@@ -425,6 +457,98 @@ func TestForwardingTCPUDPExplicitCommonPortAndAtomicConflict(t *testing.T) {
 	}
 	if rules != 1 || reservations != 6 {
 		t.Fatalf("conflict was not atomic: rules=%d reservations=%d", rules, reservations)
+	}
+}
+
+func TestForwardingBillingMigrationMaterializesLegacyGrantAndPackageModes(t *testing.T) {
+	fixture := newForwardingStorageFixture(t)
+	if _, err := fixture.repo.db.ExecContext(fixture.ctx, `UPDATE tunnel_templates SET billing_mode='download' WHERE id=?`, fixture.tunnel.ID); err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := fixture.repo.CreatePackage(fixture.ctx, Package{
+		Name: "legacy-forward-billing", TrafficLimitBytes: 1024, CycleDays: 30, ResetDay: 1,
+		ForwardingGrants: []PackageForwardingGrant{{
+			TunnelID: fixture.tunnel.ID, MaxActiveForwards: 2,
+			BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyPackageJSON, err := json.Marshal([]map[string]any{{
+		"tunnel_id": fixture.tunnel.ID, "max_active_forwards": 2,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.db.ExecContext(fixture.ctx, `UPDATE packages SET forwarding_grants=? WHERE id=?`, string(legacyPackageJSON), packageID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.db.ExecContext(fixture.ctx, `
+DROP TABLE IF EXISTS user_tunnel_grants_billing_legacy;
+CREATE TABLE user_tunnel_grants_billing_legacy (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, public_id TEXT NOT NULL UNIQUE,
+ username TEXT NOT NULL, tunnel_id INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+ starts_at TIMESTAMP NOT NULL, expires_at TIMESTAMP,
+ max_active_forwards INTEGER NOT NULL DEFAULT 1 CHECK(max_active_forwards >= 0),
+ per_forward_speed_mbps REAL NOT NULL DEFAULT 0 CHECK(per_forward_speed_mbps >= 0),
+ per_forward_connection_limit INTEGER NOT NULL DEFAULT 0 CHECK(per_forward_connection_limit >= 0),
+ traffic_limit_bytes INTEGER NOT NULL DEFAULT 0 CHECK(traffic_limit_bytes >= 0),
+ billing_mode_override TEXT CHECK(billing_mode_override IS NULL OR billing_mode_override IN ('download','both')),
+ allow_managed_target INTEGER NOT NULL DEFAULT 1,
+ allow_custom_public_target INTEGER NOT NULL DEFAULT 0 CHECK(allow_custom_public_target = 0),
+ source_type TEXT NOT NULL DEFAULT 'manual', source_package_id INTEGER,
+ version INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL,
+ created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE(username, tunnel_id)
+);
+INSERT INTO user_tunnel_grants_billing_legacy(
+ id,public_id,username,tunnel_id,enabled,starts_at,expires_at,max_active_forwards,
+ per_forward_speed_mbps,per_forward_connection_limit,traffic_limit_bytes,billing_mode_override,
+ allow_managed_target,allow_custom_public_target,source_type,source_package_id,version,created_by,created_at,updated_at)
+SELECT id,public_id,username,tunnel_id,enabled,starts_at,expires_at,max_active_forwards,
+ per_forward_speed_mbps,per_forward_connection_limit,traffic_limit_bytes,NULL,
+ allow_managed_target,allow_custom_public_target,source_type,source_package_id,version,created_by,created_at,updated_at
+FROM user_tunnel_grants;
+DROP TABLE user_tunnel_grants;
+ALTER TABLE user_tunnel_grants_billing_legacy RENAME TO user_tunnel_grants;`); err != nil {
+		t.Fatalf("install legacy tunnel grant schema: %v", err)
+	}
+
+	if err := fixture.repo.migrateForwarding(); err != nil {
+		t.Fatalf("migrateForwarding: %v", err)
+	}
+	if err := fixture.repo.migrateForwarding(); err != nil {
+		t.Fatalf("idempotent migrateForwarding: %v", err)
+	}
+	grant, err := fixture.repo.GetUserTunnelGrant(fixture.ctx, fixture.grant.PublicID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grant.BillingModeOverride == nil || *grant.BillingModeOverride != ManagedBillingDownload {
+		t.Fatalf("migrated grant billing mode=%v want=%q", grant.BillingModeOverride, ManagedBillingDownload)
+	}
+	pkg, err := fixture.repo.GetPackage(fixture.ctx, packageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkg.ForwardingGrants) != 1 || pkg.ForwardingGrants[0].BillingModeOverride == nil ||
+		*pkg.ForwardingGrants[0].BillingModeOverride != ManagedBillingDownload {
+		t.Fatalf("migrated package forwarding grants=%+v", pkg.ForwardingGrants)
+	}
+	var notNull, supportsUpload int
+	if err := fixture.repo.db.QueryRowContext(fixture.ctx, `SELECT "notnull" FROM pragma_table_info('user_tunnel_grants') WHERE name='billing_mode_override'`).Scan(&notNull); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.repo.db.QueryRowContext(fixture.ctx, `SELECT instr(lower(sql),'''upload''')>0 FROM sqlite_master WHERE type='table' AND name='user_tunnel_grants'`).Scan(&supportsUpload); err != nil {
+		t.Fatal(err)
+	}
+	if notNull != 1 || supportsUpload != 1 {
+		t.Fatalf("migrated grant constraints not_null=%d supports_upload=%d", notNull, supportsUpload)
+	}
+	if _, err := fixture.repo.db.ExecContext(fixture.ctx, `UPDATE user_tunnel_grants SET billing_mode_override=NULL WHERE id=?`, grant.ID); err == nil {
+		t.Fatal("billing_mode_override accepted NULL after migration")
 	}
 }
 
@@ -830,32 +954,17 @@ func TestForwardingGrantExpiryBumpsGenerationAndUsageBillsEntryOnce(t *testing.T
 	download := ManagedBillingDownload
 	modeInput := *fixture.grant
 	modeInput.BillingModeOverride = &download
-	modeGrant, err := fixture.repo.UpdateUserTunnelGrant(fixture.ctx, fixture.grant.PublicID, "alice", modeInput, fixture.grant.Version, "admin")
-	if err != nil {
-		t.Fatalf("set download billing: %v", err)
-	}
-	second := fixture.createForward(t, "download-only")
-	if err := fixture.repo.UpsertNodeTraffic(fixture.ctx, second.Hops[0].ServerID, second.Hops[0].ResourceTag, "inbound", 0, 0, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.repo.UpsertNodeTraffic(fixture.ctx, second.Hops[0].ServerID, second.Hops[0].ResourceTag, "inbound", 100, 50, false); err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.repo.SyncUserForwardUsage(fixture.ctx); err != nil {
-		t.Fatal(err)
-	}
-	grants, err = fixture.repo.ListUserTunnelGrants(fixture.ctx, "alice")
-	if err != nil || len(grants) != 1 || grants[0].UsedBytes != 700 {
-		t.Fatalf("mixed both/download 2x billing=%+v err=%v", grants, err)
+	if _, err := fixture.repo.UpdateUserTunnelGrant(fixture.ctx, fixture.grant.PublicID, "alice", modeInput, fixture.grant.Version, "admin"); !errors.Is(err, ErrForwardingBillingModeConflict) {
+		t.Fatalf("billing change after usage error=%v, want %v", err, ErrForwardingBillingModeConflict)
 	}
 	beforeExpiry, err := fixture.repo.GetUserForward(fixture.ctx, forward.PublicID, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
 	newExpiry := time.Now().UTC().Add(72 * time.Hour).Truncate(time.Second)
-	updatedInput := *modeGrant
+	updatedInput := *fixture.grant
 	updatedInput.ExpiresAt = &newExpiry
-	updated, err := fixture.repo.UpdateUserTunnelGrant(fixture.ctx, fixture.grant.PublicID, "alice", updatedInput, modeGrant.Version, "admin")
+	updated, err := fixture.repo.UpdateUserTunnelGrant(fixture.ctx, fixture.grant.PublicID, "alice", updatedInput, fixture.grant.Version, "admin")
 	if err != nil {
 		t.Fatalf("UpdateUserTunnelGrant: %v", err)
 	}
@@ -871,6 +980,104 @@ func TestForwardingGrantExpiryBumpsGenerationAndUsageBillsEntryOnce(t *testing.T
 	}
 	if refreshed.EffectiveExpiresAt == nil || !refreshed.EffectiveExpiresAt.Equal(newExpiry) {
 		t.Fatalf("effective expiry=%v want=%v", refreshed.EffectiveExpiresAt, newExpiry)
+	}
+}
+
+func TestForwardingUsageHonorsEveryExplicitBillingMode(t *testing.T) {
+	tests := []struct {
+		mode string
+		want int64
+	}{
+		{mode: ManagedBillingBoth, want: 600},
+		{mode: ManagedBillingUpload, want: 200},
+		{mode: ManagedBillingDownload, want: 400},
+	}
+	for _, tt := range tests {
+		t.Run(tt.mode, func(t *testing.T) {
+			fixture := newForwardingStorageFixture(t)
+			if tt.mode != ManagedBillingBoth {
+				input := *fixture.grant
+				input.BillingModeOverride = forwardingBillingModePtr(tt.mode)
+				updated, err := fixture.repo.UpdateUserTunnelGrant(fixture.ctx, fixture.grant.PublicID, "alice", input, fixture.grant.Version, "admin")
+				if err != nil {
+					t.Fatalf("set %s billing mode: %v", tt.mode, err)
+				}
+				fixture.grant = updated
+			}
+			forward := fixture.createForward(t, "metered-"+tt.mode)
+			if forward.BillingModeSnapshot != tt.mode {
+				t.Fatalf("forward snapshot=%q want=%q", forward.BillingModeSnapshot, tt.mode)
+			}
+			entry := forward.Hops[0]
+			if err := fixture.repo.UpsertNodeTraffic(fixture.ctx, entry.ServerID, entry.ResourceTag, "inbound", 0, 0, false); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.repo.UpsertNodeTraffic(fixture.ctx, entry.ServerID, entry.ResourceTag, "inbound", 100, 200, false); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.repo.SyncUserForwardUsage(fixture.ctx); err != nil {
+				t.Fatal(err)
+			}
+			grants, err := fixture.repo.ListUserTunnelGrants(fixture.ctx, "alice")
+			if err != nil || len(grants) != 1 || grants[0].UsedBytes != tt.want {
+				t.Fatalf("%s billed grants=%+v err=%v want=%d", tt.mode, grants, err, tt.want)
+			}
+			if _, err := fixture.repo.SetUserForwardDesired(fixture.ctx, forward.PublicID, "alice", ForwardDesiredDeleted, ForwardObservedCleanupPending, "none", "alice"); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.repo.FinalizeUserForwardDelete(fixture.ctx, forward.ID); err != nil {
+				t.Fatal(err)
+			}
+			grants, err = fixture.repo.ListUserTunnelGrants(fixture.ctx, "alice")
+			if err != nil || len(grants) != 1 || grants[0].UsedBytes != tt.want {
+				t.Fatalf("%s archived grants=%+v err=%v want=%d", tt.mode, grants, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestForwardingBillingChangeUpdatesUnusedSnapshotsOnly(t *testing.T) {
+	fixture := newForwardingStorageFixture(t)
+	forward := fixture.createForward(t, "unused-snapshot")
+	input := *fixture.grant
+	input.BillingModeOverride = forwardingBillingModePtr(ManagedBillingUpload)
+	updated, err := fixture.repo.UpdateUserTunnelGrant(fixture.ctx, fixture.grant.PublicID, "alice", input, fixture.grant.Version, "admin")
+	if err != nil {
+		t.Fatalf("change unused grant billing mode: %v", err)
+	}
+	forward, err = fixture.repo.GetUserForward(fixture.ctx, forward.PublicID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forward.BillingModeSnapshot != ManagedBillingUpload {
+		t.Fatalf("unused forward snapshot=%q want=%q", forward.BillingModeSnapshot, ManagedBillingUpload)
+	}
+
+	entry := forward.Hops[0]
+	if err := fixture.repo.UpsertNodeTraffic(fixture.ctx, entry.ServerID, entry.ResourceTag, "inbound", 10, 20, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.repo.SyncUserForwardUsage(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	input = *updated
+	input.BillingModeOverride = forwardingBillingModePtr(ManagedBillingDownload)
+	if _, err := fixture.repo.UpdateUserTunnelGrant(fixture.ctx, fixture.grant.PublicID, "alice", input, updated.Version, "admin"); !errors.Is(err, ErrForwardingBillingModeConflict) {
+		t.Fatalf("change used grant billing mode error=%v want=%v", err, ErrForwardingBillingModeConflict)
+	}
+	stored, err := fixture.repo.GetUserTunnelGrant(fixture.ctx, fixture.grant.PublicID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.BillingModeOverride == nil || *stored.BillingModeOverride != ManagedBillingUpload {
+		t.Fatalf("failed update changed grant mode: %+v", stored)
+	}
+	forward, err = fixture.repo.GetUserForward(fixture.ctx, forward.PublicID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forward.BillingModeSnapshot != ManagedBillingUpload {
+		t.Fatalf("failed update changed forward snapshot: %+v", forward)
 	}
 }
 

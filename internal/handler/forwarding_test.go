@@ -192,7 +192,8 @@ func newForwardingHandlerFixture(t *testing.T) forwardingHandlerFixture {
 		t.Fatal(err)
 	}
 	expires := now.Add(time.Hour)
-	grant, err := repo.CreateUserTunnelGrant(ctx, storage.UserTunnelGrant{Username: "alice", TunnelID: tunnel.ID, Enabled: true, StartsAt: now.Add(-time.Hour), ExpiresAt: &expires, MaxActiveForwards: 4, AllowManagedTarget: true, CreatedBy: "admin"})
+	billingMode := storage.ManagedBillingDownload
+	grant, err := repo.CreateUserTunnelGrant(ctx, storage.UserTunnelGrant{Username: "alice", TunnelID: tunnel.ID, Enabled: true, StartsAt: now.Add(-time.Hour), ExpiresAt: &expires, MaxActiveForwards: 4, BillingModeOverride: &billingMode, AllowManagedTarget: true, CreatedBy: "admin"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,6 +211,32 @@ func newForwardingHandlerFixture(t *testing.T) forwardingHandlerFixture {
 		t.Fatal(err)
 	}
 	return forwardingHandlerFixture{repo: repo, handler: handler, deployer: deployer, grant: grant, forward: forward, nodeID: node.ID, selectionID: activation.Selection.ID, dbPath: dbPath}
+}
+
+func TestUserForwardDTOBillsUploadMode(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	ctx := context.Background()
+	upload := storage.ManagedBillingUpload
+	input := *fixture.grant
+	input.BillingModeOverride = &upload
+	if _, err := fixture.repo.UpdateUserTunnelGrant(ctx, fixture.grant.PublicID, "alice", input, fixture.grant.Version, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	entry := fixture.forward.Hops[0]
+	if err := fixture.repo.UpsertNodeTraffic(ctx, entry.ServerID, entry.ResourceTag, "inbound", 30, 70, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.repo.SyncUserForwardUsage(ctx); err != nil {
+		t.Fatal(err)
+	}
+	forward, err := fixture.repo.GetUserForward(ctx, fixture.forward.PublicID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dto := fixture.handler.userForwardDTO(ctx, *forward)
+	if dto.UplinkBytes != 30 || dto.DownlinkBytes != 70 || dto.BilledBytes != 30 {
+		t.Fatalf("upload DTO usage=%d/%d billed=%d want=30/70 billed=30", dto.UplinkBytes, dto.DownlinkBytes, dto.BilledBytes)
+	}
 }
 
 func TestForwardingReconcileGenerationSuspendResumeAndHealthyRenew(t *testing.T) {

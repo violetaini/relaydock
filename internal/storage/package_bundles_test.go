@@ -84,7 +84,7 @@ func TestPackageBundleMaterializesUpdatesAndRevokesGrants(t *testing.T) {
 	pkg := Package{
 		Name: "bundle", TrafficLimitBytes: 1024, CycleDays: 30, ResetDay: 1,
 		ServerGrants:     []PackageServerGrant{{ServerID: serverID, MaxActiveNodes: 2, BillingMode: ManagedBillingDownload, ResetPolicy: ManagedResetNone}},
-		ForwardingGrants: []PackageForwardingGrant{{TunnelID: tunnelID, MaxActiveForwards: 3}},
+		ForwardingGrants: []PackageForwardingGrant{{TunnelID: tunnelID, MaxActiveForwards: 3, BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth)}},
 	}
 	packageID, err := repo.CreatePackage(ctx, pkg)
 	if err != nil {
@@ -135,6 +135,104 @@ func TestPackageBundleMaterializesUpdatesAndRevokesGrants(t *testing.T) {
 	serverGrants, _ = repo.ListUserServerGrants(ctx, "alice")
 	if len(serverGrants) != 0 {
 		t.Fatalf("unused unassigned package server grant should be deleted: %+v", serverGrants)
+	}
+}
+
+func TestPackageForwardingGrantRequiresExplicitBillingMode(t *testing.T) {
+	ctx := context.Background()
+	repo := packageBundleTestRepo(t)
+	serverID := addPackageBundleServer(t, repo, "explicit-billing-server")
+	tunnelID := addPackageBundleTunnel(t, repo, serverID, "explicit-billing-tunnel")
+	base := Package{
+		Name: "missing-forward-billing", TrafficLimitBytes: 1024, CycleDays: 30, ResetDay: 1,
+		ForwardingGrants: []PackageForwardingGrant{{TunnelID: tunnelID}},
+	}
+	if _, err := repo.CreatePackage(ctx, base); !errors.Is(err, ErrForwardingInvalid) {
+		t.Fatalf("package without forwarding billing mode error=%v want=%v", err, ErrForwardingInvalid)
+	}
+	base.Name = "upload-forward-billing"
+	base.ForwardingGrants[0].BillingModeOverride = forwardingBillingModePtr(ManagedBillingUpload)
+	if _, err := repo.CreatePackage(ctx, base); err != nil {
+		t.Fatalf("package with upload billing mode: %v", err)
+	}
+}
+
+func TestPackageForwardingBillingChangeUpdatesUnusedSnapshotsAndRejectsUsed(t *testing.T) {
+	ctx := context.Background()
+	repo := packageBundleTestRepo(t)
+	if err := repo.EnsureUser(ctx, "alice", "hash"); err != nil {
+		t.Fatal(err)
+	}
+	serverID := addPackageBundleServer(t, repo, "package-billing-server")
+	tunnelID := addPackageBundleTunnel(t, repo, serverID, "package-billing-tunnel")
+	packageID, err := repo.CreatePackage(ctx, Package{
+		Name: "package-billing", TrafficLimitBytes: 1024, CycleDays: 30, ResetDay: 1,
+		ForwardingGrants: []PackageForwardingGrant{{
+			TunnelID: tunnelID, MaxActiveForwards: 2,
+			BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(-time.Minute)
+	if _, err := repo.AssignPackageBundleToUser(ctx, "alice", packageID, now, now.Add(24*time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
+	grants, err := repo.ListUserTunnelGrants(ctx, "alice")
+	if err != nil || len(grants) != 1 {
+		t.Fatalf("materialized forwarding grants=%+v err=%v", grants, err)
+	}
+	forward, err := repo.CreateUserForward(ctx, CreateUserForwardInput{
+		Username: "alice", Name: "package-billing-forward", GrantPublicID: grants[0].PublicID,
+		TargetNodeID: 42, TargetHost: "198.51.100.42", TargetPort: 443, Actor: "alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := repo.GetPackage(ctx, packageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.ForwardingGrants[0].BillingModeOverride = forwardingBillingModePtr(ManagedBillingUpload)
+	if _, err := repo.UpdatePackageBundle(ctx, *pkg); err != nil {
+		t.Fatalf("change unused package forwarding billing mode: %v", err)
+	}
+	forward, err = repo.GetUserForward(ctx, forward.PublicID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forward.BillingModeSnapshot != ManagedBillingUpload {
+		t.Fatalf("package-updated forward snapshot=%q want=%q", forward.BillingModeSnapshot, ManagedBillingUpload)
+	}
+	entry := forward.Hops[0]
+	if err := repo.UpsertNodeTraffic(ctx, entry.ServerID, entry.ResourceTag, "inbound", 25, 75, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SyncUserForwardUsage(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err = repo.GetPackage(ctx, packageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.ForwardingGrants[0].BillingModeOverride = forwardingBillingModePtr(ManagedBillingDownload)
+	if _, err := repo.UpdatePackageBundle(ctx, *pkg); !errors.Is(err, ErrForwardingBillingModeConflict) {
+		t.Fatalf("change used package forwarding billing mode error=%v want=%v", err, ErrForwardingBillingModeConflict)
+	}
+	pkg, err = repo.GetPackage(ctx, packageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkg.ForwardingGrants[0].BillingModeOverride == nil || *pkg.ForwardingGrants[0].BillingModeOverride != ManagedBillingUpload {
+		t.Fatalf("failed package update changed template: %+v", pkg.ForwardingGrants)
+	}
+	forward, err = repo.GetUserForward(ctx, forward.PublicID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forward.BillingModeSnapshot != ManagedBillingUpload {
+		t.Fatalf("failed package update changed snapshot: %+v", forward)
 	}
 }
 
@@ -244,7 +342,7 @@ func TestPackageBundleFutureAssignmentCreatesScheduledGrants(t *testing.T) {
 		ServerGrants: []PackageServerGrant{{
 			ServerID: serverID, BillingMode: ManagedBillingDownload, ResetPolicy: ManagedResetNone,
 		}},
-		ForwardingGrants: []PackageForwardingGrant{{TunnelID: tunnelID}},
+		ForwardingGrants: []PackageForwardingGrant{{TunnelID: tunnelID, BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth)}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -326,7 +424,7 @@ func TestPackageBundleRevokedTombstonesCanBecomeManualGrants(t *testing.T) {
 		ServerGrants: []PackageServerGrant{{
 			ServerID: serverID, MaxActiveNodes: 2, BillingMode: ManagedBillingDownload, ResetPolicy: ManagedResetNone,
 		}},
-		ForwardingGrants: []PackageForwardingGrant{{TunnelID: tunnelID, MaxActiveForwards: 2}},
+		ForwardingGrants: []PackageForwardingGrant{{TunnelID: tunnelID, MaxActiveForwards: 2, BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth)}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -359,7 +457,8 @@ func TestPackageBundleRevokedTombstonesCanBecomeManualGrants(t *testing.T) {
 	}
 	manualTunnel, err := repo.CreateUserTunnelGrant(ctx, UserTunnelGrant{
 		Username: "alice", TunnelID: tunnelID, Enabled: true, StartsAt: now, ExpiresAt: &expires,
-		MaxActiveForwards: 5, AllowManagedTarget: true, CreatedBy: "admin",
+		MaxActiveForwards: 5, BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth),
+		AllowManagedTarget: true, CreatedBy: "admin",
 	})
 	if err != nil {
 		t.Fatal(err)
