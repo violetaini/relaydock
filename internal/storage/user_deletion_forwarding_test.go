@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -40,19 +41,7 @@ func TestTunnelGrantCreationSerializesWithUserDeletion(t *testing.T) {
 		}{grant: grant, err: createErr}
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if fixture.repo.managedNodeMu.TryLock() {
-			fixture.repo.managedNodeMu.Unlock()
-			if time.Now().After(deadline) {
-				_ = blocker.Rollback()
-				t.Fatal("grant creation did not acquire provisioning lease")
-			}
-			time.Sleep(5 * time.Millisecond)
-			continue
-		}
-		break
-	}
+	waitForUserAuthorizationLease(t, fixture.repo, "bob", func() { _ = blocker.Rollback() })
 
 	deletionDone := make(chan error, 1)
 	go func() {
@@ -88,6 +77,26 @@ func TestTunnelGrantCreationSerializesWithUserDeletion(t *testing.T) {
 	}
 	if _, err := fixture.repo.CreateUserTunnelGrant(fixture.ctx, grantInput); !errors.Is(err, ErrUserDeletionPending) {
 		t.Fatalf("grant create during deletion error=%v want=%v", err, ErrUserDeletionPending)
+	}
+}
+
+func waitForUserAuthorizationLease(t *testing.T, repo *TrafficRepository, username string, cleanup func()) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		value, ok := repo.userAuthorizationLeases.Load(username)
+		if ok {
+			lease := value.(*sync.Mutex)
+			if !lease.TryLock() {
+				return
+			}
+			lease.Unlock()
+		}
+		if time.Now().After(deadline) {
+			cleanup()
+			t.Fatal("operation did not acquire user authorization lease")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

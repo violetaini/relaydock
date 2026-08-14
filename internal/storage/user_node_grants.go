@@ -366,8 +366,8 @@ func (r *TrafficRepository) AcquireNodeDeletionLease(ctx context.Context, nodeID
 func loadDirectGrantTargetTx(ctx context.Context, tx *sql.Tx, username string, nodeID int64) (User, Node, RemoteServer, error) {
 	var user User
 	var active int
-	if err := tx.QueryRowContext(ctx, `SELECT username, role, is_active FROM users WHERE username = ?`, username).
-		Scan(&user.Username, &user.Role, &active); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT username, role, is_active, authorization_mode FROM users WHERE username = ?`, username).
+		Scan(&user.Username, &user.Role, &active, &user.AuthorizationMode); errors.Is(err, sql.ErrNoRows) {
 		return user, Node{}, RemoteServer{}, ErrUserNotFound
 	} else if err != nil {
 		return user, Node{}, RemoteServer{}, fmt.Errorf("load direct grant user: %w", err)
@@ -414,6 +414,12 @@ func (r *TrafficRepository) UpsertManualUserNodeGrant(ctx context.Context, usern
 		}
 		expiresAt = &value
 	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return nil, false, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -421,6 +427,9 @@ func (r *TrafficRepository) UpsertManualUserNodeGrant(ctx context.Context, usern
 		return nil, false, fmt.Errorf("begin direct node grant: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := requireUserAuthorizationMode(ctx, tx, username, AuthorizationModeCustom); err != nil {
+		return nil, false, err
+	}
 	_, node, server, err := loadDirectGrantTargetTx(ctx, tx, username, nodeID)
 	if err != nil {
 		return nil, false, err
@@ -557,6 +566,12 @@ func (r *TrafficRepository) SetUserNodeGrantDesiredState(ctx context.Context, id
 		(desiredState != ManagedDesiredActive && desiredState != ManagedDesiredInactive) {
 		return nil, ErrManagedInvalidArgument
 	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -573,6 +588,11 @@ func (r *TrafficRepository) SetUserNodeGrantDesiredState(ctx context.Context, id
 	}
 	if grant.SourceType != GrantSourceManual || grant.AccessSourceID <= 0 {
 		return nil, ErrUserNodeGrantConflict
+	}
+	if desiredState == ManagedDesiredActive {
+		if err := requireUserAuthorizationMode(ctx, tx, username, AuthorizationModeCustom); err != nil {
+			return nil, err
+		}
 	}
 	now := time.Now().UTC()
 	suspendReason := ManagedSuspendAdminDisabled

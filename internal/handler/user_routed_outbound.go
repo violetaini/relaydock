@@ -607,50 +607,66 @@ func strOf(v interface{}) string {
 // 设计:rule 整条删除而不是 user[] 移除 email — 因为用户私有路由出站的 rule.user 只有
 // 创建者一个,移除后 user[] 为空会被 xray 视作"不限 user",意外命中其他用户。删整条 rule
 // 干净安全,恢复时根据 DB 元数据重建。
-func suspendUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string) {
-	if rm == nil {
-		return
-	}
+func suspendUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string) error {
 	nodes, err := repo.ListUserRoutedOutbounds(ctx, username)
 	if err != nil {
-		log.Printf("[SuspendUserRouted] list %s failed: %v", username, err)
-		return
+		return fmt.Errorf("list private routed nodes for %s: %w", username, err)
 	}
+	var suspendErrs []error
 	for _, n := range nodes {
 		serverID, err := resolveServerIDByNameRepo(ctx, repo, n.OriginalServer)
 		if err != nil {
-			log.Printf("[SuspendUserRouted] resolve server for node %d failed (continue): %v", n.ID, err)
+			nodeErr := fmt.Errorf("resolve server for private routed node %d: %w", n.ID, err)
+			log.Printf("[SuspendUserRouted] %v", nodeErr)
+			suspendErrs = append(suspendErrs, nodeErr)
 			continue
 		}
 		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
 		if err != nil {
-			log.Printf("[SuspendUserRouted] node %d deferred: %v", n.ID, err)
+			nodeErr := fmt.Errorf("acquire private routed node %d mutation lease: %w", n.ID, err)
+			log.Printf("[SuspendUserRouted] %v", nodeErr)
+			suspendErrs = append(suspendErrs, nodeErr)
 			continue
 		}
-		func() {
+		nodeErr := func() error {
 			defer release()
 			current, err := repo.GetRoutedNodeDetail(leasedCtx, n.ID)
-			if err != nil || current.OriginalServer != n.OriginalServer {
-				log.Printf("[SuspendUserRouted] node %d changed while acquiring lease; retry later", n.ID)
-				return
+			if err != nil {
+				return fmt.Errorf("reload private routed node %d: %w", n.ID, err)
 			}
-			sa, _ := repo.GetUserSubaccount(leasedCtx, n.ID, username)
+			if current.OriginalServer != n.OriginalServer {
+				return fmt.Errorf("private routed node %d changed while acquiring lease; retry required", n.ID)
+			}
+			sa, err := repo.GetUserSubaccount(leasedCtx, n.ID, username)
+			if err != nil {
+				return fmt.Errorf("load private routed credential for node %d: %w", n.ID, err)
+			}
 			if sa == nil {
-				return
+				return fmt.Errorf("private routed node %d has no credential record", n.ID)
+			}
+			if !sa.IsActive {
+				return nil
+			}
+			if rm == nil {
+				return errors.New("remote manager is unavailable")
 			}
 			if err := removeRuleByMarktag(leasedCtx, rm, serverID, current.RoutedRuleMarktag); err != nil {
-				log.Printf("[SuspendUserRouted] remove rule node %d failed: %v", n.ID, err)
-				return
+				return fmt.Errorf("remove rule for private routed node %d: %w", n.ID, err)
 			}
 			if err := removeClientFromInbound(leasedCtx, rm, serverID, current.InboundTag, sa.Email); err != nil {
-				log.Printf("[SuspendUserRouted] remove client node %d failed: %v", n.ID, err)
-				return
+				return fmt.Errorf("remove client for private routed node %d: %w", n.ID, err)
 			}
 			if err := repo.SetSubaccountActive(leasedCtx, sa.ID, false); err != nil {
-				log.Printf("[SuspendUserRouted] mark inactive node %d failed: %v", n.ID, err)
+				return fmt.Errorf("mark private routed node %d inactive: %w", n.ID, err)
 			}
+			return nil
 		}()
+		if nodeErr != nil {
+			log.Printf("[SuspendUserRouted] user=%s: %v", username, nodeErr)
+			suspendErrs = append(suspendErrs, nodeErr)
+		}
 	}
+	return errors.Join(suspendErrs...)
 }
 
 // resumeUserPrivateRouted 用户续费/启用时调用:恢复该用户所有 routed_owner='user' 节点的

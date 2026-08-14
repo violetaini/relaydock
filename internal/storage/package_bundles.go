@@ -150,14 +150,16 @@ WHERE username = ? AND source_type = 'package' AND source_package_id = ?`, usern
 		var id int64
 		var sourceType string
 		var sourcePackageID sql.NullInt64
-		err := tx.QueryRowContext(ctx, `SELECT id, COALESCE(source_type, 'manual'), source_package_id
-FROM user_server_grants WHERE username = ? AND server_id = ?`, username, entry.ServerID).Scan(&id, &sourceType, &sourcePackageID)
+		var enabled int
+		err := tx.QueryRowContext(ctx, `SELECT id, COALESCE(source_type, 'manual'), source_package_id, enabled
+FROM user_server_grants WHERE username = ? AND server_id = ?`, username, entry.ServerID).Scan(&id, &sourceType, &sourcePackageID, &enabled)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("read existing server grant: %w", err)
 		}
 		transferablePackageGrant := err == nil && sourceType == GrantSourcePackage && sourcePackageID.Valid &&
 			(sourcePackageID.Int64 == pkg.ID || (oldPackageID > 0 && sourcePackageID.Int64 == oldPackageID))
-		if err == nil && !transferablePackageGrant {
+		adoptableManualTombstone := err == nil && sourceType == GrantSourceManual && enabled == 0
+		if err == nil && !transferablePackageGrant && !adoptableManualTombstone {
 			warnings = append(warnings, packageGrantWarning("server", entry.ServerID))
 			continue
 		}
@@ -245,7 +247,8 @@ LEFT JOIN user_node_selection_usage u ON u.selection_id=s.id WHERE g.id=?`, id).
 			_, updateErr := tx.ExecContext(ctx, `UPDATE user_server_grants SET enabled=1,starts_at=?,expires_at=?,
 max_active_nodes=?,speed_limit_mbps=?,connection_limit=?,traffic_limit_bytes=?,billing_mode=?,reset_policy=?,
 reset_day=?,billing_timezone='Asia/Shanghai',next_reset_at=?,allowed_protocols_json=?,allowed_protocol_profiles_json=?,
-source_package_id=?,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND source_type='package'`,
+source_type='package',source_package_id=?,version=version+1,updated_at=CURRENT_TIMESTAMP
+WHERE id=? AND (source_type='package' OR (source_type='manual' AND enabled=0))`,
 				startsAt.UTC(), endsAt.UTC(), entry.MaxActiveNodes, entry.SpeedLimitMbps, entry.ConnectionLimit,
 				entry.TrafficLimitBytes, entry.BillingMode, entry.ResetPolicy, entry.ResetDay, nextReset,
 				protocols, profiles, pkg.ID, id)
@@ -303,14 +306,16 @@ WHERE username = ? AND source_type = 'package' AND source_package_id = ?`, usern
 		var sourceType string
 		var sourcePackageID sql.NullInt64
 		var currentBillingMode sql.NullString
-		err := tx.QueryRowContext(ctx, `SELECT id, COALESCE(source_type, 'manual'), source_package_id, billing_mode_override FROM user_tunnel_grants
-WHERE username=? AND tunnel_id=?`, username, entry.TunnelID).Scan(&id, &sourceType, &sourcePackageID, &currentBillingMode)
+		var enabled int
+		err := tx.QueryRowContext(ctx, `SELECT id, COALESCE(source_type, 'manual'), source_package_id, billing_mode_override, enabled FROM user_tunnel_grants
+WHERE username=? AND tunnel_id=?`, username, entry.TunnelID).Scan(&id, &sourceType, &sourcePackageID, &currentBillingMode, &enabled)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("read existing forwarding grant: %w", err)
 		}
 		transferablePackageGrant := err == nil && sourceType == GrantSourcePackage && sourcePackageID.Valid &&
 			(sourcePackageID.Int64 == pkg.ID || (oldPackageID > 0 && sourcePackageID.Int64 == oldPackageID))
-		if err == nil && !transferablePackageGrant {
+		adoptableManualTombstone := err == nil && sourceType == GrantSourceManual && enabled == 0
+		if err == nil && !transferablePackageGrant && !adoptableManualTombstone {
 			warnings = append(warnings, packageGrantWarning("tunnel", entry.TunnelID))
 			continue
 		}
@@ -347,8 +352,8 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'package')`, publicID, username, entry.Tu
 			}
 			_, updateErr := tx.ExecContext(ctx, `UPDATE user_tunnel_grants SET enabled=1,starts_at=?,expires_at=?,
 max_active_forwards=?,per_forward_speed_mbps=?,per_forward_connection_limit=?,traffic_limit_bytes=?,
-billing_mode_override=?,source_package_id=?,version=version+1,updated_at=CURRENT_TIMESTAMP
-WHERE id=? AND source_type='package'`, startsAt.UTC(), endsAt.UTC(), entry.MaxActiveForwards,
+billing_mode_override=?,source_type='package',source_package_id=?,version=version+1,updated_at=CURRENT_TIMESTAMP
+WHERE id=? AND (source_type='package' OR (source_type='manual' AND enabled=0))`, startsAt.UTC(), endsAt.UTC(), entry.MaxActiveForwards,
 				entry.PerForwardSpeedMbps, entry.PerForwardConnectionLimit, entry.TrafficLimitBytes,
 				*entry.BillingModeOverride, pkg.ID, id)
 			if updateErr != nil {

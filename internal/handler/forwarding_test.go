@@ -643,6 +643,9 @@ func TestResolveManagedForwardTargetRejectsPackageOnlyVisibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := fixture.repo.PreparePackageAuthorizationTransition(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
 	if err := fixture.repo.AssignPackageToUser(ctx, "alice", packageID, now.Add(-time.Hour), now.Add(time.Hour), false, 1); err != nil {
 		t.Fatal(err)

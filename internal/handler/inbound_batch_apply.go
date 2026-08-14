@@ -135,42 +135,53 @@ type InboundClientAddItem struct {
 	CredentialJSON string
 }
 
-// withPreparedInboundBatchMutation holds exactly one server mutation lease for
-// credential reservation, Agent publication, and any required restart. Do not
-// nest the repository's user provisioning mutex here: SaveUserInboundConfig
-// uses that mutex to reject deletion tombstones, and taking both locks in the
-// opposite order used by deletion/routed flows would deadlock. A deletion that
-// starts after reservation must acquire this same server lease before it can
-// revoke the newly published credential.
+// withPreparedInboundBatchMutation holds the users' authorization leases and
+// exactly one server mutation lease across entitlement revalidation,
+// credential reservation, and Agent publication. The provisioning lease no
+// longer owns the managed-node mutex, so SaveUserInboundConfig can safely take
+// its narrower storage lock in this order.
 func withPreparedInboundBatchMutation(ctx context.Context, repo *storage.TrafficRepository, serverID int64, items []InboundClientAddItem, action func(context.Context, []InboundClientAddItem) error) error {
+	usernames := make([]string, 0, len(items))
 	for _, item := range items {
 		if item.ServerID != serverID {
 			return fmt.Errorf("inbound batch item server=%d does not match transaction server=%d", item.ServerID, serverID)
 		}
+		usernames = append(usernames, item.Username)
 	}
-	leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
-	if err != nil {
-		return err
-	}
-	defer release()
+	return repo.WithUsersProvisioningLease(ctx, usernames, func() error {
+		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+		if err != nil {
+			return err
+		}
+		defer release()
 
-	prepared := make([]InboundClientAddItem, len(items))
-	copy(prepared, items)
-	for i := range prepared {
-		user, err := repo.GetUser(leasedCtx, prepared[i].Username)
-		if err != nil {
-			return fmt.Errorf("load user %s: %w", prepared[i].Username, err)
+		prepared := make([]InboundClientAddItem, len(items))
+		copy(prepared, items)
+		for i := range prepared {
+			user, err := repo.GetUser(leasedCtx, prepared[i].Username)
+			if err != nil {
+				return fmt.Errorf("load user %s: %w", prepared[i].Username, err)
+			}
+			hasAccess, notAfter, err := effectiveUserInboundAuthorization(
+				leasedCtx, repo, prepared[i].Username, serverID, prepared[i].InboundTag, time.Now().UTC(),
+			)
+			if err != nil {
+				return err
+			}
+			if !hasAccess || notAfter != nil {
+				return fmt.Errorf("authorization changed before batch publication for user=%s inbound=%s", prepared[i].Username, prepared[i].InboundTag)
+			}
+			credential, credentialJSON, _, err := getOrCreateInboundCredential(
+				leasedCtx, repo, user, serverID, prepared[i].InboundTag, prepared[i].Protocol, prepared[i].Settings,
+			)
+			if err != nil {
+				return fmt.Errorf("reserve credential user=%s inbound=%s: %w", prepared[i].Username, prepared[i].InboundTag, err)
+			}
+			prepared[i].Credential = credential
+			prepared[i].CredentialJSON = credentialJSON
 		}
-		credential, credentialJSON, _, err := getOrCreateInboundCredential(
-			leasedCtx, repo, user, serverID, prepared[i].InboundTag, prepared[i].Protocol, prepared[i].Settings,
-		)
-		if err != nil {
-			return fmt.Errorf("reserve credential user=%s inbound=%s: %w", prepared[i].Username, prepared[i].InboundTag, err)
-		}
-		prepared[i].Credential = credential
-		prepared[i].CredentialJSON = credentialJSON
-	}
-	return action(leasedCtx, prepared)
+		return action(leasedCtx, prepared)
+	})
 }
 
 // applyInboundClientsBatchToAgent 把同一 server 上多个用户加 client 的操作合并成 1 次

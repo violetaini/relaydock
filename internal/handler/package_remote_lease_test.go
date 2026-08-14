@@ -1,11 +1,16 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,6 +23,7 @@ type packageLeaseAgent struct {
 	requests          atomic.Int64
 	addClientCalls    atomic.Int64
 	removeClientCalls atomic.Int64
+	failRemoveAt      int64
 	serviceControls   atomic.Int64
 	restartStarted    chan struct{}
 	releaseRestart    <-chan struct{}
@@ -53,7 +59,11 @@ func (a *packageLeaseAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var request map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&request)
 		if request["action"] == "remove-client" {
-			a.removeClientCalls.Add(1)
+			call := a.removeClientCalls.Add(1)
+			if a.failRemoveAt > 0 && call == a.failRemoveAt {
+				http.Error(w, "forced remove failure", http.StatusBadGateway)
+				return
+			}
 		} else {
 			a.addClientCalls.Add(1)
 		}
@@ -75,6 +85,60 @@ func (a *packageLeaseAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "xray": map[string]any{"installed": true, "running": running}})
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+func TestPackageDeleteFailureRestoresPreviouslyUnboundUsers(t *testing.T) {
+	agent := &packageLeaseAgent{failRemoveAt: 2}
+	repo, server, remote := newPackageLeaseFixture(t, agent)
+	ctx := context.Background()
+	if err := repo.CreateUser(ctx, "bob", "bob@example.test", "bob", "test-hash", storage.RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "package-delete-node", Protocol: "vless",
+		OriginalServer: server.Name, InboundTag: "vless-in", Enabled: true,
+		ClashConfig: `{"name":"package-delete-node","type":"vless","server":"edge.example.test","port":443,"uuid":"owner-id"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "package-delete-rollback", TrafficLimitBytes: 1024, CycleDays: 30, Nodes: []int64{node.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)
+	for _, username := range []string{"alice", "bob"} {
+		if err := repo.AssignPackageToUser(ctx, username, packageID, start, end, false, 1); err != nil {
+			t.Fatalf("assign %s: %v", username, err)
+		}
+		credential := fmt.Sprintf(`{"id":"%s-id","email":"%s__vless-in"}`, username, username)
+		if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+			Username: username, ServerID: server.ID, InboundTag: "vless-in", Protocol: "vless", CredentialJSON: credential,
+		}); err != nil {
+			t.Fatalf("save %s credential: %v", username, err)
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/admin/packages/%d", packageID), nil)
+	recorder := httptest.NewRecorder()
+	NewPackageDeleteHandler(repo, remote, nil).ServeHTTP(recorder, request)
+	if recorder.Code < 400 {
+		t.Fatalf("package deletion status=%d body=%s, want failure", recorder.Code, recorder.Body.String())
+	}
+	if _, err := repo.GetPackage(ctx, packageID); err != nil {
+		t.Fatalf("package was deleted after partial unbind: %v", err)
+	}
+	for _, username := range []string{"alice", "bob"} {
+		user, err := repo.GetUser(ctx, username)
+		if err != nil || user.AuthorizationMode != storage.AuthorizationModePackage || user.PackageID != packageID {
+			t.Fatalf("user %s was not restored: user=%+v err=%v", username, user, err)
+		}
+		if config, configErr := repo.GetUserInboundConfig(ctx, username, server.ID, "vless-in"); configErr != nil || config == nil {
+			t.Fatalf("user %s credential was not restored: config=%+v err=%v", username, config, configErr)
+		}
 	}
 }
 
@@ -131,13 +195,269 @@ func TestPackageSwitchRevokeFailureRestoresEarlierRevocations(t *testing.T) {
 
 func newPackageLeaseFixture(t *testing.T, agent http.Handler) (*storage.TrafficRepository, *storage.RemoteServer, *RemoteManageHandler) {
 	t.Helper()
+	repo, server, remote, _ := newPackageLeaseFixtureWithDBPath(t, agent)
+	return repo, server, remote
+}
+
+func newPackageLeaseFixtureWithDBPath(t *testing.T, agent http.Handler) (*storage.TrafficRepository, *storage.RemoteServer, *RemoteManageHandler, string) {
+	t.Helper()
 	agentServer := httptest.NewServer(agent)
 	t.Cleanup(agentServer.Close)
-	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agentServer.URL))
+	dbPath := filepath.Join(t.TempDir(), "package-lease.db")
+	repo, err := storage.NewTrafficRepository(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	server := &storage.RemoteServer{
+		Name:           "package-lease-edge",
+		Token:          "package-lease-token",
+		Status:         storage.RemoteServerStatusConnected,
+		ConnectionMode: storage.ConnectionModeWebSocket,
+		IPAddress:      "127.0.0.1",
+		ListenPort:     testServerPort(t, agentServer.URL),
+		Domain:         "edge.example.test",
+		Use443:         true,
+		StealSelf:      true,
+		StealMode:      "tunnel",
+	}
+	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
+		t.Fatal(err)
+	}
 	if err := repo.CreateUser(context.Background(), "alice", "alice@example.test", "alice", "test-hash", storage.RoleUser, ""); err != nil {
 		t.Fatal(err)
 	}
-	return repo, server, NewRemoteManageHandler(repo, nil)
+	return repo, server, NewRemoteManageHandler(repo, nil), dbPath
+}
+
+func TestPackageUpdateSnapshotBlocksLateAssignmentUntilTemplateCommit(t *testing.T) {
+	repo, _, remote := newPackageLeaseFixture(t, &packageLeaseAgent{})
+	ctx := context.Background()
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "package-update-snapshot", TrafficLimitBytes: 1024, CycleDays: 30,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotted := make(chan struct{})
+	continueUpdate := make(chan struct{})
+	releasedUpdate := false
+	defer func() {
+		if !releasedUpdate {
+			close(continueUpdate)
+		}
+	}()
+	update := NewPackageUpdateHandler(repo, remote, nil)
+	update.afterUserSnapshotForTest = func() {
+		close(snapshotted)
+		<-continueUpdate
+	}
+	body, err := json.Marshal(updatePackageRequest{
+		ID: packageID, Name: "package-update-snapshot", TrafficLimitGB: 2, CycleDays: 30, Nodes: []int64{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	updateDone := make(chan struct{})
+	go func() {
+		defer close(updateDone)
+		update.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/api/admin/packages", bytes.NewReader(body)))
+	}()
+	select {
+	case <-snapshotted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("package update did not reach the bound-user snapshot")
+	}
+
+	assignmentDone := make(chan error, 1)
+	go func() {
+		start := time.Now().Add(-time.Minute)
+		_, assignErr := NewPackageAssignHandler(repo, remote, nil).AssignAndProvision(
+			ctx, "alice", packageID, start, start.Add(time.Hour), false, 1,
+		)
+		assignmentDone <- assignErr
+	}()
+	select {
+	case assignErr := <-assignmentDone:
+		t.Fatalf("late assignment crossed the package update snapshot: %v", assignErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(continueUpdate)
+	releasedUpdate = true
+	select {
+	case <-updateDone:
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("package update status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("package update remained blocked")
+	}
+	select {
+	case assignErr := <-assignmentDone:
+		if assignErr != nil {
+			t.Fatalf("late assignment after package update: %v", assignErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("late assignment remained blocked after package update")
+	}
+	user, err := repo.GetUser(ctx, "alice")
+	if err != nil || user.PackageID != packageID {
+		t.Fatalf("late assignment was not persisted: user=%+v err=%v", user, err)
+	}
+}
+
+func TestPackageSwitchWaitsForBothPackageLeases(t *testing.T) {
+	for _, held := range []string{"old", "new"} {
+		t.Run(held, func(t *testing.T) {
+			repo, _, remote := newPackageLeaseFixture(t, &packageLeaseAgent{})
+			ctx := context.Background()
+			oldPackageID, err := repo.CreatePackage(ctx, storage.Package{
+				Name: "package-switch-old-" + held, TrafficLimitBytes: 1024, CycleDays: 30,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			newPackageID, err := repo.CreatePackage(ctx, storage.Package{
+				Name: "package-switch-new-" + held, TrafficLimitBytes: 2048, CycleDays: 30,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := time.Now().Add(-time.Minute)
+			end := start.Add(time.Hour)
+			if err := repo.AssignPackageToUser(ctx, "alice", oldPackageID, start, end, false, 1); err != nil {
+				t.Fatal(err)
+			}
+			heldPackageID := oldPackageID
+			if held == "new" {
+				heldPackageID = newPackageID
+			}
+			_, release, err := repo.AcquirePackageAuthorizationLease(ctx, heldPackageID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			released := false
+			defer func() {
+				if !released {
+					release()
+				}
+			}()
+
+			done := make(chan error, 1)
+			go func() {
+				_, assignErr := NewPackageAssignHandler(repo, remote, nil).AssignAndProvision(
+					ctx, "alice", newPackageID, start, end, false, 1,
+				)
+				done <- assignErr
+			}()
+			select {
+			case assignErr := <-done:
+				t.Fatalf("package switch crossed held %s package lease: %v", held, assignErr)
+			case <-time.After(100 * time.Millisecond):
+			}
+			release()
+			released = true
+			select {
+			case assignErr := <-done:
+				if assignErr != nil {
+					t.Fatalf("package switch after releasing %s lease: %v", held, assignErr)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("package switch remained blocked after releasing %s lease", held)
+			}
+		})
+	}
+}
+
+func TestPackageUpdateWorkerSkipsNodeRemovedByNewerTemplate(t *testing.T) {
+	agent := &packageLeaseAgent{}
+	repo, server, remote := newPackageLeaseFixture(t, agent)
+	ctx := context.Background()
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "stale-package-add", Protocol: "vless", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "vless-stale",
+		ClashConfig: `{"name":"stale-package-add","type":"vless","server":"edge.example.test","port":443,"uuid":"owner-id"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "package-stale-worker", TrafficLimitBytes: 1024, CycleDays: 30, Nodes: []int64{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now().Add(-time.Minute)
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, start, start.Add(time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	NewPackageUpdateHandler(repo, remote, nil).syncInboundUsersAfterNodeChange(
+		ctx, packageID, []int64{}, []int64{node.ID},
+	)
+	if got := agent.requests.Load(); got != 0 {
+		t.Fatalf("stale package worker made %d Agent request(s)", got)
+	}
+}
+
+func TestPackageExpiryRetainsAssignmentWhenPrivateRoutedRevokeFails(t *testing.T) {
+	agent := &packageLeaseAgent{}
+	repo, server, remote := newPackageLeaseFixture(t, agent)
+	ctx := context.Background()
+	parent, err := repo.CreateNode(ctx, storage.Node{
+		Username: "alice", NodeName: "private-parent", Protocol: "vless", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "vless-in",
+		ClashConfig: `{"name":"private-parent","type":"vless","server":"edge.example.test","port":443,"uuid":"owner-id"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID := parent.ID
+	private, err := repo.CreateRoutedNode(ctx, storage.RoutedNodeDetail{
+		Node: storage.Node{
+			Username: "alice", NodeName: "private-routed", Protocol: "vless", Enabled: true,
+			OriginalServer: server.Name, InboundTag: "vless-in", ParentNodeID: &parentID, RoutedOwner: "user",
+		},
+		RoutedOutboundTag: "private-out", RoutedRuleMarktag: "private-rule",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
+		Username: "alice", RoutedNodeID: private.ID, Email: "alice__private",
+		CredentialJSON: `{"id":"private-id","email":"alice__private"}`, IsActive: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "expired-private-routed", TrafficLimitBytes: 1024, CycleDays: 30,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := time.Now().Add(-48*time.Hour), time.Now().Add(-24*time.Hour)
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, start, end, false, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// packageLeaseAgent intentionally has no routing endpoint, so the private
+	// routed rule revoke fails before the assignment can be cleared.
+	NewTrafficLimitEnforcer(repo, remote, nil).CheckAll(ctx)
+
+	user, err := repo.GetUser(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.AuthorizationMode != storage.AuthorizationModePackage || user.PackageID != packageID {
+		t.Fatalf("expired assignment was cleared despite failed revoke: %+v", user)
+	}
+	subaccount, err := repo.GetUserSubaccount(ctx, private.ID, "alice")
+	if err != nil || subaccount == nil || !subaccount.IsActive {
+		t.Fatalf("failed revoke changed durable subaccount state: account=%+v err=%v", subaccount, err)
+	}
 }
 
 func packageBatchItem(serverID int64) InboundClientAddItem {
@@ -149,6 +469,63 @@ func packageBatchItem(serverID int64) InboundClientAddItem {
 		Settings: map[string]any{
 			"clients": []any{map[string]any{"id": "owner-id", "flow": "xtls-rprx-vision"}},
 		},
+	}
+}
+
+func authorizeInboundBatchFixture(t *testing.T, repo *storage.TrafficRepository, server *storage.RemoteServer) {
+	t.Helper()
+	ctx := context.Background()
+	if err := repo.UpdateRemoteServerXrayMode(ctx, server.ID, "embedded"); err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "batch-authorized", Protocol: "vless",
+		OriginalServer: server.Name, InboundTag: "vless-in", Enabled: true,
+		ClashConfig: `{"name":"batch-authorized","type":"vless","server":"edge.example.test","port":443,"uuid":"owner-id"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repo.UpsertManualUserNodeGrant(ctx, "alice", node.ID, nil, "admin"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPackageWireGuardNodeSkipsPerUserCredentialProvisioning(t *testing.T) {
+	agent := &packageLeaseAgent{}
+	repo, server, remote := newPackageLeaseFixture(t, agent)
+	ctx := context.Background()
+	if err := repo.ConfigureNodeSecretEncryption(bytes.Repeat([]byte{0x57}, 32)); err != nil {
+		t.Fatalf("ConfigureNodeSecretEncryption: %v", err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "wireguard-static", Protocol: "wireguard",
+		OriginalServer: server.Name, InboundTag: "wireguard-bd61c6",
+		ClashConfig: `{"name":"wireguard-static","type":"wireguard","server":"198.51.100.10","port":51820,"private-key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","public-key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="}`,
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkgID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "wireguard-static-package", TrafficLimitBytes: 1024, CycleDays: 30,
+		Nodes: []int64{node.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)
+	warnings, err := NewPackageAssignHandler(repo, remote, nil).AssignAndProvision(
+		ctx, "alice", pkgID, start, end, false, 1,
+	)
+	if err != nil || len(warnings) != 0 {
+		t.Fatalf("AssignAndProvision warnings=%v err=%v", warnings, err)
+	}
+	if got := agent.requests.Load(); got != 0 {
+		t.Fatalf("WireGuard package node made %d Agent requests, want 0", got)
+	}
+	if config, configErr := repo.GetUserInboundConfig(ctx, "alice", server.ID, node.InboundTag); configErr == nil || config != nil {
+		t.Fatalf("WireGuard package node created per-user credential: config=%+v err=%v", config, configErr)
 	}
 }
 
@@ -179,6 +556,7 @@ func TestInboundBatchNoOpDoesNotRestartXray(t *testing.T) {
 		batchResult:    "ok (no-op)",
 	}
 	repo, server, remote := newPackageLeaseFixture(t, agent)
+	authorizeInboundBatchFixture(t, repo, server)
 
 	if err := applyInboundClientsBatchToAgent(context.Background(), remote, repo, server.ID, []InboundClientAddItem{packageBatchItem(server.ID)}); err != nil {
 		t.Fatalf("applyInboundClientsBatchToAgent: %v", err)
@@ -198,6 +576,7 @@ func TestInboundBatchNoOpDoesNotRestartXray(t *testing.T) {
 func TestInboundBatchRuntimeWarningDoesNotRestartXray(t *testing.T) {
 	agent := &packageLeaseAgent{runtimeWarnings: []string{"vless-in: runtime apply deferred"}}
 	repo, server, remote := newPackageLeaseFixture(t, agent)
+	authorizeInboundBatchFixture(t, repo, server)
 
 	if err := applyInboundClientsBatchToAgent(context.Background(), remote, repo, server.ID, []InboundClientAddItem{packageBatchItem(server.ID)}); err != nil {
 		t.Fatalf("applyInboundClientsBatchToAgent: %v", err)
@@ -292,7 +671,7 @@ func TestPackageReconcilerRevokesInboundRemovedFromTemplate(t *testing.T) {
 	}
 }
 
-func TestPackageReconcilerPreservesDirectCredentialRemovedFromTemplate(t *testing.T) {
+func TestPackageReconcilerDoesNotPreserveInactiveDirectCredential(t *testing.T) {
 	agent := &packageLeaseAgent{}
 	repo, server, remote := newPackageLeaseFixture(t, agent)
 	ctx := context.Background()
@@ -310,10 +689,6 @@ func TestPackageReconcilerPreservesDirectCredentialRemovedFromTemplate(t *testin
 		Name: "direct-cleanup-package", TrafficLimitBytes: 1024, CycleDays: 30, Nodes: []int64{node.ID},
 	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	start, end := time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)
-	if err := repo.AssignPackageToUser(ctx, "alice", packageID, start, end, false, 1); err != nil {
 		t.Fatal(err)
 	}
 	credentialJSON := `{"id":"alice-id","email":"alice__vless-in"}`
@@ -336,6 +711,13 @@ func TestPackageReconcilerPreservesDirectCredentialRemovedFromTemplate(t *testin
 	if _, err := repo.MarkUserInboundAccessSourceApplied(ctx, grant.Source.ID, grant.Source.Generation, storage.ManagedObservedActive, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
+	if err := repo.PreparePackageAuthorizationTransition(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	start, end := time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, start, end, false, 1); err != nil {
+		t.Fatal(err)
+	}
 	pkg, err := repo.GetPackage(ctx, packageID)
 	if err != nil {
 		t.Fatal(err)
@@ -347,12 +729,11 @@ func TestPackageReconcilerPreservesDirectCredentialRemovedFromTemplate(t *testin
 
 	NewPackageAssignHandler(repo, remote, nil).reconcileAssignments(ctx)
 
-	if got := agent.removeClientCalls.Load(); got != 0 {
-		t.Fatalf("reconciler removed direct credential %d time(s)", got)
+	if got := agent.removeClientCalls.Load(); got != 1 {
+		t.Fatalf("reconciler made %d remove-client calls, want 1", got)
 	}
-	stored, err := repo.GetUserInboundConfig(ctx, "alice", server.ID, "vless-in")
-	if err != nil || stored == nil || stored.CredentialJSON != credentialJSON {
-		t.Fatalf("direct credential was not retained: config=%+v err=%v", stored, err)
+	if stored, _ := repo.GetUserInboundConfig(ctx, "alice", server.ID, "vless-in"); stored != nil {
+		t.Fatalf("inactive direct credential was retained: %+v", stored)
 	}
 }
 
@@ -462,7 +843,7 @@ func TestPackageSwitchRevokesOldExclusiveInboundCredential(t *testing.T) {
 
 func TestPackageSwitchAssignmentFailureRestoresOldInboundCredential(t *testing.T) {
 	agent := &packageLeaseAgent{}
-	repo, server, remote := newPackageLeaseFixture(t, agent)
+	repo, server, remote, dbPath := newPackageLeaseFixtureWithDBPath(t, agent)
 	ctx := context.Background()
 	if err := repo.UpdateRemoteServerXrayMode(ctx, server.ID, "embedded"); err != nil {
 		t.Fatal(err)
@@ -493,28 +874,21 @@ func TestPackageSwitchAssignmentFailureRestoresOldInboundCredential(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	offer, err := repo.CreateSelfServiceNodeOffer(ctx, newNode.ID, server.ID, "admin")
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	grant, err := repo.CreateUserServerGrant(ctx, storage.UserServerGrant{
-		Username: "alice", ServerID: server.ID, Enabled: true, StartsAt: start, ExpiresAt: &end,
-		MaxActiveNodes: 1, BillingMode: storage.ManagedBillingDownload, ResetPolicy: storage.ManagedResetNone,
-		ResetDay: 1, BillingTimezone: "Asia/Shanghai", CreatedBy: "admin",
-	})
-	if err != nil {
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`CREATE TRIGGER reject_package_switch
+BEFORE UPDATE OF package_id ON users
+WHEN OLD.username='alice' AND NEW.package_id != OLD.package_id
+BEGIN SELECT RAISE(ABORT, 'forced package switch failure'); END`); err != nil {
 		t.Fatal(err)
-	}
-	if _, err := repo.ActivateUserNodeSelection(ctx, "alice", offer.ID, "admin", time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
-	if grant.SourceType != storage.GrantSourceManual {
-		t.Fatalf("fixture grant source=%q, want manual", grant.SourceType)
 	}
 
 	assign := NewPackageAssignHandler(repo, remote, nil)
-	if _, err := assign.AssignAndProvision(ctx, "alice", newPackage, start, end, false, 1); !errors.Is(err, storage.ErrManagedAccessConflict) {
-		t.Fatalf("package switch error=%v, want ErrManagedAccessConflict", err)
+	if _, err := assign.AssignAndProvision(ctx, "alice", newPackage, start, end, false, 1); err == nil || !strings.Contains(err.Error(), "forced package switch failure") {
+		t.Fatalf("package switch error=%v, want forced persistence failure", err)
 	}
 	user, err := repo.GetUser(ctx, "alice")
 	if err != nil {

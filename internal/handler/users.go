@@ -25,6 +25,7 @@ type userEntry struct {
 	Role                string   `json:"role"`
 	IsActive            bool     `json:"is_active"`
 	Remark              string   `json:"remark"`
+	AuthorizationMode   string   `json:"authorization_mode"`
 	PackageID           *int64   `json:"package_id"`
 	PackageName         string   `json:"package_name,omitempty"`
 	TrafficLimitGB      float64  `json:"traffic_limit_gb,omitempty"`
@@ -114,6 +115,7 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 				Role:                user.Role,
 				IsActive:            user.IsActive,
 				Remark:              user.Remark,
+				AuthorizationMode:   user.AuthorizationMode,
 				UserShortCode:       scInfo.UserShortCode,
 				CustomUserShortCode: scInfo.CustomUserShortCode,
 			}
@@ -203,6 +205,13 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 		}
 
 		ctx := r.Context()
+		leasedCtx, releaseAuthorization, leaseErr := repo.AcquireUserAuthorizationLease(ctx, username)
+		if leaseErr != nil {
+			writeError(w, http.StatusConflict, leaseErr)
+			return
+		}
+		defer releaseAuthorization()
+		ctx = leasedCtx
 
 		// 检查目标用户是否是admin
 		targetUser, err := repo.GetUser(ctx, username)
@@ -270,7 +279,9 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 					}
 				}
 				// 用户私有路由出站(routed_owner='user'):拆 rule + client,outbound 保留
-				suspendUserPrivateRouted(ctx, remoteManage, repo, username)
+				if err := suspendUserPrivateRouted(ctx, remoteManage, repo, username); err != nil {
+					log.Printf("[UserStatus] disable: suspend private routed access for %s failed: %v", username, err)
+				}
 			} else {
 				// 启用 → 用 saved credential 调 addUserToInbound 把 client 加回。
 				// addUserToInbound 内部会发现 GetUserInboundConfig 已有记录,自动复用 credential_json。

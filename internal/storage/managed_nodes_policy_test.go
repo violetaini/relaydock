@@ -6,24 +6,21 @@ import (
 	"time"
 )
 
-func TestManagedActivationRejectsPackageInboundOverlap(t *testing.T) {
+func TestPackageAssignmentRejectsManagedGrantBeforeOverlap(t *testing.T) {
 	repo, _ := newManagedNodesTestRepository(t)
-	ctx, server, node, offer := seedManagedNodesTest(t, repo)
+	ctx, server, node, _ := seedManagedNodesTest(t, repo)
 	now := time.Now().UTC()
 	createManagedGrantForTest(t, repo, ctx, server.ID, now)
 	packageID, err := repo.CreatePackage(ctx, Package{Name: "overlap", Nodes: []int64{node.ID}})
 	if err != nil {
 		t.Fatalf("CreatePackage: %v", err)
 	}
-	if err := repo.AssignPackageToUser(ctx, "alice", packageID, now.Add(-time.Hour), now.Add(time.Hour), false, 1); err != nil {
-		t.Fatalf("AssignPackageToUser: %v", err)
-	}
-	if _, err := repo.ActivateUserNodeSelection(ctx, "alice", offer.ID, "alice", now); !errors.Is(err, ErrManagedAccessConflict) {
-		t.Fatalf("ActivateUserNodeSelection error = %v, want %v", err, ErrManagedAccessConflict)
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, now.Add(-time.Hour), now.Add(time.Hour), false, 1); !errors.Is(err, ErrAuthorizationModeConflict) {
+		t.Fatalf("AssignPackageToUser error = %v, want %v", err, ErrAuthorizationModeConflict)
 	}
 }
 
-func TestPackageAssignmentAndUpdateRejectManagedInboundOverlap(t *testing.T) {
+func TestAuthorizationModeRejectsManagedPackageOverlap(t *testing.T) {
 	t.Run("assignment", func(t *testing.T) {
 		repo, _ := newManagedNodesTestRepository(t)
 		ctx, server, node, offer := seedManagedNodesTest(t, repo)
@@ -36,14 +33,14 @@ func TestPackageAssignmentAndUpdateRejectManagedInboundOverlap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreatePackage: %v", err)
 		}
-		if err := repo.AssignPackageToUser(ctx, "alice", packageID, now, now.Add(time.Hour), false, 1); !errors.Is(err, ErrManagedAccessConflict) {
-			t.Fatalf("AssignPackageToUser error = %v, want %v", err, ErrManagedAccessConflict)
+		if err := repo.AssignPackageToUser(ctx, "alice", packageID, now, now.Add(time.Hour), false, 1); !errors.Is(err, ErrAuthorizationModeConflict) {
+			t.Fatalf("AssignPackageToUser error = %v, want %v", err, ErrAuthorizationModeConflict)
 		}
 	})
 
-	t.Run("package update", func(t *testing.T) {
+	t.Run("manual grant while package assigned", func(t *testing.T) {
 		repo, _ := newManagedNodesTestRepository(t)
-		ctx, server, node, offer := seedManagedNodesTest(t, repo)
+		ctx, server, _, _ := seedManagedNodesTest(t, repo)
 		now := time.Now().UTC()
 		packageID, err := repo.CreatePackage(ctx, Package{Name: "updated-overlap"})
 		if err != nil {
@@ -52,17 +49,11 @@ func TestPackageAssignmentAndUpdateRejectManagedInboundOverlap(t *testing.T) {
 		if err := repo.AssignPackageToUser(ctx, "alice", packageID, now, now.Add(time.Hour), false, 1); err != nil {
 			t.Fatalf("AssignPackageToUser: %v", err)
 		}
-		createManagedGrantForTest(t, repo, ctx, server.ID, now)
-		if _, err := repo.ActivateUserNodeSelection(ctx, "alice", offer.ID, "alice", now); err != nil {
-			t.Fatalf("ActivateUserNodeSelection: %v", err)
-		}
-		pkg, err := repo.GetPackage(ctx, packageID)
-		if err != nil {
-			t.Fatalf("GetPackage: %v", err)
-		}
-		pkg.Nodes = []int64{node.ID}
-		if err := repo.UpdatePackage(ctx, *pkg); !errors.Is(err, ErrManagedAccessConflict) {
-			t.Fatalf("UpdatePackage error = %v, want %v", err, ErrManagedAccessConflict)
+		if _, err := repo.CreateUserServerGrant(ctx, UserServerGrant{
+			Username: "alice", ServerID: server.ID, Enabled: true, StartsAt: now,
+			BillingMode: ManagedBillingDownload, ResetPolicy: ManagedResetNone, ResetDay: 1, CreatedBy: "admin",
+		}); !errors.Is(err, ErrAuthorizationModeConflict) {
+			t.Fatalf("CreateUserServerGrant error = %v, want %v", err, ErrAuthorizationModeConflict)
 		}
 	})
 }

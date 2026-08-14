@@ -90,16 +90,18 @@ type TrafficRecord struct {
 
 // TrafficRepository 管理流量使用快照的持久性。
 type TrafficRepository struct {
-	db                       *sql.DB
-	authMutationMu           sync.RWMutex
-	sessionRevokerMu         sync.RWMutex
-	sessionRevoker           func(string)
-	managedNodeMu            sync.Mutex
-	remoteInstallationLeases sync.Map // serverID (int64) -> *sync.RWMutex
-	nodeSecretMu             sync.RWMutex
-	nodeSecretBox            *secretbox.Box
-	billingCacheMu           sync.Mutex
-	billingCache             map[int64]trafficBillingCacheEntry
+	db                         *sql.DB
+	authMutationMu             sync.RWMutex
+	userAuthorizationLeases    sync.Map // username -> *sync.Mutex
+	packageAuthorizationLeases sync.Map // package ID -> *sync.Mutex
+	sessionRevokerMu           sync.RWMutex
+	sessionRevoker             func(string)
+	managedNodeMu              sync.Mutex
+	remoteInstallationLeases   sync.Map // serverID (int64) -> *sync.RWMutex
+	nodeSecretMu               sync.RWMutex
+	nodeSecretBox              *secretbox.Box
+	billingCacheMu             sync.Mutex
+	billingCache               map[int64]trafficBillingCacheEntry
 }
 
 // AuthMutationMutex is shared with auth.Manager so account lifecycle changes
@@ -3164,6 +3166,9 @@ CREATE TABLE IF NOT EXISTS announcement_bot_deliveries (
 	if err := r.migrateForwarding(); err != nil {
 		return err
 	}
+	if err := r.migrateUserAuthorizationModes(); err != nil {
+		return err
+	}
 	if err := r.migrateRemoteServerDeletionTasks(); err != nil {
 		return err
 	}
@@ -5207,17 +5212,18 @@ type RuleVersionContent struct {
 
 // 用户代表存储在存储库中的经过身份验证的帐户。
 type User struct {
-	Username     string
-	PasswordHash string
-	Email        string
-	Nickname     string
-	AvatarURL    string
-	Role         string
-	IsActive     bool
-	Remark       string
-	PackageID    int64
-	IsReset      bool
-	ResetDay     int
+	Username          string
+	PasswordHash      string
+	Email             string
+	Nickname          string
+	AvatarURL         string
+	Role              string
+	IsActive          bool
+	Remark            string
+	PackageID         int64
+	AuthorizationMode string
+	IsReset           bool
+	ResetDay          int
 	// LastResetAt 记录上次按 reset_day 自动重置流量周期的时间。
 	// CheckAll 用它做"本月是否已重置"判定,避免 enforcer 每 5 min 跑一次时同一天反复 reset。
 	// 空 = 从未重置过(刚装 / 刚分配套餐),CheckAll 在 reset_day 到了之后会触发首次 reset。
@@ -5331,14 +5337,14 @@ func (r *TrafficRepository) GetUser(ctx context.Context, username string) (User,
 		return user, errors.New("username is required")
 	}
 
-	row := r.db.QueryRowContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(package_id, 0), COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), COALESCE(totp_secret, ''), COALESCE(totp_enabled, 0), COALESCE(recovery_codes, '[]'), created_at, updated_at FROM users WHERE username = ? LIMIT 1`, username)
+	row := r.db.QueryRowContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), COALESCE(totp_secret, ''), COALESCE(totp_enabled, 0), COALESCE(recovery_codes, '[]'), created_at, updated_at FROM users WHERE username = ? LIMIT 1`, username)
 	var active, isReset, totpEnabled int
 	var startDate, endDate sql.NullTime
 	var speedOverride sql.NullFloat64
 	var deviceOverride sql.NullInt64
 	var trafficOverride sql.NullInt64
 	var nodeSpeedJSON, nodeDeviceJSON string
-	if err := row.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.PackageID, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &user.TOTPSecret, &totpEnabled, &user.RecoveryCodes, &user.CreatedAt, &user.UpdatedAt); err != nil {
+	if err := row.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.PackageID, &user.AuthorizationMode, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &user.TOTPSecret, &totpEnabled, &user.RecoveryCodes, &user.CreatedAt, &user.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return user, ErrUserNotFound
 		}
@@ -5391,7 +5397,7 @@ func (r *TrafficRepository) ListUsers(ctx context.Context, limit int) ([]User, e
 		limit = 10
 	}
 
-	rows, err := r.db.QueryContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users ORDER BY created_at ASC LIMIT ?`, limit)
+	rows, err := r.db.QueryContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users ORDER BY created_at ASC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}
@@ -5406,7 +5412,7 @@ func (r *TrafficRepository) ListUsers(ctx context.Context, limit int) ([]User, e
 		var deviceOverride sql.NullInt64
 		var trafficOverride sql.NullInt64
 		var nodeSpeedJSON, nodeDeviceJSON string
-		if err := rows.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.Remark, &user.PackageID, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &user.CreatedAt, &user.UpdatedAt); err != nil {
+		if err := rows.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.Remark, &user.PackageID, &user.AuthorizationMode, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &user.CreatedAt, &user.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		if user.Nickname == "" {
@@ -5843,6 +5849,12 @@ func (r *TrafficRepository) UpdateUserStatus(ctx context.Context, username strin
 	if !active {
 		return r.DisableUserAndDeleteSessions(ctx, username)
 	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.authMutationMu.Lock()
 	defer r.authMutationMu.Unlock()
 	r.managedNodeMu.Lock()
@@ -6102,6 +6114,12 @@ func (r *TrafficRepository) DisableUserAndDeleteSessions(ctx context.Context, us
 	if username == "" {
 		return errors.New("username is required")
 	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 
 	r.authMutationMu.Lock()
 	defer r.authMutationMu.Unlock()
@@ -9113,18 +9131,9 @@ func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, usern
 		return nil, ErrUserDeletionPending
 	}
 
-	// 验证套餐存在，并拒绝与用户自选节点重复授权同一物理入站。
+	// 验证套餐存在。授权模式和所有实体化授权在同一事务内切换。
 	pkg, err := r.GetPackage(ctx, packageID)
 	if err != nil {
-		return nil, err
-	}
-	if err := packageNodesConflictWithManualSelections(ctx, r.db, username, pkg.Nodes); err != nil {
-		return nil, err
-	}
-	var oldPackageID int64
-	if err := r.db.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0) FROM users WHERE username = ?`, username).Scan(&oldPackageID); errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrUserNotFound
-	} else if err != nil {
 		return nil, err
 	}
 
@@ -9138,7 +9147,7 @@ func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, usern
 	const query = `
 		UPDATE users
 		SET traffic_limit_override = CASE WHEN package_id IS NOT ? THEN NULL ELSE traffic_limit_override END,
-		    package_id = ?, package_start_date = ?, package_end_date = ?, is_reset = ?, reset_day = ?, updated_at = CURRENT_TIMESTAMP
+		    package_id = ?, authorization_mode = 'package', package_start_date = ?, package_end_date = ?, is_reset = ?, reset_day = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE username = ?
 	`
 
@@ -9147,6 +9156,25 @@ func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, usern
 		return nil, err
 	}
 	defer tx.Rollback()
+	var oldPackageID int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0) FROM users WHERE username = ?`, username).Scan(&oldPackageID); errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUserNotFound
+	} else if err != nil {
+		return nil, err
+	}
+	if _, err := userAuthorizationMode(ctx, tx, username); err != nil {
+		return nil, err
+	}
+	manual, err := activeManualAuthorizationExists(ctx, tx, username)
+	if err != nil {
+		return nil, err
+	}
+	if manual {
+		return nil, ErrAuthorizationModeConflict
+	}
+	if err := packageNodesConflictWithManualSelections(ctx, tx, username, pkg.Nodes); err != nil {
+		return nil, err
+	}
 	result, err := tx.ExecContext(ctx, query, packageID, packageID, startDate, endDate, isResetInt, resetDay, username)
 	if err != nil {
 		return nil, fmt.Errorf("assign package to user: %w", err)
@@ -9198,7 +9226,7 @@ func (r *TrafficRepository) RemovePackageFromUser(ctx context.Context, username 
 	defer tx.Rollback()
 	const query = `
 		UPDATE users
-		SET package_id = NULL, package_start_date = NULL, package_end_date = NULL, is_reset = 0, reset_day = 1,
+		SET package_id = NULL, authorization_mode = 'custom', package_start_date = NULL, package_end_date = NULL, is_reset = 0, reset_day = 1,
 		    traffic_limit_override = NULL, updated_at = CURRENT_TIMESTAMP
 		WHERE username = ?
 	`
@@ -10452,7 +10480,7 @@ func (r *TrafficRepository) ResolveNodeNameByEmail(ctx context.Context, serverNa
 
 func (r *TrafficRepository) ListUsersWithPackage(ctx context.Context) ([]User, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), COALESCE(is_reset, 0), COALESCE(reset_day, 1), last_reset_at, package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users WHERE package_id IS NOT NULL AND package_id > 0`)
+		`SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), last_reset_at, package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users WHERE package_id IS NOT NULL AND package_id > 0 AND authorization_mode = 'package'`)
 	if err != nil {
 		return nil, err
 	}
@@ -10466,7 +10494,7 @@ func (r *TrafficRepository) ListUsersWithPackage(ctx context.Context) ([]User, e
 		var deviceOverride sql.NullInt64
 		var trafficOverride sql.NullInt64
 		var nodeSpeedJSON, nodeDeviceJSON string
-		if err := rows.Scan(&u.Username, &u.PasswordHash, &u.Email, &u.Nickname, &u.AvatarURL, &u.Role, &active, &u.Remark, &u.PackageID, &isReset, &u.ResetDay, &lastResetAt, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		if err := rows.Scan(&u.Username, &u.PasswordHash, &u.Email, &u.Nickname, &u.AvatarURL, &u.Role, &active, &u.Remark, &u.PackageID, &u.AuthorizationMode, &isReset, &u.ResetDay, &lastResetAt, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, err
 		}
 		u.IsActive = active != 0

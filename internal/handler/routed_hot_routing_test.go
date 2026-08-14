@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/violetaini/relaydock/internal/storage"
 )
@@ -376,12 +377,22 @@ func TestRoutedBatchHotRouteRejectKeepsReservationInactiveAndRetries(t *testing.
 	agent := newRoutedHotAgent()
 	repo, server, remote, routed := newRoutedHotNode(t, agent)
 	ctx := context.Background()
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "routed-hot-batch", TrafficLimitBytes: 1024, CycleDays: 30, Nodes: []int64{routed.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now().Add(-time.Minute)
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, start, start.Add(time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
 	item := routedHotBatchItem(server.ID, routed.ID)
 
 	agent.mu.Lock()
 	agent.rejectHot = true
 	agent.mu.Unlock()
-	_, err := applyRoutedBatchToAgent(ctx, remote, repo, server.ID, []routedBatchItem{item})
+	_, err = applyRoutedBatchToAgent(ctx, remote, repo, server.ID, []routedBatchItem{item})
 	if err == nil {
 		t.Fatal("hot route rejection was reported as success")
 	}

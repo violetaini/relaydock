@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -14,6 +15,90 @@ var (
 	ErrUserDeletionPending     = errors.New("user deletion is pending remote access revocation")
 	ErrUserDeletionNotPrepared = errors.New("user deletion has not been prepared")
 )
+
+type userAuthorizationLeaseContextKey struct{}
+
+type userAuthorizationLeaseContext struct {
+	repo      *TrafficRepository
+	usernames map[string]struct{}
+}
+
+func normalizeAuthorizationLeaseUsers(usernames []string) ([]string, error) {
+	unique := make(map[string]struct{}, len(usernames))
+	for _, username := range usernames {
+		username = strings.TrimSpace(username)
+		if username == "" {
+			return nil, ErrManagedInvalidArgument
+		}
+		unique[username] = struct{}{}
+	}
+	if len(unique) == 0 {
+		return nil, ErrManagedInvalidArgument
+	}
+	normalized := make([]string, 0, len(unique))
+	for username := range unique {
+		normalized = append(normalized, username)
+	}
+	sort.Strings(normalized)
+	return normalized, nil
+}
+
+// AcquireUserAuthorizationLease serializes one account's authorization state
+// transitions with every final remote provisioning mutation. The context makes
+// nested package, managed-node, and forwarding operations re-entrant while a
+// coordinator owns the account lease.
+func (r *TrafficRepository) AcquireUserAuthorizationLease(ctx context.Context, usernames ...string) (context.Context, func(), error) {
+	if r == nil || r.db == nil {
+		return ctx, func() {}, errors.New("traffic repository not initialized")
+	}
+	normalized, err := normalizeAuthorizationLeaseUsers(usernames)
+	if err != nil {
+		return ctx, func() {}, err
+	}
+	if held, _ := ctx.Value(userAuthorizationLeaseContextKey{}).(*userAuthorizationLeaseContext); held != nil {
+		if held.repo != r {
+			return ctx, func() {}, ErrManagedInvalidArgument
+		}
+		for _, username := range normalized {
+			if _, ok := held.usernames[username]; !ok {
+				return ctx, func() {}, fmt.Errorf("%w: nested authorization lease must not expand its user set", ErrManagedInvalidArgument)
+			}
+		}
+		return ctx, func() {}, nil
+	}
+
+	locks := make([]*sync.Mutex, 0, len(normalized))
+	for _, username := range normalized {
+		value, _ := r.userAuthorizationLeases.LoadOrStore(username, &sync.Mutex{})
+		lock := value.(*sync.Mutex)
+		lock.Lock()
+		locks = append(locks, lock)
+	}
+	heldUsers := make(map[string]struct{}, len(normalized))
+	for _, username := range normalized {
+		heldUsers[username] = struct{}{}
+	}
+	leasedCtx := context.WithValue(ctx, userAuthorizationLeaseContextKey{}, &userAuthorizationLeaseContext{
+		repo: r, usernames: heldUsers,
+	})
+	return leasedCtx, func() {
+		for i := len(locks) - 1; i >= 0; i-- {
+			locks[i].Unlock()
+		}
+	}, nil
+}
+
+func (r *TrafficRepository) WithUserAuthorizationLease(ctx context.Context, username string, mutate func(context.Context) error) error {
+	if mutate == nil {
+		return ErrManagedInvalidArgument
+	}
+	leasedCtx, release, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return mutate(leasedCtx)
+}
 
 const userDeletionTombstoneSchema = `
 CREATE TABLE IF NOT EXISTS user_deletion_tombstones (
@@ -72,26 +157,17 @@ func (r *TrafficRepository) WithUsersProvisioningLease(ctx context.Context, user
 	if provision == nil {
 		return ErrManagedInvalidArgument
 	}
-	unique := make(map[string]struct{}, len(usernames))
-	for _, username := range usernames {
-		username = strings.TrimSpace(username)
-		if username == "" {
-			return ErrManagedInvalidArgument
-		}
-		unique[username] = struct{}{}
+	normalized, err := normalizeAuthorizationLeaseUsers(usernames)
+	if err != nil {
+		return err
 	}
-	if len(unique) == 0 {
-		return ErrManagedInvalidArgument
+	_, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, normalized...)
+	if err != nil {
+		return err
 	}
-	normalized := make([]string, 0, len(unique))
-	for username := range unique {
-		normalized = append(normalized, username)
-	}
-	sort.Strings(normalized)
+	defer releaseAuthorization()
 	r.authMutationMu.Lock()
 	defer r.authMutationMu.Unlock()
-	r.managedNodeMu.Lock()
-	defer r.managedNodeMu.Unlock()
 	for _, username := range normalized {
 		var active int
 		if err := r.db.QueryRowContext(ctx, `SELECT is_active FROM users WHERE username = ?`, username).Scan(&active); errors.Is(err, sql.ErrNoRows) {
@@ -148,6 +224,12 @@ func (r *TrafficRepository) PrepareUserDeletion(ctx context.Context, username, a
 	if username == "" || actor == "" {
 		return nil, ErrManagedInvalidArgument
 	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 
 	r.authMutationMu.Lock()
 	defer r.authMutationMu.Unlock()

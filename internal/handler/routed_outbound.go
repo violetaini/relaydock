@@ -1386,6 +1386,33 @@ type routedBatchOutcome struct {
 	RoutingChanged bool
 }
 
+func validatePackageRoutedBatchAuthorization(ctx context.Context, repo *storage.TrafficRepository, items []routedBatchItem) error {
+	for _, item := range items {
+		user, err := repo.GetUser(ctx, item.Username)
+		if err != nil {
+			return err
+		}
+		if !packageAssignmentActive(user, time.Now().UTC()) {
+			return fmt.Errorf("package authorization changed before routed publication for user=%s", item.Username)
+		}
+		pkg, err := repo.GetPackage(ctx, user.PackageID)
+		if err != nil {
+			return err
+		}
+		authorized := false
+		for _, nodeID := range pkg.Nodes {
+			if nodeID == item.RoutedNodeID {
+				authorized = true
+				break
+			}
+		}
+		if !authorized {
+			return fmt.Errorf("routed node %d is no longer authorized for user=%s", item.RoutedNodeID, item.Username)
+		}
+	}
+	return nil
+}
+
 // applyRoutedBatchOrFallback 同台 server 上的 routed 节点改动一次性发给 agent,
 // 老 agent 不支持就 fallback 到逐项 prepareRoutedNodeForUser + applyRoutingAdditionsBatch。
 // 返回实际变更结果和人类可读 warning 列表(给前端 toast 用,空切片=全成功)。
@@ -1401,6 +1428,9 @@ func applyRoutedBatchOrFallback(ctx context.Context, rm *RemoteManageHandler, re
 	}
 	var warnings []string
 	leaseErr := repo.WithUsersProvisioningLease(ctx, usernames, func() error {
+		if err := validatePackageRoutedBatchAuthorization(ctx, repo, items); err != nil {
+			return err
+		}
 		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
 		if err != nil {
 			return err
@@ -1466,6 +1496,9 @@ func applyRoutedBatchToAgent(ctx context.Context, rm *RemoteManageHandler, repo 
 	}
 	var outcome routedBatchOutcome
 	err := repo.WithUsersProvisioningLease(ctx, usernames, func() error {
+		if err := validatePackageRoutedBatchAuthorization(ctx, repo, items); err != nil {
+			return err
+		}
 		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
 		if err != nil {
 			return err

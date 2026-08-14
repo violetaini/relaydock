@@ -106,6 +106,7 @@ func writeForwardingError(w http.ResponseWriter, err error) {
 		errors.Is(err, storage.ErrUserNotFound), errors.Is(err, storage.ErrRemoteServerNotFound):
 		status, message = http.StatusNotFound, err.Error()
 	case errors.Is(err, storage.ErrForwardingConflict), errors.Is(err, storage.ErrForwardingLimit),
+		errors.Is(err, storage.ErrAuthorizationModeConflict),
 		errors.Is(err, storage.ErrRemoteInstallationActive), errors.Is(err, storage.ErrUserDeletionPending):
 		status, message = http.StatusConflict, err.Error()
 	case errors.Is(err, storage.ErrForwardingForbidden):
@@ -450,7 +451,7 @@ func (h *ForwardingHandler) HandleAdminUserTunnelGrant(w http.ResponseWriter, r 
 		writeForwardingError(w, err)
 		return
 	}
-	if current.SourceType == storage.GrantSourcePackage && current.Enabled {
+	if current.SourceType == storage.GrantSourcePackage {
 		writeForwardingError(w, storage.ErrForwardingForbidden)
 		return
 	}
@@ -499,7 +500,7 @@ func (h *ForwardingHandler) HandleAdminUserTunnelGrantAction(w http.ResponseWrit
 		writeForwardingError(w, err)
 		return
 	}
-	if current.SourceType == storage.GrantSourcePackage && current.Enabled {
+	if current.SourceType == storage.GrantSourcePackage {
 		writeForwardingError(w, storage.ErrForwardingForbidden)
 		return
 	}
@@ -1272,6 +1273,28 @@ func forwardNeedsPortConvergence(f *storage.UserForwardRule) bool {
 }
 
 func (h *ForwardingHandler) deployForward(ctx context.Context, f *storage.UserForwardRule) error {
+	if f == nil {
+		return storage.ErrForwardingInvalid
+	}
+	return h.repo.WithUserAuthorizationLease(ctx, f.Username, func(leasedCtx context.Context) error {
+		current, err := h.repo.GetUserForward(leasedCtx, f.PublicID, f.Username)
+		if err != nil {
+			return err
+		}
+		if current.DesiredState != storage.ForwardDesiredActive {
+			return nil
+		}
+		if !h.activeGrantForForward(leasedCtx, *current) {
+			return storage.ErrForwardingForbidden
+		}
+		if _, _, _, _, err := h.resolveManagedForwardTarget(leasedCtx, current.Username, current.TargetNodeID); err != nil {
+			return err
+		}
+		return h.deployForwardLocked(leasedCtx, current)
+	})
+}
+
+func (h *ForwardingHandler) deployForwardLocked(ctx context.Context, f *storage.UserForwardRule) error {
 	current := f
 	var err, cleanupWarning error
 	if forwardNeedsPortConvergence(current) {
@@ -1313,6 +1336,19 @@ func (h *ForwardingHandler) deployForward(ctx context.Context, f *storage.UserFo
 }
 
 func (h *ForwardingHandler) suspendForward(ctx context.Context, f *storage.UserForwardRule, actor string) error {
+	if f == nil {
+		return storage.ErrForwardingInvalid
+	}
+	return h.repo.WithUserAuthorizationLease(ctx, f.Username, func(leasedCtx context.Context) error {
+		current, err := h.repo.GetUserForward(leasedCtx, f.PublicID, f.Username)
+		if err != nil {
+			return err
+		}
+		return h.suspendForwardLocked(leasedCtx, current, actor)
+	})
+}
+
+func (h *ForwardingHandler) suspendForwardLocked(ctx context.Context, f *storage.UserForwardRule, actor string) error {
 	if len(f.Hops) == 0 {
 		return storage.ErrForwardingInvalid
 	}
@@ -1336,6 +1372,19 @@ func (h *ForwardingHandler) suspendForward(ctx context.Context, f *storage.UserF
 }
 
 func (h *ForwardingHandler) resumeForward(ctx context.Context, f *storage.UserForwardRule, actor string) error {
+	if f == nil {
+		return storage.ErrForwardingInvalid
+	}
+	return h.repo.WithUserAuthorizationLease(ctx, f.Username, func(leasedCtx context.Context) error {
+		current, err := h.repo.GetUserForward(leasedCtx, f.PublicID, f.Username)
+		if err != nil {
+			return err
+		}
+		return h.resumeForwardLocked(leasedCtx, current, actor)
+	})
+}
+
+func (h *ForwardingHandler) resumeForwardLocked(ctx context.Context, f *storage.UserForwardRule, actor string) error {
 	g, err := h.repo.GetUserTunnelGrantByID(ctx, f.GrantID)
 	if err != nil {
 		return err
@@ -1360,10 +1409,23 @@ func (h *ForwardingHandler) resumeForward(ctx context.Context, f *storage.UserFo
 	if err != nil {
 		return err
 	}
-	return h.deployForward(ctx, updated)
+	return h.deployForwardLocked(ctx, updated)
 }
 
 func (h *ForwardingHandler) deleteForward(ctx context.Context, f *storage.UserForwardRule, actor string) error {
+	if f == nil {
+		return storage.ErrForwardingInvalid
+	}
+	return h.repo.WithUserAuthorizationLease(ctx, f.Username, func(leasedCtx context.Context) error {
+		current, err := h.repo.GetUserForward(leasedCtx, f.PublicID, f.Username)
+		if err != nil {
+			return err
+		}
+		return h.deleteForwardLocked(leasedCtx, current, actor)
+	})
+}
+
+func (h *ForwardingHandler) deleteForwardLocked(ctx context.Context, f *storage.UserForwardRule, actor string) error {
 	// Capture the last counters while the Guard resource still exists. Metering
 	// failure must not strand remote resources, so cleanup remains fail-open.
 	_ = h.repo.SyncUserForwardUsage(ctx)
@@ -1458,6 +1520,31 @@ func (h *ForwardingHandler) activeGrantForForward(ctx context.Context, f storage
 }
 
 func (h *ForwardingHandler) systemSuspendForward(ctx context.Context, f *storage.UserForwardRule, reason string) error {
+	if f == nil {
+		return storage.ErrForwardingInvalid
+	}
+	return h.repo.WithUserAuthorizationLease(ctx, f.Username, func(leasedCtx context.Context) error {
+		current, err := h.repo.GetUserForward(leasedCtx, f.PublicID, f.Username)
+		if err != nil {
+			return err
+		}
+		if current.DesiredState == storage.ForwardDesiredActive {
+			switch reason {
+			case "grant_inactive":
+				if h.activeGrantForForward(leasedCtx, *current) {
+					return nil
+				}
+			case "target_inactive":
+				if _, _, _, _, targetErr := h.resolveManagedForwardTarget(leasedCtx, current.Username, current.TargetNodeID); targetErr == nil {
+					return nil
+				}
+			}
+		}
+		return h.systemSuspendForwardLocked(leasedCtx, current, reason)
+	})
+}
+
+func (h *ForwardingHandler) systemSuspendForwardLocked(ctx context.Context, f *storage.UserForwardRule, reason string) error {
 	if len(f.Hops) == 0 || h.deployer == nil {
 		return storage.ErrForwardingInvalid
 	}
@@ -1480,6 +1567,22 @@ func (h *ForwardingHandler) systemSuspendForward(ctx context.Context, f *storage
 }
 
 func (h *ForwardingHandler) retryInactiveForwardSuspend(ctx context.Context, f *storage.UserForwardRule) error {
+	if f == nil {
+		return storage.ErrForwardingInvalid
+	}
+	return h.repo.WithUserAuthorizationLease(ctx, f.Username, func(leasedCtx context.Context) error {
+		current, err := h.repo.GetUserForward(leasedCtx, f.PublicID, f.Username)
+		if err != nil {
+			return err
+		}
+		if current.DesiredState != storage.ForwardDesiredInactive {
+			return nil
+		}
+		return h.retryInactiveForwardSuspendLocked(leasedCtx, current)
+	})
+}
+
+func (h *ForwardingHandler) retryInactiveForwardSuspendLocked(ctx context.Context, f *storage.UserForwardRule) error {
 	if len(f.Hops) == 0 || h.deployer == nil {
 		return storage.ErrForwardingInvalid
 	}

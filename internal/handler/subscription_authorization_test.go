@@ -148,6 +148,49 @@ func TestSubscriptionAccessFailsClosedAndCoversLegacyTypeLookup(t *testing.T) {
 	}
 }
 
+func TestPackageSubscriptionRequiresCurrentPackageAuthorization(t *testing.T) {
+	repo, directory, _ := newSubscriptionAuthorizationFixture(t)
+	ctx := context.Background()
+	filename := "package-only.yaml"
+	if err := os.WriteFile(filepath.Join(directory, filename), []byte(subscriptionAuthorizationFixture), 0600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := repo.CreateSubscribeFile(ctx, storage.SubscribeFile{
+		Name: "package only", Type: storage.SubscribeTypePackage, Filename: filename, CreatedBy: "alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AssignSubscriptionToUser(ctx, "alice", file.ID); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewSubscriptionHandlerConcrete(repo, directory)
+	fetch := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodGet, "/api/clash/subscribe?filename="+filename, nil)
+		return fetchSubscription(t, handler, request.WithContext(auth.ContextWithUsername(request.Context(), "alice")))
+	}
+	if response := fetch(); response.Code != http.StatusForbidden {
+		t.Fatalf("custom user package subscription status=%d body=%s", response.Code, response.Body.String())
+	}
+	pkgID, err := repo.CreatePackage(ctx, storage.Package{Name: "subscription package", TrafficLimitBytes: 1024, CycleDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := repo.AssignPackageBundleToUser(ctx, "alice", pkgID, now, now.Add(time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
+	if response := fetch(); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "authorization-fixture") {
+		t.Fatalf("package user subscription status=%d body=%s", response.Code, response.Body.String())
+	}
+	if err := repo.RemovePackageFromUser(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if response := fetch(); response.Code != http.StatusForbidden {
+		t.Fatalf("stale package assignment status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestSubscriptionShortLinksRequireCurrentUserSuffixAndAssignment(t *testing.T) {
 	repo, directory, file := newSubscriptionAuthorizationFixture(t)
 	if err := repo.AssignSubscriptionToUser(context.Background(), "alice", file.ID); err != nil {

@@ -1186,12 +1186,21 @@ func (r *TrafficRepository) CreateUserTunnelGrant(ctx context.Context, g UserTun
 	if g.CreatedBy == "" {
 		return nil, ErrForwardingInvalid
 	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, g.Username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	if _, err := r.GetTunnelTemplateByID(ctx, g.TunnelID); err != nil {
 		return nil, err
 	}
 	var created *UserTunnelGrant
-	err := r.WithUserProvisioningLease(ctx, g.Username, func() error {
+	err = r.WithUserProvisioningLease(ctx, g.Username, func() error {
 		if g.SourceType == GrantSourceManual {
+			if err := requireUserAuthorizationMode(ctx, r.db, g.Username, AuthorizationModeCustom); err != nil {
+				return err
+			}
 			var tombstoneID int64
 			var tombstoneVersion int64
 			tombstoneErr := r.db.QueryRowContext(ctx, `SELECT id,version FROM user_tunnel_grants
@@ -1311,11 +1320,21 @@ COALESCE((SELECT SUM(`+forwardBilledUsageExpression+`) FROM user_forward_usage u
 }
 
 func (r *TrafficRepository) UpdateUserTunnelGrant(ctx context.Context, publicID, username string, in UserTunnelGrant, expectedVersion int64, actor string) (*UserTunnelGrant, error) {
+	username = strings.TrimSpace(username)
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	var updated *UserTunnelGrant
-	err := r.WithUserProvisioningLease(ctx, username, func() error {
+	err = r.WithUserProvisioningLease(ctx, username, func() error {
 		current, err := r.GetUserTunnelGrant(ctx, publicID, username)
 		if err != nil {
 			return err
+		}
+		if current.SourceType == GrantSourcePackage {
+			return ErrAuthorizationModeConflict
 		}
 		in.Username = current.Username
 		in.TunnelID = current.TunnelID
@@ -1323,6 +1342,11 @@ func (r *TrafficRepository) UpdateUserTunnelGrant(ctx context.Context, publicID,
 		in.SourcePackageID = current.SourcePackageID
 		if err := normalizeTunnelGrant(&in); err != nil {
 			return err
+		}
+		if in.SourceType == GrantSourceManual && in.Enabled {
+			if err := requireUserAuthorizationMode(ctx, r.db, in.Username, AuthorizationModeCustom); err != nil {
+				return err
+			}
 		}
 		billingChanged := current.BillingModeOverride == nil ||
 			*current.BillingModeOverride != *in.BillingModeOverride
@@ -1381,12 +1405,22 @@ func (r *TrafficRepository) UpdateUserTunnelGrant(ctx context.Context, publicID,
 }
 
 func (r *TrafficRepository) DeleteUserTunnelGrant(ctx context.Context, publicID, username, actor string) error {
+	username = strings.TrimSpace(username)
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 
 	g, err := r.GetUserTunnelGrant(ctx, publicID, username)
 	if err != nil {
 		return err
+	}
+	if g.SourceType == GrantSourcePackage {
+		return ErrAuthorizationModeConflict
 	}
 	var n int
 	_ = r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_forward_rules WHERE grant_id=? AND desired_state!='deleted'`, g.ID).Scan(&n)
@@ -1423,6 +1457,12 @@ func (r *TrafficRepository) CreateUserForward(ctx context.Context, in CreateUser
 	if in.Username == "" || in.Name == "" || in.TargetNodeID <= 0 || in.TargetHost == "" || in.TargetPort < 1 || in.TargetPort > 65535 || in.RequestedEntryPort < 0 || in.RequestedEntryPort > 65535 {
 		return nil, ErrForwardingInvalid
 	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, in.Username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -1971,6 +2011,13 @@ WHERE id=? AND desired_state='active'`, observed, reason, code, detail, id)
 }
 
 func (r *TrafficRepository) PrepareUserForwardSystemSuspend(ctx context.Context, publicID, username, reason string) (*UserForwardRule, error) {
+	username = strings.TrimSpace(username)
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	forward, err := r.GetUserForward(ctx, publicID, username)
@@ -2001,6 +2048,13 @@ func (r *TrafficRepository) PrepareUserForwardSystemSuspend(ctx context.Context,
 }
 
 func (r *TrafficRepository) PrepareUserForwardSystemApply(ctx context.Context, publicID, username string) (*UserForwardRule, error) {
+	username = strings.TrimSpace(username)
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	forward, err := r.GetUserForward(ctx, publicID, username)
@@ -2038,6 +2092,13 @@ func (r *TrafficRepository) SetUserForwardDesired(ctx context.Context, publicID,
 	if desired != ForwardDesiredActive && desired != ForwardDesiredInactive && desired != ForwardDesiredDeleted {
 		return nil, ErrForwardingInvalid
 	}
+	username = strings.TrimSpace(username)
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	f, err := r.GetUserForward(ctx, publicID, username)

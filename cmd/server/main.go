@@ -697,6 +697,9 @@ func main() {
 	packageAssignHandler.StartReconciler(packageReconcileCtx)
 	tgbotAPIHandler.SetPackageAssign(packageAssignHandler) // 让 TGBOT 注册/兑换的套餐走同一套下发
 	mux.Handle("/api/admin/packages/assign", auth.RequireAdmin(tokenStore, userRepo, packageAssignHandler))
+	serviceAuthorizationHandler := handler.NewServiceAuthorizationHandler(repo, packageAssignHandler, managedNodesHandler, forwardingHandler)
+	mux.Handle("/api/admin/users/service-authorization/batch", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(serviceAuthorizationHandler.HandleBatch)))
+	mux.Handle("/api/admin/users/{username}/service-authorization", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(serviceAuthorizationHandler.HandleUser)))
 	// 快捷续期:复用 packageAssignHandler 的 AssignAndProvision(samePackage 快路径),只延长 package_end_date
 	mux.Handle("/api/admin/users/extend", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserExtendHandler(packageAssignHandler)))
 	mux.Handle("/api/admin/packages/unassign", auth.RequireAdmin(tokenStore, userRepo, handler.NewPackageUnassignHandler(repo, remoteManageHandler, limiterPusher)))

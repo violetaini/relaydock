@@ -198,6 +198,12 @@ func (r *TrafficRepository) ActivateUserNodeSelection(ctx context.Context, usern
 	if username == "" || actor == "" || offerID <= 0 || now.IsZero() {
 		return nil, ErrManagedInvalidArgument
 	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	now = now.UTC()
@@ -433,6 +439,12 @@ func (r *TrafficRepository) DeactivateUserNodeSelection(ctx context.Context, use
 	if username == "" || actor == "" || selectionID <= 0 || now.IsZero() || !validManagedSuspendReason(suspendReason) || suspendReason == ManagedSuspendNone {
 		return nil, ErrManagedInvalidArgument
 	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	now = now.UTC()
@@ -555,6 +567,21 @@ func (r *TrafficRepository) UpdateUserNodeSelectionLimits(ctx context.Context, s
 		}
 		normalizedBilling = value
 	}
+	var leaseUsername string
+	if err := r.db.QueryRowContext(ctx, `SELECT g.username
+FROM user_node_selections s
+JOIN user_server_grants g ON g.id = s.grant_id
+WHERE s.id = ?`, selectionID).Scan(&leaseUsername); errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUserNodeSelectionNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("resolve managed selection owner: %w", err)
+	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, leaseUsername)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	now := time.Now().UTC()
@@ -575,6 +602,9 @@ func (r *TrafficRepository) UpdateUserNodeSelectionLimits(ctx context.Context, s
 	if err := tx.QueryRowContext(ctx, `SELECT username, server_id, billing_mode
 FROM user_server_grants WHERE id = ?`, selection.GrantID).Scan(&username, &serverID, &grantBilling); err != nil {
 		return nil, err
+	}
+	if username != leaseUsername {
+		return nil, ErrManagedVersionConflict
 	}
 	currentBilling := grantBilling
 	if selection.BillingModeOverride != nil {

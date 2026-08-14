@@ -55,7 +55,10 @@ func (h *TGBotAPIHandler) assignPackage(ctx context.Context, username string, pa
 	if h.assign != nil {
 		return h.assign.AssignAndProvision(ctx, username, packageID, start, end, isReset, resetDay)
 	}
-	return nil, h.repo.AssignPackageToUser(ctx, username, packageID, start, end, isReset, resetDay)
+	err := withStableUserPackageAuthorizationLease(ctx, h.repo, username, []int64{packageID}, func(leasedCtx context.Context, _ storage.User) error {
+		return h.repo.AssignPackageToUser(leasedCtx, username, packageID, start, end, isReset, resetDay)
+	})
+	return nil, err
 }
 
 func resolveTGResetPolicy(pkg *storage.Package, current *storage.User, now time.Time) (bool, int) {

@@ -31,6 +31,7 @@ type ManagedNodesHandler struct {
 	limiter         *LimiterConfigPusher
 	guardHTTPClient *http.Client
 	reconcileMu     sync.Mutex
+	reconcileRunMu  sync.Mutex
 	reconcileWG     sync.WaitGroup
 }
 
@@ -225,6 +226,7 @@ func writeManagedError(w http.ResponseWriter, err error) {
 		status, message = http.StatusNotFound, err.Error()
 	case errors.Is(err, storage.ErrSelfServiceNodeOfferExists),
 		errors.Is(err, storage.ErrUserServerGrantExists),
+		errors.Is(err, storage.ErrAuthorizationModeConflict),
 		errors.Is(err, storage.ErrManagedVersionConflict),
 		errors.Is(err, storage.ErrManagedGenerationConflict),
 		errors.Is(err, storage.ErrManagedAccessConflict),
@@ -346,9 +348,18 @@ func (h *ManagedNodesHandler) requireManagedAgentCapabilities(ctx context.Contex
 // generation after acquiring the lock. This prevents a delayed stale add from
 // landing after a newer revoke has already completed.
 func (h *ManagedNodesHandler) reconcileSource(ctx context.Context, source storage.UserInboundAccessSource) error {
-	h.reconcileMu.Lock()
-	defer h.reconcileMu.Unlock()
-	return h.reconcileSourceCurrentLocked(ctx, source.ID)
+	return h.repo.WithUserAuthorizationLease(ctx, source.Username, func(leasedCtx context.Context) error {
+		h.reconcileMu.Lock()
+		defer h.reconcileMu.Unlock()
+		current, err := h.repo.GetUserInboundAccessSource(leasedCtx, source.ID)
+		if err != nil {
+			return err
+		}
+		if current.Username != source.Username {
+			return storage.ErrManagedServerMismatch
+		}
+		return h.reconcileSourceLocked(leasedCtx, *current)
+	})
 }
 
 func (h *ManagedNodesHandler) reconcileSourceCurrentLocked(ctx context.Context, sourceID int64) error {
@@ -677,10 +688,10 @@ func (h *ManagedNodesHandler) WaitForReconciler() {
 }
 
 func (h *ManagedNodesHandler) reconcileAll(ctx context.Context) {
-	if !h.reconcileMu.TryLock() {
+	if !h.reconcileRunMu.TryLock() {
 		return
 	}
-	defer h.reconcileMu.Unlock()
+	defer h.reconcileRunMu.Unlock()
 
 	now := time.Now().UTC()
 	h.syncManagedUsage(ctx, now)
@@ -745,7 +756,7 @@ func (h *ManagedNodesHandler) reconcileAll(ctx context.Context) {
 		return
 	}
 	for _, source := range pending {
-		if err := h.reconcileSourceCurrentLocked(ctx, source.ID); err != nil {
+		if err := h.reconcileSource(ctx, source); err != nil {
 			// User deletion materializes legacy-review revocations for every
 			// credential. A direct source may therefore be deleted first; missing
 			// source metadata must not block the legacy cleanup job.
@@ -1307,7 +1318,7 @@ func (h *ManagedNodesHandler) HandleAdminGrant(w http.ResponseWriter, r *http.Re
 		writeManagedError(w, storage.ErrUserServerGrantNotFound)
 		return
 	}
-	if existing.SourceType == storage.GrantSourcePackage && existing.Enabled {
+	if existing.SourceType == storage.GrantSourcePackage {
 		writeManagedError(w, storage.ErrManagedInvalidArgument)
 		return
 	}

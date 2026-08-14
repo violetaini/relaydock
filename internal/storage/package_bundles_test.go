@@ -283,7 +283,7 @@ func TestUpdatePackageBundleBackfillsLegacyAssignmentWindow(t *testing.T) {
 	}
 }
 
-func TestPackageBundleNeverOverwritesManualGrant(t *testing.T) {
+func TestPackageBundleRejectsActiveManualGrant(t *testing.T) {
 	ctx := context.Background()
 	repo := packageBundleTestRepo(t)
 	if err := repo.EnsureUser(ctx, "alice", "hash"); err != nil {
@@ -310,8 +310,8 @@ func TestPackageBundleNeverOverwritesManualGrant(t *testing.T) {
 		t.Fatalf("CreatePackage: %v", err)
 	}
 	warnings, err := repo.AssignPackageBundleToUser(ctx, "alice", packageID, now, now.Add(24*time.Hour), false, 1)
-	if err != nil || len(warnings) != 1 {
-		t.Fatalf("warnings=%v err=%v", warnings, err)
+	if !errors.Is(err, ErrAuthorizationModeConflict) || len(warnings) != 0 {
+		t.Fatalf("warnings=%v err=%v, want authorization mode conflict", warnings, err)
 	}
 	got, err := repo.GetUserServerGrant(ctx, manual.ID)
 	if err != nil {
@@ -320,12 +320,9 @@ func TestPackageBundleNeverOverwritesManualGrant(t *testing.T) {
 	if got.MaxActiveNodes != 9 || got.SourceType != GrantSourceManual || !got.Enabled {
 		t.Fatalf("manual grant was overwritten: %+v", got)
 	}
-	if err := repo.RemovePackageFromUser(ctx, "alice"); err != nil {
-		t.Fatal(err)
-	}
-	got, _ = repo.GetUserServerGrant(ctx, manual.ID)
-	if !got.Enabled {
-		t.Fatalf("manual grant was revoked: %+v", got)
+	user, err := repo.GetUser(ctx, "alice")
+	if err != nil || user.AuthorizationMode != AuthorizationModeCustom || user.PackageID != 0 {
+		t.Fatalf("failed assignment changed user: user=%+v err=%v", user, err)
 	}
 }
 

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -84,25 +85,46 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 	for _, user := range users {
 		// 套餐到期检查：到期后移除入站并清除套餐绑定
 		if user.PackageEndDate != nil && now.After(*user.PackageEndDate) {
-			log.Printf("[TrafficLimitEnforcer] User %s package expired at %s, removing from inbounds and clearing package",
-				user.Username, user.PackageEndDate.Format("2006-01-02"))
-			removed := e.removeUserFromAllInbounds(ctx, user.Username, true)
-			// 用户私有路由出站(routed_owner='user'):父 inbound 来自套餐分配的节点,
-			// 套餐到期后失去访问权,所以一并 suspend(凭据保留供续费恢复)。
-			suspendUserPrivateRouted(ctx, e.remoteManage, e.repo, user.Username)
-			if !removed {
-				// agent 摘除未确认成功(多半离线):保留 user_inbound_configs 与套餐绑定,下个周期重试。
-				// 不在此清 DB —— 否则 agent 残留孤儿 client 而 DB 无行,既造成「同 email 不同 uuid」漂移,
-				// 过期用户还因孤儿 client 继续有访问权。也暂不发到期通知,避免每周期反复打扰。
-				log.Printf("[TrafficLimitEnforcer] User %s expiry removal incomplete (agent unreachable?), keep configs & retry next cycle", user.Username)
+			expired := false
+			expiredPackageID := int64(0)
+			expiredAt := time.Time{}
+			cleanupErr := withStableUserPackageAuthorizationLease(ctx, e.repo, user.Username, []int64{user.PackageID}, func(leasedCtx context.Context, latest storage.User) error {
+				if latest.AuthorizationMode != storage.AuthorizationModePackage || latest.PackageID <= 0 ||
+					latest.PackageEndDate == nil || now.Before(*latest.PackageEndDate) {
+					return nil
+				}
+				expired = true
+				expiredPackageID = latest.PackageID
+				expiredAt = *latest.PackageEndDate
+				// User-owned routed children are suspended before the package row is
+				// cleared. A remote failure therefore leaves the expired assignment in
+				// place as durable retry authority for the next enforcer pass.
+				if err := suspendUserPrivateRouted(leasedCtx, e.remoteManage, e.repo, latest.Username); err != nil {
+					return fmt.Errorf("suspend private routed access: %w", err)
+				}
+				if err := unbindUserPackageLocked(leasedCtx, e.repo, e.remoteManage, e.pusher, latest.Username, true); err != nil {
+					return err
+				}
+				return nil
+			})
+			if cleanupErr != nil && !expired {
+				log.Printf("[TrafficLimitEnforcer] User %s expiry state could not be revalidated: %v", user.Username, cleanupErr)
 				continue
 			}
-			if err := e.repo.RemovePackageFromUser(ctx, user.Username); err != nil {
-				log.Printf("[TrafficLimitEnforcer] Failed to remove package from %s: %v", user.Username, err)
+			if !expired {
+				continue
+			}
+			log.Printf("[TrafficLimitEnforcer] User %s package expired at %s, removing from inbounds and clearing package",
+				user.Username, expiredAt.Format("2006-01-02"))
+			if cleanupErr != nil {
+				// Keep the expired package assignment as retry authority whenever a
+				// remote revoke or child cleanup is incomplete.
+				log.Printf("[TrafficLimitEnforcer] User %s expiry cleanup incomplete, retained for retry: %v", user.Username, cleanupErr)
+				continue
 			}
 			// 套餐过期 tg 通知 — 用户的当前 package_id 在 RemovePackageFromUser 之前的快照里
 			pkgName := ""
-			if p, perr := e.repo.GetPackage(ctx, user.PackageID); perr == nil && p != nil {
+			if p, perr := e.repo.GetPackage(ctx, expiredPackageID); perr == nil && p != nil {
 				pkgName = p.Name
 			}
 			SendPackageExpiredNotification(ctx, user.Username, pkgName)

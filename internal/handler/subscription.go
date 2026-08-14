@@ -259,6 +259,10 @@ func (h *SubscriptionHandler) authorizeSubscriptionAccess(ctx context.Context, u
 	if user.Role == storage.RoleAdmin {
 		return nil
 	}
+	if subscribeFile.Type == storage.SubscribeTypePackage &&
+		(user.AuthorizationMode != storage.AuthorizationModePackage || user.PackageID <= 0) {
+		return errSubscriptionAccessForbidden
+	}
 	// Legacy subscription_links without a subscribe_files row have no owner or
 	// assignment binding. Keep them available to administrators only.
 	if !hasSubscribeFile || subscribeFile.ID <= 0 {

@@ -1105,6 +1105,14 @@ func (r *TrafficRepository) CreateUserServerGrant(ctx context.Context, grant Use
 	if err != nil {
 		return nil, err
 	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, grant.Username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
 	var userExists, serverExists int
 	if err := r.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE username = ?),
 EXISTS(SELECT 1 FROM remote_servers WHERE id = ?)`, grant.Username, grant.ServerID).Scan(&userExists, &serverExists); err != nil {
@@ -1132,6 +1140,11 @@ EXISTS(SELECT 1 FROM remote_servers WHERE id = ?)`, grant.Username, grant.Server
 		return nil, fmt.Errorf("begin create user server grant: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if grant.SourceType == GrantSourceManual {
+		if err := requireUserAuthorizationMode(ctx, tx, grant.Username, AuthorizationModeCustom); err != nil {
+			return nil, err
+		}
+	}
 	allowedProtocolsJSON, err := json.Marshal(grant.AllowedProtocols)
 	if err != nil {
 		return nil, fmt.Errorf("encode managed grant allowed protocols: %w", err)
@@ -1300,11 +1313,29 @@ func (r *TrafficRepository) UpdateUserServerGrant(ctx context.Context, grant Use
 	if grant.ID <= 0 || expectedVersion <= 0 || actor == "" {
 		return nil, ErrManagedInvalidArgument
 	}
+	var leaseUsername string
+	if err := r.db.QueryRowContext(ctx, `SELECT username FROM user_server_grants WHERE id = ?`, grant.ID).Scan(&leaseUsername); errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUserServerGrantNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("resolve user server grant owner: %w", err)
+	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, leaseUsername)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	existing, err := r.GetUserServerGrant(ctx, grant.ID)
 	if err != nil {
 		return nil, err
+	}
+	if existing.Username != leaseUsername {
+		return nil, ErrManagedVersionConflict
+	}
+	if existing.SourceType == GrantSourcePackage {
+		return nil, ErrAuthorizationModeConflict
 	}
 	grant.Username = existing.Username
 	grant.ServerID = existing.ServerID
@@ -1355,6 +1386,11 @@ FROM user_node_selection_usage WHERE grant_id = ?`, grant.ID).Scan(&recorded); e
 		return nil, fmt.Errorf("begin update user server grant: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if grant.SourceType == GrantSourceManual && grant.Enabled {
+		if err := requireUserAuthorizationMode(ctx, tx, grant.Username, AuthorizationModeCustom); err != nil {
+			return nil, err
+		}
+	}
 
 	// Narrowing the whitelist is a revocation, not a presentation-only filter.
 	// Mark disallowed selections inactive before refreshing their access sources;
@@ -1505,6 +1541,18 @@ func (r *TrafficRepository) DeleteUserServerGrant(ctx context.Context, id, expec
 	if id <= 0 || expectedVersion <= 0 || actor == "" {
 		return ErrManagedInvalidArgument
 	}
+	var leaseUsername string
+	if err := r.db.QueryRowContext(ctx, `SELECT username FROM user_server_grants WHERE id = ?`, id).Scan(&leaseUsername); errors.Is(err, sql.ErrNoRows) {
+		return ErrUserServerGrantNotFound
+	} else if err != nil {
+		return fmt.Errorf("resolve user server grant owner: %w", err)
+	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, leaseUsername)
+	if err != nil {
+		return err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	r.managedNodeMu.Lock()
 	defer r.managedNodeMu.Unlock()
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -1519,6 +1567,9 @@ func (r *TrafficRepository) DeleteUserServerGrant(ctx context.Context, id, expec
 		return ErrUserServerGrantNotFound
 	} else if err != nil {
 		return fmt.Errorf("get grant before delete: %w", err)
+	}
+	if username != leaseUsername {
+		return ErrManagedVersionConflict
 	}
 	if version != expectedVersion {
 		return ErrManagedVersionConflict
