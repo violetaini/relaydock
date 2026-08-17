@@ -162,6 +162,9 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 	if err != nil {
 		return fmt.Errorf("load database inbound credential server: %w", err)
 	}
+	if err := h.resetPanelManagedWireGuardBasePeers(ctx, serverID, desired); err != nil {
+		return err
+	}
 	refs, err := h.repo.ListInboundNodeRefsForServer(ctx, server.Name)
 	if err != nil {
 		return fmt.Errorf("list database inbound node owners: %w", err)
@@ -177,6 +180,15 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 		}
 		if !node.Enabled || node.OriginalServer != server.Name || node.InboundTag != ref.InboundTag {
 			continue
+		}
+		if canonicalManagedProtocol(node.Protocol) == "wireguard" {
+			provisionable, provenanceErr := h.repo.ManagedWireGuardNodeAuthorityProvisionable(ctx, node.ID)
+			if provenanceErr != nil {
+				return fmt.Errorf("verify database inbound owner WireGuard node %d: %w", node.ID, provenanceErr)
+			}
+			if !provisionable {
+				continue
+			}
 		}
 		if nodeOwners[ref.InboundTag] == nil {
 			nodeOwners[ref.InboundTag] = make(map[string]struct{})
@@ -216,6 +228,12 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 		if credential == nil {
 			return fmt.Errorf("database inbound credential for %s/%s is not a JSON object", config.Username, config.InboundTag)
 		}
+		if protocol == "wireguard" {
+			credential, err = wireGuardAgentCredentialFromJSON(config.CredentialJSON)
+			if err != nil {
+				return fmt.Errorf("sanitize database WireGuard credential for %s/%s: %w", config.Username, config.InboundTag, err)
+			}
+		}
 		identityKey := inboundCredentialPrimaryKey(protocol)
 		if identityKey == "" || nonEmptyCredentialValue(credential, identityKey) == "" {
 			return fmt.Errorf("database inbound credential for %s/%s has no usable identity", config.Username, config.InboundTag)
@@ -238,6 +256,15 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 		// back only after current authorization succeeds.
 		clients = filterCredentials(clients, credential, protocol)
 		settings[listKey] = clients
+		if protocol == "wireguard" {
+			provisionable, provenanceErr := h.repo.ManagedWireGuardInboundAuthorityProvisionable(ctx, serverID, config.InboundTag)
+			if provenanceErr != nil {
+				return fmt.Errorf("verify managed WireGuard provenance for %s/%s: %w", config.Username, config.InboundTag, provenanceErr)
+			}
+			if !provisionable {
+				continue
+			}
+		}
 
 		user, userErr := h.repo.GetUser(ctx, config.Username)
 		if errors.Is(userErr, storage.ErrUserNotFound) {
@@ -252,9 +279,6 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 		overLimit, limitErr := h.repo.IsUserOverLimit(ctx, config.Username)
 		if limitErr != nil {
 			return fmt.Errorf("load inbound credential limit state for %s: %w", config.Username, limitErr)
-		}
-		if overLimit {
-			continue
 		}
 		_, ownsNode := nodeOwners[config.InboundTag][config.Username]
 		hasAccess := ownsNode
@@ -271,11 +295,21 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 			if directErr != nil {
 				return fmt.Errorf("resolve direct inbound access for %s/%s: %w", config.Username, config.InboundTag, directErr)
 			}
-			hasPackage, _, packageErr := hasLegacyPackageInboundAccess(
-				ctx, h.repo, config.Username, serverID, config.InboundTag, now,
-			)
-			if packageErr != nil {
-				return fmt.Errorf("resolve package inbound access for %s/%s: %w", config.Username, config.InboundTag, packageErr)
+			hasPackage := false
+			if !overLimit {
+				var packageErr error
+				if protocol == "wireguard" {
+					hasPackage, _, packageErr = hasLegacyPackageInboundAccessIgnoringOverLimit(
+						ctx, h.repo, config.Username, serverID, config.InboundTag, now,
+					)
+				} else {
+					hasPackage, _, packageErr = hasLegacyPackageInboundAccess(
+						ctx, h.repo, config.Username, serverID, config.InboundTag, now,
+					)
+				}
+				if packageErr != nil {
+					return fmt.Errorf("resolve package inbound access for %s/%s: %w", config.Username, config.InboundTag, packageErr)
+				}
 			}
 			hasAccess = hasManaged || hasDirect || hasPackage
 		}
@@ -323,6 +357,330 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 		}
 	}
 	return nil
+}
+
+// resetPanelManagedWireGuardBasePeers removes the anonymous bootstrap peer
+// captured by older panel-created definitions. The durable probe identity is
+// the only non-user peer allowed in a panel-managed WireGuard inbound; active
+// user peers are appended from user_inbound_configs below.
+func (h *RemoteManageHandler) resetPanelManagedWireGuardBasePeers(
+	ctx context.Context,
+	serverID int64,
+	desired map[string]map[string]interface{},
+) error {
+	for tag, inbound := range desired {
+		if canonicalManagedProtocol(wireGuardStringValue(inbound["protocol"])) != "wireguard" {
+			continue
+		}
+		resource, err := h.repo.GetManagedInboundResourceByServerTag(ctx, serverID, tag)
+		if errors.Is(err, storage.ErrManagedInboundResourceNotFound) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("load panel-managed WireGuard resource %s: %w", tag, err)
+		}
+		if canonicalManagedProtocol(resource.Protocol) != "wireguard" {
+			return fmt.Errorf("panel-managed resource %s has protocol %s, want wireguard", tag, resource.Protocol)
+		}
+		probePeer, err := ensureAuthoritativeManagedWireGuardProbePeer(ctx, h.repo, resource, inbound)
+		if err != nil {
+			return fmt.Errorf("prepare panel-managed WireGuard probe peer %s: %w", tag, err)
+		}
+		if _, err := replacePanelManagedWireGuardPeersWithProbe(inbound, probePeer); err != nil {
+			return fmt.Errorf("normalize panel-managed WireGuard peers %s: %w", tag, err)
+		}
+	}
+	return nil
+}
+
+// ensureAuthoritativeManagedWireGuardProbePeer migrates a legacy managed
+// WireGuard resource that predates wireguard_probe_peers. The new address is
+// allocated around both the legacy bootstrap peer and every durable user
+// credential, then the durable desired definition and public metadata are
+// reduced to the probe alone. The encrypted pending row is written first; no
+// Agent mutation may occur until all remaining database writes succeed.
+func ensureAuthoritativeManagedWireGuardProbePeer(
+	ctx context.Context,
+	repo *storage.TrafficRepository,
+	resource *storage.ManagedInboundResource,
+	inbound map[string]interface{},
+) (*storage.WireGuardProbePeer, error) {
+	if repo == nil || resource == nil || resource.ID <= 0 || resource.ServerID <= 0 ||
+		canonicalManagedProtocol(resource.Protocol) != "wireguard" || strings.TrimSpace(resource.InboundTag) == "" {
+		return nil, errors.New("invalid panel-managed WireGuard resource")
+	}
+
+	desiredRow, err := repo.GetDesiredInbound(ctx, resource.ServerID, resource.InboundTag)
+	if err != nil {
+		return nil, fmt.Errorf("load authoritative desired inbound: %w", err)
+	}
+	if inbound == nil && desiredRow != nil && desiredRow.DesiredState == storage.DesiredInboundStateActive {
+		inbound, err = decodeDesiredInbound(desiredRow.InboundJSON)
+		if err != nil {
+			return nil, fmt.Errorf("decode authoritative desired inbound: %w", err)
+		}
+	}
+	if inbound != nil {
+		if canonicalManagedProtocol(wireGuardStringValue(inbound["protocol"])) != "wireguard" ||
+			strings.TrimSpace(wireGuardStringValue(inbound["tag"])) != strings.TrimSpace(resource.InboundTag) {
+			return nil, errors.New("authoritative managed WireGuard definition does not match its resource")
+		}
+		port, ok := wireGuardNumericValue(inbound["port"])
+		if !ok || port != float64(resource.EndpointPort) {
+			return nil, errors.New("authoritative managed WireGuard port does not match its resource")
+		}
+	}
+
+	probePeer, peerErr := repo.GetWireGuardProbePeer(ctx, resource.ID)
+	peerMissing := errors.Is(peerErr, storage.ErrWireGuardProbePeerNotFound)
+	if peerErr != nil && !peerMissing {
+		return nil, fmt.Errorf("load encrypted probe identity: %w", peerErr)
+	}
+	if peerMissing {
+		if desiredRow == nil || desiredRow.DesiredState != storage.DesiredInboundStateActive || inbound == nil {
+			return nil, errors.New("legacy managed WireGuard resource has no active authoritative definition for probe migration")
+		}
+		resourceMutation := strings.TrimSpace(resource.MutationID)
+		if resourceMutation == "" || strings.TrimSpace(desiredRow.MutationID) != resourceMutation {
+			return nil, errors.New("legacy managed WireGuard resource generation does not match its authoritative definition")
+		}
+		allocationInbound, cloneErr := managedWireGuardProbeAllocationInbound(ctx, repo, resource, inbound)
+		if cloneErr != nil {
+			return nil, cloneErr
+		}
+		probePeer, err = createWireGuardProbePeerForInbound(ctx, repo, resource.ID, allocationInbound)
+		if err != nil {
+			// A concurrent authoritative builder may have won the unique resource
+			// row. Reuse only the successfully persisted encrypted identity.
+			persisted, loadErr := repo.GetWireGuardProbePeer(ctx, resource.ID)
+			if loadErr != nil {
+				return nil, fmt.Errorf("persist encrypted legacy WireGuard probe identity: %w", err)
+			}
+			probePeer = persisted
+		}
+	}
+	if probePeer == nil {
+		return nil, errors.New("panel-managed WireGuard probe identity is unavailable")
+	}
+
+	if desiredRow != nil && desiredRow.DesiredState != storage.DesiredInboundStateActive {
+		if peerMissing {
+			return nil, errors.New("refusing to migrate a deleted managed WireGuard definition")
+		}
+		return probePeer, nil
+	}
+	if inbound == nil {
+		return probePeer, nil
+	}
+	changed, err := replacePanelManagedWireGuardPeersWithProbe(inbound, probePeer)
+	if err != nil {
+		return nil, err
+	}
+	if changed && desiredRow != nil {
+		stripManagedInboundRuntimeFields(inbound)
+		encoded, marshalErr := json.Marshal(inbound)
+		if marshalErr != nil {
+			return nil, fmt.Errorf("encode migrated managed WireGuard definition: %w", marshalErr)
+		}
+		if _, persistErr := repo.UpsertActiveDesiredInbound(
+			ctx, resource.ServerID, resource.InboundTag, desiredRow.MutationID, encoded,
+		); persistErr != nil {
+			return nil, fmt.Errorf("persist migrated managed WireGuard definition: %w", persistErr)
+		}
+	}
+	if managedWireGuardInventoryMatchesResource(inbound, resource) != nil {
+		if err := updateWireGuardProbeResourceMetadata(ctx, repo, resource, inbound); err != nil {
+			return nil, fmt.Errorf("persist migrated managed WireGuard metadata: %w", err)
+		}
+	}
+	return probePeer, nil
+}
+
+func managedWireGuardProbeAllocationInbound(
+	ctx context.Context,
+	repo *storage.TrafficRepository,
+	resource *storage.ManagedInboundResource,
+	inbound map[string]interface{},
+) (map[string]interface{}, error) {
+	allocationInbound := cloneInboundMap(inbound)
+	if allocationInbound == nil {
+		return nil, errors.New("clone authoritative managed WireGuard definition")
+	}
+	settings, peers, err := wireGuardInboundProbePeers(allocationInbound)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]interface{}, 0, len(peers)+1)
+	for _, peer := range peers {
+		items = append(items, peer)
+	}
+	configs, err := repo.GetUserInboundConfigsByServer(ctx, resource.ServerID)
+	if err != nil {
+		return nil, fmt.Errorf("list durable WireGuard credentials for probe allocation: %w", err)
+	}
+	for _, config := range configs {
+		if strings.TrimSpace(config.InboundTag) != strings.TrimSpace(resource.InboundTag) ||
+			canonicalManagedProtocol(config.Protocol) != "wireguard" {
+			continue
+		}
+		credential, credentialErr := wireGuardAgentCredentialFromJSON(config.CredentialJSON)
+		if credentialErr != nil {
+			return nil, fmt.Errorf("validate durable WireGuard credential %s/%s for probe allocation: %w",
+				config.Username, config.InboundTag, credentialErr)
+		}
+		items = append(items, credential)
+	}
+	settings["peers"] = items
+	return allocationInbound, nil
+}
+
+func replacePanelManagedWireGuardPeersWithProbe(
+	inbound map[string]interface{},
+	probePeer *storage.WireGuardProbePeer,
+) (bool, error) {
+	settings, peers, err := wireGuardInboundProbePeers(inbound)
+	if err != nil {
+		return false, err
+	}
+	present, err := wireGuardInboundHasProbePeer(inbound, probePeer)
+	if err != nil {
+		return false, err
+	}
+	changed := !present || len(peers) != 1
+	settings["peers"] = []interface{}{map[string]interface{}{
+		"publicKey":  probePeer.PublicKey,
+		"allowedIPs": append([]string(nil), probePeer.Addresses...),
+		"keepAlive":  0,
+	}}
+	return changed, nil
+}
+
+func (h *RemoteManageHandler) markAuthoritativeWireGuardProbesActive(
+	ctx context.Context,
+	serverID int64,
+	desired map[string]map[string]interface{},
+) error {
+	for tag, inbound := range desired {
+		if canonicalManagedProtocol(wireGuardStringValue(inbound["protocol"])) != "wireguard" {
+			continue
+		}
+		resource, err := h.repo.GetManagedInboundResourceByServerTag(ctx, serverID, tag)
+		if errors.Is(err, storage.ErrManagedInboundResourceNotFound) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("load panel-managed WireGuard resource %s: %w", tag, err)
+		}
+		probePeer, err := h.repo.GetWireGuardProbePeer(ctx, resource.ID)
+		if err != nil {
+			return fmt.Errorf("load panel-managed WireGuard probe %s after Agent reconciliation: %w", tag, err)
+		}
+		present, err := wireGuardInboundHasProbePeer(inbound, probePeer)
+		if err != nil {
+			return fmt.Errorf("validate panel-managed WireGuard probe %s after Agent reconciliation: %w", tag, err)
+		}
+		if !present {
+			return fmt.Errorf("panel-managed WireGuard probe %s is absent after Agent reconciliation", tag)
+		}
+		if probePeer.State == storage.WireGuardProbePeerStatePending {
+			if _, err := h.repo.MarkWireGuardProbePeerActive(ctx, resource.ID); err != nil {
+				return fmt.Errorf("activate panel-managed WireGuard probe %s: %w", tag, err)
+			}
+		}
+	}
+	return nil
+}
+
+func databaseInboundsRequireWireGuardPolicy(
+	ctx context.Context,
+	repo *storage.TrafficRepository,
+	serverID int64,
+	desired map[string]map[string]interface{},
+) (bool, error) {
+	for tag, inbound := range desired {
+		if canonicalManagedProtocol(wireGuardStringValue(inbound["protocol"])) != "wireguard" {
+			continue
+		}
+		_, err := repo.GetManagedInboundResourceByServerTag(ctx, serverID, tag)
+		if err == nil {
+			// The probe is also an authorized WireGuard identity. Restoring even a
+			// probe-only listener before its address mapping is acknowledged would
+			// force the Agent to choose between anonymous access and broken probes.
+			return true, nil
+		}
+		if !errors.Is(err, storage.ErrManagedInboundResourceNotFound) {
+			return false, fmt.Errorf("load panel-managed WireGuard resource %s: %w", tag, err)
+		}
+	}
+	configs, err := repo.GetUserInboundConfigsByServer(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	for _, config := range configs {
+		if canonicalManagedProtocol(config.Protocol) != "wireguard" {
+			continue
+		}
+		inbound := desired[strings.TrimSpace(config.InboundTag)]
+		if inbound == nil || canonicalManagedProtocol(wireGuardStringValue(inbound["protocol"])) != "wireguard" {
+			continue
+		}
+		credential, err := wireGuardAgentCredentialFromJSON(config.CredentialJSON)
+		if err != nil {
+			return false, fmt.Errorf("sanitize database WireGuard credential for %s/%s: %w", config.Username, config.InboundTag, err)
+		}
+		publicKey := strings.TrimSpace(wireGuardStringValue(credential["publicKey"]))
+		settings, _ := inbound["settings"].(map[string]interface{})
+		for _, rawPeer := range wireGuardInterfaceSlice(settings["peers"]) {
+			peer, _ := rawPeer.(map[string]interface{})
+			if peer != nil && equalManagedWireGuardKeys(wireGuardStringValue(peer["publicKey"]), publicKey) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// requireDatabaseWireGuardPolicyACKLeased establishes the Agent's address to
+// user mapping before an authority path can expose a restored per-user peer.
+// The caller already owns the server mutation lease; using the leased helper
+// avoids lease re-entry and makes ACK failure a hard stop before Agent writes.
+func (h *RemoteManageHandler) requireDatabaseWireGuardPolicyACKLeased(
+	ctx context.Context,
+	serverID int64,
+	desired map[string]map[string]interface{},
+) error {
+	requiresWireGuardPolicy, err := databaseInboundsRequireWireGuardPolicy(ctx, h.repo, serverID, desired)
+	if err != nil {
+		return fmt.Errorf("inspect database WireGuard peers: %w", err)
+	}
+	if !requiresWireGuardPolicy {
+		return nil
+	}
+	if held, _ := h.repo.RemoteServerMutationLeaseState(ctx, serverID); !held {
+		return errors.New("database WireGuard policy gate requires the server mutation lease")
+	}
+	if err := requireWireGuardPeerUsersCapability(ctx, h, serverID); err != nil {
+		return err
+	}
+	if h.limiterPusher == nil {
+		return errors.New("database WireGuard policy gate requires a limiter pusher")
+	}
+	if err := h.limiterPusher.pushToServerCheckedLeased(ctx, serverID); err != nil {
+		return fmt.Errorf("acknowledge database WireGuard limiter policy: %w", err)
+	}
+	return nil
+}
+
+func (h *RemoteManageHandler) requireDatabaseWireGuardConfigPolicyACKLeased(
+	ctx context.Context,
+	serverID int64,
+	configJSON string,
+) error {
+	desired, err := xrayConfigInbounds(configJSON)
+	if err != nil {
+		return err
+	}
+	return h.requireDatabaseWireGuardPolicyACKLeased(ctx, serverID, desired)
 }
 
 func validateDatabaseClassicShadowsocksLiveClient(credential, liveSettings map[string]interface{}) error {
@@ -867,6 +1225,9 @@ func (h *RemoteManageHandler) reconcileDatabaseOwnedInboundsLeased(
 	if err := h.rebuildDatabaseAuthorizedInboundClients(ctx, serverID, desired, observed); err != nil {
 		return result, err
 	}
+	if err := h.requireDatabaseWireGuardPolicyACKLeased(ctx, serverID, desired); err != nil {
+		return result, fmt.Errorf("prepare database-authoritative WireGuard peers: %w", err)
+	}
 	forwardInbounds, err := h.activeForwardInbounds(ctx, serverID)
 	if err != nil {
 		return result, fmt.Errorf("list active forwarding inbounds: %w", err)
@@ -918,7 +1279,11 @@ func (h *RemoteManageHandler) reconcileDatabaseOwnedInboundsLeased(
 		sameConfig := exists && sameInboundConfig(wanted, observedInboundConfig(actual))
 		ownerMatches := mutations[tag] == "" || mutations[tag] == actualOwner
 		migrationBootstrap := strings.HasPrefix(mutations[tag], "database-migration:")
-		if sameConfig && (ownerMatches || migrationBootstrap) {
+		runtimeReady := true
+		if canonicalManagedProtocol(wireGuardStringValue(wanted["protocol"])) == "wireguard" {
+			runtimeReady = strings.EqualFold(strings.TrimSpace(wireGuardStringValue(actual["_runtime_status"])), "running")
+		}
+		if sameConfig && runtimeReady && (ownerMatches || migrationBootstrap) {
 			continue
 		}
 		if err := h.applyDatabaseInboundMutation(ctx, serverID, "add", tag, mutations[tag], wanted); err != nil {
@@ -929,6 +1294,12 @@ func (h *RemoteManageHandler) reconcileDatabaseOwnedInboundsLeased(
 		} else {
 			result.Restored++
 		}
+	}
+	// A migrated probe remains pending until the complete authoritative Agent
+	// reconciliation succeeds. This keeps database state honest across limiter
+	// rejection, capability failure, or a partial hot-mutation failure.
+	if err := h.markAuthoritativeWireGuardProbesActive(ctx, serverID, desired); err != nil {
+		return result, err
 	}
 	// Active forwarding resources have their own durable database lifecycle and
 	// expiry guard. Preserve them in the canonical snapshot when observed, but

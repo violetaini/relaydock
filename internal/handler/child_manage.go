@@ -1760,13 +1760,15 @@ func inboundClientListKey(protocol string, settings map[string]interface{}) (str
 		preferred = "users"
 	case "socks", "http":
 		preferred = "accounts"
+	case "wireguard":
+		preferred = "peers"
 	}
 	if preferred != "" {
 		if _, exists := settings[preferred]; exists {
 			return preferred, nil
 		}
 	}
-	for _, key := range []string{"clients", "users", "accounts"} {
+	for _, key := range []string{"clients", "users", "accounts", "peers"} {
 		if _, exists := settings[key]; exists {
 			return key, nil
 		}
@@ -1789,6 +1791,8 @@ func inboundCredentialPrimaryKey(protocol string) string {
 		return "auth"
 	case "socks", "http":
 		return "user"
+	case "wireguard":
+		return "publicKey"
 	default:
 		return ""
 	}
@@ -2266,8 +2270,24 @@ func mutateInboundClient(inbound, requested map[string]interface{}, add bool) (b
 	if settings == nil {
 		return false, fmt.Errorf("inbound has no settings")
 	}
+	requestedForConfig := requested
+	if canonicalManagedProtocol(protocol) == "wireguard" {
+		publicKey := nonEmptyCredentialValue(requested, "publicKey")
+		if !validWireGuardKey(publicKey) {
+			return false, fmt.Errorf("wireguard peer publicKey is invalid")
+		}
+		if add {
+			var err error
+			requestedForConfig, err = wireGuardAgentCredentialFromMap(requested)
+			if err != nil {
+				return false, err
+			}
+		} else {
+			requestedForConfig = map[string]interface{}{"publicKey": publicKey}
+		}
+	}
 	primaryKey := inboundCredentialPrimaryKey(protocol)
-	if nonEmptyCredentialValue(requested, primaryKey) == "" && nonEmptyCredentialValue(requested, "email") == "" {
+	if nonEmptyCredentialValue(requestedForConfig, primaryKey) == "" && nonEmptyCredentialValue(requestedForConfig, "email") == "" {
 		return false, fmt.Errorf("client has no usable identity")
 	}
 
@@ -2287,11 +2307,11 @@ func mutateInboundClient(inbound, requested map[string]interface{}, add bool) (b
 	if add {
 		for _, raw := range clients {
 			existing, _ := raw.(map[string]interface{})
-			if existing != nil && sameInboundClientForAdd(existing, requested, protocol) {
+			if existing != nil && sameInboundClientForAdd(existing, requestedForConfig, protocol) {
 				return false, nil
 			}
 		}
-		settings[listKey] = append(clients, requested)
+		settings[listKey] = append(clients, requestedForConfig)
 		inbound["settings"] = settings
 		return true, nil
 	}
@@ -2300,7 +2320,7 @@ func mutateInboundClient(inbound, requested map[string]interface{}, add bool) (b
 	changed := false
 	for _, raw := range clients {
 		existing, _ := raw.(map[string]interface{})
-		if existing != nil && sameInboundClientForRemove(existing, requested, protocol) {
+		if existing != nil && sameInboundClientForRemove(existing, requestedForConfig, protocol) {
 			changed = true
 			continue
 		}

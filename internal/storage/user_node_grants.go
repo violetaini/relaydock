@@ -40,6 +40,11 @@ type UserNodeGrantWithSource struct {
 	Source UserInboundAccessSource `json:"source"`
 }
 
+type WireGuardDirectGrantCandidate struct {
+	GrantID  int64
+	Username string
+}
+
 const selectUserNodeGrant = `SELECT id, username, node_id, credential_config_id,
        access_source_id, source_type, source_package_id, version, created_by,
        created_at, updated_at
@@ -398,6 +403,15 @@ FROM remote_servers WHERE name = ?`, node.OriginalServer).Scan(&server.ID, &serv
 	if !DirectNodeGrantEligible(node, server) {
 		return user, node, server, ErrManagedServerMismatch
 	}
+	if strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard") {
+		provisionable, provenanceErr := managedWireGuardNodeProvisionable(ctx, tx, node.ID)
+		if provenanceErr != nil {
+			return user, node, server, provenanceErr
+		}
+		if !provisionable {
+			return user, node, server, ErrManagedServerMismatch
+		}
+	}
 	return user, node, server, nil
 }
 
@@ -560,6 +574,139 @@ func (r *TrafficRepository) ListUserNodeGrants(ctx context.Context, username str
 	return items, nil
 }
 
+func (r *TrafficRepository) ListActiveWireGuardDirectGrantCandidates(ctx context.Context, limit int) ([]WireGuardDirectGrantCandidate, error) {
+	return r.ListActiveWireGuardDirectGrantCandidatesAfter(ctx, 0, limit)
+}
+
+func (r *TrafficRepository) ListActiveWireGuardDirectGrantCandidatesAfter(
+	ctx context.Context,
+	afterGrantID int64,
+	limit int,
+) ([]WireGuardDirectGrantCandidate, error) {
+	if err := managedInitialized(r); err != nil {
+		return nil, err
+	}
+	if afterGrantID < 0 {
+		return nil, ErrManagedInvalidArgument
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT g.id, g.username
+FROM user_node_grants g
+JOIN user_inbound_access_sources s
+  ON s.id = g.access_source_id AND s.source_type = 'direct' AND s.source_id = g.id
+JOIN nodes n ON n.id = g.node_id
+WHERE g.source_type = 'manual' AND g.source_package_id IS NULL
+  AND s.desired_state = 'active'
+  AND LOWER(TRIM(COALESCE(n.protocol, ''))) = 'wireguard'
+  AND g.id > ?
+ORDER BY g.id ASC LIMIT ?`, afterGrantID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list active WireGuard direct grants: %w", err)
+	}
+	defer rows.Close()
+	items := make([]WireGuardDirectGrantCandidate, 0)
+	for rows.Next() {
+		var item WireGuardDirectGrantCandidate
+		if err := rows.Scan(&item.GrantID, &item.Username); err != nil {
+			return nil, fmt.Errorf("scan active WireGuard direct grant: %w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// DeactivateWireGuardDirectGrantIfProvenanceInvalid rechecks provenance while
+// holding the account and managed-node write locks. A resource repaired after
+// the periodic scan is therefore not revoked by stale observation.
+func (r *TrafficRepository) DeactivateWireGuardDirectGrantIfProvenanceInvalid(
+	ctx context.Context,
+	id int64,
+	username, actor string,
+) (bool, error) {
+	username, actor = strings.TrimSpace(username), strings.TrimSpace(actor)
+	if id <= 0 || username == "" || actor == "" {
+		return false, ErrManagedInvalidArgument
+	}
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return false, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	grant, err := scanUserNodeGrant(tx.QueryRowContext(ctx, selectUserNodeGrant+` WHERE id = ? AND username = ?`, id, username))
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if grant.SourceType != GrantSourceManual || grant.SourcePackageID != nil || grant.AccessSourceID <= 0 {
+		return false, nil
+	}
+	source, err := scanUserInboundAccessSource(tx.QueryRowContext(ctx, selectUserInboundAccessSource+`
+WHERE id = ? AND source_type = ? AND source_id = ?`, grant.AccessSourceID, ManagedSourceDirect, grant.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if source.DesiredState != ManagedDesiredActive {
+		return false, nil
+	}
+	var protocol string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(protocol, '') FROM nodes WHERE id = ?`, grant.NodeID).Scan(&protocol); errors.Is(err, sql.ErrNoRows) {
+		protocol = "wireguard"
+	} else if err != nil {
+		return false, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(protocol), "wireguard") {
+		return false, nil
+	}
+	provisionable, err := managedWireGuardNodeProvisionable(ctx, tx, grant.NodeID)
+	if err != nil {
+		return false, err
+	}
+	if provisionable {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	result, err := tx.ExecContext(ctx, `UPDATE user_inbound_access_sources SET
+    desired_state = ?, suspend_reason = ?, generation = generation + 1,
+    retry_count = 0, next_retry_at = NULL, last_error = '', updated_at = ?
+WHERE id = ? AND generation = ? AND desired_state = ?`, ManagedDesiredInactive,
+		ManagedSuspendAdminDisabled, now, source.ID, source.Generation, ManagedDesiredActive)
+	if err != nil {
+		return false, fmt.Errorf("deactivate invalid WireGuard direct grant: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE user_node_grants SET version = version + 1, updated_at = ? WHERE id = ?`, now, grant.ID); err != nil {
+		return false, err
+	}
+	if err := appendManagedAccessAuditTx(ctx, tx, ManagedAccessAudit{
+		Actor: actor, Action: "node_grant.provenance_revoked", EntityType: "node_grant",
+		EntityID: grant.ID, Username: username, ServerID: source.ServerID,
+		Details: map[string]any{"node_id": grant.NodeID, "inbound_tag": source.InboundTag},
+	}); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (r *TrafficRepository) SetUserNodeGrantDesiredState(ctx context.Context, id int64, username, desiredState, actor string) (*UserNodeGrantWithSource, error) {
 	username, actor = strings.TrimSpace(username), strings.TrimSpace(actor)
 	if id <= 0 || username == "" || actor == "" ||
@@ -661,7 +808,7 @@ func (r *TrafficRepository) HasEffectiveDirectUserInboundAccess(ctx context.Cont
 	if username == "" || serverID <= 0 || inboundTag == "" || excludeSourceID < 0 || now.IsZero() {
 		return false, nil, ErrManagedInvalidArgument
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT s.expires_at, n.protocol, n.clash_config,
+	rows, err := r.db.QueryContext(ctx, `SELECT n.id, s.expires_at, n.protocol, n.clash_config,
        g.credential_config_id, c.id, c.username, c.server_id, c.inbound_tag, c.protocol,
        s.observed_state, s.generation, s.applied_generation
 FROM user_inbound_access_sources s
@@ -685,19 +832,29 @@ WHERE s.username = ? AND s.server_id = ? AND s.inbound_tag = ? AND s.id != ?
 	hasAccess, perpetual := false, false
 	var latest *time.Time
 	for rows.Next() {
+		var nodeID int64
 		var expires sql.NullString
 		var protocol, clashConfig string
 		var credentialID, configID, configServerID sql.NullInt64
 		var configUsername, configInbound, configProtocol sql.NullString
 		var observed string
 		var generation, appliedGeneration int64
-		if err := rows.Scan(&expires, &protocol, &clashConfig, &credentialID, &configID,
+		if err := rows.Scan(&nodeID, &expires, &protocol, &clashConfig, &credentialID, &configID,
 			&configUsername, &configServerID, &configInbound, &configProtocol,
 			&observed, &generation, &appliedGeneration); err != nil {
 			return false, nil, err
 		}
 		if !SelfServiceNodeProtocolEligible(protocol, clashConfig) || strings.HasPrefix(strings.ToLower(inboundTag), "anydoor-") {
 			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(protocol), "wireguard") {
+			provisionable, provenanceErr := r.ManagedWireGuardNodeProvisionable(ctx, nodeID)
+			if provenanceErr != nil {
+				return false, nil, provenanceErr
+			}
+			if !provisionable {
+				continue
+			}
 		}
 		if !credentialID.Valid {
 			if appliedGeneration != 0 || observed == ManagedObservedActive {
@@ -774,6 +931,15 @@ ORDER BY g.node_id ASC`, username, now.UTC(), now.UTC())
 			!configProtocol.Valid || !SelfServiceCredentialProtocolMatches(configProtocol.String, protocol) {
 			continue
 		}
+		if strings.EqualFold(strings.TrimSpace(protocol), "wireguard") {
+			provisionable, provenanceErr := r.ManagedWireGuardNodeProvisionable(ctx, nodeID)
+			if provenanceErr != nil {
+				return nil, provenanceErr
+			}
+			if !provisionable {
+				continue
+			}
+		}
 		ids = append(ids, nodeID)
 	}
 	return ids, rows.Err()
@@ -787,7 +953,7 @@ func (r *TrafficRepository) ListAuthorizedDirectNodeIDs(ctx context.Context, use
 	if username == "" || now.IsZero() {
 		return nil, ErrManagedInvalidArgument
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT g.node_id
+	rows, err := r.db.QueryContext(ctx, `SELECT g.node_id, COALESCE(n.protocol, '')
 FROM user_node_grants g
 JOIN user_inbound_access_sources s ON s.id=g.access_source_id AND s.source_type='direct' AND s.source_id=g.id
 JOIN users u ON u.username=g.username AND u.is_active=1
@@ -806,8 +972,18 @@ ORDER BY g.node_id ASC`, username, now.UTC(), now.UTC())
 	ids := make([]int64, 0)
 	for rows.Next() {
 		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var protocol string
+		if err := rows.Scan(&id, &protocol); err != nil {
 			return nil, err
+		}
+		if strings.EqualFold(strings.TrimSpace(protocol), "wireguard") {
+			provisionable, provenanceErr := r.ManagedWireGuardNodeProvisionable(ctx, id)
+			if provenanceErr != nil {
+				return nil, provenanceErr
+			}
+			if !provisionable {
+				continue
+			}
 		}
 		ids = append(ids, id)
 	}

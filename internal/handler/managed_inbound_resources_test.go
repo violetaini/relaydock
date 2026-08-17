@@ -24,8 +24,11 @@ type managedWireGuardAgent struct {
 	mu                 sync.Mutex
 	inbound            map[string]interface{}
 	actions            []string
+	events             []string
 	mutationIDs        []string
 	ownerMutationID    string
+	capabilities       AgentCapabilities
+	limiterStatus      int
 	addResponseMode    string
 	removeResponseMode string
 	rejectAddIfExists  bool
@@ -38,6 +41,21 @@ type managedWireGuardAgent struct {
 func (a *managedWireGuardAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/api/child/system/info":
+		a.mu.Lock()
+		capabilities := a.capabilities
+		a.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "capabilities": capabilities})
+	case r.Method == http.MethodPost && r.URL.Path == "/api/child/limiter":
+		a.mu.Lock()
+		a.events = append(a.events, "limiter")
+		status := a.limiterStatus
+		a.mu.Unlock()
+		if status == 0 {
+			status = http.StatusOK
+		}
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": status == http.StatusOK})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/child/inbounds":
 		a.mu.Lock()
 		inbounds := make([]map[string]interface{}, 0, 1)
@@ -45,6 +63,7 @@ func (a *managedWireGuardAgent) ServeHTTP(w http.ResponseWriter, r *http.Request
 		if a.inbound != nil {
 			inbound := cloneManagedWireGuardInbound(a.inbound)
 			inbound["_mutation_fence_known"] = true
+			inbound["_runtime_status"] = "running"
 			if tag := strings.TrimSpace(wireGuardStringValue(inbound["tag"])); tag != "" && a.ownerMutationID != "" {
 				inbound["_mutation_id"] = a.ownerMutationID
 				owners[tag] = a.ownerMutationID
@@ -70,6 +89,7 @@ func (a *managedWireGuardAgent) ServeHTTP(w http.ResponseWriter, r *http.Request
 		}
 		a.mu.Lock()
 		a.actions = append(a.actions, action)
+		a.events = append(a.events, action)
 		mutationID := strings.TrimSpace(wireGuardStringValue(request["mutation_id"]))
 		a.mutationIDs = append(a.mutationIDs, mutationID)
 		beforeAdd := a.beforeAdd
@@ -134,6 +154,20 @@ func (a *managedWireGuardAgent) actionSnapshot() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]string(nil), a.actions...)
+}
+
+func (a *managedWireGuardAgent) eventSnapshot() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.events...)
+}
+
+func (a *managedWireGuardAgent) setWireGuardPolicyResult(capable bool, limiterStatus int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.capabilities.WireGuardPeerUsersV1 = capable
+	a.limiterStatus = limiterStatus
+	a.events = nil
 }
 
 func (a *managedWireGuardAgent) mutationSnapshot() []string {
@@ -228,10 +262,17 @@ func newManagedInboundHandlerTest(t *testing.T, initialInbound map[string]interf
 		t.Fatalf("CreateUser: %v", err)
 	}
 	agentState := &managedWireGuardAgent{inbound: cloneManagedWireGuardInbound(initialInbound)}
+	agentState.capabilities.WireGuardPeerUsersV1 = true
 	agent := httptest.NewServer(agentState)
 	t.Cleanup(agent.Close)
 	server := createRemoteHandlerTestServer(t, repo, "managed-wireguard-edge", agent.URL)
-	return NewRemoteManageHandler(repo, nil), repo, server, agentState, dbPath
+	if err := repo.UpdateRemoteServerXrayMode(context.Background(), server.ID, "embedded"); err != nil {
+		t.Fatalf("UpdateRemoteServerXrayMode: %v", err)
+	}
+	server.XrayMode = "embedded"
+	handler := NewRemoteManageHandler(repo, nil)
+	handler.SetLimiterPusher(NewLimiterConfigPusher(repo, nil))
+	return handler, repo, server, agentState, dbPath
 }
 
 func managedWireGuardRequest(t *testing.T, method, path string, body interface{}) *http.Request {
@@ -321,6 +362,9 @@ WHERE lower(n.protocol) = 'wireguard' AND n.node_name = 'Hong Kong WireGuard'`).
 	if createResponse.Code != http.StatusCreated {
 		t.Fatalf("create status=%d body=%s", createResponse.Code, createResponse.Body.String())
 	}
+	if events := agent.eventSnapshot(); len(events) < 2 || events[0] != "limiter" || events[1] != "add" {
+		t.Fatalf("managed WireGuard create ordering=%v, want limiter ACK before add", events)
+	}
 	if err := <-stagedResult; err != nil {
 		t.Fatalf("client identity was not encrypted before remote creation: %v", err)
 	}
@@ -342,8 +386,8 @@ WHERE lower(n.protocol) = 'wireguard' AND n.node_name = 'Hong Kong WireGuard'`).
 	if created.Node.ID <= 0 || created.Node.Protocol != "wireguard" || !strings.Contains(created.Node.ClashConfig, `"private-key"`) {
 		t.Fatalf("ordinary WireGuard node missing from response: %+v", created.Node)
 	}
-	if !strings.Contains(created.ClientConfig, "[Interface]") || !strings.Contains(created.ClientConfig, "PrivateKey = ") {
-		t.Fatalf("client config missing: %q", created.ClientConfig)
+	if created.ClientConfig != "" {
+		t.Fatalf("create response advertised an unauthorized bootstrap client config: %q", created.ClientConfig)
 	}
 	resourceJSON, _ := json.Marshal(created.Resource)
 	lowerResource := strings.ToLower(string(resourceJSON))
@@ -387,8 +431,8 @@ FROM wireguard_probe_peers WHERE resource_id = ?`, created.Resource.ID).Scan(&pr
 	remoteInbound, _ := addPayload["inbound"].(map[string]interface{})
 	remoteSettings, _ := remoteInbound["settings"].(map[string]interface{})
 	remotePeers := wireGuardInterfaceSlice(remoteSettings["peers"])
-	if len(remotePeers) != 2 {
-		t.Fatalf("Agent payload peers=%#v, want client peer plus dedicated probe peer", remotePeers)
+	if len(remotePeers) != 1 {
+		t.Fatalf("Agent payload peers=%#v, want only the dedicated probe peer", remotePeers)
 	}
 	var foundClient, foundProbe bool
 	for _, rawPeer := range remotePeers {
@@ -407,12 +451,39 @@ FROM wireguard_probe_peers WHERE resource_id = ?`, created.Resource.ID).Scan(&pr
 			t.Fatalf("Agent payload peer exposed a private key: %#v", peer)
 		}
 	}
-	if !foundClient || !foundProbe {
-		t.Fatalf("Agent payload did not contain independent client and probe peers: client=%v probe=%v peers=%#v", foundClient, foundProbe, remotePeers)
+	if foundClient || !foundProbe {
+		t.Fatalf("Agent payload retained bootstrap peer or omitted probe peer: client=%v probe=%v peers=%#v", foundClient, foundProbe, remotePeers)
 	}
 	if bytes.Contains(created.Resource.PublicMetadata, []byte(probePeer.PrivateKey)) ||
 		bytes.Contains(resourceJSON, []byte(probePeer.PrivateKey)) {
 		t.Fatalf("public managed-resource metadata exposed probe private key: %s", resourceJSON)
+	}
+
+	limiterSnapshots, err := NewLimiterConfigPusher(repo, nil).BuildLimiterConfigForServer(context.Background(), server.ID)
+	if err != nil {
+		t.Fatalf("build WireGuard probe limiter snapshot: %v", err)
+	}
+	probeEmail := wireGuardProbeLimiterEmail(created.Resource.ID, created.Resource.InboundTag)
+	var foundProbePolicy bool
+	for _, snapshot := range limiterSnapshots {
+		if snapshot.InboundTag != created.Resource.InboundTag {
+			continue
+		}
+		if len(snapshot.Users) != 1 || snapshot.Users[0].Email != probeEmail {
+			t.Fatalf("probe limiter users=%#v, want synthetic identity %q", snapshot.Users, probeEmail)
+		}
+		if len(snapshot.WireGuardPeers) != len(probePeer.Addresses) {
+			t.Fatalf("probe limiter peers=%#v, want addresses %v", snapshot.WireGuardPeers, probePeer.Addresses)
+		}
+		for _, peer := range snapshot.WireGuardPeers {
+			if peer.Email != probeEmail {
+				t.Fatalf("probe limiter mapping=%#v, want email %q", peer, probeEmail)
+			}
+		}
+		foundProbePolicy = true
+	}
+	if !foundProbePolicy {
+		t.Fatalf("limiter snapshots omitted managed WireGuard probe: %#v", limiterSnapshots)
 	}
 
 	nodes, err := repo.ListAllNodes(context.Background())
@@ -448,6 +519,44 @@ FROM wireguard_probe_peers WHERE resource_id = ?`, created.Resource.ID).Scan(&pr
 	}
 	if actions := agent.actionSnapshot(); len(actions) != 2 || actions[0] != "add" || actions[1] != "remove" {
 		t.Fatalf("agent actions=%v, want [add remove]", actions)
+	}
+}
+
+func TestManagedWireGuardCreateLimiterRejectionRollsBackBeforeAgentAdd(t *testing.T) {
+	handler, repo, server, agent, _ := newManagedInboundHandlerTest(t, nil)
+	agent.setWireGuardPolicyResult(true, http.StatusInternalServerError)
+
+	response := httptest.NewRecorder()
+	handler.HandleManagedInboundResources(response, managedWireGuardRequest(t, http.MethodPost,
+		managedInboundResourcesPath+"/wireguard?server_id="+strconv.FormatInt(server.ID, 10),
+		managedWireGuardCreateBody(t, "Rejected by limiter")))
+	var failureBody struct {
+		Status int `json:"status"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &failureBody); err != nil {
+		t.Fatalf("decode limiter rejection: %v", err)
+	}
+	if response.Code != http.StatusBadRequest || failureBody.Status != http.StatusBadGateway ||
+		!strings.Contains(response.Body.String(), "限速策略未确认") {
+		t.Fatalf("status=%d body=%s, want limiter rejection", response.Code, response.Body.String())
+	}
+	if events := agent.eventSnapshot(); len(events) != 1 || events[0] != "limiter" {
+		t.Fatalf("Agent events=%v, want limiter attempt without inbound add", events)
+	}
+	if actions := agent.actionSnapshot(); len(actions) != 0 || agent.hasInbound() {
+		t.Fatalf("limiter rejection reached Agent mutation: actions=%v inbound=%v", actions, agent.hasInbound())
+	}
+	if resources, err := repo.ListManagedInboundResources(context.Background()); err != nil || len(resources) != 0 {
+		t.Fatalf("limiter rejection left resources=%+v err=%v", resources, err)
+	}
+	if nodes, err := repo.ListAllNodes(context.Background()); err != nil || len(nodes) != 0 {
+		t.Fatalf("limiter rejection left nodes=%+v err=%v", nodes, err)
+	}
+	if desired, err := repo.GetDesiredInbound(context.Background(), server.ID, "wireguard-in"); err != nil || desired != nil {
+		t.Fatalf("limiter rejection left desired inbound=%+v err=%v", desired, err)
+	}
+	if owner, err := repo.GetRemoteInboundOwnership(context.Background(), server.ID, "wireguard-in"); err != nil || owner != "" {
+		t.Fatalf("limiter rejection left ownership=%q err=%v", owner, err)
 	}
 }
 

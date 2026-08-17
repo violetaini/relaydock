@@ -464,6 +464,7 @@ var managedGrantProtocolAliases = map[string]string{
 	"socks":       "socks",
 	"socks5":      "socks",
 	"http":        "http",
+	"wireguard":   "wireguard",
 	"anytls":      "anytls",
 	"snell":       "snell",
 }
@@ -849,6 +850,15 @@ WHERE n.id = ?`, serverID, nodeID).Scan(
 	if !SelfServiceNodeOfferProtocolEligible(offer, node) {
 		return nil, fmt.Errorf("%w: protocol does not support isolated managed credentials", ErrManagedInvalidArgument)
 	}
+	if strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard") {
+		provisionable, provenanceErr := r.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+		if provenanceErr != nil {
+			return nil, provenanceErr
+		}
+		if !provisionable {
+			return nil, fmt.Errorf("%w: WireGuard node is not a current panel-managed generation", ErrManagedInvalidArgument)
+		}
+	}
 
 	now := time.Now().UTC()
 	result, err := r.db.ExecContext(ctx, `
@@ -873,7 +883,7 @@ VALUES (?, ?, ?, 1, 0, ?, ?, ?)`, nodeID, serverID, inboundTag, createdBy, now, 
 func SelfServiceNodeProtocolEligible(protocolName, clashConfig string) bool {
 	protocolName = strings.ToLower(strings.TrimSpace(protocolName))
 	switch protocolName {
-	case "vless", "vmess", "trojan", "snell", "socks", "socks5", "http", "hysteria", "hysteria2", "hy2":
+	case "vless", "vmess", "trojan", "snell", "socks", "socks5", "http", "hysteria", "hysteria2", "hy2", "wireguard":
 		return true
 	case "ss", "shadowsocks":
 		var config map[string]interface{}

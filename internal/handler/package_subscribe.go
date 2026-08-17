@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -134,7 +135,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	var proxies []map[string]any
 	for _, nodeID := range orderedNodeIDs {
 		node, err := h.repo.GetNodeByID(r.Context(), nodeID)
-		if err != nil || !node.Enabled {
+		if err != nil || !packageSubscriptionNodeEligible(r.Context(), h.repo, node) {
 			continue
 		}
 		// routed 节点:克隆父 inbound 的 clash 模板,替换 uuid 为该用户子账号 uuid + 节点名
@@ -492,10 +493,45 @@ func (h *PackageSubscribeHandler) buildUserCredentialMap(r *http.Request, userna
 	m := make(map[credKey]string, len(userConfigs))
 	for _, cfg := range userConfigs {
 		if name, ok := idToName[cfg.ServerID]; ok {
-			m[credKey{name, cfg.InboundTag}] = cfg.CredentialJSON
+			if credentialJSON, ok := subscriptionCredentialJSON(ctx, h.repo, cfg); ok {
+				m[credKey{name, cfg.InboundTag}] = credentialJSON
+			}
 		}
 	}
 	return m
+}
+
+// subscriptionCredentialJSON hydrates WireGuard's client private key only for
+// the short-lived subscription render. The database representation remains an
+// authenticated ciphertext and is never copied into the generated proxy.
+func subscriptionCredentialJSON(ctx context.Context, repo *storage.TrafficRepository, cfg storage.UserInboundConfig) (string, bool) {
+	if !strings.EqualFold(strings.TrimSpace(cfg.Protocol), "wireguard") {
+		return cfg.CredentialJSON, strings.TrimSpace(cfg.CredentialJSON) != ""
+	}
+	provisionable, err := repo.ManagedWireGuardInboundProvisionable(ctx, cfg.ServerID, cfg.InboundTag)
+	if err != nil || !provisionable {
+		return "", false
+	}
+	credential, err := HydrateWireGuardUserCredential(repo, cfg)
+	if err != nil || credential == nil {
+		return "", false
+	}
+	encoded, err := json.Marshal(credential)
+	if err != nil {
+		return "", false
+	}
+	return string(encoded), true
+}
+
+func packageSubscriptionNodeEligible(ctx context.Context, repo *storage.TrafficRepository, node storage.Node) bool {
+	if !node.Enabled {
+		return false
+	}
+	if canonicalManagedProtocol(node.Protocol) != "wireguard" {
+		return true
+	}
+	provisionable, err := repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+	return err == nil && provisionable
 }
 
 // rewriteProxyGroupRefs 给定 YAML 文档 + 节点名映射,把每个 proxy-group 的 proxies 数组里
@@ -598,20 +634,15 @@ func applyMultiplierPrefix(proxy map[string]any, node storage.Node, pkg *storage
 func applyUserCredentials(proxy map[string]any, node storage.Node, credMap map[credKey]string) bool {
 	defer delete(proxy, storage.ManagedShadowsocksMultiUserMarker)
 	managed := strings.TrimSpace(node.OriginalServer) != "" || strings.TrimSpace(node.InboundTag) != ""
+	// An imported static WireGuard profile has no server-side inbound that the
+	// panel can mutate. Publishing its one client private key to multiple users
+	// would collapse every account into the same peer and defeat revocation and
+	// per-user limits, so only panel-managed WireGuard can enter a user feed.
+	if strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard") && !managed {
+		return false
+	}
 	if !managed {
 		return true
-	}
-	// A panel-created WireGuard inbound has one static client peer. Its private
-	// key is encrypted at rest and hydrated only when the node is read, so it can
-	// be published unchanged without a user_inbound_configs credential record.
-	// This intentionally means users assigned the same node share that peer.
-	if strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard") {
-		if proxy == nil || strings.TrimSpace(node.OriginalServer) == "" || strings.TrimSpace(node.InboundTag) == "" {
-			return false
-		}
-		privateKey, _ := proxy["private-key"].(string)
-		publicKey, _ := proxy["public-key"].(string)
-		return strings.TrimSpace(privateKey) != "" && strings.TrimSpace(publicKey) != ""
 	}
 	// A half-associated node is not safe to publish: without both coordinates
 	// there is no unambiguous per-user credential lookup.
@@ -691,6 +722,55 @@ func applyCredToProxy(proxy map[string]any, protocol string, cred map[string]any
 			proxy["password"] = auth
 			return true
 		}
+	case "wireguard":
+		privateKey := strings.TrimSpace(wireGuardURIString(cred["privateKey"]))
+		serverPublicKey := strings.TrimSpace(wireGuardURIString(cred["serverPublicKey"]))
+		addresses := normalizedWireGuardStrings(wireGuardURIList(cred["address"]))
+		if !validWireGuardKey(privateKey) || !validWireGuardKey(serverPublicKey) || len(addresses) == 0 {
+			return false
+		}
+		var ipv4, ipv6 string
+		for _, address := range addresses {
+			if !validWireGuardHostCIDR(address) {
+				return false
+			}
+			ip, _, err := net.ParseCIDR(address)
+			if err != nil {
+				return false
+			}
+			if ip.To4() != nil {
+				if ipv4 != "" {
+					return false
+				}
+				ipv4 = ip.String()
+			} else {
+				if ipv6 != "" {
+					return false
+				}
+				ipv6 = ip.String()
+			}
+		}
+
+		// Only mutate after the complete peer credential validates, so a failed
+		// replacement can never partially retain the shared bootstrap profile.
+		proxy["private-key"] = privateKey
+		proxy["public-key"] = serverPublicKey
+		delete(proxy, "address")
+		delete(proxy, "ip")
+		delete(proxy, "ipv6")
+		if ipv4 != "" {
+			proxy["ip"] = ipv4
+		}
+		if ipv6 != "" {
+			proxy["ipv6"] = ipv6
+		}
+		if mtu, ok := wireGuardURIInt(cred["mtu"]); ok && mtu >= 576 && mtu <= 9000 {
+			proxy["mtu"] = mtu
+		}
+		if keepAlive, ok := wireGuardURIInt(cred["keepAlive"]); ok && keepAlive >= 0 && keepAlive <= 65535 {
+			proxy["persistent-keepalive"] = keepAlive
+		}
+		return true
 	case "socks", "http":
 		user, userOK := cred["user"].(string)
 		pass, passOK := cred["pass"].(string)

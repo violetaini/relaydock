@@ -598,6 +598,7 @@ func main() {
 	// 远程服务器管理代理（将命令转发到子服务器）
 	remoteManageHandler := handler.NewRemoteManageHandler(repo, remoteWSHandler)
 	remoteManageHandler.SetCrypto(cryptoConfig)
+	remoteManageHandler.SetLimiterPusher(limiterPusher)
 	// inbound cache: 套餐绑/换绑时 in-memory 算 cred 用,从 xray config snapshot 派生。
 	inboundCache := handler.NewInboundCache()
 	remoteManageHandler.SetInboundCache(inboundCache)

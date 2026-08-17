@@ -100,6 +100,9 @@ type AgentCapabilities struct {
 	LimiterReplace bool `json:"limiter_replace,omitempty"`
 	// LimiterReplaceAck 表示 limiter replace 只有在应用完成后才返回 RPC/HTTP 成功响应。
 	LimiterReplaceAck bool `json:"limiter_replace_ack,omitempty"`
+	// WireGuardPeerUsersV1 表示 Agent 支持按 WireGuard Peer 的隧道源地址识别用户，
+	// 并支持以 publicKey 为身份原子增删 Peer。没有该能力时不能安全提供多用户 WireGuard。
+	WireGuardPeerUsersV1 bool `json:"wireguard_peer_users_v1,omitempty"`
 	// AgentUninstallV2 表示 Agent 支持两阶段安全自卸载。主控在接单回执后
 	// 继续等待一次性 callback 确认清理完成，随后才删除服务器记录。
 	AgentUninstallV2 bool `json:"agent_uninstall_v2,omitempty"`
@@ -176,7 +179,16 @@ type WSLimiterConfigPayload struct {
 	InboundTag     string                       `json:"inbound_tag"`
 	NodeLimit      uint64                       `json:"node_limit"`
 	Users          []WSUserLimitInfo            `json:"users"`
+	WireGuardPeers []WSWireGuardPeerIdentity    `json:"wireguard_peers"`
 	AutoSpeedRules []storage.AutoSpeedLimitRule `json:"auto_speed_rules,omitempty"`
+}
+
+// WSWireGuardPeerIdentity maps the source address observed inside a WireGuard
+// tunnel to the synthetic per-user email used by the existing limiter and
+// traffic accounting pipeline.
+type WSWireGuardPeerIdentity struct {
+	Address string `json:"address"`
+	Email   string `json:"email"`
 }
 
 // WSUserLimitInfo 表示单个用户的限速配置

@@ -51,6 +51,10 @@ func TestMutateInboundClientUsesProtocolList(t *testing.T) {
 		{name: "anytls", protocol: "anytls", listKey: "users", client: map[string]interface{}{"password": "secret", "email": "alice"}},
 		{name: "snell", protocol: "snell", listKey: "users", client: map[string]interface{}{"psk": "secret", "email": "alice"}},
 		{name: "socks", protocol: "socks", listKey: "accounts", client: map[string]interface{}{"user": "alice", "pass": "secret"}},
+		{name: "wireguard", protocol: "wireguard", listKey: "peers", client: map[string]interface{}{
+			"publicKey": wireGuardYAMLTestKey(0x41), "allowedIPs": []interface{}{"10.66.66.3/32"}, "keepAlive": float64(25),
+			"encryptedPrivateKey": "must-not-reach-xray", "serverPublicKey": wireGuardYAMLTestKey(0x42),
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -63,6 +67,16 @@ func TestMutateInboundClientUsesProtocolList(t *testing.T) {
 			items, ok := settings[tt.listKey].([]interface{})
 			if !ok || len(items) != 1 {
 				t.Fatalf("settings.%s = %#v", tt.listKey, settings[tt.listKey])
+			}
+			if tt.protocol == "wireguard" {
+				peer := items[0].(map[string]interface{})
+				if _, leaked := peer["encryptedPrivateKey"]; leaked || len(peer) != 3 {
+					t.Fatalf("WireGuard peer was not sanitized: %#v", peer)
+				}
+				changed, err = mutateInboundClient(inbound, map[string]interface{}{"publicKey": wireGuardYAMLTestKey(0x41)}, false)
+				if err != nil || !changed {
+					t.Fatalf("remove WireGuard peer: changed=%v err=%v", changed, err)
+				}
 			}
 		})
 	}
@@ -81,7 +95,7 @@ func TestMutateInboundClientRejectsInvalidInput(t *testing.T) {
 		},
 		{
 			name:    "unsupported protocol",
-			inbound: map[string]interface{}{"protocol": "wireguard", "settings": map[string]interface{}{}},
+			inbound: map[string]interface{}{"protocol": "unknown", "settings": map[string]interface{}{}},
 			client:  map[string]interface{}{"email": "alice"},
 		},
 		{

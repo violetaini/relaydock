@@ -468,6 +468,12 @@ FROM nodes n JOIN remote_servers rs ON rs.id = ? WHERE n.id = ?`, offer.ServerID
 			}
 			server := RemoteServer{ID: offer.ServerID, Name: serverName, XrayMode: xrayMode}
 			structureValid := SelfServiceNodeOfferStructureValid(offer, node, server)
+			if structureValid && strings.EqualFold(strings.TrimSpace(protocol), "wireguard") {
+				structureValid, err = r.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+				if err != nil {
+					return nil, fmt.Errorf("verify managed WireGuard catalog provenance: %w", err)
+				}
+			}
 			protocolEligible := SelfServiceNodeOfferProtocolEligible(offer, node)
 			if selected {
 				copy := selection

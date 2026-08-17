@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,6 +23,9 @@ type databaseAuthorityAgent struct {
 	inbounds        map[string]map[string]interface{}
 	configOmitTags  map[string]bool
 	mutations       []map[string]interface{}
+	capabilities    AgentCapabilities
+	limiterStatus   int
+	events          []string
 	serviceControls int
 	rawConfigWrites int
 }
@@ -45,6 +50,18 @@ func (a *databaseAuthorityAgent) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	defer a.mu.Unlock()
 
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/api/child/system/info":
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true, "capabilities": a.capabilities,
+		})
+	case r.Method == http.MethodPost && r.URL.Path == "/api/child/limiter":
+		a.events = append(a.events, "limiter")
+		status := a.limiterStatus
+		if status == 0 {
+			status = http.StatusOK
+		}
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": status == http.StatusOK})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/child/inbounds":
 		inbounds := make([]map[string]interface{}, 0, len(a.inbounds))
 		for _, inbound := range a.inbounds {
@@ -64,6 +81,7 @@ func (a *databaseAuthorityAgent) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		})
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "config": string(config)})
 	case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
+		a.events = append(a.events, "mutation")
 		var request map[string]interface{}
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -87,11 +105,26 @@ func (a *databaseAuthorityAgent) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		a.serviceControls++
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 	case (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.URL.Path == "/api/child/xray/config":
+		a.events = append(a.events, "config-write")
 		a.rawConfigWrites++
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (a *databaseAuthorityAgent) setWireGuardPolicyResult(capable bool, limiterStatus int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.capabilities.WireGuardPeerUsersV1 = capable
+	a.limiterStatus = limiterStatus
+	a.events = nil
+}
+
+func (a *databaseAuthorityAgent) eventSnapshot() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.events...)
 }
 
 func (a *databaseAuthorityAgent) mutationSnapshot() []map[string]interface{} {
@@ -180,6 +213,360 @@ func seedDatabaseAuthoritySnapshot(t *testing.T, repo *storage.TrafficRepository
 	if _, err := repo.UpsertCurrentXraySnapshot(context.Background(), serverID, string(raw), storage.XraySnapshotSourceMasterWrite); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func newDatabaseAuthorityWireGuardFixture(
+	t *testing.T,
+	agentURL string,
+	withActiveProbe bool,
+) (*storage.TrafficRepository, *storage.RemoteServer, map[string]interface{}) {
+	t.Helper()
+	ctx := context.Background()
+	repo, server := newDatabaseAuthorityHandlerRepo(t, agentURL)
+	if err := repo.ConfigureNodeSecretEncryption(bytes.Repeat([]byte{0x71}, 32)); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateUser(ctx, "owner", "owner@example.test", "Owner", "hash", storage.RoleAdmin, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateUser(ctx, "alice", "alice@example.test", "Alice", "hash", storage.RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	settings, _ := wireGuardCredentialTestSettings(t)
+	inbound := map[string]interface{}{
+		"tag": "wg-authority", "listen": "0.0.0.0", "port": float64(51820), "protocol": "wireguard",
+		"settings": cloneInboundMap(map[string]interface{}{"settings": settings})["settings"],
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "owner", NodeName: "WG authority", Protocol: "wireguard", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "wg-authority", InboundMutationID: "managed-wireguard:wg-authority-generation",
+		ClashConfig: `{"name":"WG authority","type":"wireguard","server":"203.0.113.20","port":51820,"private-key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","public-key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{Name: "WG authority", CycleDays: 30, Nodes: []int64{node.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, now.Add(-time.Hour), now.Add(time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
+	alice, err := repo.GetUser(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := getOrCreateInboundCredential(ctx, repo, alice, server.ID, "wg-authority", "wireguard", settings); err != nil {
+		t.Fatal(err)
+	}
+	if withActiveProbe {
+		seedHandlerManagedWireGuardProvenance(t, repo, server, &node, inbound, "managed-wireguard:wg-authority-generation", true)
+	} else {
+		seedDatabaseAuthorityDesired(t, repo, server.ID, inbound, "managed-wireguard:wg-authority-generation")
+	}
+	seedDatabaseAuthoritySnapshot(t, repo, server.ID, inbound)
+	return repo, server, inbound
+}
+
+func TestDatabaseAuthorityWireGuardRequiresLimiterACKBeforeAgentWrites(t *testing.T) {
+	agentState := newDatabaseAuthorityAgent()
+	agent := httptest.NewServer(agentState)
+	defer agent.Close()
+	repo, server, inbound := newDatabaseAuthorityWireGuardFixture(t, agent.URL, true)
+	handler := NewRemoteManageHandler(repo, nil)
+	handler.SetLimiterPusher(NewLimiterConfigPusher(repo, nil))
+
+	reconcile := func() error {
+		leasedCtx, release, err := repo.AcquireRemoteServerExclusiveMutationLease(context.Background(), server.ID)
+		if err != nil {
+			return err
+		}
+		defer release()
+		_, err = handler.reconcileDatabaseOwnedInboundsLeased(leasedCtx, server.ID, "")
+		return err
+	}
+
+	agentState.setWireGuardPolicyResult(false, http.StatusOK)
+	if err := reconcile(); err == nil || !strings.Contains(err.Error(), "wireguard_peer_users_v1") {
+		t.Fatalf("reconcile without capability error=%v", err)
+	}
+	if events := agentState.eventSnapshot(); len(events) != 0 {
+		t.Fatalf("Agent writes occurred before capability gate: %v", events)
+	}
+
+	agentState.setWireGuardPolicyResult(true, http.StatusInternalServerError)
+	if err := reconcile(); err == nil || !strings.Contains(err.Error(), "limiter") {
+		t.Fatalf("reconcile without limiter ACK error=%v", err)
+	}
+	if events := agentState.eventSnapshot(); len(events) != 1 || events[0] != "limiter" {
+		t.Fatalf("Agent mutation occurred after rejected limiter policy: %v", events)
+	}
+
+	agentState.setWireGuardPolicyResult(true, http.StatusOK)
+	if err := reconcile(); err != nil {
+		t.Fatalf("reconcile with acknowledged limiter policy: %v", err)
+	}
+	if events := agentState.eventSnapshot(); len(events) < 2 || events[0] != "limiter" || events[1] != "mutation" {
+		t.Fatalf("authority ordering=%v, want limiter ACK before mutation", events)
+	}
+
+	configJSON, err := json.Marshal(map[string]interface{}{
+		"inbounds": []interface{}{inbound}, "outbounds": []interface{}{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestBody, err := json.Marshal(map[string]interface{}{"config": string(configJSON), "force": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentState.setWireGuardPolicyResult(true, http.StatusInternalServerError)
+	if _, err := handler.ForwardToServer(context.Background(), server.ID, http.MethodPost, "/api/child/xray/config", requestBody); err == nil {
+		t.Fatal("full-config write succeeded without limiter ACK")
+	}
+	if events := agentState.eventSnapshot(); len(events) != 1 || events[0] != "limiter" {
+		t.Fatalf("full-config write bypassed limiter gate: %v", events)
+	}
+
+	agentState.setWireGuardPolicyResult(true, http.StatusOK)
+	if _, err := handler.ForwardToServer(context.Background(), server.ID, http.MethodPost, "/api/child/xray/config", requestBody); err != nil {
+		t.Fatalf("full-config write with limiter ACK: %v", err)
+	}
+	if events := agentState.eventSnapshot(); len(events) < 2 || events[0] != "limiter" || events[1] != "config-write" {
+		t.Fatalf("full-config ordering=%v, want limiter ACK before write", events)
+	}
+}
+
+func TestDatabaseAuthorityProbeOnlyWireGuardRequiresPolicyAndRestartsSuppressedRuntime(t *testing.T) {
+	ctx := context.Background()
+	agentState := newDatabaseAuthorityAgent()
+	agent := httptest.NewServer(agentState)
+	defer agent.Close()
+	repo, server, _ := newDatabaseAuthorityWireGuardFixture(t, agent.URL, true)
+	if err := repo.DeleteUserInboundConfig(ctx, "alice", server.ID, "wg-authority"); err != nil {
+		t.Fatalf("remove dynamic user credential: %v", err)
+	}
+	resource, err := repo.GetManagedInboundResourceByServerTag(ctx, server.ID, "wg-authority")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewRemoteManageHandler(repo, nil)
+	handler.SetLimiterPusher(NewLimiterConfigPusher(repo, nil))
+	reconcile := func() (databaseInboundReconcileResult, error) {
+		leasedCtx, release, leaseErr := repo.AcquireRemoteServerExclusiveMutationLease(ctx, server.ID)
+		if leaseErr != nil {
+			return databaseInboundReconcileResult{}, leaseErr
+		}
+		defer release()
+		return handler.reconcileDatabaseOwnedInboundsLeased(leasedCtx, server.ID, "")
+	}
+
+	agentState.setWireGuardPolicyResult(false, http.StatusOK)
+	if _, err := reconcile(); err == nil || !strings.Contains(err.Error(), "wireguard_peer_users_v1") {
+		t.Fatalf("probe-only reconcile without capability error=%v", err)
+	}
+	if events := agentState.eventSnapshot(); len(events) != 0 {
+		t.Fatalf("probe-only authority wrote Agent before capability gate: %v", events)
+	}
+
+	agentState.setWireGuardPolicyResult(true, http.StatusInternalServerError)
+	if _, err := reconcile(); err == nil || !strings.Contains(err.Error(), "limiter") {
+		t.Fatalf("probe-only reconcile without limiter ACK error=%v", err)
+	}
+	if events := agentState.eventSnapshot(); len(events) != 1 || events[0] != "limiter" {
+		t.Fatalf("probe-only authority bypassed rejected limiter policy: %v", events)
+	}
+
+	agentState.setWireGuardPolicyResult(true, http.StatusOK)
+	result, err := reconcile()
+	if err != nil {
+		t.Fatalf("probe-only reconcile with policy ACK: %v", err)
+	}
+	if result.Restored != 1 {
+		t.Fatalf("probe-only reconcile result=%+v, want one restored inbound", result)
+	}
+	if events := agentState.eventSnapshot(); len(events) < 2 || events[0] != "limiter" || events[1] != "mutation" {
+		t.Fatalf("probe-only authority ordering=%v, want limiter ACK before mutation", events)
+	}
+	probe, err := repo.GetWireGuardProbePeer(ctx, resource.ID)
+	if err != nil || probe.State != storage.WireGuardProbePeerStateActive {
+		t.Fatalf("probe-only authority probe=%+v err=%v, want active", probe, err)
+	}
+	mutations := agentState.mutationSnapshot()
+	remoteInbound, _ := mutations[len(mutations)-1]["inbound"].(map[string]interface{})
+	remoteSettings, _ := remoteInbound["settings"].(map[string]interface{})
+	if peers := wireGuardInterfaceSlice(remoteSettings["peers"]); len(peers) != 1 ||
+		!equalManagedWireGuardKeys(wireGuardStringValue(peers[0].(map[string]interface{})["publicKey"]), probe.PublicKey) {
+		t.Fatalf("probe-only authority peers=%#v, want only probe %q", peers, probe.PublicKey)
+	}
+
+	// Agent startup may retain the config on disk while suppressing its runtime
+	// until limiter policy arrives. A config match is not recovery unless the
+	// Agent explicitly reports the listener running.
+	agentState.mu.Lock()
+	agentState.inbounds[resource.InboundTag]["_runtime_status"] = "not_running"
+	agentState.mu.Unlock()
+	agentState.setWireGuardPolicyResult(true, http.StatusOK)
+	result, err = reconcile()
+	if err != nil {
+		t.Fatalf("restart suppressed probe-only runtime: %v", err)
+	}
+	if result.Updated != 1 {
+		t.Fatalf("suppressed runtime reconcile result=%+v, want one update", result)
+	}
+	if events := agentState.eventSnapshot(); len(events) < 2 || events[0] != "limiter" || events[1] != "mutation" {
+		t.Fatalf("suppressed runtime ordering=%v, want limiter ACK before restart add", events)
+	}
+}
+
+func TestLegacyManagedWireGuardProbeMigratesBeforeLimiterAndAuthority(t *testing.T) {
+	ctx := context.Background()
+	agentState := newDatabaseAuthorityAgent()
+	agentState.setWireGuardPolicyResult(true, http.StatusOK)
+	agent := httptest.NewServer(agentState)
+	defer agent.Close()
+	repo, server, inbound := newDatabaseAuthorityWireGuardFixture(t, agent.URL, false)
+
+	settings, _ := inbound["settings"].(map[string]interface{})
+	legacyPeers := wireGuardInterfaceSlice(settings["peers"])
+	if len(legacyPeers) != 1 {
+		t.Fatalf("legacy fixture peers=%#v, want one bootstrap peer", legacyPeers)
+	}
+	legacyPublicKey := wireGuardStringValue(legacyPeers[0].(map[string]interface{})["publicKey"])
+	legacyMetadata, err := managedWireGuardPublicMetadataFromInbound(inbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyMetadataJSON, err := json.Marshal(legacyMetadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource, err := repo.CreateManagedInboundResource(ctx, storage.ManagedInboundResource{
+		ServerID: server.ID, DisplayName: "Legacy WG authority", Protocol: "wireguard",
+		InboundTag: "wg-authority", MutationID: "managed-wireguard:wg-authority-generation",
+		EndpointHost: "203.0.113.20", EndpointPort: 51820,
+		PublicMetadataJSON: legacyMetadataJSON, CreatedBy: "owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.GetWireGuardProbePeer(ctx, resource.ID); !errors.Is(err, storage.ErrWireGuardProbePeerNotFound) {
+		t.Fatalf("legacy resource unexpectedly had a probe row: %v", err)
+	}
+
+	pusher := NewLimiterConfigPusher(repo, nil)
+	snapshots, err := pusher.BuildLimiterConfigForServer(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("limiter-driven legacy probe migration: %v", err)
+	}
+	probePeer, err := repo.GetWireGuardProbePeer(ctx, resource.ID)
+	if err != nil {
+		t.Fatalf("load migrated probe: %v", err)
+	}
+	if probePeer.State != storage.WireGuardProbePeerStatePending || probePeer.PrivateKey == "" || probePeer.PublicKey == "" {
+		t.Fatalf("migrated probe=%+v, want encrypted pending identity", probePeer)
+	}
+	credential, err := repo.GetUserInboundConfig(ctx, "alice", server.ID, "wg-authority")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alicePeer, err := wireGuardAgentCredentialFromJSON(credential.CredentialJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wireGuardPrefixesOverlap(
+		mustWireGuardProbePrefixes(t, probePeer.Addresses),
+		mustWireGuardProbePrefixes(t, wireGuardStringValues(alicePeer["allowedIPs"])),
+	) {
+		t.Fatalf("migrated probe addresses %v overlap durable user addresses %v",
+			probePeer.Addresses, wireGuardStringValues(alicePeer["allowedIPs"]))
+	}
+	probeEmail := wireGuardProbeLimiterEmail(resource.ID, resource.InboundTag)
+	probeMapped := false
+	for _, snapshot := range snapshots {
+		if snapshot.InboundTag != resource.InboundTag {
+			continue
+		}
+		for _, peer := range snapshot.WireGuardPeers {
+			if peer.Email == probeEmail {
+				probeMapped = true
+			}
+		}
+	}
+	if !probeMapped {
+		t.Fatalf("limiter snapshots omitted migrated probe identity %q: %#v", probeEmail, snapshots)
+	}
+
+	storedDesired, err := repo.GetDesiredInbound(ctx, server.ID, resource.InboundTag)
+	if err != nil || storedDesired == nil {
+		t.Fatalf("load migrated desired inbound: row=%+v err=%v", storedDesired, err)
+	}
+	storedInbound, err := decodeDesiredInbound(storedDesired.InboundJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedSettings, _ := storedInbound["settings"].(map[string]interface{})
+	storedPeers := wireGuardInterfaceSlice(storedSettings["peers"])
+	if len(storedPeers) != 1 ||
+		!equalManagedWireGuardKeys(wireGuardStringValue(storedPeers[0].(map[string]interface{})["publicKey"]), probePeer.PublicKey) ||
+		equalManagedWireGuardKeys(wireGuardStringValue(storedPeers[0].(map[string]interface{})["publicKey"]), legacyPublicKey) {
+		t.Fatalf("migrated desired peers=%#v, want only probe %q", storedPeers, probePeer.PublicKey)
+	}
+	resource, err = repo.GetManagedInboundResource(ctx, resource.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := managedWireGuardInventoryMatchesResource(storedInbound, resource); err != nil {
+		t.Fatalf("migrated public metadata does not match authoritative probe config: %v", err)
+	}
+
+	handler := NewRemoteManageHandler(repo, nil)
+	handler.SetLimiterPusher(pusher)
+	leasedCtx, release, err := repo.AcquireRemoteServerExclusiveMutationLease(ctx, server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, reconcileErr := handler.reconcileDatabaseOwnedInboundsLeased(leasedCtx, server.ID, "")
+	release()
+	if reconcileErr != nil {
+		t.Fatalf("authority reconcile after legacy migration: %v", reconcileErr)
+	}
+	if result.Restored != 1 {
+		t.Fatalf("authority result=%+v, want restored managed WireGuard inbound", result)
+	}
+	probePeer, err = repo.GetWireGuardProbePeer(ctx, resource.ID)
+	if err != nil || probePeer.State != storage.WireGuardProbePeerStateActive {
+		t.Fatalf("reconciled probe=%+v err=%v, want active", probePeer, err)
+	}
+	if events := agentState.eventSnapshot(); len(events) < 2 || events[0] != "limiter" || events[1] != "mutation" {
+		t.Fatalf("legacy migration Agent ordering=%v, want limiter ACK before mutation", events)
+	}
+	mutations := agentState.mutationSnapshot()
+	if len(mutations) != 1 {
+		t.Fatalf("legacy migration Agent mutations=%#v", mutations)
+	}
+	remoteInbound, _ := mutations[0]["inbound"].(map[string]interface{})
+	remoteSettings, _ := remoteInbound["settings"].(map[string]interface{})
+	remotePeers := wireGuardInterfaceSlice(remoteSettings["peers"])
+	if len(remotePeers) != 2 {
+		t.Fatalf("reconciled WireGuard peers=%#v, want probe plus authorized user", remotePeers)
+	}
+	for _, rawPeer := range remotePeers {
+		peer, _ := rawPeer.(map[string]interface{})
+		if equalManagedWireGuardKeys(wireGuardStringValue(peer["publicKey"]), legacyPublicKey) {
+			t.Fatalf("legacy anonymous bootstrap peer survived authority migration: %#v", remotePeers)
+		}
+	}
+}
+
+func mustWireGuardProbePrefixes(t *testing.T, values []string) []netip.Prefix {
+	t.Helper()
+	prefixes, err := wireGuardProbePrefixes(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return prefixes
 }
 
 func TestDatabaseInboundReconcileRemovesAgentOnlyWithoutClaimingNode(t *testing.T) {

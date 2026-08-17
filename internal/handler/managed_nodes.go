@@ -286,6 +286,10 @@ func (h *ManagedNodesHandler) selectionOfferPolicy(ctx context.Context, grant st
 		return managedSelectionOfferPolicy{}
 	}
 	protocolAllowed := grant.AllowsNodeProtocol(node.Protocol, node.ClashConfig) && storage.SelfServiceNodeOfferProtocolEligible(*offer, node)
+	if protocolAllowed && canonicalManagedProtocol(node.Protocol) == "wireguard" {
+		provisionable, provenanceErr := h.repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+		protocolAllowed = provenanceErr == nil && provisionable
+	}
 	policy := managedSelectionOfferPolicy{mustRevoke: !protocolAllowed}
 	credentialSafe := true
 	if selection.CredentialConfigID == nil {
@@ -469,8 +473,17 @@ func (h *ManagedNodesHandler) reconcileSourceLocked(ctx context.Context, source 
 		} else if source.AppliedGeneration != 0 || source.ObservedState == storage.ManagedObservedActive {
 			recycleCredential = true
 		}
+		node, nodeErr := h.repo.GetNodeByID(ctx, source.NodeID)
+		if nodeErr == nil && canonicalManagedProtocol(node.Protocol) == "wireguard" {
+			provisionable, provenanceErr := h.repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+			if provenanceErr != nil {
+				return provenanceErr
+			}
+			if !provisionable {
+				recycleCredential = true
+			}
+		}
 		if source.DesiredState == storage.ManagedDesiredActive {
-			node, nodeErr := h.repo.GetNodeByID(ctx, source.NodeID)
 			server, serverErr := h.repo.GetRemoteServer(ctx, source.ServerID)
 			structureValid := nodeErr == nil && serverErr == nil && node.Enabled &&
 				strings.EqualFold(strings.TrimSpace(server.XrayMode), "embedded") &&
@@ -478,6 +491,9 @@ func (h *ManagedNodesHandler) reconcileSourceLocked(ctx context.Context, source 
 				strings.EqualFold(strings.TrimSpace(node.NodeType), "physical") &&
 				storage.SelfServiceNodeProtocolEligible(node.Protocol, node.ClashConfig) &&
 				!strings.HasPrefix(strings.ToLower(strings.TrimSpace(node.InboundTag)), "anydoor-")
+			if structureValid && canonicalManagedProtocol(node.Protocol) == "wireguard" {
+				structureValid = !recycleCredential
+			}
 			if recycleCredential || !structureValid {
 				updated, updateErr := h.repo.SetUserNodeGrantDesiredState(ctx, item.Grant.ID,
 					source.Username, storage.ManagedDesiredInactive, "reconciler")
@@ -606,11 +622,29 @@ func (h *ManagedNodesHandler) reconcileSourceMutationLocked(ctx context.Context,
 			if credentialErr != nil {
 				applyErr = credentialErr
 			} else if credential != nil {
-				applyErr = removeUserFromInbound(ctx, h.remoteManage, *credential)
+				if canonicalManagedProtocol(credential.Protocol) == "wireguard" {
+					if h.limiter == nil {
+						applyErr = errors.New("limiter pusher is not available")
+					} else {
+						// The inactive-but-observed source makes the limiter builder
+						// publish a strict residual mapping. Require its ACK before the
+						// remote peer removal so a failed removal remains fail-closed.
+						applyErr = h.limiter.PushToServerChecked(ctx, source.ServerID)
+					}
+				}
+				if applyErr == nil {
+					applyErr = removeUserFromInbound(ctx, h.remoteManage, *credential)
+				}
 				if applyErr == nil {
 					var saved map[string]interface{}
-					if err := json.Unmarshal([]byte(credential.CredentialJSON), &saved); err != nil {
-						applyErr = fmt.Errorf("parse credential for expiry cleanup: %w", err)
+					var parseErr error
+					if canonicalManagedProtocol(credential.Protocol) == "wireguard" {
+						saved, parseErr = wireGuardAgentCredentialFromJSON(credential.CredentialJSON)
+					} else {
+						parseErr = json.Unmarshal([]byte(credential.CredentialJSON), &saved)
+					}
+					if parseErr != nil {
+						applyErr = fmt.Errorf("parse credential for expiry cleanup: %w", parseErr)
 					} else {
 						applyErr = h.ensureManagedClientExpiry(ctx, source.ServerID, source.InboundTag, saved, nil)
 					}
@@ -748,6 +782,32 @@ func (h *ManagedNodesHandler) reconcileAll(ctx context.Context) {
 	}
 	if _, err := h.repo.ExpireDirectUserInboundAccessSources(ctx, now, 200); err != nil {
 		log.Printf("[ManagedNodes] expire direct sources failed: %v", err)
+	}
+	const wireGuardDirectGrantPageSize = 200
+	var afterWireGuardGrantID int64
+	for {
+		candidates, err := h.repo.ListActiveWireGuardDirectGrantCandidatesAfter(
+			ctx, afterWireGuardGrantID, wireGuardDirectGrantPageSize,
+		)
+		if err != nil {
+			log.Printf("[ManagedNodes] list active WireGuard direct grants failed: %v", err)
+			break
+		}
+		if len(candidates) == 0 {
+			break
+		}
+		for _, candidate := range candidates {
+			if _, deactivateErr := h.repo.DeactivateWireGuardDirectGrantIfProvenanceInvalid(
+				ctx, candidate.GrantID, candidate.Username, "reconciler",
+			); deactivateErr != nil {
+				log.Printf("[ManagedNodes] revoke invalid WireGuard direct grant=%d user=%s failed: %v",
+					candidate.GrantID, candidate.Username, deactivateErr)
+			}
+		}
+		afterWireGuardGrantID = candidates[len(candidates)-1].GrantID
+		if len(candidates) < wireGuardDirectGrantPageSize {
+			break
+		}
 	}
 
 	pending, err := h.repo.ListPendingUserInboundAccessSources(ctx, now, 200, 0)

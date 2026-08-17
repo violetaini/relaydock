@@ -45,6 +45,7 @@ type RemoteManageHandler struct {
 	xrayVersionsErr     string
 	xrayVersionsFetch   chan struct{}
 	publishInboundEvent func(event.InboundEvent) error
+	limiterPusher       *LimiterConfigPusher
 }
 
 const (
@@ -70,6 +71,12 @@ func remoteTransportContext(parent context.Context, path string) (context.Contex
 // SetInboundCache 注入 inbound cache。nil = 不启用 cache(套餐绑回退到逐节点 GET inbounds 老路径)。
 func (h *RemoteManageHandler) SetInboundCache(c *InboundCache) {
 	h.inboundCache = c
+}
+
+// SetLimiterPusher injects the full-replace limiter publisher used as the
+// acknowledgement gate for database-authoritative WireGuard restoration.
+func (h *RemoteManageHandler) SetLimiterPusher(p *LimiterConfigPusher) {
+	h.limiterPusher = p
 }
 
 // 创建一个新的远程管理处理程序
@@ -1717,6 +1724,15 @@ func (h *RemoteManageHandler) forwardToRemoteServerLeased(ctx context.Context, s
 		body, err = h.canonicalizeDatabaseXrayConfigRequest(ctx, serverID, body)
 		if err != nil {
 			return nil, fmt.Errorf("canonicalize database-authoritative Xray config: %w", err)
+		}
+		var request struct {
+			Config string `json:"config"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			return nil, fmt.Errorf("decode canonical database-authoritative Xray config: %w", err)
+		}
+		if err := h.requireDatabaseWireGuardConfigPolicyACKLeased(ctx, serverID, request.Config); err != nil {
+			return nil, fmt.Errorf("prepare database-authoritative WireGuard config: %w", err)
 		}
 	}
 	if method == http.MethodPost && cleanPath == "/api/child/inbounds" && !databaseInboundIntentAlreadyStaged(ctx) {

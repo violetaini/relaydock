@@ -240,6 +240,43 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 			}
 		}
 
+		if !payload.IsActive {
+			configs, cfgErr := repo.GetUserInboundConfigs(ctx, username)
+			if cfgErr != nil {
+				writeError(w, http.StatusInternalServerError, cfgErr)
+				return
+			}
+			serverLeasedCtx, releaseServers, serverLeaseErr := acquireRemoteServerMutationLeases(
+				ctx, repo, inboundConfigServerIDs(configs),
+			)
+			if serverLeaseErr != nil {
+				writeError(w, http.StatusConflict, serverLeaseErr)
+				return
+			}
+			defer releaseServers()
+			ctx = serverLeasedCtx
+			var revokeErrs []error
+			for _, cfg := range configs {
+				if remoteManage == nil {
+					revokeErrs = append(revokeErrs, errors.New("remote manager is unavailable"))
+					continue
+				}
+				if err := removeUserFromInbound(ctx, remoteManage, cfg); err != nil {
+					revokeErrs = append(revokeErrs, err)
+					log.Printf("[UserStatus] disable: remove %s from inbound %s on server %d failed: %v",
+						username, cfg.InboundTag, cfg.ServerID, err)
+				}
+			}
+			if err := suspendUserPrivateRouted(ctx, remoteManage, repo, username); err != nil {
+				revokeErrs = append(revokeErrs, err)
+				log.Printf("[UserStatus] disable: suspend private routed access for %s failed: %v", username, err)
+			}
+			if revokeErr := errors.Join(revokeErrs...); revokeErr != nil {
+				writeError(w, http.StatusBadGateway, revokeErr)
+				return
+			}
+		}
+
 		var statusErr error
 		if payload.IsActive {
 			statusErr = repo.UpdateUserStatus(ctx, username, true)
@@ -270,24 +307,12 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 			if cfgErr != nil {
 				log.Printf("[UserStatus] get inbound configs for %s failed: %v", username, cfgErr)
 			}
-			if !payload.IsActive {
-				// 禁用 → 从每个 inbound 移除 client (但保留 user_inbound_configs 行)
-				for _, cfg := range configs {
-					if err := removeUserFromInbound(ctx, remoteManage, cfg); err != nil {
-						log.Printf("[UserStatus] disable: remove %s from inbound %s on server %d failed: %v",
-							username, cfg.InboundTag, cfg.ServerID, err)
-					}
-				}
-				// 用户私有路由出站(routed_owner='user'):拆 rule + client,outbound 保留
-				if err := suspendUserPrivateRouted(ctx, remoteManage, repo, username); err != nil {
-					log.Printf("[UserStatus] disable: suspend private routed access for %s failed: %v", username, err)
-				}
-			} else {
+			if payload.IsActive {
 				// 启用 → 用 saved credential 调 addUserToInbound 把 client 加回。
 				// addUserToInbound 内部会发现 GetUserInboundConfig 已有记录,自动复用 credential_json。
 				targetUserCopy, _ := repo.GetUser(ctx, username)
 				for _, cfg := range configs {
-					if err := addUserToInbound(ctx, remoteManage, repo, targetUserCopy, cfg.ServerID, cfg.InboundTag); err != nil {
+					if err := addUserToInboundWithLimiter(ctx, remoteManage, repo, pusher, targetUserCopy, cfg.ServerID, cfg.InboundTag); err != nil {
 						log.Printf("[UserStatus] enable: add %s back to inbound %s on server %d failed: %v",
 							username, cfg.InboundTag, cfg.ServerID, err)
 					}
@@ -514,6 +539,27 @@ func NewUserDeleteHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 			writeError(w, http.StatusBadRequest, errors.New("不能删除管理员账号"))
 			return
 		}
+		leasedCtx, releaseAuthorization, leaseErr := repo.AcquireUserAuthorizationLease(ctx, username)
+		if leaseErr != nil {
+			writeError(w, http.StatusConflict, leaseErr)
+			return
+		}
+		defer releaseAuthorization()
+		ctx = leasedCtx
+		configs, cfgErr := repo.GetUserInboundConfigs(ctx, username)
+		if cfgErr != nil {
+			writeError(w, http.StatusInternalServerError, cfgErr)
+			return
+		}
+		serverLeasedCtx, releaseServers, serverLeaseErr := acquireRemoteServerMutationLeases(
+			ctx, repo, inboundConfigServerIDs(configs),
+		)
+		if serverLeaseErr != nil {
+			writeError(w, http.StatusConflict, serverLeaseErr)
+			return
+		}
+		defer releaseServers()
+		ctx = serverLeasedCtx
 
 		actor := auth.UsernameOrDefault(ctx, "admin")
 		sources, err := repo.PrepareUserDeletion(ctx, username, actor)

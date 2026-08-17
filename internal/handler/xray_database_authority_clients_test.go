@@ -2,8 +2,12 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -163,6 +167,112 @@ func TestDatabaseInboundReconcileDoesNotReviveInactiveCredential(t *testing.T) {
 	}
 }
 
+func TestDatabaseInboundAuthorityKeepsManagedCredentialWhenLegacyPackageOverLimit(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "mixed-authority.db")
+	repo, err := storage.NewTrafficRepository(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	createManagedSecurityTestUser(t, repo, "owner", storage.RoleAdmin)
+	createManagedSecurityTestUser(t, repo, "alice", storage.RoleUser)
+	server := &storage.RemoteServer{
+		Name: "mixed-authority-edge", Token: "token", IPAddress: "203.0.113.30",
+		XrayMode: "embedded", Status: storage.RemoteServerStatusConnected,
+	}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "owner", NodeName: "mixed-authority", Protocol: "vless", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "mixed-in",
+		ClashConfig: `{"name":"mixed-authority","type":"vless","server":"203.0.113.30","port":443,"uuid":"owner-uuid"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	offer, err := repo.CreateSelfServiceNodeOffer(ctx, node.ID, server.ID, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	expires := now.Add(time.Hour)
+	if _, err := repo.CreateUserServerGrant(ctx, storage.UserServerGrant{
+		Username: "alice", ServerID: server.ID, Enabled: true,
+		StartsAt: now.Add(-time.Hour), ExpiresAt: &expires, MaxActiveNodes: 1,
+		SpeedLimitMbps: 50, ConnectionLimit: 4,
+		BillingMode: storage.ManagedBillingDownload, ResetPolicy: storage.ManagedResetNone,
+		ResetDay: 1, BillingTimezone: "Asia/Shanghai", CreatedBy: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	activation, err := repo.ActivateUserNodeSelection(ctx, "alice", offer.ID, "alice", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+		Username: "alice", ServerID: server.ID, InboundTag: "mixed-in", Protocol: "vless",
+		CredentialJSON: `{"id":"alice-uuid","email":"alice__mixed-in"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	credential, err := repo.GetUserInboundConfig(ctx, "alice", server.ID, "mixed-in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetUserNodeSelectionCredential(ctx, activation.Selection.ID, credential.ID); err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "over-limit legacy package", CycleDays: 30, Nodes: []int64{node.ID},
+		SpeedLimitMbps: 5, DeviceLimit: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Current APIs correctly reject package/custom overlap. Preserve a legacy
+	// pre-mode-migration overlap explicitly so authority remains fail-safe while
+	// old rows are being reconciled instead of deleting an independent peer.
+	legacyDB, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacyDB.ExecContext(ctx, `UPDATE users SET
+package_id = ?, authorization_mode = ?, package_start_date = ?, package_end_date = ?
+WHERE username = ?`, packageID, storage.AuthorizationModePackage, now.Add(-time.Hour), expires, "alice"); err != nil {
+		_ = legacyDB.Close()
+		t.Fatal(err)
+	}
+	if err := legacyDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateUserOverLimit(ctx, "alice", true); err != nil {
+		t.Fatal(err)
+	}
+
+	desired := map[string]map[string]interface{}{
+		"mixed-in": databaseAuthorityInboundWithClients("mixed-in", 443),
+	}
+	if err := NewRemoteManageHandler(repo, nil).rebuildDatabaseAuthorizedInboundClients(ctx, server.ID, desired, nil); err != nil {
+		t.Fatalf("rebuild mixed managed credential: %v", err)
+	}
+	settings := desired["mixed-in"]["settings"].(map[string]interface{})
+	clients := settings["clients"].([]interface{})
+	if len(clients) != 1 || wireGuardStringValue(clients[0].(map[string]interface{})["id"]) != "alice-uuid" {
+		t.Fatalf("package over-limit removed independent managed credential: %#v", clients)
+	}
+
+	limiter, err := NewLimiterConfigPusher(repo, nil).BuildLimiterConfigForServer(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("build mixed managed limiter: %v", err)
+	}
+	managedLimit := findLimiterUser(t, limiter, "mixed-in", "alice__mixed-in")
+	if managedLimit.SpeedLimit != 6_250_000 || managedLimit.DeviceLimit != 4 {
+		t.Fatalf("over-limit package policy contaminated independent managed limit: %#v", managedLimit)
+	}
+}
+
 func TestDatabaseInboundReconcileRestoresEffectiveDatabaseCredential(t *testing.T) {
 	agentState := newDatabaseAuthorityAgent()
 	agent := httptest.NewServer(agentState)
@@ -182,6 +292,107 @@ func TestDatabaseInboundReconcileRestoresEffectiveDatabaseCredential(t *testing.
 	credential, _ := clients[0].(map[string]interface{})
 	if wireGuardStringValue(credential["id"]) != "alice-id" || wireGuardStringValue(credential["email"]) != "alice__database-owned" {
 		t.Fatalf("restored credential = %#v", credential)
+	}
+}
+
+func TestDatabaseInboundRebuildRestoresSanitizedWireGuardPeer(t *testing.T) {
+	ctx := context.Background()
+	repo := newWireGuardCredentialTestRepo(t)
+	if err := repo.CreateUser(ctx, "owner", "owner@example.test", "Owner", "hash", storage.RoleAdmin, ""); err != nil {
+		t.Fatal(err)
+	}
+	server := &storage.RemoteServer{Name: "wg-database-edge", Token: "token", IPAddress: "127.0.0.1", XrayMode: "embedded"}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	settings, _ := wireGuardCredentialTestSettings(t)
+	bootstrapPeer := wireGuardInterfaceSlice(settings["peers"])[0].(map[string]interface{})
+	bootstrapPublicKey := wireGuardStringValue(bootstrapPeer["publicKey"])
+	probePrivateKey, probePublicKey, err := generateWireGuardKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings["peers"] = append(wireGuardInterfaceSlice(settings["peers"]), map[string]interface{}{
+		"publicKey": probePublicKey, "allowedIPs": []interface{}{"10.66.66.3/32"}, "keepAlive": float64(0),
+	})
+	desiredInbound := map[string]interface{}{
+		"tag": "wg-database", "listen": "0.0.0.0", "port": float64(51820), "protocol": "wireguard",
+		"settings": cloneInboundMap(map[string]interface{}{"settings": settings})["settings"],
+	}
+	resource, err := repo.CreateManagedInboundResource(ctx, storage.ManagedInboundResource{
+		ServerID: server.ID, DisplayName: "wg-database", Protocol: "wireguard", InboundTag: "wg-database",
+		MutationID: "managed-wireguard:wg-generation", EndpointHost: "203.0.113.10", EndpointPort: 51820,
+		PublicMetadataJSON: json.RawMessage(`{}`), CreatedBy: "owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateWireGuardProbePeer(ctx, storage.WireGuardProbePeer{
+		ResourceID: resource.ID, PublicKey: probePublicKey, PrivateKey: probePrivateKey,
+		Addresses: []string{"10.66.66.3/32"}, State: storage.WireGuardProbePeerStatePending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.MarkWireGuardProbePeerActive(ctx, resource.ID); err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "owner", NodeName: "wg-database", Protocol: "wireguard", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "wg-database", InboundMutationID: "managed-wireguard:wg-generation",
+		ClashConfig: fmt.Sprintf(
+			`{"name":"wg-database","type":"wireguard","server":"203.0.113.10","port":51820,"private-key":%q,"public-key":%q}`,
+			wireGuardYAMLTestKey(0x51), wireGuardYAMLTestKey(0x52),
+		),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{Name: "wg-database", CycleDays: 30, Nodes: []int64{node.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, now.Add(-time.Hour), now.Add(time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
+	alice, err := repo.GetUser(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := getOrCreateInboundCredential(ctx, repo, alice, server.ID, "wg-database", "wireguard", settings); err != nil {
+		t.Fatal(err)
+	}
+	seedDatabaseAuthorityDesired(t, repo, server.ID, desiredInbound, "managed-wireguard:wg-generation")
+	desired := map[string]map[string]interface{}{"wg-database": desiredInbound}
+	if err := NewRemoteManageHandler(repo, nil).rebuildDatabaseAuthorizedInboundClients(ctx, server.ID, desired, nil); err != nil {
+		t.Fatalf("rebuild database WireGuard peers: %v", err)
+	}
+
+	peerSettings := desired["wg-database"]["settings"].(map[string]interface{})
+	peers := peerSettings["peers"].([]interface{})
+	if len(peers) != 2 {
+		t.Fatalf("rebuilt WireGuard peers=%#v, want probe plus user", peers)
+	}
+	basePeer := peers[0].(map[string]interface{})
+	if !equalManagedWireGuardKeys(wireGuardStringValue(basePeer["publicKey"]), probePublicKey) ||
+		equalManagedWireGuardKeys(wireGuardStringValue(basePeer["publicKey"]), bootstrapPublicKey) {
+		t.Fatalf("rebuilt base peer=%#v, want only database probe %q", basePeer, probePublicKey)
+	}
+	peer := peers[1].(map[string]interface{})
+	if len(peer) != 3 || peer["publicKey"] == nil || peer["allowedIPs"] == nil || peer["keepAlive"] == nil {
+		t.Fatalf("rebuilt WireGuard peer is not server-only: %#v", peer)
+	}
+	for _, forbidden := range []string{"privateKey", "encryptedPrivateKey", "serverPublicKey", "address", "email"} {
+		if _, leaked := peer[forbidden]; leaked {
+			t.Fatalf("rebuilt WireGuard peer leaked %s: %#v", forbidden, peer)
+		}
+	}
+	stored, err := repo.GetUserInboundConfig(ctx, "alice", server.ID, "wg-database")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stored.CredentialJSON, "encryptedPrivateKey") || strings.Contains(stored.CredentialJSON, `"privateKey"`) {
+		t.Fatalf("stored WireGuard credential is not encrypted: %s", stored.CredentialJSON)
 	}
 }
 

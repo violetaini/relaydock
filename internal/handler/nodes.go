@@ -539,7 +539,9 @@ func buildUserCredMapForCreator(ctx context.Context, repo *storage.TrafficReposi
 	m := make(map[credKey]string, len(userConfigs))
 	for _, cfg := range userConfigs {
 		if name, ok := idToName[cfg.ServerID]; ok {
-			m[credKey{name, cfg.InboundTag}] = cfg.CredentialJSON
+			if credentialJSON, ok := subscriptionCredentialJSON(ctx, repo, cfg); ok {
+				m[credKey{name, cfg.InboundTag}] = credentialJSON
+			}
 		}
 	}
 	return m
@@ -2460,7 +2462,12 @@ func convertAdminNodes(ctx context.Context, repo *storage.TrafficRepository, nod
 	}
 	for i, node := range nodes {
 		server, ok := byName[node.OriginalServer]
-		result[i].DirectGrantEligible = ok && storage.DirectNodeGrantEligible(node, server)
+		eligible := ok && storage.DirectNodeGrantEligible(node, server)
+		if eligible && canonicalManagedProtocol(node.Protocol) == "wireguard" {
+			provisionable, provenanceErr := repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+			eligible = provenanceErr == nil && provisionable
+		}
+		result[i].DirectGrantEligible = eligible
 	}
 	return result
 }

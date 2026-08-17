@@ -13,20 +13,20 @@ import (
 func TestNormalizeManagedGrantAllowedProtocols(t *testing.T) {
 	got, err := NormalizeManagedGrantAllowedProtocols([]string{
 		" VLESS ", "ss", "Shadowsocks", "HYSTERIA2", "hy2",
-		"SOCKS5", "socks", "AnyTLS", "snell", "http", "vmess", "trojan",
+		"SOCKS5", "socks", "AnyTLS", "snell", "http", "vmess", "trojan", " WireGuard ",
 	})
 	if err != nil {
 		t.Fatalf("NormalizeManagedGrantAllowedProtocols: %v", err)
 	}
 	want := []string{
 		"vless", "shadowsocks", "hysteria", "socks", "anytls",
-		"snell", "http", "vmess", "trojan",
+		"snell", "http", "vmess", "trojan", "wireguard",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("normalized protocols = %#v, want %#v", got, want)
 	}
 
-	for _, protocol := range []string{"", "wireguard", "anydoor", "tuic"} {
+	for _, protocol := range []string{"", "anydoor", "tuic"} {
 		t.Run("reject_"+protocol, func(t *testing.T) {
 			if _, err := NormalizeManagedGrantAllowedProtocols([]string{protocol}); !errors.Is(err, ErrManagedInvalidArgument) {
 				t.Fatalf("NormalizeManagedGrantAllowedProtocols(%q) error = %v, want %v", protocol, err, ErrManagedInvalidArgument)

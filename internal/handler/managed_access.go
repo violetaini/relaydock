@@ -34,6 +34,15 @@ func effectiveManagedNodeIDs(ctx context.Context, repo *storage.TrafficRepositor
 			!storage.SelfServiceNodeOfferAvailable(entry.Offer, node, *server) {
 			continue
 		}
+		if canonicalManagedProtocol(node.Protocol) == "wireguard" {
+			provisionable, provenanceErr := repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+			if provenanceErr != nil {
+				return nil, provenanceErr
+			}
+			if !provisionable {
+				continue
+			}
+		}
 		if entry.Selection.CredentialConfigID == nil {
 			continue
 		}

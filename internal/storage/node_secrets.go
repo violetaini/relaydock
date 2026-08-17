@@ -53,6 +53,12 @@ func (r *TrafficRepository) ConfigureNodeSecretEncryption(masterKey []byte) erro
 		r.nodeSecretMu.Unlock()
 		return err
 	}
+	if err := r.verifyExistingWireGuardUserCredentialSecrets(context.Background()); err != nil {
+		r.nodeSecretMu.Lock()
+		r.nodeSecretBox = nil
+		r.nodeSecretMu.Unlock()
+		return err
+	}
 	if err := r.ProtectWireGuardNodeSecrets(context.Background()); err != nil {
 		r.nodeSecretMu.Lock()
 		r.nodeSecretBox = nil
@@ -187,6 +193,121 @@ func (r *TrafficRepository) OpenWireGuardSubscriptionPrivateKey(scope, ciphertex
 		return "", errors.New("WireGuard 订阅私钥格式无效")
 	}
 	return privateKey, nil
+}
+
+const wireGuardUserCredentialSecretPurpose = "arcway:user-inbound:wireguard-private-key:v1:"
+
+func wireGuardUserCredentialAssociatedData(username string, serverID int64, inboundTag string) []byte {
+	return []byte(wireGuardUserCredentialSecretPurpose + strings.TrimSpace(username) + ":" + strconv.FormatInt(serverID, 10) + ":" + strings.TrimSpace(inboundTag))
+}
+
+func (r *TrafficRepository) sealWireGuardUserPrivateKey(username string, serverID int64, inboundTag, privateKey string) (string, error) {
+	r.nodeSecretMu.RLock()
+	box := r.nodeSecretBox
+	r.nodeSecretMu.RUnlock()
+	if box == nil {
+		return "", errors.New("WireGuard 私钥加密尚未初始化")
+	}
+	privateKey = strings.TrimSpace(privateKey)
+	if !validStoredWireGuardPrivateKey(privateKey) {
+		return "", errors.New("WireGuard private key must contain 32 bytes")
+	}
+	return box.Seal([]byte(privateKey), wireGuardUserCredentialAssociatedData(username, serverID, inboundTag))
+}
+
+// SealWireGuardUserPrivateKey encrypts one per-user WireGuard client private
+// key for storage inside user_inbound_configs. The ciphertext is bound to the
+// durable user/server/inbound tuple so it cannot be copied between accounts.
+func (r *TrafficRepository) SealWireGuardUserPrivateKey(username string, serverID int64, inboundTag, privateKey string) (string, error) {
+	return r.sealWireGuardUserPrivateKey(username, serverID, inboundTag, privateKey)
+}
+
+func (r *TrafficRepository) openWireGuardUserPrivateKey(username string, serverID int64, inboundTag, ciphertext string) (string, error) {
+	r.nodeSecretMu.RLock()
+	box := r.nodeSecretBox
+	r.nodeSecretMu.RUnlock()
+	if box == nil {
+		return "", errors.New("WireGuard 私钥加密尚未初始化")
+	}
+	plaintext, err := box.Open(strings.TrimSpace(ciphertext), wireGuardUserCredentialAssociatedData(username, serverID, inboundTag))
+	if err != nil {
+		return "", fmt.Errorf("解密 WireGuard 用户 %s 订阅私钥失败: %w", strings.TrimSpace(username), err)
+	}
+	privateKey := strings.TrimSpace(string(plaintext))
+	if !validStoredWireGuardPrivateKey(privateKey) {
+		return "", errors.New("WireGuard private key must contain 32 bytes")
+	}
+	return privateKey, nil
+}
+
+// OpenWireGuardUserPrivateKey authenticates and decrypts a per-user WireGuard
+// client private key for a short-lived subscription render.
+func (r *TrafficRepository) OpenWireGuardUserPrivateKey(username string, serverID int64, inboundTag, ciphertext string) (string, error) {
+	return r.openWireGuardUserPrivateKey(username, serverID, inboundTag, ciphertext)
+}
+
+func (r *TrafficRepository) verifyExistingWireGuardUserCredentialSecrets(ctx context.Context) error {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT username, server_id, inbound_tag, credential_json
+		FROM user_inbound_configs
+		WHERE protocol = 'wireguard'
+		ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("scan existing WireGuard user credentials: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var username, inboundTag, credentialJSON string
+		var serverID int64
+		if err := rows.Scan(&username, &serverID, &inboundTag, &credentialJSON); err != nil {
+			return fmt.Errorf("scan existing WireGuard user credential: %w", err)
+		}
+		var credential struct {
+			EncryptedPrivateKey string   `json:"encryptedPrivateKey"`
+			PrivateKey          string   `json:"privateKey"`
+			PublicKey           string   `json:"publicKey"`
+			ServerPublicKey     string   `json:"serverPublicKey"`
+			Address             []string `json:"address"`
+			AllowedIPs          []string `json:"allowedIPs"`
+			MTU                 int      `json:"mtu"`
+			KeepAlive           int      `json:"keepAlive"`
+		}
+		if err := json.Unmarshal([]byte(credentialJSON), &credential); err != nil {
+			return fmt.Errorf("parse WireGuard user credential for %s: %w", username, err)
+		}
+		switch {
+		case strings.TrimSpace(credential.EncryptedPrivateKey) != "":
+			if _, err := r.openWireGuardUserPrivateKey(username, serverID, inboundTag, credential.EncryptedPrivateKey); err != nil {
+				return err
+			}
+		case strings.TrimSpace(credential.PrivateKey) != "":
+			return fmt.Errorf("WireGuard user %s private key is stored in plaintext", username)
+		default:
+			return fmt.Errorf("WireGuard user %s credential is missing a private key", username)
+		}
+		addresses := credential.Address
+		if len(addresses) == 0 {
+			addresses = credential.AllowedIPs
+		}
+		if len(addresses) == 0 || strings.TrimSpace(credential.PublicKey) == "" || strings.TrimSpace(credential.ServerPublicKey) == "" {
+			return fmt.Errorf("WireGuard user %s credential metadata is incomplete", username)
+		}
+		for _, address := range addresses {
+			if strings.TrimSpace(address) == "" {
+				return fmt.Errorf("WireGuard user %s credential address is invalid", username)
+			}
+		}
+		if credential.MTU != 0 && (credential.MTU < 576 || credential.MTU > 9000) {
+			return fmt.Errorf("WireGuard user %s credential MTU is invalid", username)
+		}
+		if credential.KeepAlive < 0 || credential.KeepAlive > 65535 {
+			return fmt.Errorf("WireGuard user %s credential keepalive is invalid", username)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate existing WireGuard user credentials: %w", err)
+	}
+	return nil
 }
 
 func validStoredWireGuardPrivateKey(value string) bool {

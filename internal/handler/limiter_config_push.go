@@ -8,8 +8,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/violetaini/relaydock/internal/capabilities"
@@ -22,6 +24,7 @@ type LimiterConfigPusher struct {
 	wsHandler         *RemoteWSHandler
 	httpClient        *http.Client
 	capabilityManager *capabilities.Manager
+	serverPushLocks   sync.Map
 }
 
 func NewLimiterConfigPusher(repo *storage.TrafficRepository, wsHandler *RemoteWSHandler) *LimiterConfigPusher {
@@ -54,6 +57,19 @@ func (p *LimiterConfigPusher) SetCapabilityManager(manager *capabilities.Manager
 func connGroupKey(username string, physicalNodeID int64) string {
 	return fmt.Sprintf("%s|%d", username, physicalNodeID)
 }
+
+func wireGuardProbeLimiterEmail(resourceID int64, inboundTag string) string {
+	return fmt.Sprintf("_arcway_wireguard_probe_%d__%s", resourceID, strings.TrimSpace(inboundTag))
+}
+
+const (
+	// Limiter zero values mean unlimited. A user deletion tombstone therefore
+	// needs explicit non-zero minima while an unreachable Agent still retains
+	// the peer; the same rule applies to an over-limit package peer awaiting
+	// removal. Otherwise revocation residue silently becomes unlimited.
+	revocationResidualDenySpeedBytes      uint64 = 1
+	revocationResidualDenyConnectionLimit        = 1
+)
 
 type managedLimiterKey struct {
 	username   string
@@ -270,8 +286,10 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 	physicalByTag := make(map[string]storage.InboundNodeRef)
 	routedByTag := make(map[string]storage.InboundNodeRef)
 	allInboundTags := make(map[string]struct{})
+	nodeRefsLoaded := false
 	if serverName != "" {
 		if refs, err := p.repo.ListInboundNodeRefsForServer(ctx, serverName); err == nil {
+			nodeRefsLoaded = true
 			for _, r := range refs {
 				tag := strings.TrimSpace(r.InboundTag)
 				if tag == "" {
@@ -298,6 +316,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 	// 缓存 user 对象(指针)和套餐(指针);**不预算限速值** — 现在同一用户在不同 inbound 上限速可能不同,
 	// 推迟到内层按 (user, pkg, node_id) lookup。
 	userMap := make(map[string]*storage.User)
+	pendingDeletionUsers := make(map[string]bool)
 	pkgCache := make(map[int64]*storage.Package)
 
 	for username := range usernames {
@@ -305,11 +324,16 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if err != nil {
 			continue
 		}
-		if !user.IsActive {
+		deletionPending, pendingErr := p.repo.IsUserDeletionPending(ctx, username)
+		if pendingErr != nil {
+			return nil, pendingErr
+		}
+		if !user.IsActive && !deletionPending {
 			continue
 		}
 		u := user // 避免循环变量 alias
 		userMap[username] = &u
+		pendingDeletionUsers[username] = deletionPending
 		if user.PackageID > 0 {
 			if _, ok := pkgCache[user.PackageID]; !ok {
 				if pkg, err := p.repo.GetPackage(ctx, user.PackageID); err == nil {
@@ -322,13 +346,90 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 	if err != nil {
 		return nil, fmt.Errorf("build managed limiter limits: %w", err)
 	}
+	pendingRevocationResiduals := make(map[managedLimiterKey]bool)
+	type managedSourceState struct {
+		present     bool
+		mayHavePeer bool
+	}
+	managedSourceStates := make(map[managedLimiterKey]managedSourceState)
+	for username := range userMap {
+		sources, sourceErr := p.repo.ListUserInboundAccessSources(ctx, username, serverID)
+		if sourceErr != nil {
+			return nil, fmt.Errorf("list pending managed revocations for %s: %w", username, sourceErr)
+		}
+		for _, source := range sources {
+			key := managedLimiterKey{username: username, inboundTag: source.InboundTag}
+			state := managedSourceStates[key]
+			state.present = true
+			if source.DesiredState == storage.ManagedDesiredActive ||
+				source.ObservedState == storage.ManagedObservedActive {
+				state.mayHavePeer = true
+			}
+			managedSourceStates[key] = state
+			if source.DesiredState != storage.ManagedDesiredActive &&
+				source.ObservedState == storage.ManagedObservedActive {
+				pendingRevocationResiduals[key] = true
+			}
+		}
+	}
 
 	tagUsers := make(map[string][]WSUserLimitInfo)
+	tagWireGuardPeers := make(map[string]map[string]string)
 	tagPkgIDs := make(map[string]map[int64]bool)
 	// Empty snapshots are intentional. They clear stale per-user limits that may
 	// remain on an Agent after the last user is removed from an inbound.
 	for tag := range allInboundTags {
 		tagUsers[tag] = []WSUserLimitInfo{}
+		tagWireGuardPeers[tag] = make(map[string]string)
+	}
+
+	// Panel-managed WireGuard probes use a dedicated database identity rather
+	// than an anonymous bootstrap peer. Publish that identity through the same
+	// full-replace mapping as ordinary users so an Agent may reject every
+	// otherwise unknown tunnel source without disabling Mihomo validation.
+	resources, err := p.repo.ListManagedInboundResources(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list panel-managed WireGuard resources: %w", err)
+	}
+	for index := range resources {
+		resource := &resources[index]
+		if resource.ServerID != serverID || canonicalManagedProtocol(resource.Protocol) != "wireguard" {
+			continue
+		}
+		tag := strings.TrimSpace(resource.InboundTag)
+		if tag == "" {
+			return nil, fmt.Errorf("panel-managed WireGuard resource %d has no inbound tag", resource.ID)
+		}
+		desired, err := p.repo.GetDesiredInbound(ctx, resource.ServerID, tag)
+		if err != nil {
+			return nil, fmt.Errorf("load panel-managed WireGuard desired inbound %s: %w", tag, err)
+		}
+		_, hasNodeBinding := allInboundTags[tag]
+		if nodeRefsLoaded && !hasNodeBinding &&
+			(desired == nil || desired.DesiredState != storage.DesiredInboundStateActive) {
+			// Inventory reconciliation can leave a historical resource row after
+			// both of its actual authorities have disappeared. It must not block
+			// unrelated limiter snapshots or manufacture a new probe identity.
+			continue
+		}
+		probePeer, err := ensureAuthoritativeManagedWireGuardProbePeer(ctx, p.repo, resource, nil)
+		if err != nil {
+			return nil, fmt.Errorf("prepare panel-managed WireGuard probe peer %s: %w", tag, err)
+		}
+		email := wireGuardProbeLimiterEmail(resource.ID, tag)
+		if tagWireGuardPeers[tag] == nil {
+			tagWireGuardPeers[tag] = make(map[string]string)
+		}
+		tagUsers[tag] = append(tagUsers[tag], WSUserLimitInfo{
+			Email: email, ConnGroup: fmt.Sprintf("wireguard-probe|%d", resource.ID),
+		})
+		for _, address := range probePeer.Addresses {
+			address = strings.TrimSpace(address)
+			if existing, ok := tagWireGuardPeers[tag][address]; ok && existing != email {
+				return nil, fmt.Errorf("WireGuard probe address %s is assigned to both %s and %s on inbound %s", address, existing, email, tag)
+			}
+			tagWireGuardPeers[tag][address] = email
+		}
 	}
 
 	// 主账号:走 c.InboundTag,反查 physical 节点的 (nodeID, parentID)
@@ -349,7 +450,35 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if err != nil {
 			return nil, fmt.Errorf("resolve package limiter access for %s/%s: %w", c.Username, c.InboundTag, err)
 		}
-		if !hasManagedAccess && !hasDirectAccess && !hasPackageAccess {
+		hasOverLimitPackageResidual := false
+		if !hasManagedAccess && !hasDirectAccess && !hasPackageAccess && user.IsActive {
+			overLimit, overLimitErr := p.repo.IsUserOverLimit(ctx, c.Username)
+			if overLimitErr != nil {
+				return nil, fmt.Errorf("resolve over-limit state for %s/%s: %w", c.Username, c.InboundTag, overLimitErr)
+			}
+			if overLimit {
+				hasOverLimitPackageResidual, _, err = hasLegacyPackageInboundAccessIgnoringOverLimit(ctx, p.repo, c.Username, serverID, c.InboundTag, now)
+				if err != nil {
+					return nil, fmt.Errorf("resolve over-limit package limiter access for %s/%s: %w", c.Username, c.InboundTag, err)
+				}
+			}
+		}
+		hasDeletionResidual := pendingDeletionUsers[c.Username]
+		managedKey := managedLimiterKey{username: c.Username, inboundTag: c.InboundTag}
+		hasManagedRevocationResidual := strings.EqualFold(strings.TrimSpace(c.Protocol), "wireguard") &&
+			pendingRevocationResiduals[managedKey]
+		// A canonical WireGuard credential can outlive a legacy package template
+		// update or provenance failure until remote peer removal is acknowledged.
+		// Keeping its address mapped to a strict residual is not authorization; it
+		// makes every such cleanup window fail closed and retryable.
+		managedState := managedSourceStates[managedKey]
+		hasWireGuardCredentialResidual := user.IsActive &&
+			strings.EqualFold(strings.TrimSpace(c.Protocol), "wireguard") &&
+			!hasManagedAccess && !hasDirectAccess && !hasPackageAccess &&
+			(!managedState.present || managedState.mayHavePeer)
+		if !hasManagedAccess && !hasDirectAccess && !hasPackageAccess &&
+			!hasOverLimitPackageResidual && !hasDeletionResidual && !hasManagedRevocationResidual &&
+			!hasWireGuardCredentialResidual {
 			continue
 		}
 		var pkg *storage.Package
@@ -370,7 +499,8 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			}
 		} else if hasPackageAccess || hasDirectAccess {
 			speedMbps, deviceLimit = resolveLimit(user, pkg, ref.NodeID, ref.ParentID)
-		} else {
+		} else if !hasDeletionResidual && !hasOverLimitPackageResidual && !hasManagedRevocationResidual &&
+			!hasWireGuardCredentialResidual {
 			// A desired source can briefly outlive its grant state until the
 			// reconciler versions it inactive. It must not fall through to an
 			// unlimited legacy rule during that window.
@@ -380,16 +510,37 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if speedMbps > 0 {
 			speedBytes = uint64(speedMbps * 1000000 / 8)
 		}
+		if hasDeletionResidual || hasOverLimitPackageResidual || hasManagedRevocationResidual ||
+			hasWireGuardCredentialResidual {
+			speedBytes = revocationResidualDenySpeedBytes
+			deviceLimit = revocationResidualDenyConnectionLimit
+		}
+		limitEmail := user.Username + "__" + c.InboundTag
 		tagUsers[c.InboundTag] = append(tagUsers[c.InboundTag], WSUserLimitInfo{
 			// email 必须与 generateCredential 写进 xray inbound 的 client email 一致 —— 强制 <username>__<inboundTag>
 			// (自动子账户格式)。此前这里用纯 username,导致限速器按 username 记账、xray 流量走子账户 email,
 			// agent GetUserBucket 用连接 email 查不到限速记录 → 套餐/固定限速对自动子账户全部失效。
-			Email:      user.Username + "__" + c.InboundTag,
+			Email:      limitEmail,
 			SpeedLimit: speedBytes,
 			// 物理节点自身即 group 的物理节点(ref.NodeID);其路由出站子账户在下面用 ParentID 归到同一 group。
 			DeviceLimit: deviceLimit,
 			ConnGroup:   connGroupKey(user.Username, physicalNodeID),
 		})
+		if strings.EqualFold(strings.TrimSpace(c.Protocol), "wireguard") {
+			addresses, err := wireGuardLimiterAddresses(c.CredentialJSON)
+			if err != nil {
+				return nil, fmt.Errorf("resolve WireGuard limiter identity for %s/%s: %w", c.Username, c.InboundTag, err)
+			}
+			if tagWireGuardPeers[c.InboundTag] == nil {
+				tagWireGuardPeers[c.InboundTag] = make(map[string]string)
+			}
+			for _, address := range addresses {
+				if existing, ok := tagWireGuardPeers[c.InboundTag][address]; ok && existing != limitEmail {
+					return nil, fmt.Errorf("WireGuard tunnel address %s is assigned to both %s and %s on inbound %s", address, existing, limitEmail, c.InboundTag)
+				}
+				tagWireGuardPeers[c.InboundTag][address] = limitEmail
+			}
+		}
 		if hasPackageAccess && !(hasManagedAccess && hasManagedLimit) && user.PackageID > 0 {
 			if tagPkgIDs[c.InboundTag] == nil {
 				tagPkgIDs[c.InboundTag] = make(map[int64]bool)
@@ -451,14 +602,97 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 				rules = append(rules, pkg.AutoSpeedRules...)
 			}
 		}
+		peerAddresses := make([]string, 0, len(tagWireGuardPeers[tag]))
+		for address := range tagWireGuardPeers[tag] {
+			peerAddresses = append(peerAddresses, address)
+		}
+		sort.Strings(peerAddresses)
+		peers := make([]WSWireGuardPeerIdentity, 0, len(peerAddresses))
+		for _, address := range peerAddresses {
+			peers = append(peers, WSWireGuardPeerIdentity{Address: address, Email: tagWireGuardPeers[tag][address]})
+		}
 		payloads = append(payloads, WSLimiterConfigPayload{
 			InboundTag:     tag,
 			Users:          users,
+			WireGuardPeers: peers,
 			AutoSpeedRules: rules,
 		})
 	}
 
 	return payloads, nil
+}
+
+func hasLegacyPackageInboundAccessIgnoringOverLimit(ctx context.Context, repo *storage.TrafficRepository, username string, serverID int64, inboundTag string, now time.Time) (bool, *time.Time, error) {
+	if repo == nil || strings.TrimSpace(username) == "" || serverID <= 0 || strings.TrimSpace(inboundTag) == "" {
+		return false, nil, storage.ErrManagedInvalidArgument
+	}
+	user, err := repo.GetUser(ctx, username)
+	if err != nil {
+		return false, nil, err
+	}
+	if !packageAssignmentActive(user, now) {
+		return false, nil, nil
+	}
+	pkg, err := repo.GetPackage(ctx, user.PackageID)
+	if err != nil {
+		return false, nil, err
+	}
+	server, err := repo.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		return false, nil, err
+	}
+	for _, nodeID := range pkg.Nodes {
+		node, nodeErr := repo.GetNodeByID(ctx, nodeID)
+		if nodeErr != nil {
+			continue
+		}
+		if node.Enabled && node.NodeType != "routed" && supportsPerUserInboundCredential(node.Protocol) &&
+			node.OriginalServer == server.Name && node.InboundTag == inboundTag {
+			if canonicalManagedProtocol(node.Protocol) == "wireguard" {
+				provisionable, provenanceErr := repo.ManagedWireGuardNodeAuthorityProvisionable(ctx, node.ID)
+				if provenanceErr != nil {
+					return false, nil, provenanceErr
+				}
+				if !provisionable {
+					continue
+				}
+			}
+			if user.PackageEndDate == nil {
+				return true, nil, nil
+			}
+			expires := user.PackageEndDate.UTC()
+			return true, &expires, nil
+		}
+	}
+	return false, nil, nil
+}
+
+func wireGuardLimiterAddresses(credentialJSON string) ([]string, error) {
+	var credential struct {
+		Address []string `json:"address"`
+	}
+	if err := json.Unmarshal([]byte(credentialJSON), &credential); err != nil {
+		return nil, fmt.Errorf("parse credential: %w", err)
+	}
+	if len(credential.Address) == 0 {
+		return nil, errors.New("credential has no tunnel address")
+	}
+	addresses := make([]string, 0, len(credential.Address))
+	seen := make(map[string]struct{}, len(credential.Address))
+	for _, raw := range credential.Address {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil || prefix.Bits() != prefix.Addr().BitLen() {
+			return nil, fmt.Errorf("credential contains invalid host address %q", raw)
+		}
+		address := prefix.Addr().String() + fmt.Sprintf("/%d", prefix.Bits())
+		if _, ok := seen[address]; ok {
+			continue
+		}
+		seen[address] = struct{}{}
+		addresses = append(addresses, address)
+	}
+	sort.Strings(addresses)
+	return addresses, nil
 }
 
 // ensureEmptyLimiterSnapshots adds an explicit empty user list for every
@@ -475,6 +709,9 @@ func ensureEmptyLimiterSnapshots(configs []WSLimiterConfigPayload, inboundTags [
 		if cfg.Users == nil {
 			cfg.Users = []WSUserLimitInfo{}
 		}
+		if cfg.WireGuardPeers == nil {
+			cfg.WireGuardPeers = []WSWireGuardPeerIdentity{}
+		}
 		byTag[tag] = cfg
 	}
 	for _, rawTag := range inboundTags {
@@ -483,7 +720,7 @@ func ensureEmptyLimiterSnapshots(configs []WSLimiterConfigPayload, inboundTags [
 			continue
 		}
 		if _, ok := byTag[tag]; !ok {
-			byTag[tag] = WSLimiterConfigPayload{InboundTag: tag, Users: []WSUserLimitInfo{}}
+			byTag[tag] = WSLimiterConfigPayload{InboundTag: tag, Users: []WSUserLimitInfo{}, WireGuardPeers: []WSWireGuardPeerIdentity{}}
 		}
 	}
 	tags := make([]string, 0, len(byTag))
@@ -556,6 +793,13 @@ func (p *LimiterConfigPusher) PushToServer(ctx context.Context, serverID int64) 
 }
 
 func (p *LimiterConfigPusher) pushToServerLeased(ctx context.Context, serverID int64) {
+	_ = p.withServerPushLock(serverID, func() error {
+		p.pushToServerLeasedUnlocked(ctx, serverID)
+		return nil
+	})
+}
+
+func (p *LimiterConfigPusher) pushToServerLeasedUnlocked(ctx context.Context, serverID int64) {
 	server, configs, err := p.buildServerLimiterSnapshots(ctx, serverID)
 	if err != nil {
 		log.Printf("[LimiterPush] Failed to push config for server %d: %v", serverID, err)
@@ -576,6 +820,17 @@ func (p *LimiterConfigPusher) pushToServerLeased(ctx context.Context, serverID i
 	if err := p.pushViaHTTP(ctx, server, configs); err != nil {
 		log.Printf("[LimiterPush] Failed to push config for server %d: %v", serverID, err)
 	}
+}
+
+// withServerPushLock serializes the snapshot read with its complete delivery.
+// Remote mutation leases are intentionally shared, so they cannot prevent an
+// older limiter snapshot from being acknowledged after a newer one.
+func (p *LimiterConfigPusher) withServerPushLock(serverID int64, fn func() error) error {
+	lockValue, _ := p.serverPushLocks.LoadOrStore(serverID, &sync.Mutex{})
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
 }
 
 func (p *LimiterConfigPusher) buildServerLimiterSnapshots(ctx context.Context, serverID int64) (*storage.RemoteServer, []WSLimiterConfigPayload, error) {
@@ -620,6 +875,12 @@ func (p *LimiterConfigPusher) PushToServerChecked(ctx context.Context, serverID 
 }
 
 func (p *LimiterConfigPusher) pushToServerCheckedLeased(ctx context.Context, serverID int64) error {
+	return p.withServerPushLock(serverID, func() error {
+		return p.pushToServerCheckedLeasedUnlocked(ctx, serverID)
+	})
+}
+
+func (p *LimiterConfigPusher) pushToServerCheckedLeasedUnlocked(ctx context.Context, serverID int64) error {
 	server, configs, err := p.buildServerLimiterSnapshots(ctx, serverID)
 	if err != nil {
 		return err

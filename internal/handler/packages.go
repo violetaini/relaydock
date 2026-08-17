@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
@@ -9,9 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -573,6 +577,12 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 					log.Printf("[PackageUpdate] Failed to find server %s: %v", node.OriginalServer, err)
 					return
 				}
+				if canonicalManagedProtocol(node.Protocol) == "wireguard" {
+					mu.Lock()
+					inboundFallbacks = append(inboundFallbacks, inboundFallbackItem{Username: user.Username, ServerID: server.ID, InboundTag: node.InboundTag, NodeName: node.NodeName})
+					mu.Unlock()
+					return
+				}
 				// 阶段一:从 InboundCache 算 cred,收集成 batch item;cache miss / 续费 → fallback 逐项。
 				item, collected, cerr := collectInboundClientAddItem(ctx, h.remoteManage.inboundCache, h.repo, user, server.ID, node.InboundTag)
 				if cerr != nil {
@@ -616,7 +626,7 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 				if err != nil {
 					return
 				}
-				_, removeErr := removeStalePackageUserInboundConfig(ctx, h.remoteManage, h.repo, *cfg)
+				_, removeErr := removeStalePackageUserInboundConfig(ctx, h.remoteManage, h.repo, h.pusher, *cfg)
 				if removeErr != nil && !isInboundNotFoundErr(removeErr) {
 					log.Printf("[PackageUpdate] Failed to remove user %s from inbound %s on server %d: %v",
 						user.Username, cfg.InboundTag, cfg.ServerID, removeErr)
@@ -654,7 +664,7 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 			go func(fb inboundFallbackItem) {
 				defer fbWg.Done()
 				user := storage.User{Username: fb.Username}
-				if err := addUserToInbound(ctx, h.remoteManage, h.repo, user, fb.ServerID, fb.InboundTag); err != nil {
+				if err := addUserToInboundWithLimiter(ctx, h.remoteManage, h.repo, h.pusher, user, fb.ServerID, fb.InboundTag); err != nil {
 					log.Printf("[PackageUpdate] fallback addUserToInbound user=%s server=%d tag=%s: %v",
 						fb.Username, fb.ServerID, fb.InboundTag, err)
 				}
@@ -805,7 +815,7 @@ func unbindUserPackageLocked(ctx context.Context, repo *storage.TrafficRepositor
 		wg.Add(1)
 		go func(cfg storage.UserInboundConfig) {
 			defer wg.Done()
-			_, removeErr := removePackageUserInboundConfig(ctx, remoteManage, repo, cfg)
+			_, removeErr := removePackageUserInboundConfig(ctx, remoteManage, repo, pusher, cfg)
 			if removeErr != nil && !isInboundNotFoundErr(removeErr) {
 				log.Printf("[PackageUnbind] 从入站 %s(server %d)移除用户 %s 失败: %v", cfg.InboundTag, cfg.ServerID, username, removeErr)
 				mu.Lock()
@@ -1240,7 +1250,7 @@ func (h *PackageAssignHandler) reconcileStalePackageNodeAccessLocked(ctx context
 	}
 	var cleanupErrs []error
 	for _, cfg := range configs {
-		if _, removeErr := removeStalePackageUserInboundConfig(ctx, h.remoteManage, h.repo, cfg); removeErr != nil && !isInboundNotFoundErr(removeErr) {
+		if _, removeErr := removeStalePackageUserInboundConfig(ctx, h.remoteManage, h.repo, h.pusher, cfg); removeErr != nil && !isInboundNotFoundErr(removeErr) {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove stale inbound %d/%s: %w",
 				cfg.ServerID, cfg.InboundTag, removeErr))
 		}
@@ -1307,6 +1317,15 @@ func hasPackageTemplateInboundAccess(ctx context.Context, repo *storage.TrafficR
 		if node.Enabled && !strings.EqualFold(strings.TrimSpace(node.NodeType), "routed") &&
 			supportsPerUserInboundCredential(node.Protocol) &&
 			node.OriginalServer == server.Name && node.InboundTag == inboundTag {
+			if canonicalManagedProtocol(node.Protocol) == "wireguard" {
+				provisionable, provenanceErr := repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+				if provenanceErr != nil {
+					return false, provenanceErr
+				}
+				if !provisionable {
+					continue
+				}
+			}
 			return true, nil
 		}
 	}
@@ -1601,6 +1620,17 @@ func (h *PackageAssignHandler) assignAndProvisionLocked(ctx context.Context, use
 						!supportsPerUserInboundCredential(node.Protocol) {
 						return
 					}
+					if canonicalManagedProtocol(node.Protocol) == "wireguard" {
+						provisionable, provenanceErr := h.repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+						if provenanceErr != nil || !provisionable {
+							log.Printf("[PackageAssign] refusing unmanaged WireGuard node %d for user %s: provisionable=%v err=%v",
+								node.ID, username, provisionable, provenanceErr)
+							mu.Lock()
+							warnings = append(warnings, fmt.Sprintf("WireGuard 节点 %s 不是当前面板管理实例", node.NodeName))
+							mu.Unlock()
+							return
+						}
+					}
 					// 同一 (server, inbound) 只收集一次 —— both 的 v4/v6 双节点共享同一入站,避免重复加 client。
 					seenKey := user.Username + "|" + node.OriginalServer + "|" + node.InboundTag
 					mu.Lock()
@@ -1613,6 +1643,12 @@ func (h *PackageAssignHandler) assignAndProvisionLocked(ctx context.Context, use
 					server, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer)
 					if err != nil {
 						log.Printf("[PackageAssign] Failed to find server %s: %v", node.OriginalServer, err)
+						return
+					}
+					if canonicalManagedProtocol(node.Protocol) == "wireguard" {
+						mu.Lock()
+						inboundFallbacks = append(inboundFallbacks, inboundFallbackItem{ServerID: server.ID, InboundTag: node.InboundTag, NodeName: node.NodeName})
+						mu.Unlock()
 						return
 					}
 					// 阶段一:从 InboundCache 算 cred,收集成 batch item;cache miss / 续费 → fallback 逐项。
@@ -1669,7 +1705,7 @@ func (h *PackageAssignHandler) assignAndProvisionLocked(ctx context.Context, use
 					fbWg.Add(1)
 					go func(fb inboundFallbackItem) {
 						defer fbWg.Done()
-						if err := addUserToInbound(ctx, h.remoteManage, h.repo, user, fb.ServerID, fb.InboundTag); err != nil {
+						if err := addUserToInboundWithLimiter(ctx, h.remoteManage, h.repo, h.pusher, user, fb.ServerID, fb.InboundTag); err != nil {
 							log.Printf("[PackageAssign] fallback addUserToInbound user=%s server=%d tag=%s: %v",
 								username, fb.ServerID, fb.InboundTag, err)
 							mu.Lock()
@@ -1765,7 +1801,7 @@ func (h *PackageAssignHandler) revokePackageNodeDifference(ctx context.Context, 
 		}
 		copy := *cfg
 		revoked = append(revoked, packageNodeRevocation{inbound: &copy})
-		retained, err := removePackageUserInboundConfig(ctx, h.remoteManage, h.repo, *cfg)
+		retained, err := removePackageUserInboundConfig(ctx, h.remoteManage, h.repo, h.pusher, *cfg)
 		if err != nil && !isInboundNotFoundErr(err) {
 			return revoked, err
 		}
@@ -1791,15 +1827,21 @@ func (h *PackageAssignHandler) restorePackageNodeRevocations(ctx context.Context
 		}
 		cfg := *action.inbound
 		var credential map[string]interface{}
-		if err := json.Unmarshal([]byte(cfg.CredentialJSON), &credential); err != nil || credential == nil {
-			restoreErrors = append(restoreErrors, fmt.Errorf("inbound %d/%s credential: %v", cfg.ServerID, cfg.InboundTag, err))
+		var credentialErr error
+		if canonicalManagedProtocol(cfg.Protocol) == "wireguard" {
+			credential, credentialErr = wireGuardAgentCredentialFromJSON(cfg.CredentialJSON)
+		} else {
+			credentialErr = json.Unmarshal([]byte(cfg.CredentialJSON), &credential)
+		}
+		if credentialErr != nil || credential == nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("inbound %d/%s credential: %v", cfg.ServerID, cfg.InboundTag, credentialErr))
 			continue
 		}
 		if err := h.repo.SaveUserInboundConfig(ctx, cfg); err != nil {
 			restoreErrors = append(restoreErrors, fmt.Errorf("inbound %d/%s state: %w", cfg.ServerID, cfg.InboundTag, err))
 			continue
 		}
-		if err := applyPreparedInboundCredentialForUser(ctx, h.remoteManage, h.repo, user.Username, cfg.ServerID, cfg.InboundTag, credential, user.PackageEndDate); err != nil {
+		if err := applyPreparedInboundCredentialForUserWithLimiter(ctx, h.remoteManage, h.repo, h.pusher, user.Username, cfg.ServerID, cfg.InboundTag, credential, user.PackageEndDate, true); err != nil {
 			restoreErrors = append(restoreErrors, fmt.Errorf("inbound %d/%s remote: %w", cfg.ServerID, cfg.InboundTag, err))
 		}
 	}
@@ -1975,9 +2017,68 @@ func (h *PackageAssignHandler) loadDefaultTemplate(ctx context.Context) (string,
 // 查到 DB 无记录 → 各生成不同随机 uuid → agent 按 uuid 去重失效 → 同 email 重复子账户。
 var inboundCredLocks sync.Map // key "username|serverID|inboundTag" → *sync.Mutex
 
+// WireGuard tunnel addresses are shared by every user of an inbound. The
+// per-user credential lock above cannot prevent two different users from
+// observing the same free address, so allocation and persistence need their
+// own per-inbound critical section.
+var wireGuardAddressLocks sync.Map // key "serverID|inboundTag" → *sync.Mutex
+
+// acquireRemoteServerMutationLeases holds every relevant server against an
+// exclusive database-authority rebuild while a user authorization transition
+// changes remote credentials and then commits its local state. IDs are sorted
+// so two multi-server transitions cannot deadlock by acquiring in opposite
+// orders. The user authorization lease must be acquired first by the caller.
+func acquireRemoteServerMutationLeases(ctx context.Context, repo *storage.TrafficRepository, serverIDs []int64) (context.Context, func(), error) {
+	unique := make(map[int64]struct{}, len(serverIDs))
+	ordered := make([]int64, 0, len(serverIDs))
+	for _, serverID := range serverIDs {
+		if serverID <= 0 {
+			continue
+		}
+		if _, exists := unique[serverID]; exists {
+			continue
+		}
+		unique[serverID] = struct{}{}
+		ordered = append(ordered, serverID)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+
+	leasedCtx := ctx
+	releases := make([]func(), 0, len(ordered))
+	releaseAll := func() {
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
+		}
+	}
+	for _, serverID := range ordered {
+		nextCtx, release, err := repo.AcquireRemoteServerMutationLease(leasedCtx, serverID)
+		if err != nil {
+			releaseAll()
+			return nil, nil, err
+		}
+		leasedCtx = nextCtx
+		releases = append(releases, release)
+	}
+	return leasedCtx, releaseAll, nil
+}
+
+func inboundConfigServerIDs(configs []storage.UserInboundConfig) []int64 {
+	serverIDs := make([]int64, 0, len(configs))
+	for _, cfg := range configs {
+		serverIDs = append(serverIDs, cfg.ServerID)
+	}
+	return serverIDs
+}
+
 func inboundCredLock(username string, serverID int64, inboundTag string) *sync.Mutex {
 	key := fmt.Sprintf("%s|%d|%s", username, serverID, inboundTag)
 	v, _ := inboundCredLocks.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+func wireGuardAddressLock(serverID int64, inboundTag string) *sync.Mutex {
+	key := fmt.Sprintf("%d|%s", serverID, inboundTag)
+	v, _ := wireGuardAddressLocks.LoadOrStore(key, &sync.Mutex{})
 	return v.(*sync.Mutex)
 }
 
@@ -1995,9 +2096,61 @@ func getOrCreateInboundCredential(ctx context.Context, repo *storage.TrafficRepo
 	lock := inboundCredLock(user.Username, serverID, inboundTag)
 	lock.Lock()
 	defer lock.Unlock()
+	canonicalProtocol := canonicalManagedProtocol(protocol)
 
 	// 1) DB 复用
-	if existing, _ := repo.GetUserInboundConfig(ctx, user.Username, serverID, inboundTag); existing != nil && existing.Protocol == protocol {
+	if existing, _ := repo.GetUserInboundConfig(ctx, user.Username, serverID, inboundTag); existing != nil && canonicalManagedProtocol(existing.Protocol) == canonicalProtocol {
+		if canonicalProtocol == "wireguard" {
+			record, err := decodeWireGuardUserCredentialRecord(existing.CredentialJSON)
+			if err != nil {
+				return nil, "", false, fmt.Errorf("parse stored WireGuard credential: %w", err)
+			}
+			privateKey, err := wireGuardPrivateKeyFromRecord(repo, *existing, record)
+			if err != nil {
+				return nil, "", false, err
+			}
+			credentialChanged := false
+			if record.PublicKey == "" {
+				record.PublicKey, err = wireGuardPublicKeyFromPrivateKey(privateKey)
+				if err != nil {
+					return nil, "", false, fmt.Errorf("derive stored WireGuard public key: %w", err)
+				}
+				credentialChanged = true
+			}
+			serverPublicKey, err := wireGuardServerPublicKeyFromSettings(settings)
+			if err != nil {
+				return nil, "", false, err
+			}
+			if record.ServerPublicKey != serverPublicKey {
+				record.ServerPublicKey = serverPublicKey
+				credentialChanged = true
+			}
+			if record.MTU == 0 {
+				record.MTU = wireGuardInboundMTU(settings)
+				credentialChanged = true
+			}
+			if len(record.Address) == 0 && len(record.AllowedIPs) > 0 {
+				record.Address = normalizedWireGuardStrings(record.AllowedIPs)
+				record.AllowedIPs = nil
+				credentialChanged = true
+			}
+			credJSON := existing.CredentialJSON
+			if credentialChanged {
+				updated, err := json.Marshal(record)
+				if err != nil {
+					return nil, "", false, fmt.Errorf("marshal reconciled WireGuard credential: %w", err)
+				}
+				credJSON = string(updated)
+				if err := repo.UpdateUserInboundCredentialJSONByID(ctx, existing.ID, credJSON); err != nil {
+					return nil, "", false, fmt.Errorf("persist reconciled WireGuard credential: %w", err)
+				}
+			}
+			agentCredential, err := wireGuardAgentCredentialFromRecord(record)
+			if err != nil {
+				return nil, "", false, err
+			}
+			return agentCredential, credJSON, true, nil
+		}
 		var cred map[string]interface{}
 		if json.Unmarshal([]byte(existing.CredentialJSON), &cred) == nil && cred != nil {
 			credJSON := existing.CredentialJSON
@@ -2024,6 +2177,31 @@ func getOrCreateInboundCredential(ctx context.Context, repo *storage.TrafficRepo
 			}
 			return cred, credJSON, true, nil
 		}
+	}
+
+	if canonicalProtocol == "wireguard" {
+		allocationLock := wireGuardAddressLock(serverID, inboundTag)
+		allocationLock.Lock()
+		defer allocationLock.Unlock()
+
+		// Another process in this panel instance may have completed the same
+		// reservation while we waited for the shared address allocator.
+		if existing, _ := repo.GetUserInboundConfig(ctx, user.Username, serverID, inboundTag); existing != nil && canonicalManagedProtocol(existing.Protocol) == canonicalProtocol {
+			record, err := decodeWireGuardUserCredentialRecord(existing.CredentialJSON)
+			if err != nil {
+				return nil, "", false, fmt.Errorf("parse stored WireGuard credential: %w", err)
+			}
+			agentCredential, err := wireGuardAgentCredentialFromRecord(record)
+			if err != nil {
+				return nil, "", false, err
+			}
+			return agentCredential, existing.CredentialJSON, true, nil
+		}
+		cred, credJSON, err := createWireGuardInboundCredential(ctx, repo, user, serverID, inboundTag, settings)
+		if err != nil {
+			return nil, "", false, err
+		}
+		return cred, credJSON, false, nil
 	}
 
 	email := user.Username + "__" + inboundTag
@@ -2173,6 +2351,14 @@ func validateClassicShadowsocksManagedSettings(protocol string, settings map[str
 
 // addUserToInbound 获取远程入站配置，添加用户凭据，然后重新提交
 func addUserToInbound(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, user storage.User, serverID int64, inboundTag string) error {
+	return addUserToInboundWithLimiterPolicy(ctx, rm, repo, nil, user, serverID, inboundTag, false)
+}
+
+func addUserToInboundWithLimiter(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, user storage.User, serverID int64, inboundTag string) error {
+	return addUserToInboundWithLimiterPolicy(ctx, rm, repo, pusher, user, serverID, inboundTag, true)
+}
+
+func addUserToInboundWithLimiterPolicy(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, user storage.User, serverID int64, inboundTag string, requireWireGuardPolicy bool) error {
 	return repo.WithUserAuthorizationLease(ctx, user.Username, func(leasedCtx context.Context) error {
 		latest, err := repo.GetUser(leasedCtx, user.Username)
 		if err != nil {
@@ -2185,7 +2371,7 @@ func addUserToInbound(ctx context.Context, rm *RemoteManageHandler, repo *storag
 		if !hasAccess {
 			return errors.New("no active authorization for inbound")
 		}
-		return addUserToInboundWithExpiry(leasedCtx, rm, repo, latest, serverID, inboundTag, notAfter)
+		return addUserToInboundWithExpiryAndLimiter(leasedCtx, rm, repo, pusher, latest, serverID, inboundTag, notAfter, requireWireGuardPolicy)
 	})
 }
 
@@ -2218,6 +2404,10 @@ func packageAssignmentActive(user storage.User, now time.Time) bool {
 }
 
 func addUserToInboundWithExpiry(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, user storage.User, serverID int64, inboundTag string, notAfter *time.Time) error {
+	return addUserToInboundWithExpiryAndLimiter(ctx, rm, repo, nil, user, serverID, inboundTag, notAfter, false)
+}
+
+func addUserToInboundWithExpiryAndLimiter(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, user storage.User, serverID int64, inboundTag string, notAfter *time.Time, requireWireGuardPolicy bool) error {
 	// SaveUserInboundConfig takes the user provisioning mutex itself. Hold only
 	// the server lease across snapshot, reservation, publish, and restart to
 	// avoid reversing the user->server order used by deletion/routed flows.
@@ -2231,10 +2421,23 @@ func addUserToInboundWithExpiry(ctx context.Context, rm *RemoteManageHandler, re
 	if err != nil {
 		return err
 	}
+	if isWireGuardAgentCredential(credential) {
+		if pusher == nil {
+			if requireWireGuardPolicy {
+				return errors.New("limiter pusher is required before publishing a WireGuard peer")
+			}
+		} else if err := pusher.pushToServerCheckedLeased(leasedCtx, serverID); err != nil {
+			return fmt.Errorf("publish WireGuard limiter identity: %w", err)
+		}
+	}
 	return applyPreparedInboundCredential(leasedCtx, rm, serverID, inboundTag, credential, notAfter)
 }
 
 func applyPreparedInboundCredentialForUser(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string, serverID int64, inboundTag string, credential map[string]interface{}, notAfter *time.Time) error {
+	return applyPreparedInboundCredentialForUserWithLimiter(ctx, rm, repo, nil, username, serverID, inboundTag, credential, notAfter, false)
+}
+
+func applyPreparedInboundCredentialForUserWithLimiter(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, username string, serverID int64, inboundTag string, credential map[string]interface{}, notAfter *time.Time, requireWireGuardPolicy bool) error {
 	return repo.WithUserProvisioningLease(ctx, username, func() error {
 		hasAccess, latestExpiry, err := effectiveUserInboundAuthorization(ctx, repo, username, serverID, inboundTag, time.Now().UTC())
 		if err != nil {
@@ -2251,6 +2454,15 @@ func applyPreparedInboundCredentialForUser(ctx context.Context, rm *RemoteManage
 			return err
 		}
 		defer release()
+		if isWireGuardAgentCredential(credential) {
+			if pusher == nil {
+				if requireWireGuardPolicy {
+					return errors.New("limiter pusher is required before publishing a WireGuard peer")
+				}
+			} else if err := pusher.pushToServerCheckedLeased(leasedCtx, serverID); err != nil {
+				return fmt.Errorf("publish WireGuard limiter identity: %w", err)
+			}
+		}
 		return applyPreparedInboundCredential(leasedCtx, rm, serverID, inboundTag, credential, notAfter)
 	})
 }
@@ -2291,6 +2503,18 @@ func prepareUserInboundCredential(ctx context.Context, rm *RemoteManageHandler, 
 	if err := validateClassicShadowsocksManagedSettings(protocol, settings); err != nil {
 		return nil, err
 	}
+	if canonicalManagedProtocol(protocol) == "wireguard" {
+		provisionable, provenanceErr := repo.ManagedWireGuardInboundProvisionable(ctx, serverID, inboundTag)
+		if provenanceErr != nil {
+			return nil, fmt.Errorf("verify panel-managed WireGuard provenance: %w", provenanceErr)
+		}
+		if !provisionable {
+			return nil, errors.New("WireGuard inbound is not a current panel-managed generation")
+		}
+		if err := requireWireGuardPeerUsersCapability(ctx, rm, serverID); err != nil {
+			return nil, err
+		}
+	}
 
 	// 凭据统一走 getOrCreateInboundCredential:全局锁内查 DB 复用 / 按 email 复用 / 生成 + 立即写 DB。
 	// 根治跨操作并发时两条路径各自生成不同 uuid 的重复子账户;flow 继承 + 写 DB 都在其内部完成。
@@ -2302,6 +2526,11 @@ func prepareUserInboundCredential(ctx context.Context, rm *RemoteManageHandler, 
 }
 
 func applyPreparedInboundCredential(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag string, credential map[string]interface{}, notAfter *time.Time) error {
+	if isWireGuardAgentCredential(credential) {
+		if err := requireWireGuardPeerUsersCapability(ctx, rm, serverID); err != nil {
+			return err
+		}
+	}
 	// 原子 add-client:agent 端在 inboundsMu 内做 read-modify-write,自带幂等(已存在则 no-op)。
 	request := map[string]interface{}{
 		"action": "add-client",
@@ -2458,7 +2687,16 @@ func reconcileVLESSCredentialFlow(credential, settings map[string]interface{}) b
 // 主控不再持有 inbound 副本,所以也不存在并发解绑时彼此覆盖的可能。
 func removeUserFromInbound(ctx context.Context, rm *RemoteManageHandler, cfg storage.UserInboundConfig) error {
 	var savedCred map[string]interface{}
-	if err := json.Unmarshal([]byte(cfg.CredentialJSON), &savedCred); err != nil || savedCred == nil {
+	if canonicalManagedProtocol(cfg.Protocol) == "wireguard" {
+		if err := requireWireGuardPeerUsersCapability(ctx, rm, cfg.ServerID); err != nil {
+			return err
+		}
+		credential, err := wireGuardAgentCredentialFromJSON(cfg.CredentialJSON)
+		if err != nil {
+			return fmt.Errorf("parse saved WireGuard credential: %w", err)
+		}
+		savedCred = credential
+	} else if err := json.Unmarshal([]byte(cfg.CredentialJSON), &savedCred); err != nil || savedCred == nil {
 		return fmt.Errorf("parse saved credential: %v", err)
 	}
 	body, _ := json.Marshal(map[string]interface{}{
@@ -2516,7 +2754,7 @@ func removePackageUserFromInbound(ctx context.Context, rm *RemoteManageHandler, 
 // restart, and the local credential-state deletion all happen under the same
 // user-then-server lease order. A running installation therefore fails before
 // the Agent or user_inbound_configs can be changed.
-func removePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, cfg storage.UserInboundConfig) (bool, error) {
+func removePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, cfg storage.UserInboundConfig) (bool, error) {
 	if rm == nil || repo == nil {
 		return false, errors.New("remote manager is not available")
 	}
@@ -2543,7 +2781,16 @@ func removePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHandler
 		hasManagedAccess, notAfter = laterOptionalExpiry(hasManagedAccess, notAfter, hasDirectAccess, directExpiry)
 		if hasManagedAccess {
 			var credential map[string]interface{}
-			if err := json.Unmarshal([]byte(cfg.CredentialJSON), &credential); err != nil || credential == nil {
+			if canonicalManagedProtocol(cfg.Protocol) == "wireguard" {
+				if err := requireWireGuardPeerUsersCapability(leasedCtx, rm, cfg.ServerID); err != nil {
+					return err
+				}
+				var err error
+				credential, err = wireGuardAgentCredentialFromJSON(cfg.CredentialJSON)
+				if err != nil {
+					return fmt.Errorf("parse retained WireGuard package credential: %w", err)
+				}
+			} else if err := json.Unmarshal([]byte(cfg.CredentialJSON), &credential); err != nil || credential == nil {
 				return fmt.Errorf("parse retained package credential: %v", err)
 			}
 			err = applyPreparedInboundCredential(leasedCtx, rm, cfg.ServerID, cfg.InboundTag, credential, notAfter)
@@ -2555,11 +2802,25 @@ func removePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHandler
 			return nil
 		}
 
+		isWireGuard := canonicalManagedProtocol(cfg.Protocol) == "wireguard"
+		if isWireGuard {
+			if pusher == nil {
+				return errors.New("limiter pusher is required before removing a WireGuard peer")
+			}
+			if err := pusher.pushToServerCheckedLeased(leasedCtx, cfg.ServerID); err != nil {
+				return fmt.Errorf("publish WireGuard removal limiter identity: %w", err)
+			}
+		}
 		if err := removeUserFromInbound(leasedCtx, rm, cfg); err != nil && !isInboundNotFoundErr(err) {
 			return err
 		}
 		if err := repo.DeleteUserInboundConfig(leasedCtx, cfg.Username, cfg.ServerID, cfg.InboundTag); err != nil {
 			return fmt.Errorf("delete package inbound credential state: %w", err)
+		}
+		if isWireGuard {
+			if err := pusher.pushToServerCheckedLeased(leasedCtx, cfg.ServerID); err != nil {
+				return fmt.Errorf("clear WireGuard removal limiter identity: %w", err)
+			}
 		}
 		return nil
 	})
@@ -2570,7 +2831,7 @@ func removePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHandler
 // the durable package-template check while holding the same account lease as
 // the remote removal, so a concurrent package switch cannot make a stale
 // background task revoke a credential required by the new package.
-func removeStalePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, cfg storage.UserInboundConfig) (bool, error) {
+func removeStalePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, cfg storage.UserInboundConfig) (bool, error) {
 	if rm == nil || repo == nil {
 		return false, errors.New("remote manager is not available")
 	}
@@ -2587,7 +2848,7 @@ func removeStalePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHa
 			return nil
 		}
 		var removeErr error
-		retained, removeErr = removePackageUserInboundConfig(leasedCtx, rm, repo, cfg)
+		retained, removeErr = removePackageUserInboundConfig(leasedCtx, rm, repo, pusher, cfg)
 		return removeErr
 	})
 	return retained, err
@@ -2644,6 +2905,15 @@ func hasLegacyPackageInboundAccess(ctx context.Context, repo *storage.TrafficRep
 		}
 		if node.Enabled && node.NodeType != "routed" && supportsPerUserInboundCredential(node.Protocol) &&
 			node.OriginalServer == server.Name && node.InboundTag == inboundTag {
+			if canonicalManagedProtocol(node.Protocol) == "wireguard" {
+				provisionable, provenanceErr := repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+				if provenanceErr != nil {
+					return false, nil, provenanceErr
+				}
+				if !provisionable {
+					continue
+				}
+			}
 			if user.PackageEndDate == nil {
 				return true, nil, nil
 			}
@@ -2664,6 +2934,386 @@ func shadowsocksKeyLength(method string) int {
 	}
 	// 老 SS 算法对 key 长度宽松,16 字节够大多数场景。
 	return 16
+}
+
+type wireGuardUserCredentialRecord struct {
+	EncryptedPrivateKey string   `json:"encryptedPrivateKey,omitempty"`
+	PrivateKey          string   `json:"privateKey,omitempty"`
+	PublicKey           string   `json:"publicKey,omitempty"`
+	ServerPublicKey     string   `json:"serverPublicKey,omitempty"`
+	Address             []string `json:"address,omitempty"`
+	AllowedIPs          []string `json:"allowedIPs,omitempty"`
+	MTU                 int      `json:"mtu,omitempty"`
+	KeepAlive           int      `json:"keepAlive,omitempty"`
+}
+
+func generateWireGuardKeyPair() (string, string, error) {
+	private, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", fmt.Errorf("generate WireGuard keypair: %w", err)
+	}
+	privateKey := base64.StdEncoding.EncodeToString(private.Bytes())
+	publicKey := base64.StdEncoding.EncodeToString(private.PublicKey().Bytes())
+	return privateKey, publicKey, nil
+}
+
+func wireGuardPublicKeyFromPrivateKey(privateValue string) (string, error) {
+	raw, err := decodeManagedWireGuardKey(privateValue)
+	if err != nil {
+		return "", err
+	}
+	private, err := ecdh.X25519().NewPrivateKey(raw)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(private.PublicKey().Bytes()), nil
+}
+
+func wireGuardServerPublicKeyFromSettings(settings map[string]interface{}) (string, error) {
+	secretKey := strings.TrimSpace(wireGuardStringValue(settings["secretKey"]))
+	if secretKey == "" {
+		return "", errors.New("WireGuard inbound settings.secretKey is required")
+	}
+	return wireGuardPublicKeyFromPrivateKey(secretKey)
+}
+
+func wireGuardCredentialAddresses(record wireGuardUserCredentialRecord) []string {
+	addresses := normalizedWireGuardStrings(record.Address)
+	if len(addresses) == 0 {
+		addresses = normalizedWireGuardStrings(record.AllowedIPs)
+	}
+	return addresses
+}
+
+func decodeWireGuardUserCredentialRecord(raw string) (wireGuardUserCredentialRecord, error) {
+	var record wireGuardUserCredentialRecord
+	if err := json.Unmarshal([]byte(raw), &record); err != nil {
+		return record, err
+	}
+	record.Address = normalizedWireGuardStrings(record.Address)
+	record.AllowedIPs = normalizedWireGuardStrings(record.AllowedIPs)
+	record.PublicKey = strings.TrimSpace(record.PublicKey)
+	record.ServerPublicKey = strings.TrimSpace(record.ServerPublicKey)
+	record.EncryptedPrivateKey = strings.TrimSpace(record.EncryptedPrivateKey)
+	record.PrivateKey = strings.TrimSpace(record.PrivateKey)
+	return record, nil
+}
+
+func wireGuardPrivateKeyFromRecord(repo *storage.TrafficRepository, cfg storage.UserInboundConfig, record wireGuardUserCredentialRecord) (string, error) {
+	if record.EncryptedPrivateKey != "" {
+		return repo.OpenWireGuardUserPrivateKey(cfg.Username, cfg.ServerID, cfg.InboundTag, record.EncryptedPrivateKey)
+	}
+	if record.PrivateKey != "" {
+		return "", errors.New("stored WireGuard user private key is not encrypted")
+	}
+	return "", errors.New("stored WireGuard credential is missing the client private key")
+}
+
+func wireGuardAgentCredentialFromRecord(record wireGuardUserCredentialRecord) (map[string]interface{}, error) {
+	publicKey := strings.TrimSpace(record.PublicKey)
+	addresses := wireGuardCredentialAddresses(record)
+	if !validWireGuardKey(publicKey) || len(addresses) == 0 {
+		return nil, errors.New("stored WireGuard credential metadata is invalid")
+	}
+	for _, address := range addresses {
+		if !validWireGuardHostCIDR(address) {
+			return nil, errors.New("stored WireGuard credential address is invalid")
+		}
+	}
+	if record.KeepAlive < 0 || record.KeepAlive > 65535 {
+		return nil, errors.New("stored WireGuard credential keepalive is invalid")
+	}
+	return map[string]interface{}{
+		"publicKey":  publicKey,
+		"allowedIPs": addresses,
+		"keepAlive":  record.KeepAlive,
+	}, nil
+}
+
+func wireGuardAgentCredentialFromJSON(raw string) (map[string]interface{}, error) {
+	record, err := decodeWireGuardUserCredentialRecord(raw)
+	if err != nil {
+		return nil, err
+	}
+	return wireGuardAgentCredentialFromRecord(record)
+}
+
+func wireGuardAgentCredentialFromMap(raw map[string]interface{}) (map[string]interface{}, error) {
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
+	record, err := decodeWireGuardUserCredentialRecord(string(encoded))
+	if err != nil {
+		return nil, err
+	}
+	return wireGuardAgentCredentialFromRecord(record)
+}
+
+func HydrateWireGuardUserCredential(repo *storage.TrafficRepository, cfg storage.UserInboundConfig) (map[string]interface{}, error) {
+	if repo == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	if canonicalManagedProtocol(cfg.Protocol) != "wireguard" {
+		return nil, fmt.Errorf("unsupported WireGuard credential protocol: %s", cfg.Protocol)
+	}
+	record, err := decodeWireGuardUserCredentialRecord(cfg.CredentialJSON)
+	if err != nil {
+		return nil, fmt.Errorf("parse WireGuard credential: %w", err)
+	}
+	privateKey, err := wireGuardPrivateKeyFromRecord(repo, cfg, record)
+	if err != nil {
+		return nil, err
+	}
+	if record.PublicKey == "" {
+		record.PublicKey, err = wireGuardPublicKeyFromPrivateKey(privateKey)
+		if err != nil {
+			return nil, fmt.Errorf("derive WireGuard public key: %w", err)
+		}
+	}
+	addresses := wireGuardCredentialAddresses(record)
+	if !validWireGuardKey(record.PublicKey) || !validWireGuardKey(record.ServerPublicKey) || len(addresses) == 0 {
+		return nil, errors.New("stored WireGuard credential metadata is invalid")
+	}
+	for _, address := range addresses {
+		if !validWireGuardHostCIDR(address) {
+			return nil, errors.New("stored WireGuard credential address is invalid")
+		}
+	}
+	return map[string]interface{}{
+		"privateKey":      privateKey,
+		"publicKey":       record.PublicKey,
+		"serverPublicKey": record.ServerPublicKey,
+		"address":         addresses,
+		"mtu":             record.MTU,
+		"keepAlive":       record.KeepAlive,
+	}, nil
+}
+
+func wireGuardInboundMTU(settings map[string]interface{}) int {
+	if mtu, ok := wireGuardNumericValue(settings["mtu"]); ok && mtu >= 576 && mtu <= 9000 && mtu == float64(int(mtu)) {
+		return int(mtu)
+	}
+	return 1420
+}
+
+func wireGuardInboundKeepAlive(settings map[string]interface{}) int {
+	for _, rawPeer := range wireGuardInterfaceSlice(settings["peers"]) {
+		peer, _ := rawPeer.(map[string]interface{})
+		if peer == nil {
+			continue
+		}
+		if keepAlive, ok := wireGuardNumericValue(peer["keepAlive"]); ok && keepAlive >= 0 && keepAlive <= 65535 && keepAlive == float64(int(keepAlive)) {
+			return int(keepAlive)
+		}
+	}
+	return 25
+}
+
+func canonicalWireGuardHostPrefix(value string) (string, netip.Prefix, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", netip.Prefix{}, errors.New("empty WireGuard address")
+	}
+	prefix, err := netip.ParsePrefix(value)
+	if err != nil {
+		if address, addressErr := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(value, "["), "]")); addressErr == nil {
+			prefix = netip.PrefixFrom(address, address.BitLen())
+		} else {
+			return "", netip.Prefix{}, err
+		}
+	}
+	bits := prefix.Addr().BitLen()
+	if !prefix.Addr().IsValid() || prefix.Bits() != bits {
+		return "", netip.Prefix{}, errors.New("WireGuard address must be a host prefix")
+	}
+	return prefix.String(), prefix, nil
+}
+
+func incrementWireGuardAddress(address netip.Addr, offset int64) (netip.Addr, bool) {
+	if offset <= 0 {
+		return netip.Addr{}, false
+	}
+	if address.Is4() {
+		raw := address.As4()
+		n := new(big.Int).SetBytes(raw[:])
+		n.Add(n, big.NewInt(offset))
+		limit := new(big.Int).Lsh(big.NewInt(1), 32)
+		if n.Cmp(limit) >= 0 {
+			return netip.Addr{}, false
+		}
+		outBytes := n.Bytes()
+		var out [4]byte
+		copy(out[4-len(outBytes):], outBytes)
+		return netip.AddrFrom4(out), true
+	}
+	raw := address.As16()
+	n := new(big.Int).SetBytes(raw[:])
+	n.Add(n, big.NewInt(offset))
+	limit := new(big.Int).Lsh(big.NewInt(1), 128)
+	if n.Cmp(limit) >= 0 {
+		return netip.Addr{}, false
+	}
+	outBytes := n.Bytes()
+	var out [16]byte
+	copy(out[16-len(outBytes):], outBytes)
+	return netip.AddrFrom16(out), true
+}
+
+func wireGuardReservedHostAddresses(ctx context.Context, repo *storage.TrafficRepository, serverID int64, inboundTag string, settings map[string]interface{}) (map[string]struct{}, error) {
+	reserved := make(map[string]struct{})
+	for _, value := range wireGuardStringValues(settings["address"]) {
+		host, _, err := canonicalWireGuardHostPrefix(value)
+		if err != nil {
+			return nil, fmt.Errorf("validate WireGuard server address: %w", err)
+		}
+		reserved[host] = struct{}{}
+	}
+	for _, rawPeer := range wireGuardInterfaceSlice(settings["peers"]) {
+		peer, _ := rawPeer.(map[string]interface{})
+		if peer == nil {
+			continue
+		}
+		for _, value := range wireGuardStringValues(peer["allowedIPs"]) {
+			host, _, err := canonicalWireGuardHostPrefix(value)
+			if err != nil {
+				return nil, fmt.Errorf("WireGuard existing peer allowedIPs must be host prefixes: %w", err)
+			}
+			reserved[host] = struct{}{}
+		}
+	}
+	configs, err := repo.GetUserInboundConfigsByServer(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	for _, cfg := range configs {
+		if cfg.InboundTag != inboundTag || canonicalManagedProtocol(cfg.Protocol) != "wireguard" {
+			continue
+		}
+		record, err := decodeWireGuardUserCredentialRecord(cfg.CredentialJSON)
+		if err != nil {
+			return nil, fmt.Errorf("parse existing WireGuard credential for %s: %w", cfg.Username, err)
+		}
+		for _, value := range wireGuardCredentialAddresses(record) {
+			host, _, err := canonicalWireGuardHostPrefix(value)
+			if err != nil {
+				return nil, fmt.Errorf("validate existing WireGuard credential address for %s: %w", cfg.Username, err)
+			}
+			reserved[host] = struct{}{}
+		}
+	}
+	return reserved, nil
+}
+
+func allocateWireGuardUserAddress(ctx context.Context, repo *storage.TrafficRepository, serverID int64, inboundTag string, settings map[string]interface{}) (string, error) {
+	addresses := wireGuardStringValues(settings["address"])
+	if len(addresses) == 0 {
+		return "", errors.New("WireGuard inbound has no server tunnel address")
+	}
+	_, base, err := canonicalWireGuardHostPrefix(addresses[0])
+	if err != nil {
+		return "", fmt.Errorf("validate WireGuard server address: %w", err)
+	}
+	reserved, err := wireGuardReservedHostAddresses(ctx, repo, serverID, inboundTag, settings)
+	if err != nil {
+		return "", err
+	}
+	for offset := int64(1); offset <= int64(len(reserved)+4096); offset++ {
+		next, ok := incrementWireGuardAddress(base.Addr(), offset)
+		if !ok {
+			break
+		}
+		candidate := netip.PrefixFrom(next, next.BitLen()).String()
+		if _, used := reserved[candidate]; !used {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("no available WireGuard tunnel address in the inbound address space")
+}
+
+func createWireGuardInboundCredential(ctx context.Context, repo *storage.TrafficRepository, user storage.User, serverID int64, inboundTag string, settings map[string]interface{}) (map[string]interface{}, string, error) {
+	serverPublicKey, err := wireGuardServerPublicKeyFromSettings(settings)
+	if err != nil {
+		return nil, "", err
+	}
+	address, err := allocateWireGuardUserAddress(ctx, repo, serverID, inboundTag, settings)
+	if err != nil {
+		return nil, "", err
+	}
+	privateKey, publicKey, err := generateWireGuardKeyPair()
+	if err != nil {
+		return nil, "", err
+	}
+	encryptedPrivateKey, err := repo.SealWireGuardUserPrivateKey(user.Username, serverID, inboundTag, privateKey)
+	if err != nil {
+		return nil, "", err
+	}
+	record := wireGuardUserCredentialRecord{
+		EncryptedPrivateKey: encryptedPrivateKey,
+		PublicKey:           publicKey,
+		ServerPublicKey:     serverPublicKey,
+		Address:             []string{address},
+		MTU:                 wireGuardInboundMTU(settings),
+		KeepAlive:           wireGuardInboundKeepAlive(settings),
+	}
+	recordJSON, err := json.Marshal(record)
+	if err != nil {
+		return nil, "", fmt.Errorf("encode WireGuard credential: %w", err)
+	}
+	credentialJSON := string(recordJSON)
+	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+		Username: user.Username, ServerID: serverID, InboundTag: inboundTag,
+		Protocol: "wireguard", CredentialJSON: credentialJSON,
+	}); err != nil {
+		return nil, "", err
+	}
+	agentCredential, err := wireGuardAgentCredentialFromRecord(record)
+	if err != nil {
+		return nil, "", err
+	}
+	return agentCredential, credentialJSON, nil
+}
+
+func requireWireGuardPeerUsersCapability(ctx context.Context, rm *RemoteManageHandler, serverID int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if rm == nil {
+		return errors.New("Agent lacks wireguard_peer_users_v1 capability; remote Agent manager is unavailable")
+	}
+	if rm.wsHandler != nil {
+		if connection, connected := rm.wsHandler.GetConnectionByServerID(serverID); connected {
+			if connection.Capabilities.WireGuardPeerUsersV1 {
+				return nil
+			}
+			return errors.New("Agent lacks wireguard_peer_users_v1 capability; upgrade and reconnect relaydock-agent")
+		}
+	}
+
+	body, err := rm.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/system/info", nil)
+	if err != nil {
+		return fmt.Errorf("verify wireguard_peer_users_v1 capability: %w", err)
+	}
+	var info struct {
+		Success      bool              `json:"success"`
+		Capabilities AgentCapabilities `json:"capabilities"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return fmt.Errorf("decode Agent wireguard_peer_users_v1 capability: %w", err)
+	}
+	if !info.Success || !info.Capabilities.WireGuardPeerUsersV1 {
+		return errors.New("Agent lacks wireguard_peer_users_v1 capability; upgrade relaydock-agent")
+	}
+	return nil
+}
+
+func isWireGuardAgentCredential(credential map[string]interface{}) bool {
+	if credential == nil {
+		return false
+	}
+	_, hasPublicKey := credential["publicKey"]
+	_, hasAllowedIPs := credential["allowedIPs"]
+	return hasPublicKey && hasAllowedIPs
 }
 
 // generateCredential 生成单用户在指定 inbound 上的认证凭据。
@@ -2733,12 +3383,12 @@ func generateCredential(protocol string, user storage.User, method, inboundTag s
 }
 
 // supportsPerUserInboundCredential identifies protocols whose inbound model
-// can isolate one account with a dedicated client credential. Package nodes
-// outside this allowlist (notably WireGuard) remain visible in subscriptions,
-// but must never enter the managed add-client/revoke/reconcile lifecycle.
+// can isolate one account with a dedicated client or peer credential. Static
+// imported WireGuard nodes remain non-provisionable because they have no
+// managed server/inbound coordinates.
 func supportsPerUserInboundCredential(protocol string) bool {
 	switch canonicalManagedProtocol(protocol) {
-	case "vless", "vmess", "trojan", "anytls", "snell", "hysteria", "shadowsocks", "socks", "http":
+	case "vless", "vmess", "trojan", "anytls", "snell", "hysteria", "shadowsocks", "socks", "http", "wireguard":
 		return true
 	default:
 		return false
@@ -2776,6 +3426,8 @@ func matchCredential(a, b map[string]interface{}, protocol string) bool {
 		return fmt.Sprint(a["password"]) == fmt.Sprint(b["password"])
 	case "socks", "http":
 		return fmt.Sprint(a["user"]) == fmt.Sprint(b["user"])
+	case "wireguard":
+		return fmt.Sprint(a["publicKey"]) == fmt.Sprint(b["publicKey"])
 	}
 	return false
 }

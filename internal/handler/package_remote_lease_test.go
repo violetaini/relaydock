@@ -491,7 +491,7 @@ func authorizeInboundBatchFixture(t *testing.T, repo *storage.TrafficRepository,
 	}
 }
 
-func TestPackageWireGuardNodeSkipsPerUserCredentialProvisioning(t *testing.T) {
+func TestPackageImportedWireGuardNodeSkipsPerUserCredentialProvisioning(t *testing.T) {
 	agent := &packageLeaseAgent{}
 	repo, server, remote := newPackageLeaseFixture(t, agent)
 	ctx := context.Background()
@@ -500,7 +500,6 @@ func TestPackageWireGuardNodeSkipsPerUserCredentialProvisioning(t *testing.T) {
 	}
 	node, err := repo.CreateNode(ctx, storage.Node{
 		Username: "admin", NodeName: "wireguard-static", Protocol: "wireguard",
-		OriginalServer: server.Name, InboundTag: "wireguard-bd61c6",
 		ClashConfig: `{"name":"wireguard-static","type":"wireguard","server":"198.51.100.10","port":51820,"private-key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","public-key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="}`,
 		Enabled:     true,
 	})
@@ -524,7 +523,7 @@ func TestPackageWireGuardNodeSkipsPerUserCredentialProvisioning(t *testing.T) {
 	if got := agent.requests.Load(); got != 0 {
 		t.Fatalf("WireGuard package node made %d Agent requests, want 0", got)
 	}
-	if config, configErr := repo.GetUserInboundConfig(ctx, "alice", server.ID, node.InboundTag); configErr == nil || config != nil {
+	if config, configErr := repo.GetUserInboundConfig(ctx, "alice", server.ID, "wireguard-bd61c6"); configErr == nil || config != nil {
 		t.Fatalf("WireGuard package node created per-user credential: config=%+v err=%v", config, configErr)
 	}
 }
@@ -952,7 +951,7 @@ func TestPackageInboundUnbindActiveInstallationKeepsRemoteAndDatabaseState(t *te
 		t.Fatal(err)
 	}
 
-	_, err := removePackageUserInboundConfig(ctx, remote, repo, config)
+	_, err := removePackageUserInboundConfig(ctx, remote, repo, nil, config)
 	if !errors.Is(err, storage.ErrRemoteInstallationActive) {
 		t.Fatalf("removePackageUserInboundConfig error=%v, want ErrRemoteInstallationActive", err)
 	}

@@ -248,6 +248,16 @@ func (h *RemoteManageHandler) createManagedWireGuardResource(w http.ResponseWrit
 		remoteWriteError(w, http.StatusBadRequest, "WireGuard 专用探测 Peer 生成失败: "+err.Error())
 		return
 	}
+	// The client object is a one-time bootstrap template used to create the
+	// physical node metadata. It is not an authorized runtime identity. Start
+	// the managed inbound with only its durable probe peer; per-user peers are
+	// installed later from encrypted user_inbound_configs.
+	settings, _ := request.Inbound["settings"].(map[string]interface{})
+	if settings == nil {
+		remoteWriteError(w, http.StatusBadRequest, "WireGuard 入站缺少 settings")
+		return
+	}
+	settings["peers"] = []interface{}{}
 	if err := appendWireGuardProbePeer(request.Inbound, &probePeer); err != nil {
 		remoteWriteError(w, http.StatusBadRequest, "WireGuard 专用探测 Peer 生成失败: "+err.Error())
 		return
@@ -265,7 +275,7 @@ func (h *RemoteManageHandler) createManagedWireGuardResource(w http.ResponseWrit
 		return
 	}
 	displayName = resource.DisplayName
-	clashConfig, clientConfig, err := buildManagedWireGuardClientConfigs(displayName, resource.EndpointHost, resource.EndpointPort, client)
+	clashConfig, _, err := buildManagedWireGuardClientConfigs(displayName, resource.EndpointHost, resource.EndpointPort, client)
 	if err != nil {
 		_ = h.repo.DeleteManagedInboundResource(r.Context(), resource.ID)
 		remoteWriteError(w, http.StatusBadRequest, "WireGuard 客户端配置生成失败: "+err.Error())
@@ -301,6 +311,52 @@ func (h *RemoteManageHandler) createManagedWireGuardResource(w http.ResponseWrit
 		_, _ = h.repo.DeleteStagedWireGuardNodeIfMutation(r.Context(), stagedNodeID, mutationID)
 		_ = h.repo.DeleteManagedInboundResource(r.Context(), resource.ID)
 		remoteWriteError(w, http.StatusBadRequest, "failed to encode managed WireGuard request")
+		return
+	}
+	// The limiter builder reads canonical desired state, while the Agent must
+	// not see the probe until its source-address identity has been acknowledged.
+	// Temporarily stage this generation, publish the full limiter snapshot, then
+	// restore the prior intent so HandleInbounds can retain its normal mutation
+	// rollback semantics when it performs the actual add below.
+	policySnapshot, err := h.captureInboundDesiredMutationSnapshot(r.Context(), serverID, map[string]interface{}{
+		"action": "add", "inbound": request.Inbound, "mutation_id": mutationID,
+	})
+	if err != nil {
+		cleanupErr := h.discardStagedManagedWireGuardLocal(r.Context(), serverID, tag, stagedNodeID, mutationID)
+		message := "WireGuard 限速策略预存失败: " + err.Error()
+		if cleanupErr != nil {
+			message += "；本地暂存记录清理失败: " + cleanupErr.Error()
+		}
+		remoteWriteError(w, http.StatusBadGateway, message)
+		return
+	}
+	if _, err := h.stageDatabaseInboundMutation(r.Context(), serverID, payload); err != nil {
+		_ = h.restoreInboundDesiredMutationSnapshot(r.Context(), serverID, policySnapshot)
+		cleanupErr := h.discardStagedManagedWireGuardLocal(r.Context(), serverID, tag, stagedNodeID, mutationID)
+		message := "WireGuard 限速策略预存失败: " + err.Error()
+		if cleanupErr != nil {
+			message += "；本地暂存记录清理失败: " + cleanupErr.Error()
+		}
+		remoteWriteError(w, http.StatusBadGateway, message)
+		return
+	}
+	policyErr := h.requireManagedWireGuardPolicyACKLeased(r.Context(), serverID)
+	restoreErr := h.restoreInboundDesiredMutationSnapshot(r.Context(), serverID, policySnapshot)
+	if policyErr != nil {
+		if restoreErr != nil {
+			remoteWriteError(w, http.StatusBadGateway, "WireGuard 限速策略未确认，且数据库意图回滚失败，已保留禁用节点和加密凭据: "+restoreErr.Error())
+			return
+		}
+		cleanupErr := h.discardStagedManagedWireGuardLocal(r.Context(), serverID, tag, stagedNodeID, mutationID)
+		message := "WireGuard 限速策略未确认，未创建远端入站: " + policyErr.Error()
+		if cleanupErr != nil {
+			message += "；本地暂存记录清理失败: " + cleanupErr.Error()
+		}
+		remoteWriteError(w, http.StatusBadGateway, message)
+		return
+	}
+	if restoreErr != nil {
+		remoteWriteError(w, http.StatusBadGateway, "WireGuard 限速策略已确认，但数据库预存意图无法回滚，已保留禁用节点和加密凭据: "+restoreErr.Error())
 		return
 	}
 	recorder := h.runManagedInboundMutation(r, serverID, payload)
@@ -364,12 +420,51 @@ func (h *RemoteManageHandler) createManagedWireGuardResource(w http.ResponseWrit
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":       true,
-		"resource":      managedInboundResourceResponse(resource),
-		"node_id":       node.ID,
-		"node":          convertNode(node),
-		"client_config": clientConfig,
+		"success":  true,
+		"resource": managedInboundResourceResponse(resource),
+		"node_id":  node.ID,
+		"node":     convertNode(node),
+		// The submitted bootstrap identity is deliberately absent from the
+		// runtime inbound. A usable client is issued only through a per-user
+		// credential, so never advertise the bootstrap template as connectable.
+		"client_config": "",
 	})
+}
+
+func (h *RemoteManageHandler) requireManagedWireGuardPolicyACKLeased(ctx context.Context, serverID int64) error {
+	if held, _ := h.repo.RemoteServerMutationLeaseState(ctx, serverID); !held {
+		return errors.New("managed WireGuard policy gate requires the server mutation lease")
+	}
+	if err := requireWireGuardPeerUsersCapability(ctx, h, serverID); err != nil {
+		return err
+	}
+	if h.limiterPusher == nil {
+		return errors.New("managed WireGuard policy gate requires a limiter pusher")
+	}
+	if err := h.limiterPusher.pushToServerCheckedLeased(ctx, serverID); err != nil {
+		return fmt.Errorf("acknowledge managed WireGuard limiter policy: %w", err)
+	}
+	return nil
+}
+
+func (h *RemoteManageHandler) discardStagedManagedWireGuardLocal(
+	ctx context.Context,
+	serverID int64,
+	tag string,
+	nodeID int64,
+	mutationID string,
+) error {
+	var failures []string
+	if _, err := h.repo.DeleteStagedWireGuardNodeIfMutation(ctx, nodeID, mutationID); err != nil {
+		failures = append(failures, "delete staged node: "+err.Error())
+	}
+	if _, err := h.repo.DeleteManagedInboundResourceByServerTagMutation(ctx, serverID, tag, mutationID); err != nil {
+		failures = append(failures, "delete managed resource: "+err.Error())
+	}
+	if len(failures) > 0 {
+		return errors.New(strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 func (h *RemoteManageHandler) renameManagedInboundResource(w http.ResponseWriter, r *http.Request, id int64) {
@@ -570,6 +665,30 @@ func (h *RemoteManageHandler) recoverStagedManagedWireGuard(ctx context.Context,
 	}
 	if !present {
 		return storage.Node{}, false, errors.New("Agent 上同代 WireGuard 配置缺少专用探测 Peer")
+	}
+	desired, err := h.repo.GetDesiredInbound(ctx, resource.ServerID, resource.InboundTag)
+	if err != nil {
+		return storage.Node{}, false, fmt.Errorf("读取 WireGuard 权威配置: %w", err)
+	}
+	if desired == nil {
+		desiredJSON, marshalErr := json.Marshal(observedInboundConfig(inbound))
+		if marshalErr != nil {
+			return storage.Node{}, false, fmt.Errorf("编码 WireGuard 权威配置: %w", marshalErr)
+		}
+		if _, err := h.repo.UpsertActiveDesiredInbound(
+			ctx, resource.ServerID, resource.InboundTag, resource.MutationID, desiredJSON,
+		); err != nil {
+			return storage.Node{}, false, fmt.Errorf("恢复 WireGuard 权威配置: %w", err)
+		}
+		if err := h.repo.SetRemoteInboundOwnership(ctx, resource.ServerID, resource.InboundTag, resource.MutationID); err != nil {
+			return storage.Node{}, false, fmt.Errorf("恢复 WireGuard 入站所有权: %w", err)
+		}
+	} else if desired.DesiredState != storage.DesiredInboundStateActive ||
+		strings.TrimSpace(desired.MutationID) != strings.TrimSpace(resource.MutationID) {
+		return storage.Node{}, false, errors.New("WireGuard 权威配置已由另一代状态取代")
+	}
+	if err := h.requireManagedWireGuardPolicyACKLeased(ctx, resource.ServerID); err != nil {
+		return storage.Node{}, false, fmt.Errorf("恢复 WireGuard 限速策略: %w", err)
 	}
 	if _, err := h.repo.MarkWireGuardProbePeerActive(ctx, resource.ID); err != nil {
 		return storage.Node{}, false, fmt.Errorf("恢复 WireGuard 专用探测 Peer 状态: %w", err)

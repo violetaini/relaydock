@@ -65,6 +65,82 @@ func createManagedGrantForTest(t *testing.T, repo *TrafficRepository, ctx contex
 	return grant
 }
 
+func TestWireGuardSelfServiceRequiresManagedEmbeddedStructure(t *testing.T) {
+	if !SelfServiceNodeProtocolEligible("wireguard", `{}`) {
+		t.Fatal("WireGuard protocol should support isolated managed peer credentials")
+	}
+	node := Node{ID: 1, Protocol: "wireguard", Enabled: true, NodeType: "physical", OriginalServer: "edge", InboundTag: "wg-in"}
+	offer := SelfServiceNodeOffer{NodeID: 1, ServerID: 2, InboundTag: "wg-in", Enabled: true}
+	embedded := RemoteServer{ID: 2, Name: "edge", XrayMode: "embedded"}
+	if !SelfServiceNodeOfferStructureValid(offer, node, embedded) {
+		t.Fatal("managed embedded WireGuard node was rejected")
+	}
+	imported := node
+	imported.OriginalServer = ""
+	imported.InboundTag = ""
+	if SelfServiceNodeOfferStructureValid(offer, imported, embedded) {
+		t.Fatal("imported static WireGuard node passed managed structure validation")
+	}
+	external := embedded
+	external.XrayMode = "external"
+	if SelfServiceNodeOfferStructureValid(offer, node, external) {
+		t.Fatal("external Xray WireGuard node passed managed structure validation")
+	}
+}
+
+func TestWireGuardManagedGrantCatalogAndActivation(t *testing.T) {
+	tests := []struct {
+		name             string
+		allowedProtocols []string
+	}{
+		{name: "empty whitelist"},
+		{name: "explicit whitelist", allowedProtocols: []string{"wireguard"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, _ := newManagedNodesTestRepository(t)
+			configureTestNodeSecretEncryption(t, repo, 0x6d)
+			ctx, server, node, offer := seedManagedNodesTest(t, repo)
+			node.Protocol = "wireguard"
+			node.ClashConfig = testWireGuardNodeConfig("managed-wg")
+			node.ParsedConfig = node.ClashConfig
+			if _, err := repo.UpdateNode(ctx, node); err != nil {
+				t.Fatalf("update managed node to WireGuard: %v", err)
+			}
+			seedManagedWireGuardProvenanceForTest(t, repo, ctx, server, &node, 0x6d)
+			now := time.Date(2026, 8, 15, 5, 0, 0, 0, time.UTC)
+			grant := createManagedGrantForTest(t, repo, ctx, server.ID, now)
+			if tt.allowedProtocols != nil {
+				grant.AllowedProtocols = tt.allowedProtocols
+				var err error
+				grant, err = repo.UpdateUserServerGrant(ctx, *grant, grant.Version, "admin")
+				if err != nil {
+					t.Fatalf("allow WireGuard: %v", err)
+				}
+			}
+
+			catalog, err := repo.ListManagedNodeCatalog(ctx, "alice", now)
+			if err != nil {
+				t.Fatalf("list WireGuard catalog: %v", err)
+			}
+			if len(catalog) != 1 || !catalog[0].CanCreate || catalog[0].DenyReason != "" {
+				t.Fatalf("WireGuard catalog=%+v, want creatable", catalog)
+			}
+			if catalog[0].ProtocolProfile != "" {
+				t.Fatalf("WireGuard profile=%q, want no profile restriction", catalog[0].ProtocolProfile)
+			}
+
+			activation, err := repo.ActivateUserNodeSelection(ctx, "alice", offer.ID, "alice", now)
+			if err != nil {
+				t.Fatalf("activate WireGuard selection: %v", err)
+			}
+			if !activation.Created || !activation.Selection.DesiredEnabled || activation.Source.DesiredState != ManagedDesiredActive {
+				t.Fatalf("unexpected WireGuard activation: %+v", activation)
+			}
+		})
+	}
+}
+
 func TestForwardedNodeCannotBecomeSelfServiceOffer(t *testing.T) {
 	repo, _ := newManagedNodesTestRepository(t)
 	ctx := context.Background()

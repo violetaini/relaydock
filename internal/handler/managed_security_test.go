@@ -183,8 +183,20 @@ func TestApplyUserCredentialsFailsClosed(t *testing.T) {
 		"public-key":  "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
 	}
 	wireGuardNode := storage.Node{ID: 9, NodeName: "WG", Protocol: "wireguard", OriginalServer: "edge-1", InboundTag: "wg-in"}
-	if !applyUserCredentials(wireGuardProxy, wireGuardNode, nil) {
-		t.Fatal("managed WireGuard static client config was hidden from an assigned user")
+	if applyUserCredentials(wireGuardProxy, wireGuardNode, nil) {
+		t.Fatal("managed WireGuard without a per-user peer credential was published")
+	}
+	wireGuardCred := map[credKey]string{{"edge-1", "wg-in"}: fmt.Sprintf(
+		`{"privateKey":%q,"serverPublicKey":%q,"address":["10.66.66.3/32"],"mtu":1280,"keepAlive":25}`,
+		wireGuardYAMLTestKey(0x21), wireGuardYAMLTestKey(0x22),
+	)}
+	if !applyUserCredentials(wireGuardProxy, wireGuardNode, wireGuardCred) {
+		t.Fatal("managed WireGuard per-user peer credential was rejected")
+	}
+	if wireGuardProxy["private-key"] != wireGuardYAMLTestKey(0x21) ||
+		wireGuardProxy["public-key"] != wireGuardYAMLTestKey(0x22) ||
+		wireGuardProxy["ip"] != "10.66.66.3" {
+		t.Fatalf("managed WireGuard credential was not replaced: %#v", wireGuardProxy)
 	}
 	wireGuardJSON, _ := json.Marshal(wireGuardProxy)
 	wireGuardNode.ClashConfig = string(wireGuardJSON)
@@ -193,8 +205,8 @@ func TestApplyUserCredentialsFailsClosed(t *testing.T) {
 		t.Fatalf("managed WireGuard URI item=%+v err=%v", item, err)
 	}
 	delete(wireGuardProxy, "private-key")
-	if applyUserCredentials(wireGuardProxy, wireGuardNode, nil) {
-		t.Fatal("managed WireGuard config without a hydrated private key passed")
+	if applyUserCredentials(wireGuardProxy, wireGuardNode, map[credKey]string{{"edge-1", "wg-in"}: `{"address":["10.66.66.3/32"]}`}) {
+		t.Fatal("managed WireGuard config with incomplete peer credentials passed")
 	}
 }
 

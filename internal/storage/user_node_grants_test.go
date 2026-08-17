@@ -85,6 +85,68 @@ func TestManualUserNodeGrantLifecycleAndCredentialFence(t *testing.T) {
 	}
 }
 
+func TestWireGuardManualGrantCredentialRemainsEffective(t *testing.T) {
+	repo, ctx, server, node := seedDirectNodeGrantTest(t)
+	configureTestNodeSecretEncryption(t, repo, 0x6e)
+	node.Protocol = "wireguard"
+	node.ClashConfig = testWireGuardNodeConfig("direct-wg")
+	node.ParsedConfig = node.ClashConfig
+	if _, err := repo.UpdateNode(ctx, node); err != nil {
+		t.Fatalf("update direct node to WireGuard: %v", err)
+	}
+	seedManagedWireGuardProvenanceForTest(t, repo, ctx, server, &node, 0x6e)
+
+	item, created, err := repo.UpsertManualUserNodeGrant(ctx, "alice", node.ID, nil, "admin")
+	if err != nil {
+		t.Fatalf("UpsertManualUserNodeGrant: %v", err)
+	}
+	if !created {
+		t.Fatal("WireGuard direct grant was not created")
+	}
+	if err := repo.SaveUserInboundConfig(ctx, UserInboundConfig{
+		Username: "alice", ServerID: server.ID, InboundTag: node.InboundTag,
+		Protocol: "wireguard", CredentialJSON: `{"encryptedPrivateKey":"ciphertext","publicKey":"peer","address":["10.66.66.3/32"]}`,
+	}); err != nil {
+		t.Fatalf("SaveUserInboundConfig: %v", err)
+	}
+	credential, err := repo.GetUserInboundConfig(ctx, "alice", server.ID, node.InboundTag)
+	if err != nil {
+		t.Fatalf("GetUserInboundConfig: %v", err)
+	}
+	if err := repo.SetUserNodeGrantCredential(ctx, item.Grant.ID, credential.ID); err != nil {
+		t.Fatalf("SetUserNodeGrantCredential: %v", err)
+	}
+	if _, err := repo.MarkUserInboundAccessSourceApplied(ctx, item.Source.ID, item.Source.Generation, ManagedObservedActive, time.Now().UTC()); err != nil {
+		t.Fatalf("MarkUserInboundAccessSourceApplied: %v", err)
+	}
+
+	hasAccess, _, err := repo.HasEffectiveDirectUserInboundAccess(ctx, "alice", server.ID, node.InboundTag, 0, time.Now().UTC())
+	if err != nil || !hasAccess {
+		t.Fatalf("WireGuard direct access=(%v,%v), want active", hasAccess, err)
+	}
+	ids, err := repo.ListEffectiveDirectNodeIDs(ctx, "alice", time.Now().UTC())
+	if err != nil || len(ids) != 1 || ids[0] != node.ID {
+		t.Fatalf("WireGuard effective node IDs=%v err=%v", ids, err)
+	}
+	if _, err := repo.db.ExecContext(ctx, `UPDATE remote_inbound_ownership SET mutation_id = 'stale-generation'
+WHERE server_id = ? AND inbound_tag = ?`, server.ID, node.InboundTag); err != nil {
+		t.Fatalf("invalidate WireGuard provenance: %v", err)
+	}
+	candidates, err := repo.ListActiveWireGuardDirectGrantCandidates(ctx, 10)
+	if err != nil || len(candidates) != 1 || candidates[0].GrantID != item.Grant.ID {
+		t.Fatalf("WireGuard direct candidates=%+v err=%v", candidates, err)
+	}
+	deactivated, err := repo.DeactivateWireGuardDirectGrantIfProvenanceInvalid(ctx, item.Grant.ID, "alice", "reconciler")
+	if err != nil || !deactivated {
+		t.Fatalf("deactivate invalid WireGuard direct grant=%v err=%v", deactivated, err)
+	}
+	updated, err := repo.GetUserNodeGrant(ctx, item.Grant.ID)
+	if err != nil || updated.Source.DesiredState != ManagedDesiredInactive ||
+		updated.Source.Generation <= updated.Source.AppliedGeneration {
+		t.Fatalf("invalid WireGuard direct grant was not queued for revoke: item=%+v err=%v", updated, err)
+	}
+}
+
 func TestManualUserNodeGrantRevocationIsImmediate(t *testing.T) {
 	repo, ctx, server, node := seedDirectNodeGrantTest(t)
 	item, _, err := repo.UpsertManualUserNodeGrant(ctx, "alice", node.ID, nil, "admin")

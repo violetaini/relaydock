@@ -339,6 +339,15 @@ func (h *ServiceAuthorizationHandler) validateCustomRequest(ctx context.Context,
 		if err != nil || !storage.DirectNodeGrantEligible(node, *server) {
 			return storage.ErrManagedServerMismatch
 		}
+		if canonicalManagedProtocol(node.Protocol) == "wireguard" {
+			provisionable, provenanceErr := h.repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+			if provenanceErr != nil {
+				return provenanceErr
+			}
+			if !provisionable {
+				return storage.ErrManagedServerMismatch
+			}
+		}
 		if grant.ExpiresAt != nil && !grant.ExpiresAt.After(now) {
 			return fmt.Errorf("%w: fixed node expiry must be in the future", storage.ErrManagedInvalidArgument)
 		}

@@ -252,6 +252,15 @@ WHERE u.username = ? AND n.id = ? AND rs.id = ?`, username, offer.NodeID, offer.
 	if !node.Enabled || !SelfServiceNodeOfferStructureValid(offer, node, server) {
 		return nil, ErrManagedServerMismatch
 	}
+	if strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard") {
+		provisionable, provenanceErr := managedWireGuardNodeProvisionable(ctx, tx, node.ID)
+		if provenanceErr != nil {
+			return nil, provenanceErr
+		}
+		if !provisionable {
+			return nil, ErrManagedServerMismatch
+		}
+	}
 	billed, err := grantUsageTx(ctx, tx, grant.ID, grant.BillingMode)
 	if err != nil {
 		return nil, fmt.Errorf("read grant usage for activation: %w", err)
@@ -964,7 +973,7 @@ func (r *TrafficRepository) HasEffectiveUserInboundAccess(ctx context.Context, u
 	if username == "" || serverID <= 0 || inboundTag == "" || excludeSourceID < 0 || now.IsZero() {
 		return false, nil, ErrManagedInvalidArgument
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT s.expires_at, g.allowed_protocols_json,
+	rows, err := r.db.QueryContext(ctx, `SELECT n.id, s.expires_at, g.allowed_protocols_json,
 	       g.allowed_protocol_profiles_json,
 	       COALESCE(n.protocol, ''), COALESCE(n.clash_config, ''), COALESCE(o.inbound_tag, ''),
 	       sel.credential_config_id, c.id, c.username, c.server_id, c.inbound_tag, c.protocol,
@@ -992,13 +1001,14 @@ WHERE s.username = ? AND s.server_id = ? AND s.inbound_tag = ? AND s.id != ?
 	hasAccess, perpetual := false, false
 	var latest *time.Time
 	for rows.Next() {
+		var nodeID int64
 		var expires sql.NullString
 		var allowedProtocolsJSON, allowedProtocolProfilesJSON, protocol, clashConfig, offerInboundTag string
 		var credentialID, configID, configServerID sql.NullInt64
 		var configUsername, configInboundTag, configProtocol sql.NullString
 		var observedState string
 		var generation, appliedGeneration int64
-		if err := rows.Scan(&expires, &allowedProtocolsJSON, &allowedProtocolProfilesJSON, &protocol, &clashConfig, &offerInboundTag,
+		if err := rows.Scan(&nodeID, &expires, &allowedProtocolsJSON, &allowedProtocolProfilesJSON, &protocol, &clashConfig, &offerInboundTag,
 			&credentialID, &configID, &configUsername, &configServerID, &configInboundTag, &configProtocol,
 			&observedState, &generation, &appliedGeneration); err != nil {
 			return false, nil, fmt.Errorf("scan effective managed access: %w", err)
@@ -1023,6 +1033,15 @@ WHERE s.username = ? AND s.server_id = ? AND s.inbound_tag = ? AND s.id != ?
 		if !grant.AllowsNodeProtocol(protocol, clashConfig) || !SelfServiceNodeProtocolEligible(protocol, clashConfig) ||
 			strings.HasPrefix(strings.ToLower(strings.TrimSpace(offerInboundTag)), "anydoor-") {
 			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(protocol), "wireguard") {
+			provisionable, provenanceErr := r.ManagedWireGuardNodeProvisionable(ctx, nodeID)
+			if provenanceErr != nil {
+				return false, nil, provenanceErr
+			}
+			if !provisionable {
+				continue
+			}
 		}
 		// A nil credential pointer means this source is still provisioning. Once
 		// a credential has been linked, its protocol becomes an immutable safety

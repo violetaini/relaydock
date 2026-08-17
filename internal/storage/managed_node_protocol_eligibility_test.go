@@ -79,7 +79,7 @@ func TestSelfServiceProtocolEligible(t *testing.T) {
 		{name: "VLESS allowed", protocol: "vless", want: true},
 		{name: "AnyTLS rejected", protocol: "anytls", clashConfig: `{"type":"anytls","tls":true}`, want: false},
 		{name: "TUIC rejected", protocol: "tuic", clashConfig: `{"type":"tuic"}`, want: false},
-		{name: "WireGuard rejected", protocol: "wireguard", want: false},
+		{name: "WireGuard allowed", protocol: "wireguard", want: true},
 		{name: "empty protocol rejected", protocol: "", want: false},
 	}
 
