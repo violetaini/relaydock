@@ -25,7 +25,7 @@ const (
 	legacyStateVersion = 1
 )
 
-var identityKeys = []string{"email", "id", "password", "user", "psk", "auth"}
+var identityKeys = []string{"email", "id", "publicKey", "password", "user", "psk", "auth"}
 
 type Schedule struct {
 	Key           string                 `json:"key"`

@@ -75,6 +75,32 @@ func TestGuardHTTPAuthAndPersistence(t *testing.T) {
 	}
 }
 
+func TestGuardPersistsWireGuardPeerByPublicKey(t *testing.T) {
+	guard, statePath, _ := newTestGuard(t, http.NotFoundHandler())
+	schedule := Schedule{
+		Tag:      "wireguard-in",
+		Protocol: "wireguard",
+		Client: map[string]interface{}{
+			"publicKey":  "bW9jay13aXJlZ3VhcmQtcHVibGljLWtleS0zMi1ieXRlcw==",
+			"allowedIPs": []interface{}{"10.0.0.2/32"},
+		},
+		NotAfter: time.Now().Add(time.Hour).UTC(),
+	}
+	if err := guard.Upsert(schedule); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+	reloaded, err := New(statePath, "guard-secret", "secret-token", "http://127.0.0.1:1", nil)
+	if err != nil {
+		t.Fatalf("reload error = %v", err)
+	}
+	if err := reloaded.Delete(schedule.Tag, schedule.Client); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if got := reloaded.Pending(); got != 0 {
+		t.Fatalf("pending after WireGuard delete = %d, want 0", got)
+	}
+}
+
 func TestGuardExpiresClientAndPersistsCompletion(t *testing.T) {
 	var mu sync.Mutex
 	var calls []map[string]interface{}
