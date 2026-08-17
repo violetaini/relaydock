@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,10 +31,11 @@ import (
 type UserRoutedOutboundHandler struct {
 	repo         *storage.TrafficRepository
 	remoteManage *RemoteManageHandler
+	pusher       *LimiterConfigPusher
 }
 
-func NewUserRoutedOutboundHandler(repo *storage.TrafficRepository, rm *RemoteManageHandler) *UserRoutedOutboundHandler {
-	return &UserRoutedOutboundHandler{repo: repo, remoteManage: rm}
+func NewUserRoutedOutboundHandler(repo *storage.TrafficRepository, rm *RemoteManageHandler, pusher *LimiterConfigPusher) *UserRoutedOutboundHandler {
+	return &UserRoutedOutboundHandler{repo: repo, remoteManage: rm, pusher: pusher}
 }
 
 func (h *UserRoutedOutboundHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +93,27 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 	}
 	if req.ParentNodeID <= 0 || req.TargetNodeID <= 0 || req.Outbound == nil {
 		writeJSONError(w, http.StatusBadRequest, "parent_node_id, target_node_id, outbound 都必填")
+		return
+	}
+	leasedCtx, releaseAuthorization, err := h.repo.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("用户授权状态正在变更: %v", err))
+		return
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
+	currentUser, err := h.repo.GetUser(ctx, username)
+	if err != nil || !currentUser.IsActive {
+		writeJSONError(w, http.StatusForbidden, "用户当前不可创建路由出站")
+		return
+	}
+	overLimit, err := h.repo.IsUserOverLimit(ctx, username)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("读取流量限制状态失败: %v", err))
+		return
+	}
+	if overLimit {
+		writeJSONError(w, http.StatusForbidden, "流量已超限,暂不可创建路由出站")
 		return
 	}
 
@@ -193,6 +216,16 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 	}
 	defer release()
 	ctx = leasedCtx
+	currentUser, err = h.repo.GetUser(ctx, username)
+	if err != nil || !currentUser.IsActive {
+		writeJSONError(w, http.StatusConflict, "用户授权状态在创建期间发生变化")
+		return
+	}
+	overLimit, err = h.repo.IsUserOverLimit(ctx, username)
+	if err != nil || overLimit {
+		writeJSONError(w, http.StatusConflict, "用户流量授权状态在创建期间发生变化")
+		return
+	}
 
 	// Re-read all server-bound inputs under the lease. The earlier reads only
 	// discover/validate the request; they must not feed a remote transaction if
@@ -249,59 +282,8 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 	outboundCopy := cloneMap(req.Outbound)
 	outboundCopy["tag"] = outboundTag
 
-	// === Step 1: 加用户子账号 client(幂等,没有 admin 占位)===
-	// 同 routed_outbound.go Step 1:agent matchClientCredential 现在只看 primary key,
-	// 同 email 不同 uuid 不再被去重 → 重复 add 后 xray "User already exists" 启动失败。
-	pkField := primaryKeyFieldForProtocol(parent.Protocol)
-	if existingUUID, existingFlow, existingMethod, perr := peekInboundClientByEmail(ctx, h.remoteManage, serverID, parent.InboundTag, userEmail); perr == nil && existingUUID != "" {
-		if err := reconcileRoutedShadowsocksLiveMethod(parent.Protocol, shadowsocksMethod, existingMethod, userCred); err != nil {
-			writeJSONError(w, http.StatusConflict, fmt.Sprintf("复用 client 失败: %v", err))
-			return
-		}
-		log.Printf("[UserRoutedCreate] inbound %s already has client email=%s pk=%s — reusing", parent.InboundTag, userEmail, existingUUID)
-		userCred[pkField] = existingUUID
-		if existingFlow != "" {
-			userCred["flow"] = existingFlow
-		}
-	} else if err := addClientToInbound(ctx, h.remoteManage, serverID, parent.InboundTag, userCred); err != nil {
-		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("加 client 失败: %v", err))
-		return
-	}
-
-	// === Step 2: 加 outbound ===
-	addOutBody, _ := json.Marshal(map[string]interface{}{"action": "add", "outbound": outboundCopy})
-	addOutResponse, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", addOutBody)
-	if err == nil {
-		err = applyAgentConfigMutationACK(ctx, h.remoteManage, serverID, "UserRoutedOutboundAdd", addOutResponse)
-	}
-	if err != nil {
-		removeClientFromInbound(ctx, h.remoteManage, serverID, parent.InboundTag, userEmail)
-		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("加 outbound 失败: %v", err))
-		return
-	}
-
-	// === Step 3: 加 routing rule (user=[userEmail], 没有 admin 占位) ===
-	rule := map[string]interface{}{
-		"type":        "field",
-		"marktag":     marktag,
-		"user":        []string{userEmail},
-		"inboundTag":  []string{parent.InboundTag},
-		"outboundTag": outboundTag,
-	}
-	addRuleBody, _ := json.Marshal(map[string]interface{}{"action": "add_rule", "rule": rule})
-	addRuleResponse, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", addRuleBody)
-	if err == nil {
-		err = applyAgentConfigMutationACK(ctx, h.remoteManage, serverID, "UserRoutedRuleAdd", addRuleResponse)
-	}
-	if err != nil {
-		removeOutBody, _ := json.Marshal(map[string]string{"action": "remove", "tag": outboundTag})
-		h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", removeOutBody)
-		removeClientFromInbound(ctx, h.remoteManage, serverID, parent.InboundTag, userEmail)
-		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("加 routing rule 失败: %v", err))
-		return
-	}
-
-	// === Step 4: 持久化 routed 节点 ===
+	// Persist the complete retry authority before any rule or client can become
+	// live. ManagedNodes can finish this activation after an Agent reconnects.
 	parentID := parent.ID
 	nodeName := strings.TrimSpace(req.NodeName)
 	if nodeName == "" {
@@ -336,35 +318,47 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 	}
 	created, err := h.repo.CreateRoutedNode(ctx, detail)
 	if err != nil {
-		rollbackRoutedOutboundCreate(ctx, h.remoteManage, serverID, parent.InboundTag, marktag, outboundTag, userEmail)
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("DB 写入失败,远端变更已回滚: %v", err))
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("保存路由出站失败: %v", err))
 		return
 	}
-	created = sanitizeRoutedNodeDetailForExternal(created)
-
-	// 写 user_subaccounts(凭据存档,暂停/续费用得上)
-	if _, err := h.repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
+	subaccountID, err := h.repo.ReserveUserSubaccountActivation(ctx, storage.UserSubaccount{
 		Username:       username,
 		RoutedNodeID:   created.ID,
 		Email:          userEmail,
 		CredentialJSON: string(credBytes),
-		IsActive:       true,
-	}); err != nil {
-		rollbackRoutedOutboundCreate(ctx, h.remoteManage, serverID, parent.InboundTag, marktag, outboundTag, userEmail)
+	})
+	if err != nil {
 		if deleteErr := h.repo.DeleteRoutedNode(ctx, created.ID); deleteErr != nil {
 			log.Printf("[UserRoutedOutbound] rollback DB node %d failed: %v", created.ID, deleteErr)
 		}
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("保存用户凭据失败,远端变更已回滚: %v", err))
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("保存用户激活状态失败: %v", err))
 		return
 	}
 
-	// 记录每日操作次数(成功路径才计数,失败/校验拒绝不计)
+	// DB creation consumes the action quota even if the Agent must converge it
+	// asynchronously; retrying the same durable row does not consume it again.
 	if err := h.repo.LogUserRoutedOutboundAction(ctx, username, "create"); err != nil {
 		log.Printf("[UserRoutedOutbound] LogAction create failed (continue): %v", err)
 	}
+	sa, err := h.repo.GetUserSubaccount(ctx, created.ID, username)
+	if err != nil || sa == nil || sa.ID != subaccountID {
+		activationErr := errors.Join(err, errors.New("reserved private routed activation could not be reloaded"))
+		log.Printf("[UserRoutedOutbound] activation pending node=%d user=%s: %v", created.ID, username, activationErr)
+		respondJSON(w, http.StatusAccepted, map[string]any{
+			"success": false, "status": "activation_pending", "node": sanitizeRoutedNodeDetailForExternal(created),
+		})
+		return
+	}
+	if err := activatePrivateRoutedSubaccountLocked(ctx, h.remoteManage, h.repo, h.pusher, serverID, created, *sa); err != nil {
+		log.Printf("[UserRoutedOutbound] activation pending node=%d user=%s: %v", created.ID, username, err)
+		respondJSON(w, http.StatusAccepted, map[string]any{
+			"success": false, "status": "activation_pending", "node": sanitizeRoutedNodeDetailForExternal(created),
+		})
+		return
+	}
 
 	log.Printf("[UserRoutedOutbound] created routed node id=%d tag=%s user=%s parent=%d", created.ID, outboundTag, username, parent.ID)
-	respondJSON(w, http.StatusOK, map[string]any{"success": true, "node": created})
+	respondJSON(w, http.StatusOK, map[string]any{"success": true, "node": sanitizeRoutedNodeDetailForExternal(created)})
 }
 
 // DELETE /api/user/routed-outbound?id=X  删除自己的路由出站
@@ -375,6 +369,13 @@ func (h *UserRoutedOutboundHandler) delete(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusBadRequest, "id 必填")
 		return
 	}
+	leasedCtx, releaseAuthorization, err := h.repo.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("用户授权状态正在变更: %v", err))
+		return
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
 	detail, err := h.repo.GetRoutedNodeDetail(ctx, id)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("节点不存在: %v", err))
@@ -401,12 +402,12 @@ func (h *UserRoutedOutboundHandler) delete(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("无法定位 Agent: %v", err))
 		return
 	}
-	leasedCtx, release, ok := acquireRemoteServerMutationLeaseHTTP(w, h.repo, ctx, serverID)
+	serverLeasedCtx, release, ok := acquireRemoteServerMutationLeaseHTTP(w, h.repo, ctx, serverID)
 	if !ok {
 		return
 	}
 	defer release()
-	ctx = leasedCtx
+	ctx = serverLeasedCtx
 	detail, err = h.repo.GetRoutedNodeDetail(ctx, id)
 	if err != nil || detail.RoutedOwner != "user" || detail.Username != username {
 		writeJSONError(w, http.StatusConflict, "节点在删除期间发生变化,请重试")
@@ -417,35 +418,121 @@ func (h *UserRoutedOutboundHandler) delete(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusConflict, "节点所属服务器在删除期间发生变化,请重试")
 		return
 	}
-	if err := removeRuleByMarktag(ctx, h.remoteManage, serverID, detail.RoutedRuleMarktag); err != nil {
-		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("删除 routing rule 失败: %v", err))
+	if err := h.repo.PrepareUserPrivateRoutedDelete(ctx, id, username); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("保存删除意图失败: %v", err))
 		return
 	}
-	rmOutBody, _ := json.Marshal(map[string]string{"action": "remove", "tag": detail.RoutedOutboundTag})
-	rmOutResponse, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", rmOutBody)
-	if err == nil {
-		err = applyAgentConfigMutationACK(ctx, h.remoteManage, serverID, "UserRoutedOutboundRemove", rmOutResponse)
-	}
+	detail.Enabled = false
+	subaccs, err := h.repo.ListSubaccountsByRoutedNode(ctx, id)
 	if err != nil {
-		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("删除 outbound 失败: %v", err))
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("读取 client 状态失败: %v", err))
 		return
 	}
-	subaccs, _ := h.repo.ListSubaccountsByRoutedNode(ctx, id)
-	for _, sa := range subaccs {
-		if err := removeClientFromInbound(ctx, h.remoteManage, serverID, detail.InboundTag, sa.Email); err != nil {
-			writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("删除 client 失败: %v", err))
-			return
+	if len(subaccs) == 0 {
+		writeJSONError(w, http.StatusConflict, "路由出站缺少可撤销的 client 凭据")
+		return
+	}
+	failDelete := func(cause error) {
+		for _, sa := range subaccs {
+			if persistErr := h.repo.MarkUserSubaccountRevokeFailed(ctx, sa.ID); persistErr != nil {
+				cause = errors.Join(cause, persistErr)
+			}
 		}
+		log.Printf("[UserRoutedOutbound] delete pending node=%d user=%s: %v", id, username, cause)
+		respondJSON(w, http.StatusAccepted, map[string]any{
+			"success": false, "status": "delete_pending", "message": "远端删除待重试",
+		})
 	}
-
-	if err := h.repo.DeleteRoutedNode(ctx, id); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("DB 删除失败: %v", err))
+	if err := reconcilePrivateRoutedDeleteLocked(ctx, h.remoteManage, h.repo, h.pusher, serverID, detail, subaccs); err != nil {
+		failDelete(err)
 		return
-	}
-	if err := h.repo.LogUserRoutedOutboundAction(ctx, username, "delete"); err != nil {
-		log.Printf("[UserRoutedOutbound] LogAction delete failed (continue): %v", err)
 	}
 	respondJSON(w, http.StatusOK, map[string]any{"success": true})
+}
+
+func reconcilePrivateRoutedDeleteLocked(
+	ctx context.Context,
+	rm *RemoteManageHandler,
+	repo *storage.TrafficRepository,
+	pusher *LimiterConfigPusher,
+	serverID int64,
+	node storage.RoutedNodeDetail,
+	subaccounts []storage.UserSubaccount,
+) error {
+	if node.Enabled {
+		return errors.New("private routed delete intent is not durable")
+	}
+	if len(subaccounts) == 0 {
+		return errors.New("private routed delete is missing credential authority")
+	}
+	if err := pushPrivateRoutedLimiterChecked(ctx, repo, pusher, serverID); err != nil {
+		return fmt.Errorf("publish private routed delete deny: %w", err)
+	}
+	if rm == nil {
+		return errors.New("remote manager is unavailable for private routed deletion")
+	}
+	if err := removePrivateRoutedRuleByMarktag(ctx, rm, serverID, node.RoutedRuleMarktag); err != nil {
+		return fmt.Errorf("remove private routed delete rule: %w", err)
+	}
+	for _, subaccount := range subaccounts {
+		if err := removePrivateRoutedClient(ctx, rm, serverID, node.InboundTag, subaccount.Email); err != nil {
+			return fmt.Errorf("remove private routed delete client %s: %w", subaccount.Email, err)
+		}
+	}
+	if err := removePrivateRoutedOutbound(ctx, rm, serverID, node.RoutedOutboundTag); err != nil {
+		return fmt.Errorf("remove private routed delete outbound: %w", err)
+	}
+	if err := repo.FinalizeUserPrivateRoutedDelete(ctx, node.ID, node.Username); err != nil {
+		return fmt.Errorf("finalize private routed delete: %w", err)
+	}
+	// Removing a stale deny bucket is not an access-enabling boundary. A later
+	// periodic push can safely retry if the Agent is unavailable after deletion.
+	if err := pushPrivateRoutedLimiterChecked(ctx, repo, pusher, serverID); err != nil {
+		log.Printf("[UserRoutedOutbound] post-delete limiter cleanup pending node=%d: %v", node.ID, err)
+	}
+	return nil
+}
+
+func removePrivateRoutedOutbound(ctx context.Context, rm *RemoteManageHandler, serverID int64, tag string) error {
+	present, err := privateRoutedOutboundPresent(ctx, rm, serverID, tag)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	body, _ := json.Marshal(map[string]string{"action": "remove", "tag": tag})
+	response, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", body)
+	if err != nil {
+		return err
+	}
+	return requirePrivateRoutedMutationACK(response, "remove private routed outbound")
+}
+
+func privateRoutedOutboundPresent(ctx context.Context, rm *RemoteManageHandler, serverID int64, tag string) (bool, error) {
+	if rm == nil || strings.TrimSpace(tag) == "" {
+		return false, errors.New("private routed outbound inventory requires a tag and remote manager")
+	}
+	response, err := rm.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/outbounds", nil)
+	if err != nil {
+		return false, fmt.Errorf("read private routed outbound inventory: %w", err)
+	}
+	var inventory struct {
+		Success   bool             `json:"success"`
+		Outbounds []map[string]any `json:"outbounds"`
+	}
+	if err := json.Unmarshal(response, &inventory); err != nil {
+		return false, fmt.Errorf("decode private routed outbound inventory: %w", err)
+	}
+	if !inventory.Success {
+		return false, errors.New("Agent did not acknowledge private routed outbound inventory")
+	}
+	for _, outbound := range inventory.Outbounds {
+		if outboundTag, _ := outbound["tag"].(string); outboundTag == tag {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // ===== helpers =====
@@ -607,13 +694,69 @@ func strOf(v interface{}) string {
 // 设计:rule 整条删除而不是 user[] 移除 email — 因为用户私有路由出站的 rule.user 只有
 // 创建者一个,移除后 user[] 为空会被 xray 视作"不限 user",意外命中其他用户。删整条 rule
 // 干净安全,恢复时根据 DB 元数据重建。
-func suspendUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string) error {
+func suspendUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, username string) error {
+	leasedCtx, releaseAuthorization, err := repo.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return fmt.Errorf("acquire private routed authorization lease for %s: %w", username, err)
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
+
 	nodes, err := repo.ListUserRoutedOutbounds(ctx, username)
 	if err != nil {
 		return fmt.Errorf("list private routed nodes for %s: %w", username, err)
 	}
+	if err := repo.PrepareUserPrivateSubaccountRevokes(ctx, username); err != nil {
+		return fmt.Errorf("prepare private routed revokes for %s: %w", username, err)
+	}
+	serverIDs, err := repo.ListServerIDsForUserSubaccounts(ctx, username)
+	if err != nil {
+		return fmt.Errorf("list private routed servers for %s: %w", username, err)
+	}
+	serverLeasedCtx, releaseServers, err := acquireRemoteServerMutationLeases(ctx, repo, serverIDs)
+	if err != nil {
+		return fmt.Errorf("acquire private routed server leases for %s: %w", username, err)
+	}
+	defer releaseServers()
+	ctx = serverLeasedCtx
+	embeddedServerIDs, err := embeddedLimiterServerIDsForIDs(ctx, repo, serverIDs)
+	if err != nil {
+		return fmt.Errorf("resolve private routed limiter servers for %s: %w", username, err)
+	}
+	if len(embeddedServerIDs) > 0 && pusher == nil {
+		return errors.New("limiter pusher is required to revoke private routed access")
+	}
+	for _, serverID := range embeddedServerIDs {
+		if err := pusher.pushToServerCheckedLeased(ctx, serverID); err != nil {
+			return fmt.Errorf("publish private routed deny on server %d: %w", serverID, err)
+		}
+	}
 	var suspendErrs []error
 	for _, n := range nodes {
+		sa, err := repo.GetUserSubaccount(ctx, n.ID, username)
+		if err != nil {
+			nodeErr := fmt.Errorf("load private routed credential for node %d: %w", n.ID, err)
+			log.Printf("[SuspendUserRouted] %v", nodeErr)
+			suspendErrs = append(suspendErrs, nodeErr)
+			continue
+		}
+		if sa == nil {
+			nodeErr := fmt.Errorf("private routed node %d has no credential record", n.ID)
+			log.Printf("[SuspendUserRouted] %v", nodeErr)
+			suspendErrs = append(suspendErrs, nodeErr)
+			continue
+		}
+		if !sa.IsActive && !sa.RevokePending {
+			continue
+		}
+		// Persist the fail-closed state before even resolving the Agent. A stale
+		// or missing server mapping must remain visible to the reconciler.
+		if err := repo.MarkUserSubaccountRevokePending(ctx, sa.ID); err != nil {
+			nodeErr := fmt.Errorf("mark private routed node %d revoke pending: %w", n.ID, err)
+			log.Printf("[SuspendUserRouted] %v", nodeErr)
+			suspendErrs = append(suspendErrs, nodeErr)
+			continue
+		}
 		serverID, err := resolveServerIDByNameRepo(ctx, repo, n.OriginalServer)
 		if err != nil {
 			nodeErr := fmt.Errorf("resolve server for private routed node %d: %w", n.ID, err)
@@ -637,27 +780,40 @@ func suspendUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo
 			if current.OriginalServer != n.OriginalServer {
 				return fmt.Errorf("private routed node %d changed while acquiring lease; retry required", n.ID)
 			}
-			sa, err := repo.GetUserSubaccount(leasedCtx, n.ID, username)
+			if !current.Enabled {
+				subaccounts, err := repo.ListSubaccountsByRoutedNode(leasedCtx, n.ID)
+				if err != nil {
+					return err
+				}
+				return reconcilePrivateRoutedDeleteLocked(leasedCtx, rm, repo, pusher, serverID, current, subaccounts)
+			}
+			sa, err = repo.GetUserSubaccount(leasedCtx, n.ID, username)
 			if err != nil {
 				return fmt.Errorf("load private routed credential for node %d: %w", n.ID, err)
 			}
 			if sa == nil {
 				return fmt.Errorf("private routed node %d has no credential record", n.ID)
 			}
-			if !sa.IsActive {
+			if !sa.RevokePending {
 				return nil
 			}
+			failRevoke := func(cause error) error {
+				if persistErr := repo.MarkUserSubaccountRevokeFailed(leasedCtx, sa.ID); persistErr != nil {
+					return errors.Join(cause, persistErr)
+				}
+				return cause
+			}
 			if rm == nil {
-				return errors.New("remote manager is unavailable")
+				return failRevoke(errors.New("remote manager is unavailable"))
 			}
 			if err := removeRuleByMarktag(leasedCtx, rm, serverID, current.RoutedRuleMarktag); err != nil {
-				return fmt.Errorf("remove rule for private routed node %d: %w", n.ID, err)
+				return failRevoke(fmt.Errorf("remove rule for private routed node %d: %w", n.ID, err))
 			}
 			if err := removeClientFromInbound(leasedCtx, rm, serverID, current.InboundTag, sa.Email); err != nil {
-				return fmt.Errorf("remove client for private routed node %d: %w", n.ID, err)
+				return failRevoke(fmt.Errorf("remove client for private routed node %d: %w", n.ID, err))
 			}
-			if err := repo.SetSubaccountActive(leasedCtx, sa.ID, false); err != nil {
-				return fmt.Errorf("mark private routed node %d inactive: %w", n.ID, err)
+			if err := repo.CompleteUserSubaccountRevoke(leasedCtx, sa.ID); err != nil {
+				return failRevoke(fmt.Errorf("mark private routed node %d inactive: %w", n.ID, err))
 			}
 			return nil
 		}()
@@ -669,94 +825,451 @@ func suspendUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo
 	return errors.Join(suspendErrs...)
 }
 
+// retryPendingUserPrivateRoutedRevokes is intentionally driven by the durable
+// subaccount marker rather than by user activity. Disabled/over-limit users
+// must keep retrying after an Agent reconnect, while active rows are skipped by
+// suspendUserPrivateRouted's state check.
+func retryPendingUserPrivateRoutedRevokes(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, pusher *LimiterConfigPusher) []error {
+	pending, err := repo.ListPendingUserSubaccountRevokes(ctx, 200)
+	if err != nil {
+		return []error{err}
+	}
+	usernames := make(map[string]struct{}, len(pending))
+	deleteTargets := make(map[int64]storage.UserSubaccount)
+	errs := make([]error, 0)
+	for _, subaccount := range pending {
+		node, nodeErr := repo.GetRoutedNodeDetail(ctx, subaccount.RoutedNodeID)
+		if nodeErr != nil {
+			errs = append(errs, fmt.Errorf("load pending private routed node %d: %w", subaccount.RoutedNodeID, nodeErr))
+			continue
+		}
+		if !node.Enabled {
+			current, exists := deleteTargets[node.ID]
+			if !exists || (current.Username != node.Username && subaccount.Username == node.Username) {
+				deleteTargets[node.ID] = subaccount
+			}
+			continue
+		}
+		usernames[subaccount.Username] = struct{}{}
+	}
+	for _, subaccount := range deleteTargets {
+		if err := reconcilePendingPrivateRoutedDelete(ctx, rm, repo, pusher, subaccount); err != nil {
+			errs = append(errs, fmt.Errorf("delete private routed node %d: %w", subaccount.RoutedNodeID, err))
+		}
+	}
+	for username := range usernames {
+		if err := suspendUserPrivateRouted(ctx, rm, repo, pusher, username); err != nil {
+			errs = append(errs, fmt.Errorf("user %s: %w", username, err))
+		}
+	}
+	return errs
+}
+
+func reconcilePendingPrivateRoutedDelete(
+	ctx context.Context,
+	rm *RemoteManageHandler,
+	repo *storage.TrafficRepository,
+	pusher *LimiterConfigPusher,
+	subaccount storage.UserSubaccount,
+) error {
+	leasedCtx, releaseAuthorization, err := repo.AcquireUserAuthorizationLease(ctx, subaccount.Username)
+	if err != nil {
+		return err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
+	node, err := repo.GetRoutedNodeDetail(ctx, subaccount.RoutedNodeID)
+	if err != nil {
+		return err
+	}
+	if node.Enabled {
+		return errors.New("private routed node no longer has delete intent")
+	}
+	originalServer := node.OriginalServer
+	serverID, err := resolveServerIDByNameRepo(ctx, repo, originalServer)
+	if err != nil {
+		return err
+	}
+	serverLeasedCtx, releaseServer, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer releaseServer()
+	ctx = serverLeasedCtx
+	node, err = repo.GetRoutedNodeDetail(ctx, subaccount.RoutedNodeID)
+	if err != nil {
+		return err
+	}
+	if node.Enabled || node.Username != subaccount.Username || node.OriginalServer != originalServer {
+		return errors.New("private routed delete intent changed while acquiring lease")
+	}
+	lockedServerID, err := resolveServerIDByNameRepo(ctx, repo, node.OriginalServer)
+	if err != nil || lockedServerID != serverID {
+		return errors.New("private routed delete server mapping changed while acquiring lease")
+	}
+	subaccounts, err := repo.ListSubaccountsByRoutedNode(ctx, node.ID)
+	if err != nil {
+		return err
+	}
+	return reconcilePrivateRoutedDeleteLocked(ctx, rm, repo, pusher, serverID, node, subaccounts)
+}
+
+func retryPendingUserPrivateRoutedActivations(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, pusher *LimiterConfigPusher) []error {
+	pending, err := repo.ListPendingUserSubaccountActivations(ctx, 200)
+	if err != nil {
+		return []error{err}
+	}
+	usernames := make(map[string]struct{}, len(pending))
+	for _, subaccount := range pending {
+		usernames[subaccount.Username] = struct{}{}
+	}
+	errList := make([]error, 0)
+	for username := range usernames {
+		if err := resumeUserPrivateRouted(ctx, rm, repo, pusher, username); err != nil {
+			errList = append(errList, fmt.Errorf("user %s: %w", username, err))
+		}
+	}
+	return errList
+}
+
+func embeddedLimiterServerIDsForIDs(ctx context.Context, repo *storage.TrafficRepository, candidates []int64) ([]int64, error) {
+	seen := make(map[int64]struct{}, len(candidates))
+	serverIDs := make([]int64, 0, len(candidates))
+	for _, serverID := range candidates {
+		if serverID <= 0 {
+			continue
+		}
+		if _, exists := seen[serverID]; exists {
+			continue
+		}
+		server, err := repo.GetRemoteServer(ctx, serverID)
+		if err != nil {
+			return nil, err
+		}
+		if server.XrayMode != "embedded" {
+			continue
+		}
+		seen[serverID] = struct{}{}
+		serverIDs = append(serverIDs, serverID)
+	}
+	sort.Slice(serverIDs, func(i, j int) bool { return serverIDs[i] < serverIDs[j] })
+	return serverIDs, nil
+}
+
+func pushPrivateRoutedLimiterChecked(ctx context.Context, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, serverID int64) error {
+	server, err := repo.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	if server.XrayMode != "embedded" {
+		return nil
+	}
+	if pusher == nil {
+		return errors.New("limiter pusher is required for private routed access")
+	}
+	return pusher.pushToServerCheckedLeased(ctx, serverID)
+}
+
+func preservePrivateRoutedResumeDeny(
+	ctx context.Context,
+	rm *RemoteManageHandler,
+	repo *storage.TrafficRepository,
+	pusher *LimiterConfigPusher,
+	serverID int64,
+	node storage.RoutedNodeDetail,
+	subaccount storage.UserSubaccount,
+	cause error,
+) error {
+	markErr := repo.FailUserSubaccountActivation(ctx, subaccount.ID)
+	pushErr := pushPrivateRoutedLimiterChecked(ctx, repo, pusher, serverID)
+	var ruleErr, clientErr error
+	if rm != nil {
+		ruleErr = removePrivateRoutedRuleByMarktag(ctx, rm, serverID, node.RoutedRuleMarktag)
+		clientErr = removePrivateRoutedClient(ctx, rm, serverID, node.InboundTag, subaccount.Email)
+	}
+	return errors.Join(cause, markErr, pushErr, ruleErr, clientErr)
+}
+
 // resumeUserPrivateRouted 用户续费/启用时调用:恢复该用户所有 routed_owner='user' 节点的
 // xray 配置 (重建 rule + 加回 client),凭据从 user_subaccounts 取。
-func resumeUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string) {
-	if rm == nil {
-		return
+func resumeUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, username string) error {
+	leasedCtx, releaseAuthorization, err := repo.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return fmt.Errorf("acquire private routed authorization lease for %s: %w", username, err)
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
+
+	user, err := repo.GetUser(ctx, username)
+	if err != nil {
+		return fmt.Errorf("load private routed activation user %s: %w", username, err)
+	}
+	if !user.IsActive {
+		return storage.ErrUserInactive
+	}
+	overLimit, err := repo.IsUserOverLimit(ctx, username)
+	if err != nil {
+		return fmt.Errorf("load private routed over-limit state for %s: %w", username, err)
+	}
+	if overLimit {
+		return errors.New("private routed activation is blocked while user is over limit")
+	}
+	if err := repo.PrepareUserPrivateSubaccountActivations(ctx, username); err != nil {
+		return err
 	}
 	nodes, err := repo.ListUserRoutedOutbounds(ctx, username)
 	if err != nil {
-		log.Printf("[ResumeUserRouted] list %s failed: %v", username, err)
-		return
+		return fmt.Errorf("list private routed nodes for %s: %w", username, err)
 	}
-	for _, n := range nodes {
-		serverID, err := resolveServerIDByNameRepo(ctx, repo, n.OriginalServer)
-		if err != nil {
-			log.Printf("[ResumeUserRouted] resolve server for node %d failed (continue): %v", n.ID, err)
+	type activationTarget struct {
+		node     storage.RoutedNodeDetail
+		serverID int64
+	}
+	targets := make([]activationTarget, 0, len(nodes))
+	serverIDs := make([]int64, 0, len(nodes))
+	var activationErrs []error
+	for _, node := range nodes {
+		// A disabled node carries durable delete intent. Do not let a stale
+		// activation_pending bit (for example after a crash between state
+		// writes) turn a delete into a resume attempt.
+		if !node.Enabled {
 			continue
 		}
+		sa, subaccountErr := repo.GetUserSubaccount(ctx, node.ID, username)
+		if subaccountErr != nil {
+			activationErrs = append(activationErrs, fmt.Errorf("load private routed subaccount node %d: %w", node.ID, subaccountErr))
+			continue
+		}
+		if sa == nil || !sa.ActivationPending {
+			continue
+		}
+		serverID, resolveErr := resolveServerIDByNameRepo(ctx, repo, node.OriginalServer)
+		if resolveErr != nil {
+			activationErrs = append(activationErrs, fmt.Errorf("resolve server for private routed node %d: %w", node.ID, resolveErr))
+			continue
+		}
+		serverIDs = append(serverIDs, serverID)
+		targets = append(targets, activationTarget{node: node, serverID: serverID})
+	}
+	if len(targets) == 0 {
+		return errors.Join(activationErrs...)
+	}
+	if rm == nil {
+		return errors.Join(errors.Join(activationErrs...), errors.New("remote manager is unavailable for private routed activation"))
+	}
+	serverLeasedCtx, releaseServers, err := acquireRemoteServerMutationLeases(ctx, repo, serverIDs)
+	if err != nil {
+		return errors.Join(errors.Join(activationErrs...), fmt.Errorf("acquire private routed server leases for %s: %w", username, err))
+	}
+	defer releaseServers()
+	ctx = serverLeasedCtx
+	for _, target := range targets {
+		n := target.node
+		serverID := target.serverID
 		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
 		if err != nil {
-			log.Printf("[ResumeUserRouted] node %d deferred: %v", n.ID, err)
+			activationErrs = append(activationErrs, fmt.Errorf("acquire private routed node %d mutation lease: %w", n.ID, err))
 			continue
 		}
-		func() {
+		nodeErr := func() error {
 			defer release()
 			current, err := repo.GetRoutedNodeDetail(leasedCtx, n.ID)
 			if err != nil || current.OriginalServer != n.OriginalServer {
-				log.Printf("[ResumeUserRouted] node %d changed while acquiring lease; retry later", n.ID)
-				return
+				return fmt.Errorf("private routed node %d changed while acquiring lease", n.ID)
+			}
+			if !current.Enabled {
+				return nil
 			}
 			sa, err := repo.GetUserSubaccount(leasedCtx, n.ID, username)
-			if err != nil || sa == nil {
-				log.Printf("[ResumeUserRouted] node %d no subaccount for %s, skip", n.ID, username)
-				return
-			}
-			var cred map[string]interface{}
-			if err := json.Unmarshal([]byte(sa.CredentialJSON), &cred); err != nil {
-				log.Printf("[ResumeUserRouted] parse credential for node %d failed: %v", n.ID, err)
-				return
-			}
-			method := routedExpectedShadowsocksMethod(leasedCtx, repo, current)
-			var changed bool
-			var credentialJSON string
-			if canonicalManagedProtocol(current.Protocol) == "shadowsocks" && isClassicManagedShadowsocksCipher(method) {
-				var clientMissing bool
-				cred, credentialJSON, changed, clientMissing, err = reconcileRoutedClassicCredential(
-					leasedCtx, rm, serverID, current.InboundTag, current.Protocol, method, sa.Email, cred,
-				)
-				if err != nil {
-					log.Printf("[ResumeUserRouted] reconcile classic Shadowsocks node %d failed: %v", n.ID, err)
-					return
-				}
-				_ = clientMissing
-			}
-			if err := addClientToInbound(leasedCtx, rm, serverID, current.InboundTag, cred); err != nil {
-				log.Printf("[ResumeUserRouted] addClient node %d failed (continue): %v", n.ID, err)
-				return
-			}
-			if canonicalManagedProtocol(current.Protocol) == "shadowsocks" && isClassicManagedShadowsocksCipher(method) && changed {
-				if _, err := repo.UpsertUserSubaccount(leasedCtx, storage.UserSubaccount{
-					ID: sa.ID, Username: sa.Username, RoutedNodeID: sa.RoutedNodeID,
-					Email: sa.Email, CredentialJSON: credentialJSON, IsActive: sa.IsActive,
-				}); err != nil {
-					log.Printf("[ResumeUserRouted] persist classic Shadowsocks credential node %d failed: %v", n.ID, err)
-					return
-				}
-			}
-			rule := map[string]interface{}{
-				"type":        "field",
-				"marktag":     current.RoutedRuleMarktag,
-				"user":        []string{sa.Email},
-				"inboundTag":  []string{current.InboundTag},
-				"outboundTag": current.RoutedOutboundTag,
-			}
-			body, _ := json.Marshal(map[string]interface{}{"action": "add_rule", "rule": rule})
-			response, err := rm.forwardToRemoteServer(leasedCtx, serverID, "POST", "/api/child/routing", body)
-			if err == nil {
-				err = applyAgentConfigMutationACK(leasedCtx, rm, serverID, "ResumeUserRoutedRule", response)
-			}
 			if err != nil {
-				log.Printf("[ResumeUserRouted] add_rule node %d failed (continue): %v", n.ID, err)
-				_ = removeClientFromInbound(leasedCtx, rm, serverID, current.InboundTag, sa.Email)
-				return
+				return fmt.Errorf("load private routed subaccount node %d: %w", n.ID, err)
 			}
-			if err := repo.SetSubaccountActive(leasedCtx, sa.ID, true); err != nil {
-				log.Printf("[ResumeUserRouted] mark active node %d failed: %v", n.ID, err)
+			if sa == nil {
+				return fmt.Errorf("private routed node %d has no subaccount", n.ID)
 			}
+			if !sa.ActivationPending {
+				return nil
+			}
+			return activatePrivateRoutedSubaccountLocked(leasedCtx, rm, repo, pusher, serverID, current, *sa)
 		}()
+		if nodeErr != nil {
+			activationErrs = append(activationErrs, fmt.Errorf("activate private routed node %d: %w", n.ID, nodeErr))
+		}
 	}
+	return errors.Join(activationErrs...)
+}
+
+func activatePrivateRoutedSubaccountLocked(
+	ctx context.Context,
+	rm *RemoteManageHandler,
+	repo *storage.TrafficRepository,
+	pusher *LimiterConfigPusher,
+	serverID int64,
+	node storage.RoutedNodeDetail,
+	sa storage.UserSubaccount,
+) error {
+	fail := func(cause error) error {
+		return preservePrivateRoutedResumeDeny(ctx, rm, repo, pusher, serverID, node, sa, cause)
+	}
+	if err := repo.FailUserSubaccountActivation(ctx, sa.ID); err != nil {
+		return fmt.Errorf("establish routed activation deny: %w", err)
+	}
+	if err := pushPrivateRoutedLimiterChecked(ctx, repo, pusher, serverID); err != nil {
+		return fmt.Errorf("publish routed activation deny: %w", err)
+	}
+	if err := removePrivateRoutedRuleByMarktag(ctx, rm, serverID, node.RoutedRuleMarktag); err != nil {
+		return fail(fmt.Errorf("settle old routed rule: %w", err))
+	}
+	if err := removePrivateRoutedClient(ctx, rm, serverID, node.InboundTag, sa.Email); err != nil {
+		return fail(fmt.Errorf("settle old routed client: %w", err))
+	}
+
+	var credential map[string]interface{}
+	if err := json.Unmarshal([]byte(sa.CredentialJSON), &credential); err != nil {
+		return fail(fmt.Errorf("parse routed credential: %w", err))
+	}
+	method := routedExpectedShadowsocksMethod(ctx, repo, node)
+	if canonicalManagedProtocol(node.Protocol) == "shadowsocks" && isClassicManagedShadowsocksCipher(method) {
+		var credentialJSON string
+		var changed, clientMissing bool
+		var err error
+		credential, credentialJSON, changed, clientMissing, err = reconcileRoutedClassicCredential(
+			ctx, rm, serverID, node.InboundTag, node.Protocol, method, sa.Email, credential,
+		)
+		if err != nil {
+			return fail(fmt.Errorf("reconcile routed Shadowsocks credential: %w", err))
+		}
+		_ = clientMissing
+		if changed {
+			if err := repo.UpdateUserSubaccountCredential(ctx, sa.ID, credentialJSON); err != nil {
+				return fail(fmt.Errorf("persist routed Shadowsocks credential: %w", err))
+			}
+			sa.CredentialJSON = credentialJSON
+		}
+	}
+	if err := ensurePrivateRoutedOutbound(ctx, rm, serverID, node); err != nil {
+		return fail(err)
+	}
+	if err := addPrivateRoutedRule(ctx, rm, serverID, node, sa.Email); err != nil {
+		return fail(err)
+	}
+	if err := repo.StageUserSubaccountActivationPolicy(ctx, sa.ID); err != nil {
+		return fail(fmt.Errorf("stage routed normal limiter policy: %w", err))
+	}
+	if err := pushPrivateRoutedLimiterChecked(ctx, repo, pusher, serverID); err != nil {
+		return fail(fmt.Errorf("publish routed normal limiter policy: %w", err))
+	}
+	clientOutcome, err := addClientToInboundDeferred(ctx, rm, serverID, node.InboundTag, credential)
+	if err != nil {
+		return fail(err)
+	}
+	if clientOutcome.RuntimeDeferred {
+		return fail(fmt.Errorf("server %d Agent deferred routed client runtime activation", serverID))
+	}
+	if err := repo.CompleteUserSubaccountActivation(ctx, sa.ID); err != nil {
+		return fail(err)
+	}
+	return nil
+}
+
+func ensurePrivateRoutedOutbound(ctx context.Context, rm *RemoteManageHandler, serverID int64, node storage.RoutedNodeDetail) error {
+	var outbound map[string]interface{}
+	if err := json.Unmarshal([]byte(node.RoutedOutboundJSON), &outbound); err != nil {
+		return fmt.Errorf("parse private routed outbound: %w", err)
+	}
+	present, err := privateRoutedOutboundPresent(ctx, rm, serverID, node.RoutedOutboundTag)
+	if err != nil {
+		return err
+	}
+	if present {
+		// Activation starts from a durable deny with no rule/client. Replacing an
+		// existing outbound is therefore safe and turns response-loss/runtime-
+		// warning retries into a fresh mutation with a strict ACK.
+		if err := removePrivateRoutedOutbound(ctx, rm, serverID, node.RoutedOutboundTag); err != nil {
+			return fmt.Errorf("settle existing private routed outbound: %w", err)
+		}
+	}
+	body, _ := json.Marshal(map[string]interface{}{"action": "add", "outbound": outbound})
+	response, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", body)
+	if err != nil {
+		return fmt.Errorf("ensure private routed outbound: %w", err)
+	}
+	return requirePrivateRoutedMutationACK(response, "ensure private routed outbound")
+}
+
+func addPrivateRoutedRule(ctx context.Context, rm *RemoteManageHandler, serverID int64, node storage.RoutedNodeDetail, email string) error {
+	rule := map[string]interface{}{
+		"type": "field", "marktag": node.RoutedRuleMarktag, "user": []string{email},
+		"inboundTag": []string{node.InboundTag}, "outboundTag": node.RoutedOutboundTag,
+	}
+	body, _ := json.Marshal(map[string]interface{}{"action": "add_rule", "rule": rule})
+	response, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", body)
+	if err != nil {
+		return fmt.Errorf("add private routed rule: %w", err)
+	}
+	return requirePrivateRoutedMutationACK(response, "add private routed rule")
+}
+
+func requirePrivateRoutedMutationACK(body []byte, label string) error {
+	deferred, err := inspectAgentConfigMutationACK(body)
+	if err != nil {
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	if deferred {
+		return fmt.Errorf("%s: Agent deferred runtime apply", label)
+	}
+	return nil
+}
+
+func removePrivateRoutedClient(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag, email string) error {
+	outcome, err := removeClientFromInboundDeferred(ctx, rm, serverID, inboundTag, email)
+	if err != nil {
+		return err
+	}
+	if outcome.RuntimeDeferred {
+		return fmt.Errorf("server %d Agent deferred private routed client removal", serverID)
+	}
+	return nil
+}
+
+func removePrivateRoutedRuleByMarktag(ctx context.Context, rm *RemoteManageHandler, serverID int64, marktag string) error {
+	for attempts := 0; attempts < 32; attempts++ {
+		result, err := rm.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/routing", nil)
+		if err != nil {
+			return err
+		}
+		var response struct {
+			Success bool                   `json:"success"`
+			Routing map[string]interface{} `json:"routing"`
+		}
+		if err := json.Unmarshal(result, &response); err != nil {
+			return err
+		}
+		if !response.Success {
+			return errors.New("Agent did not acknowledge routing snapshot")
+		}
+		rules, _ := response.Routing["rules"].([]interface{})
+		index := -1
+		for i, rawRule := range rules {
+			rule, _ := rawRule.(map[string]interface{})
+			if tag, _ := rule["marktag"].(string); tag == marktag {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			return nil
+		}
+		body, _ := json.Marshal(map[string]interface{}{"action": "remove_rule", "index": index})
+		mutation, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", body)
+		if err != nil {
+			return err
+		}
+		if err := requirePrivateRoutedMutationACK(mutation, "remove private routed rule"); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("too many duplicate private routed rules for marktag %s", marktag)
 }
 
 // deleteUserPrivateRoutedAll 用户账户删除时调用:清理该用户所有 routed_owner='user' 节点的

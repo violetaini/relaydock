@@ -991,7 +991,7 @@ func removeClientFromInbound(ctx context.Context, rm *RemoteManageHandler, serve
 		return err
 	}
 	if outcome.RuntimeDeferred {
-		log.Printf("[RoutedClientRemove] server=%d Agent deferred inbound runtime apply; Xray lifecycle left unchanged", serverID)
+		return fmt.Errorf("server %d Agent deferred inbound runtime removal", serverID)
 	}
 	return nil
 }
@@ -1031,7 +1031,14 @@ func removeRuleByMarktag(ctx context.Context, rm *RemoteManageHandler, serverID 
 			if err != nil {
 				return err
 			}
-			return applyAgentConfigMutationACK(ctx, rm, serverID, "RoutedRuleRemove", response)
+			deferred, err := inspectAgentConfigMutationACK(response)
+			if err != nil {
+				return err
+			}
+			if deferred {
+				return fmt.Errorf("server %d Agent deferred routing rule removal", serverID)
+			}
+			return nil
 		}
 	}
 	return nil
@@ -1840,7 +1847,7 @@ func removeUserFromRoutedNode(ctx context.Context, rm *RemoteManageHandler, repo
 		return false, err
 	}
 	if clientOutcome.RuntimeDeferred {
-		log.Printf("[RoutedClientRemove] server=%d Agent deferred runtime inbound replacement; preserving its retry path without restarting the core", serverID)
+		return routingChanged, fmt.Errorf("server %d Agent deferred routed client runtime removal", serverID)
 	}
 
 	// 3. DB 置 is_active=0(凭据保留)

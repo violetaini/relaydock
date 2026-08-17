@@ -742,7 +742,7 @@ func main() {
 	routedOutboundHandler := handler.NewRoutedOutboundHandler(repo, remoteManageHandler)
 	mux.Handle("/api/admin/routed-outbound", auth.RequireAdmin(tokenStore, userRepo, routedOutboundHandler))
 	// 用户私有路由出站(routed_owner='user'):普通用户为自己创建/删除/查询专属出站
-	mux.Handle("/api/user/routed-outbound", auth.RequireToken(tokenStore, userRepo, handler.NewUserRoutedOutboundHandler(repo, remoteManageHandler)))
+	mux.Handle("/api/user/routed-outbound", auth.RequireToken(tokenStore, userRepo, handler.NewUserRoutedOutboundHandler(repo, remoteManageHandler, limiterPusher)))
 
 	// 从兼容面板备份导入数据。
 	migrateHandler := handler.NewMigrateHandler(repo, remoteManageHandler)

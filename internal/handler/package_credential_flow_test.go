@@ -3,10 +3,51 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/violetaini/relaydock/internal/storage"
 )
+
+func TestGetOrCreateInboundCredentialRejectsStoredProtocolDrift(t *testing.T) {
+	ctx := context.Background()
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "alice", storage.RoleUser)
+	server := &storage.RemoteServer{
+		Name: "edge-protocol-drift", Token: "token", IPAddress: "203.0.113.10", XrayMode: "embedded",
+	}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	storedJSON := `{"id":"old-vless-id","email":"alice__shared-in"}`
+	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+		Username: "alice", ServerID: server.ID, InboundTag: "shared-in",
+		Protocol: "vless", CredentialJSON: storedJSON,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	user, err := repo.GetUser(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	credential, raw, reused, err := getOrCreateInboundCredential(
+		ctx, repo, user, server.ID, "shared-in", "trojan", map[string]interface{}{},
+	)
+	if !errors.Is(err, storage.ErrUserInboundConfigConflict) {
+		t.Fatalf("protocol drift error=%v, want %v", err, storage.ErrUserInboundConfigConflict)
+	}
+	if credential != nil || raw != "" || reused {
+		t.Fatalf("protocol drift returned usable credential: credential=%v raw=%q reused=%v", credential, raw, reused)
+	}
+	stored, loadErr := repo.GetUserInboundConfig(ctx, "alice", server.ID, "shared-in")
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if stored.Protocol != "vless" || stored.CredentialJSON != storedJSON {
+		t.Fatalf("protocol drift changed authoritative row: %+v", stored)
+	}
+}
 
 func TestGetOrCreateInboundCredentialReconcilesStoredVLESSFlow(t *testing.T) {
 	tests := []struct {

@@ -126,6 +126,41 @@ func validatePackageTemplateFilename(name string) error {
 	return nil
 }
 
+// validatePackageNodeProtocolConflicts rejects templates that address the same
+// physical inbound with different credential protocols. The credential table
+// is intentionally keyed by (user, server, tag) for compatibility, so silently
+// choosing whichever node goroutine runs first would persist the wrong client
+// shape and make later cleanup ambiguous.
+func validatePackageNodeProtocolConflicts(ctx context.Context, repo *storage.TrafficRepository, nodeIDs []int64) error {
+	if repo == nil {
+		return errors.New("package repository is unavailable")
+	}
+	protocols := make(map[string]string)
+	for _, nodeID := range nodeIDs {
+		node, err := repo.GetNodeByID(ctx, nodeID)
+		if err != nil {
+			return fmt.Errorf("load package node %d: %w", nodeID, err)
+		}
+		if strings.EqualFold(strings.TrimSpace(node.NodeType), "routed") ||
+			strings.TrimSpace(node.OriginalServer) == "" || strings.TrimSpace(node.InboundTag) == "" ||
+			!supportsPerUserInboundCredential(node.Protocol) {
+			continue
+		}
+		server, err := repo.GetRemoteServerByName(ctx, node.OriginalServer)
+		if err != nil {
+			return fmt.Errorf("resolve package node %d server: %w", nodeID, err)
+		}
+		protocol := canonicalManagedProtocol(node.Protocol)
+		key := fmt.Sprintf("%d|%s", server.ID, node.InboundTag)
+		if previous, exists := protocols[key]; exists && previous != protocol {
+			return fmt.Errorf("package nodes conflict at server %s inbound %s: protocols %s and %s",
+				server.Name, node.InboundTag, previous, protocol)
+		}
+		protocols[key] = protocol
+	}
+	return nil
+}
+
 func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -173,6 +208,10 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	nodes := req.Nodes
 	if nodes == nil {
 		nodes = []int64{}
+	}
+	if err := validatePackageNodeProtocolConflicts(r.Context(), h.repo, nodes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	trafficMode := req.TrafficMode
@@ -228,6 +267,103 @@ type PackageUpdateHandler struct {
 	forwarding               *ForwardingHandler
 	capabilityManager        *capabilities.Manager
 	afterUserSnapshotForTest func()
+}
+
+type packageTemplateRevocationPlan struct {
+	user              storage.User
+	revoked           []packageNodeRevocation
+	wireGuardConfigs  []storage.UserInboundConfig
+	wireGuardCleanups []storage.UserInboundAccessSource
+}
+
+func indexedPackageTemplateCleanupPlans(plans []packageTemplateRevocationPlan) map[int64]storage.UserInboundAccessSource {
+	result := make(map[int64]storage.UserInboundAccessSource)
+	for _, plan := range plans {
+		for _, source := range plan.wireGuardCleanups {
+			result[source.SourceID] = source
+		}
+	}
+	return result
+}
+
+func (h *PackageUpdateHandler) rollbackPackageTemplateRevocations(
+	ctx context.Context,
+	plans []packageTemplateRevocationPlan,
+) error {
+	prepared := indexedPackageTemplateCleanupPlans(plans)
+	var rollbackErrs []error
+	if err := restorePreparedPackageWireGuardPolicies(ctx, h.repo, h.pusher, prepared); err != nil {
+		rollbackErrs = append(rollbackErrs, fmt.Errorf("restore package cleanup policies: %w", err))
+	}
+	assigner := NewPackageAssignHandler(h.repo, h.remoteManage, h.pusher)
+	for i := len(plans) - 1; i >= 0; i-- {
+		if err := assigner.restorePackageNodeRevocations(ctx, plans[i].user, plans[i].revoked); err != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("restore user %s package access: %w", plans[i].user.Username, err))
+		}
+	}
+	return errors.Join(rollbackErrs...)
+}
+
+func (h *PackageUpdateHandler) stagePackageTemplateRevocations(
+	ctx context.Context,
+	current *storage.Package,
+	target *storage.Package,
+	users []storage.User,
+) ([]packageTemplateRevocationPlan, error) {
+	if current == nil || target == nil {
+		return nil, errors.New("package template is unavailable")
+	}
+	assigner := NewPackageAssignHandler(h.repo, h.remoteManage, h.pusher)
+	plans := make([]packageTemplateRevocationPlan, 0, len(users))
+	for _, snapshot := range users {
+		latest, err := h.repo.GetUser(ctx, snapshot.Username)
+		if err != nil {
+			return plans, errors.Join(err, h.rollbackPackageTemplateRevocations(ctx, plans))
+		}
+		if latest.PackageID != current.ID || !packageAssignmentActive(latest, time.Now().UTC()) {
+			continue
+		}
+		plan := packageTemplateRevocationPlan{user: latest}
+		plan.revoked, plan.wireGuardConfigs, err = assigner.revokePackageNodeDifference(ctx, latest.Username, current, target)
+		plans = append(plans, plan)
+		if err != nil {
+			return plans, errors.Join(fmt.Errorf("stage user %s package access removal: %w", latest.Username, err),
+				h.rollbackPackageTemplateRevocations(ctx, plans))
+		}
+		for _, cfg := range plan.wireGuardConfigs {
+			source, prepareErr := h.repo.PreparePackageInboundCredentialCleanup(ctx, cfg, "package-template-update")
+			if prepareErr != nil {
+				return plans, errors.Join(
+					fmt.Errorf("prepare user %s WireGuard cleanup %d/%s: %w", latest.Username, cfg.ServerID, cfg.InboundTag, prepareErr),
+					h.rollbackPackageTemplateRevocations(ctx, plans),
+				)
+			}
+			plans[len(plans)-1].wireGuardCleanups = append(plans[len(plans)-1].wireGuardCleanups, *source)
+		}
+	}
+	prepared := indexedPackageTemplateCleanupPlans(plans)
+	if err := pushPreparedPackageWireGuardPoliciesChecked(ctx, h.pusher, prepared); err != nil {
+		return plans, errors.Join(fmt.Errorf("publish package template cleanup policy: %w", err),
+			h.rollbackPackageTemplateRevocations(ctx, plans))
+	}
+	return plans, nil
+}
+
+func (h *PackageUpdateHandler) finishPackageTemplateRevocations(
+	ctx context.Context,
+	plans []packageTemplateRevocationPlan,
+) map[string][]string {
+	warnings := make(map[string][]string)
+	for _, plan := range plans {
+		for index, source := range plan.wireGuardCleanups {
+			cfg := plan.wireGuardConfigs[index]
+			if err := h.managed.reconcileSource(ctx, source); err != nil {
+				warnings[plan.user.Username] = append(warnings[plan.user.Username],
+					fmt.Sprintf("WireGuard %d/%s cleanup pending retry: %v", cfg.ServerID, cfg.InboundTag, err))
+			}
+		}
+	}
+	return warnings
 }
 
 func (h *PackageUpdateHandler) SetCapabilityManager(manager *capabilities.Manager) {
@@ -311,6 +447,10 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if nodes == nil {
 		nodes = []int64{}
 	}
+	if err := validatePackageNodeProtocolConflicts(r.Context(), h.repo, nodes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	packageCtx, releasePackage, err := h.repo.AcquirePackageAuthorizationLease(r.Context(), req.ID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
@@ -324,6 +464,10 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if p, err := h.repo.GetPackage(packageCtx, req.ID); err == nil {
 		oldPkg = p
 		oldNodes = p.Nodes
+	}
+	if oldPkg == nil {
+		http.Error(w, "Package not found", http.StatusNotFound)
+		return
 	}
 
 	// 套餐表单没有按月重置的控件,请求里不带这两个字段。缺省时必须沿用旧值,
@@ -394,9 +538,15 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		}
 		defer releaseAuthorization()
 	}
+	revocationPlans, err := h.stagePackageTemplateRevocations(updateCtx, oldPkg, &pkg, boundUsers)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
 
 	bundleWarnings, err := h.repo.UpdatePackageBundle(updateCtx, pkg)
 	if err != nil {
+		err = errors.Join(err, h.rollbackPackageTemplateRevocations(updateCtx, revocationPlans))
 		if errors.Is(err, storage.ErrPackageNotFound) {
 			http.Error(w, "Package not found", http.StatusNotFound)
 			return
@@ -410,6 +560,9 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 	if bundleWarnings == nil {
 		bundleWarnings = make(map[string][]string)
+	}
+	for username, warnings := range h.finishPackageTemplateRevocations(updateCtx, revocationPlans) {
+		bundleWarnings[username] = append(bundleWarnings[username], warnings...)
 	}
 	if h.pusher != nil {
 		go h.pusher.PushToAllServersForPackage(context.Background(), req.ID)
@@ -780,6 +933,15 @@ func unbindUserPackageLocked(ctx context.Context, repo *storage.TrafficRepositor
 	if previous.AuthorizationMode != storage.AuthorizationModePackage || previous.PackageID <= 0 {
 		return storage.ErrAuthorizationModeConflict
 	}
+	configs, err := repo.GetUserInboundConfigs(ctx, username)
+	if err != nil {
+		return fmt.Errorf("获取用户 %s 入站配置失败: %w", username, err)
+	}
+	for _, cfg := range configs {
+		if canonicalManagedProtocol(cfg.Protocol) == "wireguard" {
+			return unbindUserPackageWireGuardLocked(ctx, repo, remoteManage, pusher, previous, configs, deleteSubscription)
+		}
+	}
 	packages := NewPackageAssignHandler(repo, remoteManage, pusher)
 	helper := &ServiceAuthorizationHandler{
 		repo: repo, packages: packages, managed: packages.managed, forwarding: packages.forwarding,
@@ -807,10 +969,6 @@ func unbindUserPackageLocked(ctx context.Context, repo *storage.TrafficRepositor
 	// inbound 移除 + routed 下线并发执行 — 每条目独立,失败只 log。
 	var wg sync.WaitGroup
 
-	configs, err := repo.GetUserInboundConfigs(ctx, username)
-	if err != nil {
-		return fmt.Errorf("获取用户 %s 入站配置失败: %w", username, err)
-	}
 	for _, cfg := range configs {
 		wg.Add(1)
 		go func(cfg storage.UserInboundConfig) {
@@ -875,6 +1033,201 @@ func unbindUserPackageLocked(ctx context.Context, repo *storage.TrafficRepositor
 		}
 	}
 	return nil
+}
+
+// unbindUserPackageWireGuardLocked first acknowledges the WireGuard deny policy,
+// then removes non-WireGuard and routed access while the old package can still
+// be restored, and only then commits the authorization transition. Every saved
+// credential also gets a durable cleanup source for idempotent retry.
+func unbindUserPackageWireGuardLocked(
+	ctx context.Context,
+	repo *storage.TrafficRepository,
+	remoteManage *RemoteManageHandler,
+	pusher *LimiterConfigPusher,
+	previous storage.User,
+	configs []storage.UserInboundConfig,
+	deleteSubscription bool,
+) error {
+	username := previous.Username
+	packageRoutedNodes, err := packageRoutedNodeIDsForUser(ctx, repo, username)
+	if err != nil {
+		return err
+	}
+	subaccounts, err := repo.ListUserSubaccounts(ctx, username)
+	if err != nil {
+		return fmt.Errorf("获取用户 %s 路由子账号失败: %w", username, err)
+	}
+	preparedCleanups := make(map[int64]storage.UserInboundAccessSource)
+	for _, cfg := range configs {
+		source, prepareErr := repo.PreparePackageInboundCredentialCleanup(ctx, cfg, "package-unbind")
+		if prepareErr != nil {
+			return errors.Join(
+				fmt.Errorf("server %d inbound %s prepare credential cleanup: %w", cfg.ServerID, cfg.InboundTag, prepareErr),
+				settlePreparedPackageWireGuardCleanups(ctx, repo, preparedCleanups),
+			)
+		}
+		preparedCleanups[cfg.ID] = *source
+	}
+
+	packages := NewPackageAssignHandler(repo, remoteManage, pusher)
+	if err := pushPreparedPackageWireGuardPoliciesChecked(ctx, pusher, preparedCleanups); err != nil {
+		return errors.Join(
+			fmt.Errorf("publish package cleanup policy: %w", err),
+			restorePreparedPackageWireGuardPolicies(ctx, repo, pusher, preparedCleanups),
+		)
+	}
+
+	// Remove non-WireGuard clients before committing the authorization change.
+	// They do not have the tunnel-address fail-closed policy available to
+	// WireGuard, so a failed mutation must leave the old package authoritative
+	// and restore every client already touched in this attempt.
+	revocations := make([]packageNodeRevocation, 0, len(configs)+len(subaccounts))
+	for _, cfg := range configs {
+		if canonicalManagedProtocol(cfg.Protocol) == "wireguard" {
+			continue
+		}
+		copy := cfg
+		revocations = append(revocations, packageNodeRevocation{inbound: &copy})
+		if removeErr := removeUserFromInbound(ctx, remoteManage, cfg); removeErr != nil && !isInboundNotFoundErr(removeErr) {
+			return errors.Join(
+				fmt.Errorf("server %d inbound %s: %w", cfg.ServerID, cfg.InboundTag, removeErr),
+				restorePreparedPackageWireGuardPolicies(ctx, repo, pusher, preparedCleanups),
+				packages.restorePackageNodeRevocations(ctx, previous, revocations),
+			)
+		}
+	}
+	for _, subaccount := range subaccounts {
+		if !subaccount.IsActive || !packageRoutedNodes[subaccount.RoutedNodeID] {
+			continue
+		}
+		// Record the route before the call because an uncertain Agent reply can
+		// have removed only part of its remote state.
+		revocations = append(revocations, packageNodeRevocation{routedNodeID: subaccount.RoutedNodeID})
+		if _, removeErr := removeUserFromRoutedNode(ctx, remoteManage, repo, username, subaccount.RoutedNodeID); removeErr != nil {
+			return errors.Join(
+				fmt.Errorf("routed node %d: %w", subaccount.RoutedNodeID, removeErr),
+				restorePreparedPackageWireGuardPolicies(ctx, repo, pusher, preparedCleanups),
+				packages.restorePackageNodeRevocations(ctx, previous, revocations),
+			)
+		}
+	}
+	if err := repo.RemovePackageFromUser(ctx, username); err != nil && !errors.Is(err, storage.ErrUserNotFound) {
+		persisted, readErr := repo.GetUser(ctx, username)
+		var cancelErr error
+		var restoreErr error
+		if readErr == nil && persisted.AuthorizationMode == storage.AuthorizationModePackage && persisted.PackageID == previous.PackageID {
+			cancelErr = restorePreparedPackageWireGuardPolicies(ctx, repo, pusher, preparedCleanups)
+			restoreErr = packages.restorePackageNodeRevocations(ctx, previous, revocations)
+		}
+		return errors.Join(fmt.Errorf("remove package assignment for %s: %w", username, err), readErr, cancelErr, restoreErr)
+	}
+
+	helper := &ServiceAuthorizationHandler{
+		repo: repo, packages: packages, managed: packages.managed, forwarding: packages.forwarding,
+	}
+	var cleanupErrs []error
+	for _, cfg := range configs {
+		source := preparedCleanups[cfg.ID]
+		if reconcileErr := packages.managed.reconcileSource(ctx, source); reconcileErr != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("server %d inbound %s revoke credential: %w",
+				cfg.ServerID, cfg.InboundTag, reconcileErr))
+		}
+	}
+	if warnings := helper.reconcileAuthorizationTombstones(ctx, username, storage.GrantSourcePackage, "package-unbind"); len(warnings) > 0 {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("package child cleanup is incomplete: %s", strings.Join(warnings, "; ")))
+	}
+	if len(cleanupErrs) == 0 && pusher != nil {
+		go pusher.PushToAllServersForUser(context.Background(), username)
+	}
+	if deleteSubscription {
+		if sf, lookupErr := repo.GetUserPackageSubscription(ctx, username); lookupErr == nil && sf.ID > 0 {
+			if deleteErr := deleteSubscribeFileAndPhysical(ctx, repo, "subscribes", sf); deleteErr != nil {
+				log.Printf("[PackageUnbind] 删除用户 %s 套餐订阅记录失败: %v", username, deleteErr)
+			}
+		}
+	}
+	for _, cleanupErr := range cleanupErrs {
+		// The package transition and strict policy are already durable. The
+		// managed reconciler owns the remaining idempotent remote cleanup.
+		log.Printf("[PackageUnbind] durable cleanup pending for %s: %v", username, cleanupErr)
+	}
+	return nil
+}
+
+func settlePreparedPackageWireGuardCleanups(
+	ctx context.Context,
+	repo *storage.TrafficRepository,
+	sources map[int64]storage.UserInboundAccessSource,
+) error {
+	var settleErrs []error
+	for _, source := range sources {
+		if _, err := repo.MarkUserInboundAccessSourceApplied(ctx, source.ID, source.Generation,
+			storage.ManagedObservedInactive, time.Now().UTC()); err != nil {
+			settleErrs = append(settleErrs, fmt.Errorf("cancel WireGuard cleanup source %d: %w", source.ID, err))
+		}
+	}
+	return errors.Join(settleErrs...)
+}
+
+func pushPreparedPackageWireGuardPoliciesChecked(
+	ctx context.Context,
+	pusher *LimiterConfigPusher,
+	sources map[int64]storage.UserInboundAccessSource,
+) error {
+	serverSet := make(map[int64]struct{})
+	for _, source := range sources {
+		if pusher == nil || pusher.repo == nil {
+			return errors.New("limiter pusher is not available")
+		}
+		cfg, err := pusher.repo.GetUserInboundConfig(ctx, source.Username, source.ServerID, source.InboundTag)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("load cleanup credential %s/%s: %w", source.Username, source.InboundTag, err)
+		}
+		if canonicalManagedProtocol(cfg.Protocol) != "wireguard" {
+			continue
+		}
+		serverSet[source.ServerID] = struct{}{}
+	}
+	if len(serverSet) == 0 {
+		return nil
+	}
+	if pusher == nil {
+		return errors.New("limiter pusher is not available")
+	}
+	serverIDs := make([]int64, 0, len(serverSet))
+	for serverID := range serverSet {
+		serverIDs = append(serverIDs, serverID)
+	}
+	sort.Slice(serverIDs, func(i, j int) bool { return serverIDs[i] < serverIDs[j] })
+	var pushErrs []error
+	for _, serverID := range serverIDs {
+		if err := pusher.PushToServerChecked(ctx, serverID); err != nil {
+			pushErrs = append(pushErrs, fmt.Errorf("server %d: %w", serverID, err))
+		}
+	}
+	return errors.Join(pushErrs...)
+}
+
+func restorePreparedPackageWireGuardPolicies(
+	ctx context.Context,
+	repo *storage.TrafficRepository,
+	pusher *LimiterConfigPusher,
+	sources map[int64]storage.UserInboundAccessSource,
+) error {
+	settleErr := settlePreparedPackageWireGuardCleanups(ctx, repo, sources)
+	pushErr := pushPreparedPackageWireGuardPoliciesChecked(ctx, pusher, sources)
+	return errors.Join(settleErr, pushErr)
+}
+
+func indexedPackageWireGuardCleanupSources(sources []storage.UserInboundAccessSource) map[int64]storage.UserInboundAccessSource {
+	indexed := make(map[int64]storage.UserInboundAccessSource, len(sources))
+	for _, source := range sources {
+		indexed[source.SourceID] = source
+	}
+	return indexed
 }
 
 func packageRoutedNodeIDsForUser(ctx context.Context, repo *storage.TrafficRepository, username string) (map[int64]bool, error) {
@@ -1250,7 +1603,13 @@ func (h *PackageAssignHandler) reconcileStalePackageNodeAccessLocked(ctx context
 	}
 	var cleanupErrs []error
 	for _, cfg := range configs {
-		if _, removeErr := removeStalePackageUserInboundConfig(ctx, h.remoteManage, h.repo, h.pusher, cfg); removeErr != nil && !isInboundNotFoundErr(removeErr) {
+		var removeErr error
+		if canonicalManagedProtocol(cfg.Protocol) == "wireguard" {
+			_, removeErr = h.reconcileStalePackageWireGuardCredential(ctx, cfg)
+		} else {
+			_, removeErr = removeStalePackageUserInboundConfig(ctx, h.remoteManage, h.repo, h.pusher, cfg)
+		}
+		if removeErr != nil && !isInboundNotFoundErr(removeErr) {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove stale inbound %d/%s: %w",
 				cfg.ServerID, cfg.InboundTag, removeErr))
 		}
@@ -1286,11 +1645,43 @@ func (h *PackageAssignHandler) reconcileStalePackageNodeAccessLocked(ctx context
 	return errors.Join(cleanupErrs...)
 }
 
+func (h *PackageAssignHandler) reconcileStalePackageWireGuardCredential(
+	ctx context.Context,
+	cfg storage.UserInboundConfig,
+) (bool, error) {
+	hasPackageAccess, err := hasPackageTemplateInboundAccessProtocol(
+		ctx, h.repo, cfg.Username, cfg.ServerID, cfg.InboundTag, cfg.Protocol, time.Now().UTC(),
+	)
+	if err != nil {
+		return false, err
+	}
+	if hasPackageAccess {
+		return true, nil
+	}
+	source, err := h.repo.PreparePackageInboundCredentialCleanup(ctx, cfg, "package-reconcile")
+	if err != nil {
+		return false, err
+	}
+	if err := h.managed.reconcileSource(ctx, *source); err != nil {
+		return false, err
+	}
+	if _, err := h.repo.GetUserInboundConfig(ctx, cfg.Username, cfg.ServerID, cfg.InboundTag); errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // hasPackageTemplateInboundAccess answers only the durable template question.
 // It intentionally does not apply traffic-limit or Agent-observed state: an
 // over-limit user still owns the package credential and the normal enforcer
 // must be able to retry it later.
 func hasPackageTemplateInboundAccess(ctx context.Context, repo *storage.TrafficRepository, username string, serverID int64, inboundTag string, now time.Time) (bool, error) {
+	return hasPackageTemplateInboundAccessProtocol(ctx, repo, username, serverID, inboundTag, "", now)
+}
+
+func hasPackageTemplateInboundAccessProtocol(ctx context.Context, repo *storage.TrafficRepository, username string, serverID int64, inboundTag, protocol string, now time.Time) (bool, error) {
 	user, err := repo.GetUser(ctx, username)
 	if err != nil {
 		return false, err
@@ -1316,7 +1707,8 @@ func hasPackageTemplateInboundAccess(ctx context.Context, repo *storage.TrafficR
 		}
 		if node.Enabled && !strings.EqualFold(strings.TrimSpace(node.NodeType), "routed") &&
 			supportsPerUserInboundCredential(node.Protocol) &&
-			node.OriginalServer == server.Name && node.InboundTag == inboundTag {
+			node.OriginalServer == server.Name && node.InboundTag == inboundTag &&
+			(strings.TrimSpace(protocol) == "" || canonicalManagedProtocol(node.Protocol) == canonicalManagedProtocol(protocol)) {
 			if canonicalManagedProtocol(node.Protocol) == "wireguard" {
 				provisionable, provenanceErr := repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
 				if provenanceErr != nil {
@@ -1476,6 +1868,8 @@ func (h *PackageAssignHandler) AssignAndProvision(ctx context.Context, username 
 func (h *PackageAssignHandler) assignAndProvisionLocked(ctx context.Context, username string, packageID int64, startDate, endDate time.Time, isReset bool, resetDay int) ([]string, error) {
 	var warnings []string
 	var revokedPreviousAccess []packageNodeRevocation
+	var pendingWireGuardCleanups []storage.UserInboundConfig
+	var preparedWireGuardCleanups []storage.UserInboundAccessSource
 	var previousPackageChildren authorizationChildState
 	if startDate.After(time.Now().Add(time.Minute)) || !endDate.After(startDate) || !endDate.After(time.Now()) {
 		return nil, errInvalidPackageWindow
@@ -1486,6 +1880,9 @@ func (h *PackageAssignHandler) assignAndProvisionLocked(ctx context.Context, use
 	}
 	targetPackage, err := h.repo.GetPackage(ctx, packageID)
 	if err != nil {
+		return nil, err
+	}
+	if err := validatePackageNodeProtocolConflicts(ctx, h.repo, targetPackage.Nodes); err != nil {
 		return nil, err
 	}
 	switchingPackages := currentUser.PackageID > 0 && currentUser.PackageID != packageID
@@ -1504,13 +1901,37 @@ func (h *PackageAssignHandler) assignAndProvisionLocked(ctx context.Context, use
 		if currentErr != nil {
 			return nil, fmt.Errorf("load current package before switch: %w", currentErr)
 		}
-		revokedPreviousAccess, err = h.revokePackageNodeDifference(ctx, username, currentPackage, targetPackage)
+		revokedPreviousAccess, pendingWireGuardCleanups, err = h.revokePackageNodeDifference(ctx, username, currentPackage, targetPackage)
 		if err != nil {
 			revokeErr := fmt.Errorf("revoke previous package access before switch: %w", err)
 			if compensateErr := h.restorePackageNodeRevocations(ctx, currentUser, revokedPreviousAccess); compensateErr != nil {
 				return nil, errors.Join(revokeErr, fmt.Errorf("restore previous package access: %w", compensateErr))
 			}
 			return nil, revokeErr
+		}
+		for _, cfg := range pendingWireGuardCleanups {
+			source, prepareErr := h.repo.PreparePackageInboundCredentialCleanup(ctx, cfg, "package-switch")
+			if prepareErr != nil {
+				prepareErr = fmt.Errorf("prepare old WireGuard inbound %d/%s cleanup: %w",
+					cfg.ServerID, cfg.InboundTag, prepareErr)
+				cancelErr := settlePreparedPackageWireGuardCleanups(ctx, h.repo,
+					indexedPackageWireGuardCleanupSources(preparedWireGuardCleanups))
+				if compensateErr := h.restorePackageNodeRevocations(ctx, currentUser, revokedPreviousAccess); compensateErr != nil {
+					return nil, errors.Join(prepareErr, cancelErr, fmt.Errorf("restore previous package access: %w", compensateErr))
+				}
+				return nil, errors.Join(prepareErr, cancelErr)
+			}
+			preparedWireGuardCleanups = append(preparedWireGuardCleanups, *source)
+		}
+		prepared := indexedPackageWireGuardCleanupSources(preparedWireGuardCleanups)
+		if policyErr := pushPreparedPackageWireGuardPoliciesChecked(ctx, h.pusher, prepared); policyErr != nil {
+			restorePolicyErr := restorePreparedPackageWireGuardPolicies(ctx, h.repo, h.pusher, prepared)
+			restoreAccessErr := h.restorePackageNodeRevocations(ctx, currentUser, revokedPreviousAccess)
+			return nil, errors.Join(
+				fmt.Errorf("publish old WireGuard cleanup policy: %w", policyErr),
+				restorePolicyErr,
+				restoreAccessErr,
+			)
 		}
 	}
 
@@ -1520,11 +1941,16 @@ func (h *PackageAssignHandler) assignAndProvisionLocked(ctx context.Context, use
 		// assignment authoritative. Confirm that state before restoring the old
 		// remote access: if commit status were ever uncertain, restoring without
 		// this check could grant both packages at once.
-		if len(revokedPreviousAccess) > 0 {
+		if len(revokedPreviousAccess) > 0 || len(preparedWireGuardCleanups) > 0 {
 			persisted, readErr := h.repo.GetUser(ctx, username)
 			if readErr == nil && persisted.PackageID == currentUser.PackageID {
+				cancelErr := restorePreparedPackageWireGuardPolicies(ctx, h.repo, h.pusher,
+					indexedPackageWireGuardCleanupSources(preparedWireGuardCleanups))
 				if compensateErr := h.restorePackageNodeRevocations(ctx, currentUser, revokedPreviousAccess); compensateErr != nil {
-					return nil, errors.Join(err, fmt.Errorf("restore previous package access: %w", compensateErr))
+					return nil, errors.Join(err, cancelErr, fmt.Errorf("restore previous package access: %w", compensateErr))
+				}
+				if cancelErr != nil {
+					return nil, errors.Join(err, cancelErr)
 				}
 			} else if readErr != nil {
 				return nil, errors.Join(err, fmt.Errorf("verify package state before compensation: %w", readErr))
@@ -1535,27 +1961,49 @@ func (h *PackageAssignHandler) assignAndProvisionLocked(ctx context.Context, use
 	warnings = append(warnings, bundleWarnings...)
 
 	if switchingPackages {
+		var wireGuardCleanupErrs []error
+		for index, source := range preparedWireGuardCleanups {
+			cfg := pendingWireGuardCleanups[index]
+			if reconcileErr := h.managed.reconcileSource(ctx, source); reconcileErr != nil {
+				wireGuardCleanupErrs = append(wireGuardCleanupErrs, fmt.Errorf("revoke old WireGuard inbound %d/%s: %w",
+					cfg.ServerID, cfg.InboundTag, reconcileErr))
+			}
+		}
+		if joined := errors.Join(wireGuardCleanupErrs...); joined != nil {
+			// The new assignment is already authoritative. The retained cleanup
+			// source keeps the old peer fail-closed and lets ManagedNodes retry it;
+			// continue provisioning the new package instead of returning a partial
+			// database transition as a failed assignment.
+			warnings = append(warnings, fmt.Sprintf("旧 WireGuard 访问清理待重试: %v", joined))
+		}
 		cleanupWarnings := authorizationHelper.reconcileAuthorizationTombstones(
 			ctx, username, storage.GrantSourcePackage, "package-switch",
 		)
 		if len(cleanupWarnings) > 0 {
 			switchErr := fmt.Errorf("previous package cleanup is incomplete: %s", strings.Join(cleanupWarnings, "; "))
-			_, restoreErr := h.repo.AssignPackageBundleToUser(ctx, username, currentUser.PackageID,
-				*currentUser.PackageStartDate, *currentUser.PackageEndDate, currentUser.IsReset, currentUser.ResetDay)
-			if restoreErr == nil {
-				restoreErr = h.repo.UpdateUserTrafficLimitOverride(ctx, username, currentUser.TrafficLimitOverride)
+			if len(pendingWireGuardCleanups) > 0 {
+				// WireGuard cleanup is already protected by the acknowledged strict
+				// policy and has a durable retry source. Keep the new assignment and
+				// surface the remaining cleanup as a warning.
+				warnings = append(warnings, switchErr.Error())
+			} else {
+				_, restoreErr := h.repo.AssignPackageBundleToUser(ctx, username, currentUser.PackageID,
+					*currentUser.PackageStartDate, *currentUser.PackageEndDate, currentUser.IsReset, currentUser.ResetDay)
+				if restoreErr == nil {
+					restoreErr = h.repo.UpdateUserTrafficLimitOverride(ctx, username, currentUser.TrafficLimitOverride)
+				}
+				if restoreErr == nil {
+					newPackageCleanupWarnings := authorizationHelper.reconcileAuthorizationTombstones(
+						ctx, username, storage.GrantSourcePackage, "package-switch-rollback",
+					)
+					restoreErr = errors.Join(
+						warningsError("new package cleanup rollback warnings", newPackageCleanupWarnings),
+						authorizationHelper.restoreAuthorizationChildState(ctx, username, previousPackageChildren, "package-switch-rollback"),
+						h.restorePackageNodeRevocations(ctx, currentUser, revokedPreviousAccess),
+					)
+				}
+				return nil, errors.Join(switchErr, restoreErr)
 			}
-			if restoreErr == nil {
-				newPackageCleanupWarnings := authorizationHelper.reconcileAuthorizationTombstones(
-					ctx, username, storage.GrantSourcePackage, "package-switch-rollback",
-				)
-				restoreErr = errors.Join(
-					warningsError("new package cleanup rollback warnings", newPackageCleanupWarnings),
-					authorizationHelper.restoreAuthorizationChildState(ctx, username, previousPackageChildren, "package-switch-rollback"),
-					h.restorePackageNodeRevocations(ctx, currentUser, revokedPreviousAccess),
-				)
-			}
-			return nil, errors.Join(switchErr, restoreErr)
 		}
 	}
 
@@ -1730,15 +2178,16 @@ type packageNodeRevocation struct {
 	inbound      *storage.UserInboundConfig
 }
 
-// revokePackageNodeDifference removes old-package-only credentials before the
-// database assignment changes. A failed Agent mutation therefore leaves the
-// old package authoritative and makes the switch retryable instead of granting
-// the new package while stale old access remains live.
-func (h *PackageAssignHandler) revokePackageNodeDifference(ctx context.Context, username string, current, target *storage.Package) ([]packageNodeRevocation, error) {
+// revokePackageNodeDifference removes old non-WireGuard access before the
+// assignment changes and returns old-exclusive WireGuard credentials as a
+// durable-cleanup plan. WireGuard peers are never touched until the target
+// package is authoritative and its strict limiter replacement is acknowledged.
+func (h *PackageAssignHandler) revokePackageNodeDifference(ctx context.Context, username string, current, target *storage.Package) ([]packageNodeRevocation, []storage.UserInboundConfig, error) {
 	if current == nil || target == nil {
-		return nil, errors.New("package template is unavailable")
+		return nil, nil, errors.New("package template is unavailable")
 	}
 	revoked := make([]packageNodeRevocation, 0)
+	pendingWireGuard := make([]storage.UserInboundConfig, 0)
 	targetNodes := make(map[int64]struct{}, len(target.Nodes))
 	targetInbounds := make(map[string]struct{}, len(target.Nodes))
 	for _, nodeID := range target.Nodes {
@@ -1750,7 +2199,7 @@ func (h *PackageAssignHandler) revokePackageNodeDifference(ctx context.Context, 
 		}
 		server, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer)
 		if err == nil {
-			targetInbounds[fmt.Sprintf("%d|%s", server.ID, node.InboundTag)] = struct{}{}
+			targetInbounds[fmt.Sprintf("%d|%s|%s", server.ID, node.InboundTag, canonicalManagedProtocol(node.Protocol))] = struct{}{}
 		}
 	}
 	seenInbound := make(map[string]struct{})
@@ -1765,14 +2214,14 @@ func (h *PackageAssignHandler) revokePackageNodeDifference(ctx context.Context, 
 		if node.NodeType == "routed" {
 			subaccount, err := h.repo.GetUserSubaccount(ctx, node.ID, username)
 			if err != nil {
-				return revoked, err
+				return revoked, pendingWireGuard, err
 			}
 			wasActive := subaccount != nil && subaccount.IsActive
 			if wasActive {
 				revoked = append(revoked, packageNodeRevocation{routedNodeID: node.ID})
 			}
 			if _, err := removeUserFromRoutedNode(ctx, h.remoteManage, h.repo, username, node.ID); err != nil {
-				return revoked, err
+				return revoked, pendingWireGuard, err
 			}
 			continue
 		}
@@ -1782,9 +2231,9 @@ func (h *PackageAssignHandler) revokePackageNodeDifference(ctx context.Context, 
 		}
 		server, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer)
 		if err != nil {
-			return revoked, err
+			return revoked, pendingWireGuard, err
 		}
-		key := fmt.Sprintf("%d|%s", server.ID, node.InboundTag)
+		key := fmt.Sprintf("%d|%s|%s", server.ID, node.InboundTag, canonicalManagedProtocol(node.Protocol))
 		if _, keep := targetInbounds[key]; keep {
 			continue
 		}
@@ -1797,19 +2246,25 @@ func (h *PackageAssignHandler) revokePackageNodeDifference(ctx context.Context, 
 			continue
 		}
 		if err != nil {
-			return revoked, err
+			return revoked, pendingWireGuard, err
 		}
 		copy := *cfg
+		if canonicalManagedProtocol(copy.Protocol) == "wireguard" {
+			// Commit the target package first. The resulting lack of package access
+			// is what makes the queued limiter snapshot a strict tombstone.
+			pendingWireGuard = append(pendingWireGuard, copy)
+			continue
+		}
 		revoked = append(revoked, packageNodeRevocation{inbound: &copy})
 		retained, err := removePackageUserInboundConfig(ctx, h.remoteManage, h.repo, h.pusher, *cfg)
 		if err != nil && !isInboundNotFoundErr(err) {
-			return revoked, err
+			return revoked, pendingWireGuard, err
 		}
 		if retained {
 			revoked = revoked[:len(revoked)-1]
 		}
 	}
-	return revoked, nil
+	return revoked, pendingWireGuard, nil
 }
 
 func (h *PackageAssignHandler) restorePackageNodeRevocations(ctx context.Context, user storage.User, revoked []packageNodeRevocation) error {
@@ -2099,7 +2554,16 @@ func getOrCreateInboundCredential(ctx context.Context, repo *storage.TrafficRepo
 	canonicalProtocol := canonicalManagedProtocol(protocol)
 
 	// 1) DB 复用
-	if existing, _ := repo.GetUserInboundConfig(ctx, user.Username, serverID, inboundTag); existing != nil && canonicalManagedProtocol(existing.Protocol) == canonicalProtocol {
+	existing, existingErr := repo.GetUserInboundConfig(ctx, user.Username, serverID, inboundTag)
+	if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+		return nil, "", false, fmt.Errorf("load stored inbound credential: %w", existingErr)
+	}
+	if existing != nil && canonicalManagedProtocol(existing.Protocol) != canonicalProtocol {
+		return nil, "", false, fmt.Errorf("%w: user=%s server=%d inbound=%s stored_protocol=%s requested_protocol=%s",
+			storage.ErrUserInboundConfigConflict, user.Username, serverID, inboundTag,
+			existing.Protocol, protocol)
+	}
+	if existing != nil {
 		if canonicalProtocol == "wireguard" {
 			record, err := decodeWireGuardUserCredentialRecord(existing.CredentialJSON)
 			if err != nil {
@@ -2186,7 +2650,7 @@ func getOrCreateInboundCredential(ctx context.Context, repo *storage.TrafficRepo
 
 		// Another process in this panel instance may have completed the same
 		// reservation while we waited for the shared address allocator.
-		if existing, _ := repo.GetUserInboundConfig(ctx, user.Username, serverID, inboundTag); existing != nil && canonicalManagedProtocol(existing.Protocol) == canonicalProtocol {
+		if existing, err := repo.GetUserInboundConfig(ctx, user.Username, serverID, inboundTag); err == nil && existing != nil && canonicalManagedProtocol(existing.Protocol) == canonicalProtocol {
 			record, err := decodeWireGuardUserCredentialRecord(existing.CredentialJSON)
 			if err != nil {
 				return nil, "", false, fmt.Errorf("parse stored WireGuard credential: %w", err)
@@ -2713,7 +3177,7 @@ func removeUserFromInbound(ctx context.Context, rm *RemoteManageHandler, cfg sto
 		return fmt.Errorf("remove-client ACK: %w", err)
 	}
 	if runtimeDeferred {
-		log.Printf("[ManagedClientRemove] server=%d Agent deferred inbound runtime apply; Xray lifecycle left unchanged", cfg.ServerID)
+		return fmt.Errorf("server %d Agent deferred inbound runtime removal", cfg.ServerID)
 	}
 	return nil
 }
@@ -2837,8 +3301,8 @@ func removeStalePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHa
 	}
 	retained := false
 	err := repo.WithUserAuthorizationLease(ctx, cfg.Username, func(leasedCtx context.Context) error {
-		hasPackageAccess, err := hasPackageTemplateInboundAccess(
-			leasedCtx, repo, cfg.Username, cfg.ServerID, cfg.InboundTag, time.Now().UTC(),
+		hasPackageAccess, err := hasPackageTemplateInboundAccessProtocol(
+			leasedCtx, repo, cfg.Username, cfg.ServerID, cfg.InboundTag, cfg.Protocol, time.Now().UTC(),
 		)
 		if err != nil {
 			return err
@@ -2873,6 +3337,10 @@ func requeueManagedInboundAccess(ctx context.Context, repo *storage.TrafficRepos
 // this check because they are removing that source; managed cleanup uses it to
 // avoid revoking a shared credential that the package still needs.
 func hasLegacyPackageInboundAccess(ctx context.Context, repo *storage.TrafficRepository, username string, serverID int64, inboundTag string, now time.Time) (bool, *time.Time, error) {
+	return hasLegacyPackageInboundAccessProtocol(ctx, repo, username, serverID, inboundTag, "", now)
+}
+
+func hasLegacyPackageInboundAccessProtocol(ctx context.Context, repo *storage.TrafficRepository, username string, serverID int64, inboundTag, protocol string, now time.Time) (bool, *time.Time, error) {
 	if repo == nil || strings.TrimSpace(username) == "" || serverID <= 0 || strings.TrimSpace(inboundTag) == "" {
 		return false, nil, storage.ErrManagedInvalidArgument
 	}
@@ -2904,7 +3372,8 @@ func hasLegacyPackageInboundAccess(ctx context.Context, repo *storage.TrafficRep
 			continue
 		}
 		if node.Enabled && node.NodeType != "routed" && supportsPerUserInboundCredential(node.Protocol) &&
-			node.OriginalServer == server.Name && node.InboundTag == inboundTag {
+			node.OriginalServer == server.Name && node.InboundTag == inboundTag &&
+			(strings.TrimSpace(protocol) == "" || canonicalManagedProtocol(node.Protocol) == canonicalManagedProtocol(protocol)) {
 			if canonicalManagedProtocol(node.Protocol) == "wireguard" {
 				provisionable, provenanceErr := repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
 				if provenanceErr != nil {

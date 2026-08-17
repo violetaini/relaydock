@@ -27,7 +27,7 @@ func TestAgentCapabilitiesParseAndFailClosed(t *testing.T) {
 	}
 
 	var currentPayload WSAuthPayload
-	if err := json.Unmarshal([]byte(`{"token":"current","capabilities":{"rpc":true,"stream":true,"managed_clients_v1":true,"client_expiry":true,"limiter_replace":true,"limiter_replace_ack":true,"agent_uninstall_v2":true}}`), &currentPayload); err != nil {
+	if err := json.Unmarshal([]byte(`{"token":"current","capabilities":{"rpc":true,"stream":true,"managed_clients_v1":true,"client_expiry":true,"limiter_replace":true,"limiter_replace_ack":true,"agent_uninstall_v2":true,"limiter_denied_v1":true}}`), &currentPayload); err != nil {
 		t.Fatalf("parse current auth payload: %v", err)
 	}
 	if missing := currentPayload.Capabilities.MissingManagedNodeCapabilities(); len(missing) != 0 {
@@ -35,6 +35,9 @@ func TestAgentCapabilitiesParseAndFailClosed(t *testing.T) {
 	}
 	if !currentPayload.Capabilities.AgentUninstallV2 {
 		t.Fatal("current Agent did not advertise agent_uninstall_v2")
+	}
+	if !currentPayload.Capabilities.LimiterDeniedV1 {
+		t.Fatal("current Agent did not advertise limiter_denied_v1")
 	}
 }
 

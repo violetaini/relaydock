@@ -138,8 +138,9 @@ type RemoteHeartbeatRequest struct {
 	// PublicIPv4/v6 由 agent 端 ipProbeLoop 缓存后随心跳上报(WS auth/heartbeat 同款字段)。
 	// master 优先用上报值写 db,fallback 才用 r.RemoteAddr 并强校验类型(避免 v6 写 v4 字段)。
 	// 老 agent 不发 → 字段为空 → 走 fallback 路径,行为退化为现状。
-	PublicIPv4 string `json:"public_ipv4,omitempty"`
-	PublicIPv6 string `json:"public_ipv6,omitempty"`
+	PublicIPv4   string            `json:"public_ipv4,omitempty"`
+	PublicIPv6   string            `json:"public_ipv6,omitempty"`
+	Capabilities AgentCapabilities `json:"capabilities,omitempty"`
 }
 
 // RemoteHeartbeatResponse 表示心跳响应

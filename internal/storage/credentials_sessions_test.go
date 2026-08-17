@@ -29,6 +29,52 @@ func TestReservedGlobalAPITokenUsernameCannotBeCreatedOrRenamed(t *testing.T) {
 	}
 }
 
+func TestSaveUserInboundConfigRejectsConflictingCredentialOrProtocol(t *testing.T) {
+	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "inbound-conflict.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	ctx := context.Background()
+	if err := repo.CreateUser(ctx, "alice", "", "", "hash", RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	base := UserInboundConfig{
+		Username: "alice", ServerID: 7, InboundTag: "shared-in", Protocol: "vless",
+		CredentialJSON: `{"email":"alice__shared-in","id":"stable-id"}`,
+	}
+	if err := repo.SaveUserInboundConfig(ctx, base); err != nil {
+		t.Fatalf("save base credential: %v", err)
+	}
+
+	equivalent := base
+	equivalent.Protocol = " VLESS "
+	equivalent.CredentialJSON = `{"id":"stable-id", "email":"alice__shared-in"}`
+	if err := repo.SaveUserInboundConfig(ctx, equivalent); err != nil {
+		t.Fatalf("equivalent retry was not idempotent: %v", err)
+	}
+
+	differentCredential := base
+	differentCredential.CredentialJSON = `{"email":"alice__shared-in","id":"untracked-id"}`
+	if err := repo.SaveUserInboundConfig(ctx, differentCredential); !errors.Is(err, ErrUserInboundConfigConflict) {
+		t.Fatalf("different credential error=%v, want %v", err, ErrUserInboundConfigConflict)
+	}
+
+	differentProtocol := base
+	differentProtocol.Protocol = "trojan"
+	if err := repo.SaveUserInboundConfig(ctx, differentProtocol); !errors.Is(err, ErrUserInboundConfigConflict) {
+		t.Fatalf("different protocol error=%v, want %v", err, ErrUserInboundConfigConflict)
+	}
+
+	stored, err := repo.GetUserInboundConfig(ctx, base.Username, base.ServerID, base.InboundTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Protocol != base.Protocol || stored.CredentialJSON != base.CredentialJSON {
+		t.Fatalf("conflicting writes changed authoritative credential: %+v", stored)
+	}
+}
+
 func TestRenameUserRejectsRemoteBoundAccounts(t *testing.T) {
 	tests := []struct {
 		name  string

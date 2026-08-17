@@ -117,6 +117,7 @@ func (a *databaseAuthorityAgent) setWireGuardPolicyResult(capable bool, limiterS
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.capabilities.WireGuardPeerUsersV1 = capable
+	a.capabilities.LimiterDeniedV1 = capable
 	a.limiterStatus = limiterStatus
 	a.events = nil
 }

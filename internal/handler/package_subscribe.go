@@ -799,9 +799,12 @@ func syncVLESSFlow(proxy map[string]any, cred map[string]any) {
 //
 // 返回 (proxy_map, true) 或 (nil, false)(用户未绑定子账号 / 未 active / 父节点不可用 → 跳过)。
 func buildRoutedProxyForUser(ctx context.Context, repo *storage.TrafficRepository, routedNode storage.Node, username string) (map[string]any, bool) {
+	if !routedNode.Enabled {
+		return nil, false
+	}
 	// 子账号必须 is_active=1,否则该用户当前没有访问权(下线 / 未绑套餐 / 暂停)
 	sa, err := repo.GetUserSubaccount(ctx, routedNode.ID, username)
-	if err != nil || sa == nil || !sa.IsActive {
+	if err != nil || sa == nil || !sa.IsActive || sa.ActivationPending {
 		return nil, false
 	}
 

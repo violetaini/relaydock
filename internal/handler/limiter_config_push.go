@@ -317,6 +317,8 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 	// 推迟到内层按 (user, pkg, node_id) lookup。
 	userMap := make(map[string]*storage.User)
 	pendingDeletionUsers := make(map[string]bool)
+	pendingDisableUsers := make(map[string]bool)
+	overLimitUsers := make(map[string]bool)
 	pkgCache := make(map[int64]*storage.Package)
 
 	for username := range usernames {
@@ -328,12 +330,19 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if pendingErr != nil {
 			return nil, pendingErr
 		}
-		if !user.IsActive && !deletionPending {
-			continue
+		disablePending, pendingErr := p.repo.IsUserDisablePending(ctx, username)
+		if pendingErr != nil {
+			return nil, pendingErr
+		}
+		overLimit, pendingErr := p.repo.IsUserOverLimit(ctx, username)
+		if pendingErr != nil {
+			return nil, pendingErr
 		}
 		u := user // 避免循环变量 alias
 		userMap[username] = &u
 		pendingDeletionUsers[username] = deletionPending
+		pendingDisableUsers[username] = disablePending
+		overLimitUsers[username] = overLimit
 		if user.PackageID > 0 {
 			if _, ok := pkgCache[user.PackageID]; !ok {
 				if pkg, err := p.repo.GetPackage(ctx, user.PackageID); err == nil {
@@ -348,8 +357,8 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 	}
 	pendingRevocationResiduals := make(map[managedLimiterKey]bool)
 	type managedSourceState struct {
-		present     bool
-		mayHavePeer bool
+		present                bool
+		peerRemovalUnconfirmed bool
 	}
 	managedSourceStates := make(map[managedLimiterKey]managedSourceState)
 	for username := range userMap {
@@ -362,12 +371,14 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			state := managedSourceStates[key]
 			state.present = true
 			if source.DesiredState == storage.ManagedDesiredActive ||
-				source.ObservedState == storage.ManagedObservedActive {
-				state.mayHavePeer = true
+				source.ObservedState != storage.ManagedObservedInactive {
+				// Unknown includes the crash window after Agent peer creation but
+				// before the source generation is acknowledged in storage.
+				state.peerRemovalUnconfirmed = true
 			}
 			managedSourceStates[key] = state
 			if source.DesiredState != storage.ManagedDesiredActive &&
-				source.ObservedState == storage.ManagedObservedActive {
+				source.ObservedState != storage.ManagedObservedInactive {
 				pendingRevocationResiduals[key] = true
 			}
 		}
@@ -446,7 +457,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if err != nil {
 			return nil, fmt.Errorf("resolve direct limiter access for %s/%s: %w", c.Username, c.InboundTag, err)
 		}
-		hasPackageAccess, _, err := hasLegacyPackageInboundAccess(ctx, p.repo, c.Username, serverID, c.InboundTag, now)
+		hasPackageAccess, _, err := hasLegacyPackageInboundAccessProtocol(ctx, p.repo, c.Username, serverID, c.InboundTag, c.Protocol, now)
 		if err != nil {
 			return nil, fmt.Errorf("resolve package limiter access for %s/%s: %w", c.Username, c.InboundTag, err)
 		}
@@ -464,20 +475,25 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			}
 		}
 		hasDeletionResidual := pendingDeletionUsers[c.Username]
+		hasDisableResidual := pendingDisableUsers[c.Username]
 		managedKey := managedLimiterKey{username: c.Username, inboundTag: c.InboundTag}
-		hasManagedRevocationResidual := strings.EqualFold(strings.TrimSpace(c.Protocol), "wireguard") &&
-			pendingRevocationResiduals[managedKey]
+		hasManagedRevocationResidual := pendingRevocationResiduals[managedKey]
 		// A canonical WireGuard credential can outlive a legacy package template
 		// update or provenance failure until remote peer removal is acknowledged.
 		// Keeping its address mapped to a strict residual is not authorization; it
 		// makes every such cleanup window fail closed and retryable.
 		managedState := managedSourceStates[managedKey]
+		// A legacy package can reuse the canonical credential after a managed
+		// source has converged inactive. Its package assignment remains the
+		// durable provenance until stale credential cleanup removes the peer.
+		hasLegacyPackageCredentialProvenance := user.AuthorizationMode == storage.AuthorizationModePackage &&
+			user.PackageID > 0
 		hasWireGuardCredentialResidual := user.IsActive &&
 			strings.EqualFold(strings.TrimSpace(c.Protocol), "wireguard") &&
 			!hasManagedAccess && !hasDirectAccess && !hasPackageAccess &&
-			(!managedState.present || managedState.mayHavePeer)
+			(!managedState.present || managedState.peerRemovalUnconfirmed || hasLegacyPackageCredentialProvenance)
 		if !hasManagedAccess && !hasDirectAccess && !hasPackageAccess &&
-			!hasOverLimitPackageResidual && !hasDeletionResidual && !hasManagedRevocationResidual &&
+			!hasOverLimitPackageResidual && !hasDeletionResidual && !hasDisableResidual && !hasManagedRevocationResidual &&
 			!hasWireGuardCredentialResidual {
 			continue
 		}
@@ -499,7 +515,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			}
 		} else if hasPackageAccess || hasDirectAccess {
 			speedMbps, deviceLimit = resolveLimit(user, pkg, ref.NodeID, ref.ParentID)
-		} else if !hasDeletionResidual && !hasOverLimitPackageResidual && !hasManagedRevocationResidual &&
+		} else if !hasDeletionResidual && !hasDisableResidual && !hasOverLimitPackageResidual && !hasManagedRevocationResidual &&
 			!hasWireGuardCredentialResidual {
 			// A desired source can briefly outlive its grant state until the
 			// reconciler versions it inactive. It must not fall through to an
@@ -510,7 +526,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if speedMbps > 0 {
 			speedBytes = uint64(speedMbps * 1000000 / 8)
 		}
-		if hasDeletionResidual || hasOverLimitPackageResidual || hasManagedRevocationResidual ||
+		if hasDeletionResidual || hasDisableResidual || hasOverLimitPackageResidual || hasManagedRevocationResidual ||
 			hasWireGuardCredentialResidual {
 			speedBytes = revocationResidualDenySpeedBytes
 			deviceLimit = revocationResidualDenyConnectionLimit
@@ -524,6 +540,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			SpeedLimit: speedBytes,
 			// 物理节点自身即 group 的物理节点(ref.NodeID);其路由出站子账户在下面用 ParentID 归到同一 group。
 			DeviceLimit: deviceLimit,
+			Denied:      hasDeletionResidual || hasDisableResidual || hasOverLimitPackageResidual || hasManagedRevocationResidual || hasWireGuardCredentialResidual,
 			ConnGroup:   connGroupKey(user.Username, physicalNodeID),
 		})
 		if strings.EqualFold(strings.TrimSpace(c.Protocol), "wireguard") {
@@ -566,6 +583,17 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if speedMbps > 0 {
 			speedBytes = uint64(speedMbps * 1000000 / 8)
 		}
+		// A routed client that is being revoked (or belongs to a disabled/deleting
+		// account) must remain explicitly denied until the remote rule and client
+		// removal are acknowledged. The row is intentionally still returned by
+		// the repository while revoke_pending=1 so a checked snapshot can replace
+		// the prior normal bucket instead of silently dropping it.
+		subaccountDenied := !user.IsActive || overLimitUsers[sa.Username] || sa.RevokePending ||
+			pendingDisableUsers[sa.Username] || pendingDeletionUsers[sa.Username]
+		if subaccountDenied {
+			speedBytes = revocationResidualDenySpeedBytes
+			deviceLimit = revocationResidualDenyConnectionLimit
+		}
 		// 路由出站的 group 归到**父物理节点**(ref.ParentID),从而与父节点及其它路由出站共享连接配额。
 		physID := ref.ParentID
 		if physID == 0 {
@@ -575,6 +603,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			Email:       sa.Email,
 			SpeedLimit:  speedBytes,
 			DeviceLimit: deviceLimit,
+			Denied:      subaccountDenied,
 			ConnGroup:   connGroupKey(user.Username, physID),
 		})
 		if user.PackageID > 0 {
@@ -623,6 +652,10 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 }
 
 func hasLegacyPackageInboundAccessIgnoringOverLimit(ctx context.Context, repo *storage.TrafficRepository, username string, serverID int64, inboundTag string, now time.Time) (bool, *time.Time, error) {
+	return hasLegacyPackageInboundAccessIgnoringOverLimitProtocol(ctx, repo, username, serverID, inboundTag, "", now)
+}
+
+func hasLegacyPackageInboundAccessIgnoringOverLimitProtocol(ctx context.Context, repo *storage.TrafficRepository, username string, serverID int64, inboundTag, protocol string, now time.Time) (bool, *time.Time, error) {
 	if repo == nil || strings.TrimSpace(username) == "" || serverID <= 0 || strings.TrimSpace(inboundTag) == "" {
 		return false, nil, storage.ErrManagedInvalidArgument
 	}
@@ -647,7 +680,8 @@ func hasLegacyPackageInboundAccessIgnoringOverLimit(ctx context.Context, repo *s
 			continue
 		}
 		if node.Enabled && node.NodeType != "routed" && supportsPerUserInboundCredential(node.Protocol) &&
-			node.OriginalServer == server.Name && node.InboundTag == inboundTag {
+			node.OriginalServer == server.Name && node.InboundTag == inboundTag &&
+			(strings.TrimSpace(protocol) == "" || canonicalManagedProtocol(node.Protocol) == canonicalManagedProtocol(protocol)) {
 			if canonicalManagedProtocol(node.Protocol) == "wireguard" {
 				provisionable, provenanceErr := repo.ManagedWireGuardNodeAuthorityProvisionable(ctx, node.ID)
 				if provenanceErr != nil {
@@ -890,6 +924,9 @@ func (p *LimiterConfigPusher) pushToServerCheckedLeasedUnlocked(ctx context.Cont
 	// returns. If the transport disappears, replay the full snapshots over HTTP.
 	if p.wsHandler != nil {
 		if connection, ok := p.wsHandler.GetConnectionByServerID(serverID); ok && connection.Capabilities.RPC {
+			if limiterSnapshotsContainDenied(configs) && !connection.Capabilities.LimiterDeniedV1 {
+				return errors.New("Agent lacks limiter_denied_v1 capability; upgrade and reconnect relaydock-agent")
+			}
 			for _, cfg := range configs {
 				body, marshalErr := json.Marshal(cfg)
 				if marshalErr != nil {
@@ -920,7 +957,9 @@ func (p *LimiterConfigPusher) pushToServerCheckedLeasedUnlocked(ctx context.Cont
 
 func validateLimiterReplaceACK(body []byte) error {
 	var ack struct {
-		Success bool `json:"success"`
+		Success        bool   `json:"success"`
+		Warning        string `json:"warning"`
+		RuntimeWarning string `json:"runtime_warning"`
 	}
 	if err := json.Unmarshal(body, &ack); err != nil {
 		return fmt.Errorf("invalid limiter replace ACK: %w", err)
@@ -928,10 +967,83 @@ func validateLimiterReplaceACK(body []byte) error {
 	if !ack.Success {
 		return fmt.Errorf("limiter replace was not acknowledged")
 	}
+	if warning := strings.TrimSpace(ack.Warning); warning != "" {
+		return fmt.Errorf("limiter replace persistence warning: %s", warning)
+	}
+	if warning := strings.TrimSpace(ack.RuntimeWarning); warning != "" {
+		return fmt.Errorf("limiter replace runtime warning: %s", warning)
+	}
+	return nil
+}
+
+func limiterSnapshotsContainDenied(configs []WSLimiterConfigPayload) bool {
+	for _, config := range configs {
+		for _, user := range config.Users {
+			if user.Denied {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// requireLimiterDeniedCapability prevents a legacy Agent from acknowledging a
+// payload while silently ignoring denied=true. An active WS handshake is the
+// authority for the running process; only an Agent without a WS connection is
+// probed through system/info before an HTTP limiter delivery.
+func (p *LimiterConfigPusher) requireLimiterDeniedCapability(ctx context.Context, server *storage.RemoteServer, configs []WSLimiterConfigPayload) error {
+	if !limiterSnapshotsContainDenied(configs) {
+		return nil
+	}
+	if p == nil {
+		return errors.New("verify limiter_denied_v1 capability: limiter pusher is unavailable")
+	}
+	if server == nil {
+		return errors.New("verify limiter_denied_v1 capability: remote server is unavailable")
+	}
+	if p.wsHandler != nil {
+		if connection, connected := p.wsHandler.GetConnectionByServerID(server.ID); connected {
+			if connection.Capabilities.LimiterDeniedV1 {
+				return nil
+			}
+			return errors.New("Agent lacks limiter_denied_v1 capability; upgrade and reconnect relaydock-agent")
+		}
+	}
+	hdr := http.Header{}
+	hdr.Set("Authorization", "Bearer "+server.Token)
+	hdr.Set("User-Agent", version.AgentUserAgent)
+	resp, err := tryHTTPWithFallback(ctx, p.httpClient, server, http.MethodGet, "/api/child/system/info", nil, hdr)
+	if err != nil {
+		return fmt.Errorf("verify limiter_denied_v1 capability: %w", err)
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	closeErr := resp.Body.Close()
+	if readErr != nil {
+		return fmt.Errorf("read limiter_denied_v1 capability: %w", readErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close limiter_denied_v1 capability response: %w", closeErr)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("verify limiter_denied_v1 capability returned HTTP %d", resp.StatusCode)
+	}
+	var info struct {
+		Success      bool              `json:"success"`
+		Capabilities AgentCapabilities `json:"capabilities"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return fmt.Errorf("decode Agent limiter_denied_v1 capability: %w", err)
+	}
+	if !info.Success || !info.Capabilities.LimiterDeniedV1 {
+		return errors.New("Agent lacks limiter_denied_v1 capability; upgrade relaydock-agent")
+	}
 	return nil
 }
 
 func (p *LimiterConfigPusher) pushViaHTTP(ctx context.Context, server *storage.RemoteServer, configs []WSLimiterConfigPayload) error {
+	if err := p.requireLimiterDeniedCapability(ctx, server, configs); err != nil {
+		return err
+	}
 	hdr := http.Header{}
 	hdr.Set("Content-Type", "application/json")
 	hdr.Set("Authorization", "Bearer "+server.Token)
@@ -968,6 +1080,9 @@ func (p *LimiterConfigPusher) pushViaHTTP(ctx context.Context, server *storage.R
 }
 
 func (p *LimiterConfigPusher) pushViaHTTPChecked(ctx context.Context, server *storage.RemoteServer, configs []WSLimiterConfigPayload) error {
+	if err := p.requireLimiterDeniedCapability(ctx, server, configs); err != nil {
+		return err
+	}
 	hdr := http.Header{}
 	hdr.Set("Content-Type", "application/json")
 	hdr.Set("Authorization", "Bearer "+server.Token)

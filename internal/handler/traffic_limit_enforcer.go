@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sort"
 	"time"
 
 	"github.com/violetaini/relaydock/internal/storage"
@@ -101,7 +100,7 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 				// User-owned routed children are suspended before the package row is
 				// cleared. A remote failure therefore leaves the expired assignment in
 				// place as durable retry authority for the next enforcer pass.
-				if err := suspendUserPrivateRouted(leasedCtx, e.remoteManage, e.repo, latest.Username); err != nil {
+				if err := suspendUserPrivateRouted(leasedCtx, e.remoteManage, e.repo, e.pusher, latest.Username); err != nil {
 					return fmt.Errorf("suspend private routed access: %w", err)
 				}
 				if err := unbindUserPackageLocked(leasedCtx, e.repo, e.remoteManage, e.pusher, latest.Username, true); err != nil {
@@ -175,11 +174,11 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 			} else {
 				billableTraffic[user.Username] = 0
 				// 复用现有"恢复入站"路径:如果用户之前因超额被踢,reset 后自动放回
-				if wasOver, _ := e.repo.IsUserOverLimit(ctx, user.Username); wasOver {
+				wasOver, _ := e.repo.IsUserOverLimit(ctx, user.Username)
+				restorePending, _ := e.repo.IsUserOverLimitRevokePending(ctx, user.Username)
+				if wasOver || restorePending {
 					log.Printf("[TrafficLimitEnforcer] User %s back under limit after monthly reset, restoring inbounds", user.Username)
-					if e.restoreOverLimitUserIfAllowed(ctx, user.Username, billableTraffic, pkgCache) {
-						resumeUserPrivateRouted(ctx, e.remoteManage, e.repo, user.Username)
-					}
+					e.restoreOverLimitUserIfAllowed(ctx, user.Username, billableTraffic, pkgCache)
 				}
 				// limiter 配置在 agent 端按 user_traffic 累计算,重置归零后下次 push 自然刷新
 			}
@@ -191,15 +190,20 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 		if limitBytes <= 0 {
 			// Switching an already-blocked user to explicit unlimited must restore
 			// access; simply continuing would leave is_over_limit stuck forever.
-			if wasOverLimit, _ := e.repo.IsUserOverLimit(ctx, user.Username); wasOverLimit {
-				if e.restoreOverLimitUserIfAllowed(ctx, user.Username, billableTraffic, pkgCache) {
-					resumeUserPrivateRouted(ctx, e.remoteManage, e.repo, user.Username)
-				}
+			wasOverLimit, _ := e.repo.IsUserOverLimit(ctx, user.Username)
+			restorePending, _ := e.repo.IsUserOverLimitRevokePending(ctx, user.Username)
+			if wasOverLimit || restorePending {
+				e.restoreOverLimitUserIfAllowed(ctx, user.Username, billableTraffic, pkgCache)
 			}
 			continue
 		}
 
 		wasOverLimit, _ := e.repo.IsUserOverLimit(ctx, user.Username)
+		transitionPending, pendingErr := e.repo.IsUserOverLimitRevokePending(ctx, user.Username)
+		if pendingErr != nil {
+			log.Printf("[TrafficLimitEnforcer] User %s over-limit transition state unavailable: %v", user.Username, pendingErr)
+			continue
+		}
 		// Already weighted when each traffic delta was collected. Applying the
 		// current package here would retroactively rewrite historical usage.
 		usedWeighted := billableTraffic[user.Username]
@@ -221,20 +225,22 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 			}
 		}
 
-		if isOverLimit && !wasOverLimit {
-			log.Printf("[TrafficLimitEnforcer] User %s exceeded limit (%d/%d bytes), removing from inbounds",
-				user.Username, usedWeighted, limitBytes)
-			if usedForNotification, limitForNotification, ok := e.enforceUserOverLimit(ctx, user.Username, billableTraffic, pkgCache); ok {
+		if isOverLimit && (!wasOverLimit || transitionPending) {
+			if !wasOverLimit {
+				log.Printf("[TrafficLimitEnforcer] User %s exceeded limit (%d/%d bytes), removing from inbounds",
+					user.Username, usedWeighted, limitBytes)
+			} else {
+				log.Printf("[TrafficLimitEnforcer] User %s retrying incomplete over-limit revoke", user.Username)
+			}
+			if usedForNotification, limitForNotification, ok := e.enforceUserOverLimit(ctx, user.Username, billableTraffic, pkgCache); ok && !wasOverLimit {
 				usedGB := float64(usedForNotification) / (1024 * 1024 * 1024)
 				limitGB := float64(limitForNotification) / (1024 * 1024 * 1024)
 				SendOverLimitNotification(ctx, user.Username, usedGB, limitGB)
 			}
-		} else if !isOverLimit && wasOverLimit {
+		} else if !isOverLimit && (wasOverLimit || transitionPending) {
 			log.Printf("[TrafficLimitEnforcer] User %s back under limit (%d/%d bytes), restoring inbounds",
 				user.Username, usedWeighted, limitBytes)
-			if e.restoreOverLimitUserIfAllowed(ctx, user.Username, billableTraffic, pkgCache) {
-				resumeUserPrivateRouted(ctx, e.remoteManage, e.repo, user.Username)
-			}
+			e.restoreOverLimitUserIfAllowed(ctx, user.Username, billableTraffic, pkgCache)
 		}
 	}
 
@@ -279,7 +285,12 @@ func (e *TrafficLimitEnforcer) enforceUserOverLimit(ctx context.Context, usernam
 		return 0, 0, false
 	}
 	wasOverLimit, _ := e.repo.IsUserOverLimit(leasedCtx, username)
-	if wasOverLimit {
+	revokePending, err := e.repo.IsUserOverLimitRevokePending(leasedCtx, username)
+	if err != nil {
+		log.Printf("[TrafficLimitEnforcer] User %s over-limit revoke deferred: load retry state: %v", username, err)
+		return 0, 0, false
+	}
+	if wasOverLimit && !revokePending {
 		return 0, 0, false
 	}
 	pkg := pkgCache[latest.PackageID]
@@ -301,26 +312,45 @@ func (e *TrafficLimitEnforcer) enforceUserOverLimit(ctx context.Context, usernam
 		log.Printf("[TrafficLimitEnforcer] User %s over-limit revoke deferred: list inbound configs: %v", username, err)
 		return 0, 0, false
 	}
-	serverLeasedCtx, releaseServers, err := acquireRemoteServerMutationLeases(
-		leasedCtx, e.repo, inboundConfigServerIDs(configs),
-	)
+	routedServerIDs, err := e.repo.ListServerIDsForUserSubaccounts(leasedCtx, username)
+	if err != nil {
+		log.Printf("[TrafficLimitEnforcer] User %s over-limit revoke deferred: list routed servers: %v", username, err)
+		return 0, 0, false
+	}
+	allServerIDs := append(inboundConfigServerIDs(configs), routedServerIDs...)
+	serverLeasedCtx, releaseServers, err := acquireRemoteServerMutationLeases(leasedCtx, e.repo, allServerIDs)
 	if err != nil {
 		log.Printf("[TrafficLimitEnforcer] User %s over-limit revoke deferred: acquire server leases: %v", username, err)
 		return 0, 0, false
 	}
 	defer releaseServers()
 	leasedCtx = serverLeasedCtx
+	limiterServerIDs, err := embeddedLimiterServerIDsForIDs(leasedCtx, e.repo, allServerIDs)
+	if err != nil {
+		log.Printf("[TrafficLimitEnforcer] User %s over-limit revoke deferred: resolve limiter servers: %v", username, err)
+		return 0, 0, false
+	}
+	if !wasOverLimit {
+		if err := e.repo.BeginUserOverLimitRevoke(leasedCtx, username); err != nil {
+			log.Printf("[TrafficLimitEnforcer] User %s over-limit state update failed: %v", username, err)
+			return 0, 0, false
+		}
+	}
+	if err := e.pushLimiterPoliciesCheckedLeased(leasedCtx, limiterServerIDs); err != nil {
+		log.Printf("[TrafficLimitEnforcer] User %s over-limit tombstone limiter publish failed; retained retry state: %v", username, err)
+		return 0, 0, false
+	}
 	removed := e.removeUserFromAllInbounds(leasedCtx, username, false)
-	if err := suspendUserPrivateRouted(leasedCtx, e.remoteManage, e.repo, username); err != nil {
+	if err := suspendUserPrivateRouted(leasedCtx, e.remoteManage, e.repo, e.pusher, username); err != nil {
 		log.Printf("[TrafficLimitEnforcer] User %s over-limit private routed suspend failed: %v", username, err)
 		removed = false
 	}
 	if !removed {
-		log.Printf("[TrafficLimitEnforcer] User %s over-limit revoke incomplete; retaining active limiter mapping for retry", username)
+		log.Printf("[TrafficLimitEnforcer] User %s over-limit revoke incomplete; retaining tombstone limiter and retry state", username)
 		return 0, 0, false
 	}
-	if err := e.repo.UpdateUserOverLimit(leasedCtx, username, true); err != nil {
-		log.Printf("[TrafficLimitEnforcer] User %s over-limit state update failed: %v", username, err)
+	if err := e.repo.CompleteUserOverLimitRevoke(leasedCtx, username); err != nil {
+		log.Printf("[TrafficLimitEnforcer] User %s over-limit retry completion failed: %v", username, err)
 		return 0, 0, false
 	}
 	return usedWeighted, limitBytes, true
@@ -343,7 +373,12 @@ func (e *TrafficLimitEnforcer) restoreOverLimitUserIfAllowed(ctx context.Context
 		return false
 	}
 	wasOverLimit, _ := e.repo.IsUserOverLimit(leasedCtx, username)
-	if !wasOverLimit {
+	restorePending, err := e.repo.IsUserOverLimitRevokePending(leasedCtx, username)
+	if err != nil {
+		log.Printf("[TrafficLimitEnforcer] User %s over-limit restore deferred: load transition state: %v", username, err)
+		return false
+	}
+	if !wasOverLimit && !restorePending {
 		return false
 	}
 	pkg := pkgCache[latest.PackageID]
@@ -365,18 +400,27 @@ func (e *TrafficLimitEnforcer) restoreOverLimitUserIfAllowed(ctx context.Context
 		log.Printf("[TrafficLimitEnforcer] User %s over-limit restore deferred: list inbound configs: %v", username, err)
 		return false
 	}
-	serverLeasedCtx, releaseServers, err := acquireRemoteServerMutationLeases(
-		leasedCtx, e.repo, inboundConfigServerIDs(configs),
-	)
+	routedServerIDs, err := e.repo.ListServerIDsForUserSubaccounts(leasedCtx, username)
+	if err != nil {
+		log.Printf("[TrafficLimitEnforcer] User %s over-limit restore deferred: list routed servers: %v", username, err)
+		return false
+	}
+	allServerIDs := append(inboundConfigServerIDs(configs), routedServerIDs...)
+	serverLeasedCtx, releaseServers, err := acquireRemoteServerMutationLeases(leasedCtx, e.repo, allServerIDs)
 	if err != nil {
 		log.Printf("[TrafficLimitEnforcer] User %s over-limit restore deferred: acquire server leases: %v", username, err)
 		return false
 	}
 	defer releaseServers()
 	leasedCtx = serverLeasedCtx
-	limiterServerIDs, err := e.embeddedLimiterServerIDs(leasedCtx, configs)
+	limiterServerIDs, err := embeddedLimiterServerIDsForIDs(leasedCtx, e.repo, allServerIDs)
 	if err != nil {
 		log.Printf("[TrafficLimitEnforcer] User %s over-limit restore deferred: resolve limiter servers: %v", username, err)
+		return false
+	}
+	if err := suspendUserPrivateRouted(leasedCtx, e.remoteManage, e.repo, e.pusher, username); err != nil {
+		log.Printf("[TrafficLimitEnforcer] User %s over-limit private routed revoke incomplete: %v", username, err)
+		e.restoreOverLimitTombstone(leasedCtx, username, limiterServerIDs)
 		return false
 	}
 	if !e.restoreUserToInbounds(leasedCtx, latest, time.Now().UTC()) {
@@ -384,41 +428,36 @@ func (e *TrafficLimitEnforcer) restoreOverLimitUserIfAllowed(ctx context.Context
 		e.restoreOverLimitTombstone(leasedCtx, username, limiterServerIDs)
 		return false
 	}
-	if err := e.repo.UpdateUserOverLimit(leasedCtx, username, false); err != nil {
+	if err := e.repo.BeginUserOverLimitRestore(leasedCtx, username); err != nil {
 		log.Printf("[TrafficLimitEnforcer] User %s over-limit restore state update failed: %v", username, err)
 		e.restoreOverLimitTombstone(leasedCtx, username, limiterServerIDs)
+		return false
+	}
+	if err := resumeUserPrivateRouted(leasedCtx, e.remoteManage, e.repo, e.pusher, username); err != nil {
+		log.Printf("[TrafficLimitEnforcer] User %s private routed restore incomplete: %v", username, err)
+		e.restoreOverLimitTombstone(leasedCtx, username, limiterServerIDs)
+		if revokeErr := suspendUserPrivateRouted(leasedCtx, e.remoteManage, e.repo, e.pusher, username); revokeErr != nil {
+			log.Printf("[TrafficLimitEnforcer] User %s private routed restore compensation pending: %v", username, revokeErr)
+		}
 		return false
 	}
 	if err := e.pushLimiterPoliciesCheckedLeased(leasedCtx, limiterServerIDs); err != nil {
 		log.Printf("[TrafficLimitEnforcer] User %s normal limiter restore failed: %v", username, err)
 		e.restoreOverLimitTombstone(leasedCtx, username, limiterServerIDs)
+		if revokeErr := suspendUserPrivateRouted(leasedCtx, e.remoteManage, e.repo, e.pusher, username); revokeErr != nil {
+			log.Printf("[TrafficLimitEnforcer] User %s post-restore private routed compensation pending: %v", username, revokeErr)
+		}
+		return false
+	}
+	if err := e.repo.CompleteUserOverLimitRestore(leasedCtx, username); err != nil {
+		log.Printf("[TrafficLimitEnforcer] User %s over-limit restore completion failed: %v", username, err)
+		e.restoreOverLimitTombstone(leasedCtx, username, limiterServerIDs)
+		if revokeErr := suspendUserPrivateRouted(leasedCtx, e.remoteManage, e.repo, e.pusher, username); revokeErr != nil {
+			log.Printf("[TrafficLimitEnforcer] User %s completion-failure private routed compensation pending: %v", username, revokeErr)
+		}
 		return false
 	}
 	return true
-}
-
-func (e *TrafficLimitEnforcer) embeddedLimiterServerIDs(ctx context.Context, configs []storage.UserInboundConfig) ([]int64, error) {
-	unique := make(map[int64]struct{}, len(configs))
-	serverIDs := make([]int64, 0, len(configs))
-	for _, cfg := range configs {
-		if cfg.ServerID <= 0 {
-			continue
-		}
-		if _, exists := unique[cfg.ServerID]; exists {
-			continue
-		}
-		server, err := e.repo.GetRemoteServer(ctx, cfg.ServerID)
-		if err != nil {
-			return nil, err
-		}
-		if server.XrayMode != "embedded" {
-			continue
-		}
-		unique[cfg.ServerID] = struct{}{}
-		serverIDs = append(serverIDs, cfg.ServerID)
-	}
-	sort.Slice(serverIDs, func(i, j int) bool { return serverIDs[i] < serverIDs[j] })
-	return serverIDs, nil
 }
 
 func (e *TrafficLimitEnforcer) pushLimiterPoliciesCheckedLeased(ctx context.Context, serverIDs []int64) error {
@@ -437,7 +476,7 @@ func (e *TrafficLimitEnforcer) pushLimiterPoliciesCheckedLeased(ctx context.Cont
 }
 
 func (e *TrafficLimitEnforcer) restoreOverLimitTombstone(ctx context.Context, username string, serverIDs []int64) {
-	if err := e.repo.UpdateUserOverLimit(ctx, username, true); err != nil {
+	if err := e.repo.RestoreUserOverLimitRevokePending(ctx, username); err != nil {
 		log.Printf("[TrafficLimitEnforcer] User %s failed to restore over-limit retry state: %v", username, err)
 		return
 	}

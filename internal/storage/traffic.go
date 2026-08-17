@@ -223,6 +223,7 @@ var (
 	ErrUserNotFound                              = errors.New("user not found")
 	ErrUserExists                                = errors.New("user already exists")
 	ErrUserInactive                              = errors.New("user is inactive")
+	ErrUserInboundConfigConflict                 = errors.New("user inbound credential conflicts with an existing protocol or credential")
 	ErrReservedUsername                          = errors.New("username is reserved")
 	ErrUsernameRenameRequiresCredentialMigration = errors.New("username cannot be changed while remote access is configured")
 	ErrRuleVersionNotFound                       = errors.New("rule version not found")
@@ -1302,6 +1303,9 @@ CREATE TABLE IF NOT EXISTS users (
 		return err
 	}
 	if err := r.ensureUserColumn("is_over_limit", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureUserColumn("over_limit_revoke_pending", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	if err := r.ensureUserColumn("totp_secret", "TEXT NOT NULL DEFAULT ''"); err != nil {
@@ -2984,6 +2988,8 @@ CREATE TABLE IF NOT EXISTS user_subaccounts (
     email TEXT NOT NULL,
     credential_json TEXT NOT NULL,
     is_active INTEGER NOT NULL DEFAULT 1,
+    revoke_pending INTEGER NOT NULL DEFAULT 0,
+    activation_pending INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(routed_node_id, username),
@@ -2996,6 +3002,12 @@ CREATE INDEX IF NOT EXISTS idx_subacc_routed ON user_subaccounts(routed_node_id)
 `
 	if _, err := r.db.Exec(userSubaccountsSchema); err != nil {
 		return fmt.Errorf("migrate user_subaccounts: %w", err)
+	}
+	if err := r.ensureTableColumn("user_subaccounts", "revoke_pending", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate user_subaccounts.revoke_pending: %w", err)
+	}
+	if err := r.ensureTableColumn("user_subaccounts", "activation_pending", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate user_subaccounts.activation_pending: %w", err)
 	}
 
 	// xray 配置快照:主控维护的 agent xray 完整 config.json 版本链,用于
@@ -5863,6 +5875,11 @@ func (r *TrafficRepository) UpdateUserStatus(ctx context.Context, username strin
 		return err
 	} else if pending {
 		return ErrUserDeletionPending
+	}
+	if pending, err := r.IsUserDisablePending(ctx, username); err != nil {
+		return err
+	} else if pending {
+		return ErrUserDisablePending
 	}
 
 	res, err := r.db.ExecContext(ctx, `UPDATE users SET is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, username)
@@ -9276,13 +9293,49 @@ func (r *TrafficRepository) SaveUserInboundConfig(ctx context.Context, cfg UserI
 	} else if pending {
 		return ErrUserDeletionPending
 	}
-	// ON CONFLICT DO NOTHING:配合 UNIQUE(username,server_id,inbound_tag) 索引,并发写只保留第一条、
-	// 后写静默忽略。凭据以「先写入的那条」为准,与全局锁 + 生成时立即写 DB 配合,彻底防同用户同入站重复凭据。
-	_, err := r.db.ExecContext(ctx,
+	// The unique key is deliberately protocol-blind because one physical
+	// inbound can have only one credential identity for a user. An equivalent
+	// retry is idempotent; a different protocol or credential is a hard
+	// conflict and must be revoked before replacement. Silently accepting that
+	// conflict would let callers publish a credential that has no authoritative
+	// database row.
+	result, err := r.db.ExecContext(ctx,
 		`INSERT INTO user_inbound_configs (username, server_id, inbound_tag, protocol, credential_json) VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(username, server_id, inbound_tag) DO NOTHING`,
 		cfg.Username, cfg.ServerID, cfg.InboundTag, cfg.Protocol, cfg.CredentialJSON)
-	return err
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read user inbound credential insert result: %w", err)
+	}
+	if affected == 1 {
+		return nil
+	}
+
+	existing, err := r.GetUserInboundConfig(ctx, cfg.Username, cfg.ServerID, cfg.InboundTag)
+	if err != nil {
+		return fmt.Errorf("load conflicting user inbound credential: %w", err)
+	}
+	if strings.EqualFold(strings.TrimSpace(existing.Protocol), strings.TrimSpace(cfg.Protocol)) &&
+		jsonValuesEqual(existing.CredentialJSON, cfg.CredentialJSON) {
+		return nil
+	}
+	return fmt.Errorf("%w: user=%s server=%d inbound=%s stored_protocol=%s requested_protocol=%s",
+		ErrUserInboundConfigConflict, cfg.Username, cfg.ServerID, cfg.InboundTag,
+		existing.Protocol, cfg.Protocol)
+}
+
+func jsonValuesEqual(left, right string) bool {
+	var leftValue any
+	var rightValue any
+	if json.Unmarshal([]byte(left), &leftValue) != nil || json.Unmarshal([]byte(right), &rightValue) != nil {
+		return left == right
+	}
+	leftCanonical, leftErr := json.Marshal(leftValue)
+	rightCanonical, rightErr := json.Marshal(rightValue)
+	return leftErr == nil && rightErr == nil && string(leftCanonical) == string(rightCanonical)
 }
 
 func (r *TrafficRepository) GetUserInboundConfigs(ctx context.Context, username string) ([]UserInboundConfig, error) {
@@ -9477,14 +9530,16 @@ func (r *TrafficRepository) DeleteUserOutboundByServerTag(ctx context.Context, s
 // UserSubaccount 记录一个 RelayDock 用户在某 routed 节点上的 Xray client 凭据。
 // is_active=0 表示已下线(凭据保留供续费恢复),=1 表示已下发到 inbound + routing rule.user。
 type UserSubaccount struct {
-	ID             int64
-	Username       string
-	RoutedNodeID   int64
-	Email          string
-	CredentialJSON string
-	IsActive       bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID                int64
+	Username          string
+	RoutedNodeID      int64
+	Email             string
+	CredentialJSON    string
+	IsActive          bool
+	RevokePending     bool
+	ActivationPending bool
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // ClearNegativeTrafficUsedOffsetsAfterReset 紧急修复 — 配套 ResetTrafficTotalsForXrayBootTimeMigration。
@@ -9717,12 +9772,14 @@ func (r *TrafficRepository) UpsertUserSubaccount(ctx context.Context, sa UserSub
 		active = 1
 	}
 	res, err := r.db.ExecContext(ctx, `
-		INSERT INTO user_subaccounts (username, routed_node_id, email, credential_json, is_active, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		INSERT INTO user_subaccounts (username, routed_node_id, email, credential_json, is_active, revoke_pending, activation_pending, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		ON CONFLICT(routed_node_id, username) DO UPDATE SET
 			email = excluded.email,
 			credential_json = excluded.credential_json,
 			is_active = excluded.is_active,
+			revoke_pending = CASE WHEN excluded.is_active = 1 THEN 0 ELSE user_subaccounts.revoke_pending END,
+			activation_pending = CASE WHEN excluded.is_active = 1 THEN 0 ELSE user_subaccounts.activation_pending END,
 			updated_at = CURRENT_TIMESTAMP
 	`, sa.Username, sa.RoutedNodeID, sa.Email, sa.CredentialJSON, active)
 	if err != nil {
@@ -9741,8 +9798,8 @@ func (r *TrafficRepository) UpsertUserSubaccount(ctx context.Context, sa UserSub
 // client becomes usable. Existing active bindings are left unchanged.
 func (r *TrafficRepository) ReserveUserSubaccount(ctx context.Context, sa UserSubaccount) error {
 	res, err := r.db.ExecContext(ctx, `
-		INSERT INTO user_subaccounts (username, routed_node_id, email, credential_json, is_active, created_at, updated_at)
-		VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		INSERT INTO user_subaccounts (username, routed_node_id, email, credential_json, is_active, revoke_pending, activation_pending, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 		ON CONFLICT(routed_node_id, username) DO NOTHING
 	`, sa.Username, sa.RoutedNodeID, sa.Email, sa.CredentialJSON)
 	if err == nil {
@@ -9755,11 +9812,11 @@ func (r *TrafficRepository) ReserveUserSubaccount(ctx context.Context, sa UserSu
 
 func (r *TrafficRepository) GetUserSubaccount(ctx context.Context, routedNodeID int64, username string) (*UserSubaccount, error) {
 	var sa UserSubaccount
-	var active int
+	var active, revokePending, activationPending int
 	err := r.db.QueryRowContext(ctx, `
-		SELECT id, username, routed_node_id, email, credential_json, is_active, created_at, updated_at
+		SELECT id, username, routed_node_id, email, credential_json, is_active, revoke_pending, activation_pending, created_at, updated_at
 		FROM user_subaccounts WHERE routed_node_id = ? AND username = ?
-	`, routedNodeID, username).Scan(&sa.ID, &sa.Username, &sa.RoutedNodeID, &sa.Email, &sa.CredentialJSON, &active, &sa.CreatedAt, &sa.UpdatedAt)
+	`, routedNodeID, username).Scan(&sa.ID, &sa.Username, &sa.RoutedNodeID, &sa.Email, &sa.CredentialJSON, &active, &revokePending, &activationPending, &sa.CreatedAt, &sa.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -9767,12 +9824,14 @@ func (r *TrafficRepository) GetUserSubaccount(ctx context.Context, routedNodeID 
 		return nil, err
 	}
 	sa.IsActive = active == 1
+	sa.RevokePending = revokePending == 1
+	sa.ActivationPending = activationPending == 1
 	return &sa, nil
 }
 
 func (r *TrafficRepository) ListUserSubaccounts(ctx context.Context, username string) ([]UserSubaccount, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, username, routed_node_id, email, credential_json, is_active, created_at, updated_at
+		SELECT id, username, routed_node_id, email, credential_json, is_active, revoke_pending, activation_pending, created_at, updated_at
 		FROM user_subaccounts WHERE username = ? ORDER BY routed_node_id
 	`, username)
 	if err != nil {
@@ -9782,11 +9841,13 @@ func (r *TrafficRepository) ListUserSubaccounts(ctx context.Context, username st
 	var out []UserSubaccount
 	for rows.Next() {
 		var sa UserSubaccount
-		var active int
-		if err := rows.Scan(&sa.ID, &sa.Username, &sa.RoutedNodeID, &sa.Email, &sa.CredentialJSON, &active, &sa.CreatedAt, &sa.UpdatedAt); err != nil {
+		var active, revokePending, activationPending int
+		if err := rows.Scan(&sa.ID, &sa.Username, &sa.RoutedNodeID, &sa.Email, &sa.CredentialJSON, &active, &revokePending, &activationPending, &sa.CreatedAt, &sa.UpdatedAt); err != nil {
 			return nil, err
 		}
 		sa.IsActive = active == 1
+		sa.RevokePending = revokePending == 1
+		sa.ActivationPending = activationPending == 1
 		out = append(out, sa)
 	}
 	return out, rows.Err()
@@ -9859,7 +9920,7 @@ func (r *TrafficRepository) ListRoutedAdminEmailNodes(ctx context.Context) ([]Ro
 
 func (r *TrafficRepository) ListSubaccountsByRoutedNode(ctx context.Context, routedNodeID int64) ([]UserSubaccount, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, username, routed_node_id, email, credential_json, is_active, created_at, updated_at
+		SELECT id, username, routed_node_id, email, credential_json, is_active, revoke_pending, activation_pending, created_at, updated_at
 		FROM user_subaccounts WHERE routed_node_id = ? ORDER BY username
 	`, routedNodeID)
 	if err != nil {
@@ -9869,11 +9930,13 @@ func (r *TrafficRepository) ListSubaccountsByRoutedNode(ctx context.Context, rou
 	var out []UserSubaccount
 	for rows.Next() {
 		var sa UserSubaccount
-		var active int
-		if err := rows.Scan(&sa.ID, &sa.Username, &sa.RoutedNodeID, &sa.Email, &sa.CredentialJSON, &active, &sa.CreatedAt, &sa.UpdatedAt); err != nil {
+		var active, revokePending, activationPending int
+		if err := rows.Scan(&sa.ID, &sa.Username, &sa.RoutedNodeID, &sa.Email, &sa.CredentialJSON, &active, &revokePending, &activationPending, &sa.CreatedAt, &sa.UpdatedAt); err != nil {
 			return nil, err
 		}
 		sa.IsActive = active == 1
+		sa.RevokePending = revokePending == 1
+		sa.ActivationPending = activationPending == 1
 		out = append(out, sa)
 	}
 	return out, rows.Err()
@@ -9882,17 +9945,19 @@ func (r *TrafficRepository) ListSubaccountsByRoutedNode(ctx context.Context, rou
 // ListActiveSubaccountsByServerName 用于 limiter 下发:列出某 server 上所有 active 子账号
 // 以及其挂的 inbound_tag(继承自父物理节点)。需要 JOIN nodes 表拿 inbound 信息。
 type ActiveSubaccountForLimiter struct {
-	Username   string
-	Email      string
-	InboundTag string
+	Username      string
+	Email         string
+	InboundTag    string
+	RevokePending bool
 }
 
 func (r *TrafficRepository) ListActiveSubaccountsByServerName(ctx context.Context, serverName string) ([]ActiveSubaccountForLimiter, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT sa.username, sa.email, COALESCE(n.inbound_tag, '')
+		SELECT sa.username, sa.email, COALESCE(n.inbound_tag, ''), sa.revoke_pending
 		FROM user_subaccounts sa
 		INNER JOIN nodes n ON sa.routed_node_id = n.id
-		WHERE sa.is_active = 1 AND n.original_server = ? AND n.node_type = 'routed'
+		WHERE (sa.is_active = 1 OR sa.revoke_pending = 1 OR sa.activation_pending = 1)
+		  AND n.original_server = ? AND n.node_type = 'routed'
 	`, serverName)
 	if err != nil {
 		return nil, err
@@ -9901,9 +9966,11 @@ func (r *TrafficRepository) ListActiveSubaccountsByServerName(ctx context.Contex
 	var out []ActiveSubaccountForLimiter
 	for rows.Next() {
 		var a ActiveSubaccountForLimiter
-		if err := rows.Scan(&a.Username, &a.Email, &a.InboundTag); err != nil {
+		var pending int
+		if err := rows.Scan(&a.Username, &a.Email, &a.InboundTag, &pending); err != nil {
 			return nil, err
 		}
+		a.RevokePending = pending == 1
 		if a.InboundTag == "" {
 			continue
 		}
@@ -9921,7 +9988,8 @@ func (r *TrafficRepository) ListServerIDsForUserSubaccounts(ctx context.Context,
 		FROM user_subaccounts sa
 		INNER JOIN nodes n ON sa.routed_node_id = n.id
 		INNER JOIN remote_servers rs ON rs.name = n.original_server
-		WHERE sa.is_active = 1 AND sa.username = ? AND n.node_type = 'routed'
+		WHERE (sa.is_active = 1 OR sa.revoke_pending = 1 OR sa.activation_pending = 1)
+		  AND sa.username = ? AND n.node_type = 'routed'
 	`, username)
 	if err != nil {
 		return nil, err
@@ -9974,14 +10042,18 @@ func (r *TrafficRepository) ListInboundNodeRefsForServer(ctx context.Context, se
 	return out, rows.Err()
 }
 
-// SetSubaccountActive 切换 is_active(下线/恢复),不动 credential。
+// SetSubaccountActive 切换 is_active(下线/恢复),不动 credential。恢复成功时
+// 同时清除未完成的 revoke 标记；普通下线由专用 revoke API 保留 pending。
 func (r *TrafficRepository) SetSubaccountActive(ctx context.Context, id int64, active bool) error {
 	v := 0
 	if active {
 		v = 1
 	}
 	_, err := r.db.ExecContext(ctx,
-		`UPDATE user_subaccounts SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, v, id)
+		`UPDATE user_subaccounts SET is_active = ?,
+			revoke_pending = CASE WHEN ? = 1 THEN 0 ELSE revoke_pending END,
+			activation_pending = CASE WHEN ? = 1 THEN 0 ELSE activation_pending END,
+			updated_at = CURRENT_TIMESTAMP WHERE id = ?`, v, v, v, id)
 	return err
 }
 
@@ -10852,9 +10924,74 @@ func (r *TrafficRepository) UpdateUserOverLimit(ctx context.Context, username st
 	val := 0
 	if isOverLimit {
 		val = 1
+		_, err := r.db.ExecContext(ctx, `UPDATE users SET is_over_limit = ? WHERE username = ?`, val, username)
+		return err
 	}
-	_, err := r.db.ExecContext(ctx, `UPDATE users SET is_over_limit = ? WHERE username = ?`, val, username)
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE users
+		SET is_over_limit = ?, over_limit_revoke_pending = 0
+		WHERE username = ?`, val, username)
 	return err
+}
+
+// BeginUserOverLimitRevoke records the deny intent and its unfinished remote
+// reconciliation in one durable write. Callers must do this before publishing
+// the deny limiter policy or removing any remote credential.
+func (r *TrafficRepository) BeginUserOverLimitRevoke(ctx context.Context, username string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin over-limit revoke: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `
+		UPDATE users
+		SET is_over_limit = 1, over_limit_revoke_pending = 1
+		WHERE username = ?`, username)
+	if err != nil {
+		return fmt.Errorf("persist over-limit revoke: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return ErrUserNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE user_subaccounts
+		SET is_active = 0, revoke_pending = 1, activation_pending = 0,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE username = ? AND (is_active = 1 OR revoke_pending = 1 OR activation_pending = 1)
+		  AND EXISTS (
+		      SELECT 1 FROM nodes n
+		      WHERE n.id = user_subaccounts.routed_node_id
+		        AND n.node_type = 'routed'
+		        AND n.routed_owner = 'user'
+		        AND n.username = user_subaccounts.username
+		  )`, username); err != nil {
+		return fmt.Errorf("persist over-limit private routed revokes: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit over-limit revoke: %w", err)
+	}
+	r.invalidateTrafficBillingCache()
+	return nil
+}
+
+// CompleteUserOverLimitRevoke clears only the retry marker. The over-limit
+// deny remains authoritative until the normal restore path explicitly clears
+// is_over_limit.
+func (r *TrafficRepository) CompleteUserOverLimitRevoke(ctx context.Context, username string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE users
+		SET over_limit_revoke_pending = 0
+		WHERE username = ? AND is_over_limit = 1`, username)
+	return err
+}
+
+func (r *TrafficRepository) IsUserOverLimitRevokePending(ctx context.Context, username string) (bool, error) {
+	var val int
+	err := r.db.QueryRowContext(ctx, `
+		SELECT COALESCE(over_limit_revoke_pending, 0)
+		FROM users
+		WHERE username = ?`, username).Scan(&val)
+	return val == 1, err
 }
 
 func (r *TrafficRepository) IsUserOverLimit(ctx context.Context, username string) (bool, error) {

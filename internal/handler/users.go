@@ -185,6 +185,7 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 	if tokens != nil {
 		repo.SetSessionRevoker(tokens.RevokeAllForUser)
 	}
+	managedHandler := NewManagedNodesHandler(repo, remoteManage, pusher)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -238,6 +239,20 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 				writeError(w, http.StatusConflict, storage.ErrUserDeletionPending)
 				return
 			}
+			activationPending, pendingErr := repo.IsUserSubaccountActivationPending(ctx, username)
+			if pendingErr != nil {
+				writeError(w, http.StatusInternalServerError, pendingErr)
+				return
+			}
+			disablePending, pendingErr := repo.IsUserDisablePending(ctx, username)
+			if pendingErr != nil {
+				writeError(w, http.StatusInternalServerError, pendingErr)
+				return
+			}
+			if disablePending && !activationPending {
+				writeError(w, http.StatusConflict, storage.ErrUserDisablePending)
+				return
+			}
 		}
 
 		if !payload.IsActive {
@@ -246,8 +261,14 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 				writeError(w, http.StatusInternalServerError, cfgErr)
 				return
 			}
+			routedServerIDs, routedErr := repo.ListServerIDsForUserSubaccounts(ctx, username)
+			if routedErr != nil {
+				writeError(w, http.StatusInternalServerError, routedErr)
+				return
+			}
+			serverIDs := append(inboundConfigServerIDs(configs), routedServerIDs...)
 			serverLeasedCtx, releaseServers, serverLeaseErr := acquireRemoteServerMutationLeases(
-				ctx, repo, inboundConfigServerIDs(configs),
+				ctx, repo, serverIDs,
 			)
 			if serverLeaseErr != nil {
 				writeError(w, http.StatusConflict, serverLeaseErr)
@@ -255,77 +276,101 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 			}
 			defer releaseServers()
 			ctx = serverLeasedCtx
+			sources, prepareErr := repo.PrepareUserDisable(ctx, username)
+			if prepareErr != nil {
+				if errors.Is(prepareErr, storage.ErrUserNotFound) {
+					writeError(w, http.StatusNotFound, prepareErr)
+					return
+				}
+				writeError(w, http.StatusInternalServerError, prepareErr)
+				return
+			}
+			if tokens != nil {
+				tokens.RevokeAllForUser(username)
+			}
+
 			var revokeErrs []error
-			for _, cfg := range configs {
-				if remoteManage == nil {
-					revokeErrs = append(revokeErrs, errors.New("remote manager is unavailable"))
+			for _, source := range sources {
+				if source.DesiredState == storage.ManagedDesiredInactive &&
+					source.ObservedState == storage.ManagedObservedInactive &&
+					source.Generation == source.AppliedGeneration {
 					continue
 				}
-				if err := removeUserFromInbound(ctx, remoteManage, cfg); err != nil {
+				if err := managedHandler.reconcileSource(ctx, source); err != nil {
 					revokeErrs = append(revokeErrs, err)
-					log.Printf("[UserStatus] disable: remove %s from inbound %s on server %d failed: %v",
-						username, cfg.InboundTag, cfg.ServerID, err)
+					log.Printf("[UserStatus] disable: reconcile %s inbound %s on server %d failed: %v",
+						username, source.InboundTag, source.ServerID, err)
 				}
 			}
-			if err := suspendUserPrivateRouted(ctx, remoteManage, repo, username); err != nil {
+			if err := suspendUserPrivateRouted(ctx, remoteManage, repo, pusher, username); err != nil {
 				revokeErrs = append(revokeErrs, err)
 				log.Printf("[UserStatus] disable: suspend private routed access for %s failed: %v", username, err)
 			}
 			if revokeErr := errors.Join(revokeErrs...); revokeErr != nil {
-				writeError(w, http.StatusBadGateway, revokeErr)
+				if pusher != nil {
+					go pusher.PushToAllServersForUser(context.Background(), username)
+				}
+				writeJSON(w, http.StatusAccepted, map[string]interface{}{
+					"status": "disable_pending", "message": "remote access revocation is pending",
+				})
 				return
 			}
-		}
-
-		var statusErr error
-		if payload.IsActive {
-			statusErr = repo.UpdateUserStatus(ctx, username, true)
-		} else {
-			statusErr = repo.DisableUserAndDeleteSessions(ctx, username)
-		}
-		if statusErr != nil {
-			if errors.Is(statusErr, storage.ErrUserNotFound) {
-				writeError(w, http.StatusNotFound, errors.New("user not found"))
-				return
+			if pusher != nil {
+				go pusher.PushToAllServersForUser(context.Background(), username)
 			}
-			writeError(w, http.StatusInternalServerError, statusErr)
+			writeJSON(w, http.StatusOK, map[string]interface{}{"status": "disabled"})
 			return
 		}
-		if !payload.IsActive {
-			// Inactive users are already rejected by auth middleware, but deleting
-			// both stores makes revocation immediate and prevents a restart from
-			// loading a previously issued session back into memory.
-			if tokens != nil {
-				tokens.RevokeAllForUser(username)
+
+		if !targetUser.IsActive {
+			statusErr := repo.UpdateUserStatus(ctx, username, true)
+			if statusErr != nil {
+				if errors.Is(statusErr, storage.ErrUserNotFound) {
+					writeError(w, http.StatusNotFound, errors.New("user not found"))
+					return
+				}
+				writeError(w, http.StatusInternalServerError, statusErr)
+				return
 			}
 		}
 
 		// 状态切换后,同步 xray inbound clients。
 		// 仅在 remoteManage 非空且用户有套餐绑定时才有 inbound 需要操作。
+		var activationErrs []error
 		if remoteManage != nil {
 			configs, cfgErr := repo.GetUserInboundConfigs(ctx, username)
 			if cfgErr != nil {
 				log.Printf("[UserStatus] get inbound configs for %s failed: %v", username, cfgErr)
+				activationErrs = append(activationErrs, cfgErr)
 			}
-			if payload.IsActive {
-				// 启用 → 用 saved credential 调 addUserToInbound 把 client 加回。
-				// addUserToInbound 内部会发现 GetUserInboundConfig 已有记录,自动复用 credential_json。
-				targetUserCopy, _ := repo.GetUser(ctx, username)
-				for _, cfg := range configs {
-					if err := addUserToInboundWithLimiter(ctx, remoteManage, repo, pusher, targetUserCopy, cfg.ServerID, cfg.InboundTag); err != nil {
-						log.Printf("[UserStatus] enable: add %s back to inbound %s on server %d failed: %v",
-							username, cfg.InboundTag, cfg.ServerID, err)
-					}
+			// 启用 → 用 saved credential 调 addUserToInbound 把 client 加回。
+			// addUserToInbound 内部会发现 GetUserInboundConfig 已有记录,自动复用 credential_json。
+			targetUserCopy, _ := repo.GetUser(ctx, username)
+			for _, cfg := range configs {
+				if err := addUserToInboundWithLimiter(ctx, remoteManage, repo, pusher, targetUserCopy, cfg.ServerID, cfg.InboundTag); err != nil {
+					log.Printf("[UserStatus] enable: add %s back to inbound %s on server %d failed: %v",
+						username, cfg.InboundTag, cfg.ServerID, err)
+					activationErrs = append(activationErrs, err)
 				}
-				// 用户私有路由出站:重建 rule + 加回 client
-				resumeUserPrivateRouted(ctx, remoteManage, repo, username)
 			}
+		}
+		// 用户私有路由出站始终进入 durable activation 流程。即使 Agent 管理
+		// 当前不可用，也必须保留 pending 并向调用方返回 enable_pending。
+		if err := resumeUserPrivateRouted(ctx, remoteManage, repo, pusher, username); err != nil {
+			activationErrs = append(activationErrs, err)
+			log.Printf("[UserStatus] enable: private routed activation for %s pending: %v", username, err)
 		}
 
 		// 推 limiter 配置,让 agent 内存 limiter UserInfo 跟 DB 状态对齐
 		// (push 路径会重新从 DB 读 is_active,disabled 用户不会被推送。)
 		if pusher != nil {
 			go pusher.PushToAllServersForUser(context.Background(), username)
+		}
+		if activationErr := errors.Join(activationErrs...); activationErr != nil {
+			writeJSON(w, http.StatusAccepted, map[string]interface{}{
+				"status": "enable_pending", "message": "remote access activation is pending",
+			})
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")

@@ -980,6 +980,7 @@ func (r *TrafficRepository) HasEffectiveUserInboundAccess(ctx context.Context, u
 	       s.observed_state, s.generation, s.applied_generation
 FROM user_inbound_access_sources s
 JOIN user_node_selections sel ON sel.id = s.source_id AND sel.desired_enabled = 1
+JOIN users u ON u.username = s.username AND u.is_active = 1
 JOIN user_server_grants g ON g.id = sel.grant_id AND g.username = s.username AND g.server_id = s.server_id
 JOIN self_service_node_offers o ON o.id = sel.offer_id AND o.enabled = 1
 	AND o.server_id = s.server_id AND o.inbound_tag = s.inbound_tag

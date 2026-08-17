@@ -455,8 +455,8 @@ func TestPackageExpiryRetainsAssignmentWhenPrivateRoutedRevokeFails(t *testing.T
 		t.Fatalf("expired assignment was cleared despite failed revoke: %+v", user)
 	}
 	subaccount, err := repo.GetUserSubaccount(ctx, private.ID, "alice")
-	if err != nil || subaccount == nil || !subaccount.IsActive {
-		t.Fatalf("failed revoke changed durable subaccount state: account=%+v err=%v", subaccount, err)
+	if err != nil || subaccount == nil || subaccount.IsActive || !subaccount.RevokePending {
+		t.Fatalf("failed revoke did not persist inactive retry state: account=%+v err=%v", subaccount, err)
 	}
 }
 

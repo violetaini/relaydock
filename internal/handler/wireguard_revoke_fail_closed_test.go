@@ -34,6 +34,13 @@ type wireGuardRevokeAgent struct {
 func (a *wireGuardRevokeAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/api/child/system/info":
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"capabilities": map[string]bool{
+				"limiter_denied_v1": true,
+			},
+		})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/child/inbounds":
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": true,
@@ -163,6 +170,40 @@ func wireGuardRevokeLatestUserLimit(payloads []WSLimiterConfigPayload) (WSUserLi
 	return WSUserLimitInfo{}, false
 }
 
+func wireGuardRevokePayloadHasTombstone(payload WSLimiterConfigPayload) bool {
+	if !wireGuardRevokePayloadHasMapping(payload) {
+		return false
+	}
+	for _, user := range payload.Users {
+		if user.Email == "alice__wg-revoke" {
+			return user.SpeedLimit == revocationResidualDenySpeedBytes &&
+				user.DeviceLimit == revocationResidualDenyConnectionLimit && user.Denied
+		}
+	}
+	return false
+}
+
+func wireGuardRevokeEveryRemoveHadTombstone(events []string, payloads []WSLimiterConfigPayload) bool {
+	payloadIndex := 0
+	tombstoneReady := false
+	for _, event := range events {
+		switch event {
+		case "limiter":
+			if payloadIndex >= len(payloads) {
+				return false
+			}
+			tombstoneReady = wireGuardRevokePayloadHasTombstone(payloads[payloadIndex])
+			payloadIndex++
+		case "remove":
+			if !tombstoneReady {
+				return false
+			}
+			tombstoneReady = false
+		}
+	}
+	return true
+}
+
 func wireGuardRevokeEveryPeerHadMappedLimiter(events []string, payloads []WSLimiterConfigPayload) bool {
 	payloadIndex := 0
 	mappedLimiterReady := false
@@ -264,6 +305,38 @@ func assignWireGuardRevokePackage(t *testing.T, repo *storage.TrafficRepository,
 	return packageID
 }
 
+func seedFailingPrivateRoutedRevoke(t *testing.T, repo *storage.TrafficRepository, username string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	parent, err := repo.CreateNode(ctx, storage.Node{
+		Username: username, NodeName: "missing-private-parent", Protocol: "vless", Enabled: true,
+		OriginalServer: "missing-private-edge", InboundTag: "vless-in",
+		ClashConfig: `{"name":"missing-private-parent","type":"vless","server":"missing.example.test","port":443,"uuid":"owner-id"}`,
+	})
+	if err != nil {
+		t.Fatalf("create private parent: %v", err)
+	}
+	parentID := parent.ID
+	private, err := repo.CreateRoutedNode(ctx, storage.RoutedNodeDetail{
+		Node: storage.Node{
+			Username: username, NodeName: "missing-private-routed", Protocol: "vless", Enabled: true,
+			OriginalServer: "missing-private-edge", InboundTag: "vless-in", ParentNodeID: &parentID,
+			RoutedOwner: "user",
+		},
+		RoutedOutboundTag: "missing-private-out", RoutedRuleMarktag: "missing-private-rule",
+	})
+	if err != nil {
+		t.Fatalf("create private routed node: %v", err)
+	}
+	if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
+		Username: username, RoutedNodeID: private.ID, Email: username + "__missing_private",
+		CredentialJSON: `{"id":"private-id","email":"alice__missing_private"}`, IsActive: true,
+	}); err != nil {
+		t.Fatalf("create private routed subaccount: %v", err)
+	}
+	return private.ID
+}
+
 func TestUserStatusDisableFailsClosedWhenWireGuardRemoveFails(t *testing.T) {
 	settings, serverPublicKey := wireGuardCredentialTestSettings(t)
 	agent := &wireGuardRevokeAgent{settings: settings, failRemove: 1}
@@ -275,22 +348,64 @@ func TestUserStatusDisableFailsClosedWhenWireGuardRemoveFails(t *testing.T) {
 		strings.NewReader(`{"username":"alice","is_active":false}`))
 	response := httptest.NewRecorder()
 	NewUserStatusHandler(repo, remote, pusher, nil).ServeHTTP(response, request)
-	if response.Code < 400 {
-		t.Fatalf("status=%d body=%s, want remote failure", response.Code, response.Body.String())
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s, want durable pending disable", response.Code, response.Body.String())
 	}
 	user, err := repo.GetUser(context.Background(), "alice")
-	if err != nil || !user.IsActive {
-		t.Fatalf("disable failure changed active state: user=%+v err=%v", user, err)
+	if err != nil || user.IsActive {
+		t.Fatalf("pending disable user active=%v err=%v, want inactive", user.IsActive, err)
 	}
 	if _, err := repo.GetUserInboundConfig(context.Background(), "alice", server.ID, "wg-revoke"); err != nil {
-		t.Fatalf("disable failure removed saved credential: %v", err)
+		t.Fatalf("pending disable removed stable credential: %v", err)
+	}
+	pending, err := repo.IsUserDisablePending(context.Background(), "alice")
+	if err != nil || !pending {
+		t.Fatalf("disable pending=%v err=%v, want true", pending, err)
 	}
 	removeCalls, _, limiterHits := agent.counts()
 	if removeCalls != 1 {
 		t.Fatalf("remove calls=%d, want 1", removeCalls)
 	}
-	if limiterHits != 0 {
-		t.Fatalf("limiter was pushed after failed disable; hits=%d", limiterHits)
+	if limiterHits == 0 {
+		t.Fatal("disable did not publish a checked tombstone before remove")
+	}
+	events, payloads := agent.snapshot()
+	if !wireGuardRevokeEveryRemoveHadTombstone(events, payloads) {
+		t.Fatalf("disable events=%v payloads=%#v, want tombstone before every remove", events, payloads)
+	}
+	limit, ok := wireGuardRevokeLatestUserLimit(payloads)
+	if !ok || limit.SpeedLimit != revocationResidualDenySpeedBytes ||
+		limit.DeviceLimit != revocationResidualDenyConnectionLimit {
+		t.Fatalf("pending disable limiter=%+v found=%v, want tombstone", limit, ok)
+	}
+
+	sources, err := repo.ListUserInboundAccessSources(context.Background(), "alice", server.ID)
+	if err != nil || len(sources) == 0 {
+		t.Fatalf("list durable disable sources: len=%d err=%v", len(sources), err)
+	}
+	if err := NewManagedNodesHandler(repo, remote, pusher).reconcileSource(context.Background(), sources[len(sources)-1]); err != nil {
+		t.Fatalf("retry pending disable: %v", err)
+	}
+	pending, err = repo.IsUserDisablePending(context.Background(), "alice")
+	if err != nil || pending {
+		t.Fatalf("disable retry pending=%v err=%v, want complete", pending, err)
+	}
+	if _, err := repo.GetUserInboundConfig(context.Background(), "alice", server.ID, "wg-revoke"); err != nil {
+		t.Fatalf("completed disable did not retain stable credential: %v", err)
+	}
+	if err := pusher.PushToServerChecked(context.Background(), server.ID); err != nil {
+		t.Fatalf("publish completed disable limiter: %v", err)
+	}
+	_, payloads = agent.snapshot()
+	var latest *WSLimiterConfigPayload
+	for payloadIndex := len(payloads) - 1; payloadIndex >= 0; payloadIndex-- {
+		if payloads[payloadIndex].InboundTag == "wg-revoke" {
+			latest = &payloads[payloadIndex]
+			break
+		}
+	}
+	if latest == nil || wireGuardRevokePayloadHasMapping(*latest) {
+		t.Fatalf("completed disable latest limiter=%#v, want user mapping cleared", latest)
 	}
 }
 
@@ -301,7 +416,7 @@ func TestUserStatusDisableSerializesAuthorityUntilInactiveStateCommits(t *testin
 	agent := &wireGuardRevokeAgent{
 		settings: settings, removeStarted: removeStarted, allowRemove: allowRemove,
 	}
-	repo, server, remote, _ := newWireGuardRevokeFixture(t, agent)
+	repo, server, remote, pusher := newWireGuardRevokeFixture(t, agent)
 	assignWireGuardRevokePackage(t, repo, "alice", server, settings, 1024)
 	saveWireGuardRevokeCredential(t, repo, "alice", server.ID, serverPublicKey)
 
@@ -310,7 +425,7 @@ func TestUserStatusDisableSerializesAuthorityUntilInactiveStateCommits(t *testin
 	go func() {
 		request := httptest.NewRequest(http.MethodPost, "/api/admin/users/status",
 			strings.NewReader(`{"username":"alice","is_active":false}`))
-		NewUserStatusHandler(repo, remote, nil, nil).ServeHTTP(response, request)
+		NewUserStatusHandler(repo, remote, pusher, nil).ServeHTTP(response, request)
 		close(disableDone)
 	}()
 	select {
@@ -364,7 +479,7 @@ func TestUserStatusDisableSerializesAuthorityUntilInactiveStateCommits(t *testin
 	}
 }
 
-func TestTrafficLimitEnforcerRetriesWireGuardRevokeBeforeMarkingOverLimit(t *testing.T) {
+func TestTrafficLimitEnforcerPersistsTombstoneBeforeWireGuardRevokeAndRetries(t *testing.T) {
 	settings, serverPublicKey := wireGuardCredentialTestSettings(t)
 	agent := &wireGuardRevokeAgent{settings: settings, failRemove: 1}
 	repo, server, remote, pusher := newWireGuardRevokeFixture(t, agent)
@@ -381,12 +496,23 @@ func TestTrafficLimitEnforcerRetriesWireGuardRevokeBeforeMarkingOverLimit(t *tes
 	enforcer := NewTrafficLimitEnforcer(repo, remote, pusher)
 	enforcer.CheckAll(ctx)
 	over, err := repo.IsUserOverLimit(ctx, "alice")
-	if err != nil || over {
-		t.Fatalf("failed revoke over-limit state=(%v,%v), want false", over, err)
+	if err != nil || !over {
+		t.Fatalf("failed revoke over-limit state=(%v,%v), want durable true", over, err)
 	}
-	removeCalls, _, _ := agent.counts()
+	pending, err := repo.IsUserOverLimitRevokePending(ctx, "alice")
+	if err != nil || !pending {
+		t.Fatalf("failed revoke pending state=(%v,%v), want true", pending, err)
+	}
+	removeCalls, _, limiterHits := agent.counts()
 	if removeCalls != 1 {
 		t.Fatalf("first CheckAll remove calls=%d, want 1", removeCalls)
+	}
+	if limiterHits != 1 {
+		t.Fatalf("first CheckAll limiter hits=%d, want checked tombstone before remove", limiterHits)
+	}
+	events, limiterPayloads := agent.snapshot()
+	if !wireGuardRevokeEveryRemoveHadTombstone(events, limiterPayloads) {
+		t.Fatalf("first revoke events=%v payloads=%#v, want tombstone ACK before remove", events, limiterPayloads)
 	}
 
 	enforcer.CheckAll(ctx)
@@ -394,9 +520,122 @@ func TestTrafficLimitEnforcerRetriesWireGuardRevokeBeforeMarkingOverLimit(t *tes
 	if err != nil || !over {
 		t.Fatalf("successful retry over-limit state=(%v,%v), want true", over, err)
 	}
-	removeCalls, _, _ = agent.counts()
+	pending, err = repo.IsUserOverLimitRevokePending(ctx, "alice")
+	if err != nil || pending {
+		t.Fatalf("successful retry pending state=(%v,%v), want false", pending, err)
+	}
+	removeCalls, _, limiterHits = agent.counts()
 	if removeCalls != 2 {
 		t.Fatalf("second CheckAll remove calls=%d, want 2", removeCalls)
+	}
+	if limiterHits != 2 {
+		t.Fatalf("second CheckAll limiter hits=%d, want 2", limiterHits)
+	}
+	events, limiterPayloads = agent.snapshot()
+	if !wireGuardRevokeEveryRemoveHadTombstone(events, limiterPayloads) {
+		t.Fatalf("retry events=%v payloads=%#v, want tombstone ACK before every remove", events, limiterPayloads)
+	}
+
+	enforcer.CheckAll(ctx)
+	finalRemoveCalls, _, finalLimiterHits := agent.counts()
+	if finalRemoveCalls != removeCalls || finalLimiterHits != limiterHits {
+		t.Fatalf("completed revoke replayed: remove %d->%d limiter %d->%d", removeCalls, finalRemoveCalls, limiterHits, finalLimiterHits)
+	}
+}
+
+func TestTrafficLimitEnforcerLimiterFailureStopsBeforeWireGuardRemoveAndRetries(t *testing.T) {
+	settings, serverPublicKey := wireGuardCredentialTestSettings(t)
+	agent := &wireGuardRevokeAgent{settings: settings, failLimiterAt: 1}
+	repo, server, remote, pusher := newWireGuardRevokeFixture(t, agent)
+	assignWireGuardRevokePackage(t, repo, "alice", server, settings, 100)
+	saveWireGuardRevokeCredential(t, repo, "alice", server.ID, serverPublicKey)
+	ctx := context.Background()
+	if err := repo.UpsertUserTraffic(ctx, server.ID, "alice", 0, 0, false); err != nil {
+		t.Fatalf("seed traffic: %v", err)
+	}
+	if err := repo.UpsertUserTraffic(ctx, server.ID, "alice", 60, 50, false); err != nil {
+		t.Fatalf("accumulate traffic: %v", err)
+	}
+
+	enforcer := NewTrafficLimitEnforcer(repo, remote, pusher)
+	enforcer.CheckAll(ctx)
+	over, overErr := repo.IsUserOverLimit(ctx, "alice")
+	pending, pendingErr := repo.IsUserOverLimitRevokePending(ctx, "alice")
+	if overErr != nil || pendingErr != nil || !over || !pending {
+		t.Fatalf("limiter failure state over=(%v,%v) pending=(%v,%v), want true/true", over, overErr, pending, pendingErr)
+	}
+	removeCalls, _, limiterHits := agent.counts()
+	if removeCalls != 0 || limiterHits != 1 {
+		t.Fatalf("limiter failure calls remove=%d limiter=%d, want 0/1", removeCalls, limiterHits)
+	}
+	_, limiterPayloads := agent.snapshot()
+	if len(limiterPayloads) != 1 || !wireGuardRevokePayloadHasTombstone(limiterPayloads[0]) {
+		t.Fatalf("rejected limiter payloads=%#v, want tombstone", limiterPayloads)
+	}
+
+	enforcer.CheckAll(ctx)
+	pending, pendingErr = repo.IsUserOverLimitRevokePending(ctx, "alice")
+	removeCalls, _, limiterHits = agent.counts()
+	if pendingErr != nil || pending || removeCalls != 1 || limiterHits != 2 {
+		t.Fatalf("retry state pending=(%v,%v) remove=%d limiter=%d, want false,1,2", pending, pendingErr, removeCalls, limiterHits)
+	}
+}
+
+func TestTrafficLimitEnforcerPrivateRoutedSuspendFailureKeepsWireGuardRevokePending(t *testing.T) {
+	settings, serverPublicKey := wireGuardCredentialTestSettings(t)
+	agent := &wireGuardRevokeAgent{settings: settings}
+	repo, server, remote, pusher := newWireGuardRevokeFixture(t, agent)
+	assignWireGuardRevokePackage(t, repo, "alice", server, settings, 100)
+	saveWireGuardRevokeCredential(t, repo, "alice", server.ID, serverPublicKey)
+	privateRoutedID := seedFailingPrivateRoutedRevoke(t, repo, "alice")
+	ctx := context.Background()
+	if err := repo.UpsertUserTraffic(ctx, server.ID, "alice", 0, 0, false); err != nil {
+		t.Fatalf("seed traffic: %v", err)
+	}
+	if err := repo.UpsertUserTraffic(ctx, server.ID, "alice", 60, 50, false); err != nil {
+		t.Fatalf("accumulate traffic: %v", err)
+	}
+
+	enforcer := NewTrafficLimitEnforcer(repo, remote, pusher)
+	enforcer.CheckAll(ctx)
+	over, overErr := repo.IsUserOverLimit(ctx, "alice")
+	pending, pendingErr := repo.IsUserOverLimitRevokePending(ctx, "alice")
+	if overErr != nil || pendingErr != nil || !over || !pending {
+		t.Fatalf("suspend failure state over=(%v,%v) pending=(%v,%v), want true/true", over, overErr, pending, pendingErr)
+	}
+	removeCalls, _, limiterHits := agent.counts()
+	if removeCalls != 1 || limiterHits != 1 {
+		t.Fatalf("suspend failure calls remove=%d limiter=%d, want 1/1", removeCalls, limiterHits)
+	}
+	events, limiterPayloads := agent.snapshot()
+	if !wireGuardRevokeEveryRemoveHadTombstone(events, limiterPayloads) {
+		t.Fatalf("suspend failure events=%v payloads=%#v, want tombstone before remove", events, limiterPayloads)
+	}
+
+	if err := repo.DeleteRoutedNode(ctx, privateRoutedID); err != nil {
+		t.Fatalf("remove failing routed node before retry: %v", err)
+	}
+	enforcer.CheckAll(ctx)
+	pending, pendingErr = repo.IsUserOverLimitRevokePending(ctx, "alice")
+	removeCalls, _, limiterHits = agent.counts()
+	if pendingErr != nil || pending || removeCalls != 2 || limiterHits != 2 {
+		t.Fatalf("suspend retry state pending=(%v,%v) remove=%d limiter=%d, want false,2,2", pending, pendingErr, removeCalls, limiterHits)
+	}
+}
+
+func TestUpdateUserOverLimitClearAlsoClearsPendingRevoke(t *testing.T) {
+	repo := newWireGuardCredentialTestRepo(t)
+	ctx := context.Background()
+	if err := repo.BeginUserOverLimitRevoke(ctx, "alice"); err != nil {
+		t.Fatalf("begin over-limit revoke: %v", err)
+	}
+	if err := repo.UpdateUserOverLimit(ctx, "alice", false); err != nil {
+		t.Fatalf("clear over-limit: %v", err)
+	}
+	over, overErr := repo.IsUserOverLimit(ctx, "alice")
+	pending, pendingErr := repo.IsUserOverLimitRevokePending(ctx, "alice")
+	if overErr != nil || pendingErr != nil || over || pending {
+		t.Fatalf("cleared state over=(%v,%v) pending=(%v,%v), want false/false", over, overErr, pending, pendingErr)
 	}
 }
 
@@ -407,7 +646,7 @@ func TestTrafficLimitEnforcerRetriesWireGuardRestoreWithMappedLimiter(t *testing
 	assignWireGuardRevokePackage(t, repo, "alice", server, settings, 100)
 	saveWireGuardRevokeCredential(t, repo, "alice", server.ID, serverPublicKey)
 	ctx := context.Background()
-	if err := repo.UpdateUserOverLimit(ctx, "alice", true); err != nil {
+	if err := repo.BeginUserOverLimitRevoke(ctx, "alice"); err != nil {
 		t.Fatalf("mark over-limit: %v", err)
 	}
 	agent.mu.Lock()
@@ -432,6 +671,10 @@ func TestTrafficLimitEnforcerRetriesWireGuardRestoreWithMappedLimiter(t *testing
 	over, err = repo.IsUserOverLimit(ctx, "alice")
 	if err != nil || over {
 		t.Fatalf("successful restore over-limit state=(%v,%v), want false", over, err)
+	}
+	pending, err := repo.IsUserOverLimitRevokePending(ctx, "alice")
+	if err != nil || pending {
+		t.Fatalf("successful restore pending state=(%v,%v), want false", pending, err)
 	}
 	_, addCalls, _ = agent.counts()
 	if addCalls != 2 {
@@ -463,6 +706,10 @@ func TestTrafficLimitEnforcerNormalLimiterFailureRestoresWireGuardTombstone(t *t
 	over, err := repo.IsUserOverLimit(ctx, "alice")
 	if err != nil || !over {
 		t.Fatalf("normal limiter failure over-limit state=(%v,%v), want retryable true", over, err)
+	}
+	pending, err := repo.IsUserOverLimitRevokePending(ctx, "alice")
+	if err != nil || !pending {
+		t.Fatalf("normal limiter failure pending state=(%v,%v), want retryable true", pending, err)
 	}
 	_, addCalls, limiterHits := agent.counts()
 	if addCalls != 1 || limiterHits != 3 {
@@ -794,6 +1041,123 @@ func TestManagedSelectionWireGuardRevokePublishesTombstoneBeforeRemoveAndClearsM
 	}
 	if len(limiterPayloads) == 0 || wireGuardRevokePayloadHasMapping(limiterPayloads[len(limiterPayloads)-1]) {
 		t.Fatalf("successful selection revoke retained limiter mapping: %#v", limiterPayloads)
+	}
+}
+
+func TestLimiterWireGuardManagedSourceResidualState(t *testing.T) {
+	settings, serverPublicKey := wireGuardCredentialTestSettings(t)
+	agent := &wireGuardRevokeAgent{settings: settings}
+	repo, server, remote, pusher := newWireGuardRevokeFixture(t, agent)
+	ctx := context.Background()
+
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "wg-revoke", Protocol: "wireguard", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "wg-revoke",
+		ClashConfig: `{"name":"wg-revoke","type":"wireguard","server":"203.0.113.10","port":51820,"private-key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","public-key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+	inbound := map[string]interface{}{
+		"tag": "wg-revoke", "listen": "0.0.0.0", "port": float64(51820), "protocol": "wireguard",
+		"settings": settings,
+	}
+	seedHandlerManagedWireGuardProvenance(t, repo, server, &node, inbound,
+		"managed-wireguard:limiter-source-state", true)
+	item, _, err := repo.UpsertManualUserNodeGrant(ctx, "alice", node.ID, nil, "admin")
+	if err != nil {
+		t.Fatalf("UpsertManualUserNodeGrant: %v", err)
+	}
+	saveWireGuardRevokeCredential(t, repo, "alice", server.ID, serverPublicKey)
+	credential, err := repo.GetUserInboundConfig(ctx, "alice", server.ID, "wg-revoke")
+	if err != nil {
+		t.Fatalf("GetUserInboundConfig: %v", err)
+	}
+	if err := repo.SetUserNodeGrantCredential(ctx, item.Grant.ID, credential.ID); err != nil {
+		t.Fatalf("SetUserNodeGrantCredential: %v", err)
+	}
+	inactive, err := repo.SetUserNodeGrantDesiredState(ctx, item.Grant.ID, "alice",
+		storage.ManagedDesiredInactive, "admin")
+	if err != nil {
+		t.Fatalf("SetUserNodeGrantDesiredState: %v", err)
+	}
+
+	configs, err := pusher.BuildLimiterConfigForServer(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("build unknown revoke limiter: %v", err)
+	}
+	limit, ok := wireGuardRevokeLatestUserLimit(configs)
+	if !ok || limit.SpeedLimit != revocationResidualDenySpeedBytes ||
+		limit.DeviceLimit != revocationResidualDenyConnectionLimit ||
+		!wireGuardRevokePayloadsHaveMapping(configs) {
+		t.Fatalf("unknown revoke limiter=%+v found=%v configs=%#v, want strict mapped residual", limit, ok, configs)
+	}
+
+	settled, err := repo.MarkUserInboundAccessSourceApplied(ctx, inactive.Source.ID,
+		inactive.Source.Generation, storage.ManagedObservedInactive, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("MarkUserInboundAccessSourceApplied inactive: %v", err)
+	}
+	configs, err = pusher.BuildLimiterConfigForServer(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("build confirmed inactive limiter: %v", err)
+	}
+	if wireGuardRevokePayloadsHaveMapping(configs) {
+		t.Fatalf("confirmed inactive source retained WireGuard mapping: source=%+v configs=%#v", settled, configs)
+	}
+
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "legacy-wg", CycleDays: 30, Nodes: []int64{node.ID},
+		SpeedLimitMbps: 5, DeviceLimit: 2,
+	})
+	if err != nil {
+		t.Fatalf("CreatePackage: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, now.Add(-time.Hour), now.Add(time.Hour), false, 1); err != nil {
+		t.Fatalf("AssignPackageToUser: %v", err)
+	}
+	user, err := repo.GetUser(ctx, "alice")
+	if err != nil {
+		t.Fatalf("GetUser: %v", err)
+	}
+	if err := addUserToInboundWithExpiryAndLimiter(ctx, remote, repo, pusher, user,
+		server.ID, "wg-revoke", user.PackageEndDate, true); err != nil {
+		t.Fatalf("re-add legacy package WireGuard peer: %v", err)
+	}
+	_, addCalls, _ := agent.counts()
+	if addCalls != 1 {
+		t.Fatalf("legacy package add calls=%d, want 1", addCalls)
+	}
+	pkg, err := repo.GetPackage(ctx, packageID)
+	if err != nil {
+		t.Fatalf("GetPackage: %v", err)
+	}
+	pkg.Nodes = []int64{}
+	if err := repo.UpdatePackage(ctx, *pkg); err != nil {
+		t.Fatalf("remove WireGuard node from package: %v", err)
+	}
+
+	configs, err = pusher.BuildLimiterConfigForServer(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("build stale package limiter: %v", err)
+	}
+	limit, ok = wireGuardRevokeLatestUserLimit(configs)
+	if !ok || limit.SpeedLimit != revocationResidualDenySpeedBytes ||
+		limit.DeviceLimit != revocationResidualDenyConnectionLimit ||
+		!wireGuardRevokePayloadsHaveMapping(configs) {
+		t.Fatalf("historical source masked package residual: limit=%+v found=%v configs=%#v", limit, ok, configs)
+	}
+
+	if err := repo.DeleteUserInboundConfig(ctx, "alice", server.ID, "wg-revoke"); err != nil {
+		t.Fatalf("DeleteUserInboundConfig: %v", err)
+	}
+	configs, err = pusher.BuildLimiterConfigForServer(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("build limiter after credential cleanup: %v", err)
+	}
+	if wireGuardRevokePayloadsHaveMapping(configs) {
+		t.Fatalf("credential cleanup retained WireGuard mapping: %#v", configs)
 	}
 }
 

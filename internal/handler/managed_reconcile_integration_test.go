@@ -115,7 +115,7 @@ func (a *managedFakeAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func managedReadyAgentCapabilities() AgentCapabilities {
 	return AgentCapabilities{
 		ManagedClientsV1: true, ClientExpiry: true,
-		LimiterReplace: true, LimiterReplaceAck: true,
+		LimiterReplace: true, LimiterReplaceAck: true, LimiterDeniedV1: true,
 	}
 }
 

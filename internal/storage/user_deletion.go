@@ -393,6 +393,14 @@ WHERE username = ? AND (
 	if pendingSources != 0 {
 		return false, nil
 	}
+	var pendingRoutedRevokes int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_subaccounts
+WHERE username = ? AND (revoke_pending = 1 OR activation_pending = 1)`, username).Scan(&pendingRoutedRevokes); err != nil {
+		return false, err
+	}
+	if pendingRoutedRevokes != 0 {
+		return false, nil
+	}
 	forwardingReady, err := userForwardDeletionReadyTx(ctx, tx, username)
 	if err != nil {
 		return false, err

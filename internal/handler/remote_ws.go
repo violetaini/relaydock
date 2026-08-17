@@ -103,6 +103,10 @@ type AgentCapabilities struct {
 	// WireGuardPeerUsersV1 表示 Agent 支持按 WireGuard Peer 的隧道源地址识别用户，
 	// 并支持以 publicKey 为身份原子增删 Peer。没有该能力时不能安全提供多用户 WireGuard。
 	WireGuardPeerUsersV1 bool `json:"wireguard_peer_users_v1,omitempty"`
+	// LimiterDeniedV1 means limiter user entries with denied=true are enforced
+	// as an explicit connection rejection, including existing unlimited users.
+	// A legacy Agent can ACK the same JSON while silently ignoring this field.
+	LimiterDeniedV1 bool `json:"limiter_denied_v1,omitempty"`
 	// AgentUninstallV2 表示 Agent 支持两阶段安全自卸载。主控在接单回执后
 	// 继续等待一次性 callback 确认清理完成，随后才删除服务器记录。
 	AgentUninstallV2 bool `json:"agent_uninstall_v2,omitempty"`
@@ -199,6 +203,10 @@ type WSUserLimitInfo struct {
 	Email       string `json:"email"`
 	SpeedLimit  uint64 `json:"speed_limit"`
 	DeviceLimit int    `json:"device_limit"`
+	// Denied is an explicit fail-closed revocation state. It is separate from
+	// the small residual throttle kept for old agents: new agents reject the
+	// connection and stop existing limiter buckets when this flag is set.
+	Denied bool `json:"denied,omitempty"`
 	// ConnGroup 连接数计数分组键 = "<username>|<物理父节点ID>"。一个用户在同一物理节点(含其路由
 	// 出站子账户)的多个 email 共享同一 group → 共享一份连接配额(问题1:20 而非 20×N)。空=老 agent 兼容,退化按 email。
 	ConnGroup string `json:"conn_group,omitempty"`
@@ -1445,6 +1453,9 @@ func (h *RemoteWSHandler) SendLimiterConfig(serverID int64, configs []WSLimiterC
 
 	wsConn.mu.Lock()
 	defer wsConn.mu.Unlock()
+	if limiterSnapshotsContainDenied(configs) && !wsConn.Capabilities.LimiterDeniedV1 {
+		return errors.New("Agent lacks limiter_denied_v1 capability; upgrade and reconnect relaydock-agent")
+	}
 
 	for _, cfg := range configs {
 		payload, err := json.Marshal(cfg)

@@ -669,6 +669,21 @@ func (h *ManagedNodesHandler) reconcileSourceMutationLocked(ctx context.Context,
 				if applyErr == nil && directGrant != nil && directGrant.CredentialConfigID != nil {
 					applyErr = h.repo.ClearUserNodeGrantCredential(ctx, directGrant.ID, *directGrant.CredentialConfigID)
 				}
+			} else if applyErr == nil && source.SourceType == storage.ManagedSourceLegacyReview &&
+				source.SuspendReason == storage.ManagedSuspendAdminDisabled {
+				// Legacy-review sources also back durable package credential cleanup.
+				// Once the peer is gone there is no remaining authority for this row,
+				// so remove it before publishing the checked empty replacement.
+				if credential != nil {
+					applyErr = h.repo.DeleteUserInboundConfig(ctx, source.Username, source.ServerID, source.InboundTag)
+				}
+				if applyErr == nil {
+					if h.limiter == nil {
+						applyErr = errors.New("limiter pusher is not available")
+					} else {
+						applyErr = h.limiter.PushToServerChecked(ctx, source.ServerID)
+					}
+				}
 			}
 		}
 	}
@@ -829,6 +844,12 @@ func (h *ManagedNodesHandler) reconcileAll(ctx context.Context) {
 			}
 			log.Printf("[ManagedNodes] reconcile source=%d server=%d failed: %v", source.ID, source.ServerID, err)
 		}
+	}
+	for _, revokeErr := range retryPendingUserPrivateRoutedRevokes(ctx, h.remoteManage, h.repo, h.limiter) {
+		log.Printf("[ManagedNodes] retry private routed revoke failed: %v", revokeErr)
+	}
+	for _, activationErr := range retryPendingUserPrivateRoutedActivations(ctx, h.remoteManage, h.repo, h.limiter) {
+		log.Printf("[ManagedNodes] retry private routed activation failed: %v", activationErr)
 	}
 	h.finalizeReadyUserDeletions(ctx)
 }

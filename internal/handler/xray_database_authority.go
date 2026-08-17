@@ -299,12 +299,12 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 			if !overLimit {
 				var packageErr error
 				if protocol == "wireguard" {
-					hasPackage, _, packageErr = hasLegacyPackageInboundAccessIgnoringOverLimit(
-						ctx, h.repo, config.Username, serverID, config.InboundTag, now,
+					hasPackage, _, packageErr = hasLegacyPackageInboundAccessIgnoringOverLimitProtocol(
+						ctx, h.repo, config.Username, serverID, config.InboundTag, protocol, now,
 					)
 				} else {
-					hasPackage, _, packageErr = hasLegacyPackageInboundAccess(
-						ctx, h.repo, config.Username, serverID, config.InboundTag, now,
+					hasPackage, _, packageErr = hasLegacyPackageInboundAccessProtocol(
+						ctx, h.repo, config.Username, serverID, config.InboundTag, protocol, now,
 					)
 				}
 				if packageErr != nil {

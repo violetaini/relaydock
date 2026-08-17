@@ -344,8 +344,9 @@ func TestManagedSelectionLimitsFeedLimiterAndDormantCredentialIsCleared(t *testi
 	if err != nil {
 		t.Fatalf("build dormant limiter: %v", err)
 	}
-	if len(configs) != 1 || configs[0].InboundTag != "vless-in" || len(configs[0].Users) != 0 {
-		t.Fatalf("dormant managed credential was not cleared: %#v", configs)
+	if len(configs) != 1 || configs[0].InboundTag != "vless-in" || len(configs[0].Users) != 1 ||
+		!configs[0].Users[0].Denied {
+		t.Fatalf("pending managed credential was not denied: %#v", configs)
 	}
 }
 
