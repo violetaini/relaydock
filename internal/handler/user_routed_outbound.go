@@ -806,7 +806,7 @@ func suspendUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo
 			if rm == nil {
 				return failRevoke(errors.New("remote manager is unavailable"))
 			}
-			if err := removeRuleByMarktag(leasedCtx, rm, serverID, current.RoutedRuleMarktag); err != nil {
+			if err := removePrivateRoutedRuleByMarktag(leasedCtx, rm, serverID, current.RoutedRuleMarktag); err != nil {
 				return failRevoke(fmt.Errorf("remove rule for private routed node %d: %w", n.ID, err))
 			}
 			if err := removeClientFromInbound(leasedCtx, rm, serverID, current.InboundTag, sa.Email); err != nil {
@@ -1306,7 +1306,7 @@ func deleteUserPrivateRoutedAll(ctx context.Context, rm *RemoteManageHandler, re
 			if current.OriginalServer != n.OriginalServer {
 				return fmt.Errorf("private routed node %d server changed; retry required", n.ID)
 			}
-			if err := removeRuleByMarktag(leasedCtx, rm, serverID, current.RoutedRuleMarktag); err != nil {
+			if err := removePrivateRoutedRuleByMarktag(leasedCtx, rm, serverID, current.RoutedRuleMarktag); err != nil {
 				return fmt.Errorf("remove rule for private routed node %d: %w", n.ID, err)
 			}
 			rmOutBody, _ := json.Marshal(map[string]string{"action": "remove", "tag": current.RoutedOutboundTag})
