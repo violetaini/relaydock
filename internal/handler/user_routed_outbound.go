@@ -1235,45 +1235,10 @@ func removePrivateRoutedClient(ctx context.Context, rm *RemoteManageHandler, ser
 }
 
 func removePrivateRoutedRuleByMarktag(ctx context.Context, rm *RemoteManageHandler, serverID int64, marktag string) error {
-	mu := acquireRoutingMutateLock(serverID)
-	defer mu.Unlock()
-	for attempts := 0; attempts < 32; attempts++ {
-		result, err := rm.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/routing", nil)
-		if err != nil {
-			return err
-		}
-		var response struct {
-			Success bool                   `json:"success"`
-			Routing map[string]interface{} `json:"routing"`
-		}
-		if err := json.Unmarshal(result, &response); err != nil {
-			return err
-		}
-		if !response.Success {
-			return errors.New("Agent did not acknowledge routing snapshot")
-		}
-		rules, _ := response.Routing["rules"].([]interface{})
-		index := -1
-		for i, rawRule := range rules {
-			rule, _ := rawRule.(map[string]interface{})
-			if tag, _ := rule["marktag"].(string); tag == marktag {
-				index = i
-				break
-			}
-		}
-		if index < 0 {
-			return nil
-		}
-		body, _ := json.Marshal(map[string]interface{}{"action": "remove_rule", "index": index})
-		mutation, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", body)
-		if err != nil {
-			return err
-		}
-		if err := requirePrivateRoutedMutationACK(mutation, "remove private routed rule"); err != nil {
-			return err
-		}
-	}
-	return fmt.Errorf("too many duplicate private routed rules for marktag %s", marktag)
+	return removeRoutingRulesMatchingHot(ctx, rm, serverID, "remove private routed rule", func(rule map[string]interface{}) bool {
+		tag, _ := rule["marktag"].(string)
+		return tag == marktag
+	})
 }
 
 // deleteUserPrivateRoutedAll 用户账户删除时调用:清理该用户所有 routed_owner='user' 节点的

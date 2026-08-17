@@ -132,7 +132,7 @@ func (a *privateRoutedRevokeAgent) ServeHTTP(w http.ResponseWriter, r *http.Requ
 				a.warnAddRule--
 				warning = "forced add rule runtime warning"
 			}
-		case "remove_rule":
+		case "remove_rule", "remove_rule_hot":
 			a.present = false
 		}
 		a.mu.Unlock()
@@ -607,7 +607,7 @@ func TestPrivateRoutedDeleteRuntimeWarningRetainsDurableRetry(t *testing.T) {
 	}
 	events := agent.snapshotEvents()
 	deny := privateRoutedEventIndex(events, "limiter:deny")
-	rule := privateRoutedEventIndex(events, "rule:remove_rule")
+	rule := privateRoutedEventIndex(events, "rule:remove_rule_hot")
 	client := privateRoutedEventIndex(events, "client:remove-client")
 	outbound := privateRoutedEventIndex(events, "outbound:remove")
 	if deny < 0 || rule < 0 || client < 0 || outbound < 0 || !(deny < rule && rule < client && client < outbound) {

@@ -4026,6 +4026,15 @@ func (h *RemoteManageHandler) HandleRouting(w http.ResponseWriter, r *http.Reque
 			_, _ = w.Write(result)
 			return
 		}
+		leasedCtx, release, leaseErr := acquireRemoteMutationLease(r.Context(), h, id)
+		if leaseErr != nil {
+			remoteWriteForwardError(w, leaseErr)
+			return
+		}
+		defer release()
+		r = r.WithContext(leasedCtx)
+		routingLock := acquireRoutingMutateLock(id)
+		defer routingLock.Unlock()
 	}
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/routing", body)

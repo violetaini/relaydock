@@ -457,11 +457,12 @@ func TestRemoteManageRoutingHotActionSupportsSetHotOnlyAgentAndRejectsStaleRule(
 }
 
 type atomicRoutingAgent struct {
-	mu            sync.Mutex
-	routing       map[string]interface{}
-	nativePosts   int
-	snapshotReads int
-	setHotPosts   int
+	mu                      sync.Mutex
+	routing                 map[string]interface{}
+	nativePosts             int
+	snapshotReads           int
+	setHotPosts             int
+	prependBeforeNativeOnce string
 }
 
 func (agent *atomicRoutingAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -497,6 +498,12 @@ func (agent *atomicRoutingAgent) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	agent.nativePosts++
+	if agent.prependBeforeNativeOnce != "" {
+		rules, _ := agent.routing["rules"].([]interface{})
+		rule := map[string]interface{}{"type": "field", "outboundTag": agent.prependBeforeNativeOnce}
+		agent.routing["rules"] = append([]interface{}{rule}, rules...)
+		agent.prependBeforeNativeOnce = ""
+	}
 	candidate, err := mutateRoutingRules(agent.routing, request.Action, request)
 	if err != nil {
 		status := http.StatusBadRequest
@@ -612,6 +619,30 @@ func TestFederatedRoutingHotActionPreservesAtomicConflict(t *testing.T) {
 	defer agent.mu.Unlock()
 	if agent.nativePosts != 1 || agent.snapshotReads != 0 || agent.setHotPosts != 0 {
 		t.Fatalf("federated conflict counters native=%d snapshots=%d set_hot=%d", agent.nativePosts, agent.snapshotReads, agent.setHotPosts)
+	}
+}
+
+func TestRemoveRoutingRulesMatchingHotRetriesStaleFederatedIndex(t *testing.T) {
+	agent := &atomicRoutingAgent{
+		routing:                 routingWithOutboundTags("target", "keep"),
+		prependBeforeNativeOnce: "concurrent",
+	}
+	remote, serverID := newFederatedRoutingFixture(t, agent)
+	err := removeRoutingRulesMatchingHot(context.Background(), remote, serverID, "remove target", func(rule map[string]interface{}) bool {
+		outboundTag, _ := rule["outboundTag"].(string)
+		return outboundTag == "target"
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	if got := routingRuleOutboundTags(agent.routing["rules"].([]interface{})); !reflect.DeepEqual(got, []string{"concurrent", "keep"}) {
+		t.Fatalf("routing tags after conflict retry = %#v", got)
+	}
+	if agent.nativePosts != 2 || agent.snapshotReads != 3 || agent.setHotPosts != 0 {
+		t.Fatalf("conflict retry counters native=%d snapshots=%d set_hot=%d", agent.nativePosts, agent.snapshotReads, agent.setHotPosts)
 	}
 }
 

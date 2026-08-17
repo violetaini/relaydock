@@ -1796,24 +1796,20 @@ func (h *nodesHandler) deleteRemoteRoutedOutbound(ctx context.Context, serverNam
 		log.Printf("[Nodes] routed delete: lookup server %q failed: %v", serverName, err)
 		return
 	}
-	// 1. routing rules by outboundTag(全删,从后往前避免 index 漂移)
-	if raw, err := h.remoteManage.forwardToRemoteServer(ctx, server.ID, "GET", "/api/child/routing", nil); err == nil {
-		var resp struct {
-			Success bool                   `json:"success"`
-			Routing map[string]interface{} `json:"routing"`
-		}
-		if json.Unmarshal(raw, &resp) == nil && resp.Routing != nil {
-			rules, _ := resp.Routing["rules"].([]interface{})
-			for i := len(rules) - 1; i >= 0; i-- {
-				rmap, _ := rules[i].(map[string]interface{})
-				if t, _ := rmap["outboundTag"].(string); t == outboundTag {
-					body, _ := json.Marshal(map[string]interface{}{"action": "remove_rule", "index": i})
-					if _, err := h.remoteManage.forwardToRemoteServer(ctx, server.ID, "POST", "/api/child/routing", body); err != nil {
-						log.Printf("[Nodes] routed delete: remove rule (server=%s tag=%s idx=%d) failed: %v", serverName, outboundTag, i, err)
-					}
-				}
-			}
-		}
+	leasedCtx, release, err := acquireRemoteMutationLease(ctx, h.remoteManage, server.ID)
+	if err != nil {
+		log.Printf("[Nodes] routed delete: acquire server %q mutation lease failed: %v", serverName, err)
+		return
+	}
+	defer release()
+	ctx = leasedCtx
+	// 1. routing rules by outboundTag. Expected-rule guarded mutations prevent
+	// a concurrent writer from shifting an index underneath this cleanup.
+	if err := removeRoutingRulesMatchingHot(ctx, h.remoteManage, server.ID, "remove routed node rules", func(rule map[string]interface{}) bool {
+		tag, _ := rule["outboundTag"].(string)
+		return tag == outboundTag
+	}); err != nil {
+		log.Printf("[Nodes] routed delete: remove rules (server=%s tag=%s) failed: %v", serverName, outboundTag, err)
 	}
 	// 2. outbound by tag
 	rmOut, _ := json.Marshal(map[string]string{"action": "remove", "tag": outboundTag})
@@ -1995,23 +1991,19 @@ func (h *nodesHandler) cleanupOutboundsTargetingNodes(ctx context.Context, nodes
 // removeOutboundAndRules 删指定 server 上的 outbound(by tag)+ 所有引用该 outboundTag 的 routing rule
 // (逆序删避免 index 漂移,复用 deleteRemoteRoutedOutbound 同款范式)+ best-effort 删 user_outbounds 行。
 func (h *nodesHandler) removeOutboundAndRules(ctx context.Context, serverID int64, serverName, tag string) {
-	if raw, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/routing", nil); err == nil {
-		var resp struct {
-			Success bool                   `json:"success"`
-			Routing map[string]interface{} `json:"routing"`
-		}
-		if json.Unmarshal(raw, &resp) == nil && resp.Routing != nil {
-			rules, _ := resp.Routing["rules"].([]interface{})
-			for i := len(rules) - 1; i >= 0; i-- {
-				rmap, _ := rules[i].(map[string]interface{})
-				if t, _ := rmap["outboundTag"].(string); t == tag {
-					body, _ := json.Marshal(map[string]interface{}{"action": "remove_rule", "index": i})
-					if _, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", body); err != nil {
-						log.Printf("[Nodes] cleanup outbound-target: remove rule (server=%s tag=%s idx=%d) failed: %v", serverName, tag, i, err)
-					}
-				}
-			}
-		}
+	leasedCtx, release, err := acquireRemoteMutationLease(ctx, h.remoteManage, serverID)
+	if err != nil {
+		log.Printf("[Nodes] cleanup outbound-target: acquire server %s mutation lease failed: %v", serverName, err)
+		return
+	}
+	defer release()
+	ctx = leasedCtx
+
+	if err := removeRoutingRulesMatchingHot(ctx, h.remoteManage, serverID, "remove outbound target rules", func(rule map[string]interface{}) bool {
+		outboundTag, _ := rule["outboundTag"].(string)
+		return outboundTag == tag
+	}); err != nil {
+		log.Printf("[Nodes] cleanup outbound-target: remove rules (server=%s tag=%s) failed: %v", serverName, tag, err)
 	}
 	rmOut, _ := json.Marshal(map[string]string{"action": "remove", "tag": tag})
 	if _, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", rmOut); err != nil {

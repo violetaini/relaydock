@@ -250,10 +250,15 @@ func (h *RoutedOutboundHandler) create(w http.ResponseWriter, r *http.Request) {
 		"outboundTag": outboundTag,
 	}
 	addRuleBody, _ := json.Marshal(map[string]interface{}{"action": "add_rule", "rule": rule})
-	addRuleResponse, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", addRuleBody)
-	if err == nil {
-		err = applyAgentConfigMutationACK(ctx, h.remoteManage, serverID, "RoutedRuleAdd", addRuleResponse)
-	}
+	err = func() error {
+		routingLock := acquireRoutingMutateLock(serverID)
+		defer routingLock.Unlock()
+		addRuleResponse, addErr := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", addRuleBody)
+		if addErr != nil {
+			return addErr
+		}
+		return applyAgentConfigMutationACK(ctx, h.remoteManage, serverID, "RoutedRuleAdd", addRuleResponse)
+	}()
 	if err != nil {
 		// rollback: 删 outbound + admin client
 		removeOutBody, _ := json.Marshal(map[string]string{"action": "remove", "tag": outboundTag})
@@ -543,6 +548,54 @@ func setRoutedRoutingHot(ctx context.Context, rm *RemoteManageHandler, serverID 
 		message = "Agent did not acknowledge hot routing update"
 	}
 	return errors.New(message)
+}
+
+func removeRoutingRulesMatchingHot(ctx context.Context, rm *RemoteManageHandler, serverID int64, label string, matches func(map[string]interface{}) bool) error {
+	for attempts := 0; attempts < 64; attempts++ {
+		routing, err := fetchRoutedRoutingSnapshot(ctx, rm, serverID)
+		if err != nil {
+			return err
+		}
+		rules, _ := routing["rules"].([]interface{})
+		matchedIndex := -1
+		var expectedRule map[string]interface{}
+		for index, rawRule := range rules {
+			rule, _ := rawRule.(map[string]interface{})
+			if rule != nil && matches(rule) {
+				matchedIndex = index
+				expectedRule = rule
+				break
+			}
+		}
+		if matchedIndex < 0 {
+			return nil
+		}
+
+		request := ChildRoutingRequest{
+			Action:       "remove_rule_hot",
+			Index:        &matchedIndex,
+			ExpectedRule: expectedRule,
+		}
+		body, err := json.Marshal(request)
+		if err != nil {
+			return fmt.Errorf("%s: marshal mutation: %w", label, err)
+		}
+		response, err := rm.performRemoteRoutingRuleHotAction(ctx, serverID, body, request)
+		if err != nil {
+			if status, _, _, ok := routingRemoteHTTPFailure(err); ok && status == http.StatusConflict {
+				continue
+			}
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		deferred, err := inspectAgentConfigMutationACK(response)
+		if err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		if deferred {
+			return fmt.Errorf("%s: Agent deferred runtime apply", label)
+		}
+	}
+	return fmt.Errorf("%s: routing changed too frequently", label)
 }
 
 func mutateRoutingRuleUser(ctx context.Context, rm *RemoteManageHandler, serverID int64, selectorKey, selectorValue, userEmail string, add bool) (bool, error) {
@@ -1004,44 +1057,10 @@ func removeRuleByMarktag(ctx context.Context, rm *RemoteManageHandler, serverID 
 	}
 	defer release()
 	ctx = leasedCtx
-
-	result, err := rm.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/routing", nil)
-	if err != nil {
-		return err
-	}
-	var resp struct {
-		Success bool                   `json:"success"`
-		Routing map[string]interface{} `json:"routing"`
-	}
-	if err := json.Unmarshal(result, &resp); err != nil {
-		return err
-	}
-	if !resp.Success {
-		return errors.New("Agent did not acknowledge routing snapshot")
-	}
-	if resp.Routing == nil {
-		return nil
-	}
-	rules, _ := resp.Routing["rules"].([]interface{})
-	for i, ru := range rules {
-		rmap, _ := ru.(map[string]interface{})
-		if t, _ := rmap["marktag"].(string); t == marktag {
-			body, _ := json.Marshal(map[string]interface{}{"action": "remove_rule", "index": i})
-			response, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", body)
-			if err != nil {
-				return err
-			}
-			deferred, err := inspectAgentConfigMutationACK(response)
-			if err != nil {
-				return err
-			}
-			if deferred {
-				return fmt.Errorf("server %d Agent deferred routing rule removal", serverID)
-			}
-			return nil
-		}
-	}
-	return nil
+	return removeRoutingRulesMatchingHot(ctx, rm, serverID, "remove routed rule", func(rule map[string]interface{}) bool {
+		tag, _ := rule["marktag"].(string)
+		return tag == marktag
+	})
 }
 
 // routingRuleAddition 描述"给某条 routing rule 加一个 user email"的待办,

@@ -152,6 +152,17 @@ func (h *FederationHandler) handleManage(w http.ResponseWriter, r *http.Request,
 	if req.Method == http.MethodPost && cleanPath == "/api/child/routing" &&
 		json.Unmarshal(body, &routingRequest) == nil && isRoutingRuleHotAction(strings.ToLower(strings.TrimSpace(routingRequest.Action))) {
 		result, ferr = h.remoteManage.performRemoteRoutingRuleHotAction(r.Context(), serverID, body, routingRequest)
+	} else if req.Method == http.MethodPost && (cleanPath == "/api/child/routing" || cleanPath == "/api/child/batch-apply") {
+		result, ferr = func() ([]byte, error) {
+			leasedCtx, release, err := acquireRemoteMutationLease(r.Context(), h.remoteManage, serverID)
+			if err != nil {
+				return nil, err
+			}
+			defer release()
+			routingLock := acquireRoutingMutateLock(serverID)
+			defer routingLock.Unlock()
+			return h.remoteManage.ForwardToAgent(leasedCtx, serverID, req.Method, req.Path, body)
+		}()
 	} else {
 		result, ferr = h.remoteManage.ForwardToAgent(r.Context(), serverID, req.Method, req.Path, body)
 	}

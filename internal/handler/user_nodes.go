@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -224,7 +223,9 @@ func (h *UserNodesHandler) handleAddOutbound(w http.ResponseWriter, r *http.Requ
 		"action": "add_rule",
 		"rule":   rule,
 	})
+	routingLock := acquireRoutingMutateLock(serverID)
 	routingResult, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", routingBody)
+	routingLock.Unlock()
 	if err != nil {
 		h.rollbackAddedUserOutbound(ctx, serverID, email, namespacedTag)
 		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("添加路由规则失败: %v", err))
@@ -487,55 +488,27 @@ func (h *UserNodesHandler) getUserEmailForInbound(ctx context.Context, username 
 
 // removeRoutingRule 从子服务器的路由配置中删除匹配的规则
 func (h *UserNodesHandler) removeRoutingRule(ctx context.Context, serverID int64, email, outboundTag string) error {
-	result, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/routing", nil)
-	if err != nil {
-		return fmt.Errorf("获取路由配置: %w", err)
-	}
-
-	var resp struct {
-		Success bool                   `json:"success"`
-		Routing map[string]interface{} `json:"routing"`
-	}
-	if err := json.Unmarshal(result, &resp); err != nil || !resp.Success {
-		return errors.New("Agent 未确认路由配置快照")
-	}
-
-	rules, _ := resp.Routing["rules"].([]interface{})
-	removeIndex := -1
-	for i, r := range rules {
-		rule, ok := r.(map[string]interface{})
-		if !ok {
-			continue
-		}
+	return removeRoutingRulesMatchingHot(ctx, h.remoteManage, serverID, "remove user outbound rule", func(rule map[string]interface{}) bool {
 		ruleOutbound, _ := rule["outboundTag"].(string)
 		if ruleOutbound != outboundTag {
-			continue
+			return false
 		}
-		users, _ := rule["user"].([]interface{})
-		for _, u := range users {
-			if s, ok := u.(string); ok && s == email {
-				removeIndex = i
-				break
+		switch users := rule["user"].(type) {
+		case []interface{}:
+			for _, rawUser := range users {
+				if user, _ := rawUser.(string); user == email {
+					return true
+				}
+			}
+		case []string:
+			for _, user := range users {
+				if user == email {
+					return true
+				}
 			}
 		}
-		if removeIndex >= 0 {
-			break
-		}
-	}
-
-	if removeIndex < 0 {
-		return nil
-	}
-
-	removeBody, _ := json.Marshal(map[string]interface{}{
-		"action": "remove_rule",
-		"index":  removeIndex,
+		return false
 	})
-	response, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", removeBody)
-	if err != nil {
-		return err
-	}
-	return applyAgentConfigMutationACK(ctx, h.remoteManage, serverID, "UserOutboundRuleRemove", response)
 }
 
 func (h *UserNodesHandler) rollbackAddedOutbound(ctx context.Context, serverID int64, outboundTag string) {
