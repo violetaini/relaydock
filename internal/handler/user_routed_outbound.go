@@ -1198,6 +1198,8 @@ func ensurePrivateRoutedOutbound(ctx context.Context, rm *RemoteManageHandler, s
 }
 
 func addPrivateRoutedRule(ctx context.Context, rm *RemoteManageHandler, serverID int64, node storage.RoutedNodeDetail, email string) error {
+	mu := acquireRoutingMutateLock(serverID)
+	defer mu.Unlock()
 	rule := map[string]interface{}{
 		"type": "field", "marktag": node.RoutedRuleMarktag, "user": []string{email},
 		"inboundTag": []string{node.InboundTag}, "outboundTag": node.RoutedOutboundTag,
@@ -1233,6 +1235,8 @@ func removePrivateRoutedClient(ctx context.Context, rm *RemoteManageHandler, ser
 }
 
 func removePrivateRoutedRuleByMarktag(ctx context.Context, rm *RemoteManageHandler, serverID int64, marktag string) error {
+	mu := acquireRoutingMutateLock(serverID)
+	defer mu.Unlock()
 	for attempts := 0; attempts < 32; attempts++ {
 		result, err := rm.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/routing", nil)
 		if err != nil {

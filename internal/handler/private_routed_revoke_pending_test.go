@@ -164,19 +164,21 @@ func (a *privateRoutedRevokeAgent) ServeHTTP(w http.ResponseWriter, r *http.Requ
 			a.warnOutbound--
 			warning = "forced outbound runtime warning"
 		}
-		if a.outbounds == nil {
-			a.outbounds = make(map[string]bool)
+		if !fail {
+			if a.outbounds == nil {
+				a.outbounds = make(map[string]bool)
+			}
+			switch action {
+			case "add":
+				outbound, _ := body["outbound"].(map[string]any)
+				tag, _ := outbound["tag"].(string)
+				a.outbounds[tag] = true
+			case "remove":
+				tag, _ := body["tag"].(string)
+				delete(a.outbounds, tag)
+			}
 		}
-		switch action {
-		case "add":
-			outbound, _ := body["outbound"].(map[string]any)
-			tag, _ := outbound["tag"].(string)
-			a.outbounds[tag] = true
-		case "remove":
-			tag, _ := body["tag"].(string)
-			delete(a.outbounds, tag)
-		}
-		failAfterApply := action == "add" && a.failAddAfterApply > 0
+		failAfterApply := !fail && action == "add" && a.failAddAfterApply > 0
 		if failAfterApply {
 			a.failAddAfterApply--
 		}
