@@ -923,6 +923,103 @@ func withStableUserPackageAuthorizationLease(
 	}
 }
 
+func userHasManagedNodeCreations(ctx context.Context, repo *storage.TrafficRepository, username string) (bool, error) {
+	creations, err := repo.ListUserManagedNodeCreations(ctx, username, 0)
+	if err != nil {
+		return false, err
+	}
+	return len(creations) > 0, nil
+}
+
+func preparePackageUserManagedNodeCreationDenies(ctx context.Context, managed *ManagedNodesHandler, username, actor string) ([]int64, error) {
+	if managed == nil || managed.repo == nil {
+		return nil, errors.New("managed node handler is unavailable")
+	}
+	creations, err := managed.repo.ListUserManagedNodeCreations(ctx, username, 0)
+	if err != nil {
+		return nil, err
+	}
+	packageCreations := make([]storage.UserManagedNodeCreation, 0, len(creations))
+	for _, creation := range creations {
+		grant, grantErr := managed.repo.GetUserServerGrant(ctx, creation.GrantID)
+		if grantErr != nil {
+			return nil, fmt.Errorf("load user-managed creation grant %d: %w", creation.GrantID, grantErr)
+		}
+		if grant.SourceType == storage.GrantSourcePackage {
+			packageCreations = append(packageCreations, creation)
+		}
+	}
+	if len(packageCreations) == 0 {
+		return nil, nil
+	}
+	if managed.limiter == nil {
+		return nil, errors.New("managed node deny publisher is unavailable")
+	}
+	sort.Slice(packageCreations, func(i, j int) bool {
+		if packageCreations[i].ServerID != packageCreations[j].ServerID {
+			return packageCreations[i].ServerID < packageCreations[j].ServerID
+		}
+		return packageCreations[i].ID < packageCreations[j].ID
+	})
+	for first := 0; first < len(packageCreations); {
+		serverID := packageCreations[first].ServerID
+		last := first + 1
+		for last < len(packageCreations) && packageCreations[last].ServerID == serverID {
+			last++
+		}
+		leasedCtx, releaseServer, leaseErr := managed.repo.AcquireRemoteServerExclusiveMutationLease(ctx, serverID)
+		if leaseErr != nil {
+			return nil, leaseErr
+		}
+		prepareErr := func() error {
+			deactivated := false
+			for _, expected := range packageCreations[first:last] {
+				current, currentErr := managed.repo.GetUserManagedNodeCreation(leasedCtx, expected.ID)
+				if errors.Is(currentErr, storage.ErrUserManagedNodeCreationNotFound) {
+					continue
+				}
+				if currentErr != nil {
+					return currentErr
+				}
+				if current.Username != username || current.ServerID != serverID || current.GrantID != expected.GrantID {
+					return storage.ErrManagedVersionConflict
+				}
+				if recovered, recoverErr := managed.repo.RecoverUserManagedNodeCreationLinks(leasedCtx, current.ID); recoverErr == nil {
+					current = recovered
+				} else if !errors.Is(recoverErr, storage.ErrUserManagedNodeCreationNotFound) {
+					return recoverErr
+				}
+				if current.SelectionID == nil {
+					deactivated = true
+					continue
+				}
+				if _, deactivateErr := managed.repo.DeactivateUserNodeSelection(leasedCtx, username,
+					*current.SelectionID, actor, storage.ManagedSuspendAdminDisabled, time.Now().UTC()); deactivateErr != nil &&
+					!errors.Is(deactivateErr, storage.ErrUserNodeSelectionNotFound) {
+					return deactivateErr
+				}
+				deactivated = true
+			}
+			if deactivated {
+				if err := managed.limiter.pushToServerCheckedLeased(leasedCtx, serverID); err != nil {
+					return fmt.Errorf("acknowledge user-managed creation deny on server %d: %w", serverID, err)
+				}
+			}
+			return nil
+		}()
+		releaseServer()
+		if prepareErr != nil {
+			return nil, prepareErr
+		}
+		first = last
+	}
+	ids := make([]int64, 0, len(packageCreations))
+	for _, creation := range packageCreations {
+		ids = append(ids, creation.ID)
+	}
+	return ids, nil
+}
+
 func unbindUserPackageLocked(ctx context.Context, repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher, username string, deleteSubscription bool) error {
 	var mu sync.Mutex
 	var mutationErrs []error
@@ -1015,14 +1112,26 @@ func unbindUserPackageLocked(ctx context.Context, repo *storage.TrafficRepositor
 	if joined := errors.Join(mutationErrs...); joined != nil {
 		return restoreOnFailure(joined)
 	}
-	if pusher != nil {
-		go pusher.PushToAllServersForUser(context.Background(), username)
+	preparedCreationIDs, err := preparePackageUserManagedNodeCreationDenies(ctx, packages.managed, username, "package-unbind")
+	if err != nil {
+		return restoreOnFailure(fmt.Errorf("prepare user-created node deny before package unbind: %w", err))
 	}
 	if err := repo.RemovePackageFromUser(ctx, username); err != nil && err != storage.ErrUserNotFound {
 		return restoreOnFailure(fmt.Errorf("remove package assignment for %s: %w", username, err))
 	}
+	for _, creationID := range preparedCreationIDs {
+		if _, err := repo.MarkUserManagedNodeCreationDeleting(ctx, creationID, "package authorization removed"); err != nil &&
+			!errors.Is(err, storage.ErrUserManagedNodeCreationNotFound) {
+			log.Printf("[PackageUnbind] failed to persist deleting creation %d for %s: %v", creationID, username, err)
+		}
+	}
 	if cleanupWarnings := helper.reconcileAuthorizationTombstones(ctx, username, storage.GrantSourcePackage, "package-unbind"); len(cleanupWarnings) > 0 {
-		return restoreOnFailure(fmt.Errorf("package child cleanup is incomplete: %s", strings.Join(cleanupWarnings, "; ")))
+		// The authorization transition is committed and user-managed dedicated
+		// inbounds may already have been deleted. Restoring the package here cannot
+		// recreate those private offers/runtime resources and would falsely report
+		// a rollback. Keep the package unbound; the managed reconciler owns every
+		// remaining deleting creation and inactive grant.
+		log.Printf("[PackageUnbind] durable child cleanup pending for %s: %s", username, strings.Join(cleanupWarnings, "; "))
 	}
 	// 删除该用户残留的套餐订阅(历史 auto-gen 文件)
 	if deleteSubscription {
@@ -1031,6 +1140,9 @@ func unbindUserPackageLocked(ctx context.Context, repo *storage.TrafficRepositor
 				log.Printf("[PackageUnbind] 删除用户 %s 套餐订阅记录失败: %v", username, derr)
 			}
 		}
+	}
+	if pusher != nil {
+		go pusher.PushToAllServersForUser(context.Background(), username)
 	}
 	return nil
 }
@@ -1057,8 +1169,19 @@ func unbindUserPackageWireGuardLocked(
 	if err != nil {
 		return fmt.Errorf("获取用户 %s 路由子账号失败: %w", username, err)
 	}
+	creationOwnedConfigs := make(map[int64]struct{})
 	preparedCleanups := make(map[int64]storage.UserInboundAccessSource)
 	for _, cfg := range configs {
+		ownedByCreation, ownershipErr := repo.HasUserManagedNodeCreationForInbound(
+			ctx, cfg.Username, cfg.ServerID, cfg.InboundTag,
+		)
+		if ownershipErr != nil {
+			return fmt.Errorf("check user-managed creation ownership for %s: %w", cfg.InboundTag, ownershipErr)
+		}
+		if ownedByCreation {
+			creationOwnedConfigs[cfg.ID] = struct{}{}
+			continue
+		}
 		source, prepareErr := repo.PreparePackageInboundCredentialCleanup(ctx, cfg, "package-unbind")
 		if prepareErr != nil {
 			return errors.Join(
@@ -1070,6 +1193,13 @@ func unbindUserPackageWireGuardLocked(
 	}
 
 	packages := NewPackageAssignHandler(repo, remoteManage, pusher)
+	helper := &ServiceAuthorizationHandler{
+		repo: repo, packages: packages, managed: packages.managed, forwarding: packages.forwarding,
+	}
+	packageChildren, err := helper.captureAuthorizationChildState(ctx, username, storage.GrantSourcePackage)
+	if err != nil {
+		return fmt.Errorf("capture package child access: %w", err)
+	}
 	if err := pushPreparedPackageWireGuardPoliciesChecked(ctx, pusher, preparedCleanups); err != nil {
 		return errors.Join(
 			fmt.Errorf("publish package cleanup policy: %w", err),
@@ -1083,6 +1213,9 @@ func unbindUserPackageWireGuardLocked(
 	// and restore every client already touched in this attempt.
 	revocations := make([]packageNodeRevocation, 0, len(configs)+len(subaccounts))
 	for _, cfg := range configs {
+		if _, ownedByCreation := creationOwnedConfigs[cfg.ID]; ownedByCreation {
+			continue
+		}
 		if canonicalManagedProtocol(cfg.Protocol) == "wireguard" {
 			continue
 		}
@@ -1111,23 +1244,43 @@ func unbindUserPackageWireGuardLocked(
 			)
 		}
 	}
+	preparedCreationIDs, err := preparePackageUserManagedNodeCreationDenies(
+		ctx, packages.managed, username, "package-unbind",
+	)
+	if err != nil {
+		return errors.Join(
+			fmt.Errorf("prepare user-created node deny before package unbind: %w", err),
+			restorePreparedPackageWireGuardPolicies(ctx, repo, pusher, preparedCleanups),
+			packages.restorePackageNodeRevocations(ctx, previous, revocations),
+			helper.restoreAuthorizationChildState(ctx, username, packageChildren, "package-unbind-rollback"),
+		)
+	}
 	if err := repo.RemovePackageFromUser(ctx, username); err != nil && !errors.Is(err, storage.ErrUserNotFound) {
 		persisted, readErr := repo.GetUser(ctx, username)
 		var cancelErr error
 		var restoreErr error
 		if readErr == nil && persisted.AuthorizationMode == storage.AuthorizationModePackage && persisted.PackageID == previous.PackageID {
 			cancelErr = restorePreparedPackageWireGuardPolicies(ctx, repo, pusher, preparedCleanups)
-			restoreErr = packages.restorePackageNodeRevocations(ctx, previous, revocations)
+			restoreErr = errors.Join(
+				packages.restorePackageNodeRevocations(ctx, previous, revocations),
+				helper.restoreAuthorizationChildState(ctx, username, packageChildren, "package-unbind-rollback"),
+			)
 		}
 		return errors.Join(fmt.Errorf("remove package assignment for %s: %w", username, err), readErr, cancelErr, restoreErr)
 	}
-
-	helper := &ServiceAuthorizationHandler{
-		repo: repo, packages: packages, managed: packages.managed, forwarding: packages.forwarding,
+	for _, creationID := range preparedCreationIDs {
+		if _, err := repo.MarkUserManagedNodeCreationDeleting(ctx, creationID, "package authorization removed"); err != nil &&
+			!errors.Is(err, storage.ErrUserManagedNodeCreationNotFound) {
+			log.Printf("[PackageUnbind] failed to persist deleting creation %d for %s: %v", creationID, username, err)
+		}
 	}
+
 	var cleanupErrs []error
 	for _, cfg := range configs {
-		source := preparedCleanups[cfg.ID]
+		source, prepared := preparedCleanups[cfg.ID]
+		if !prepared {
+			continue
+		}
 		if reconcileErr := packages.managed.reconcileSource(ctx, source); reconcileErr != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("server %d inbound %s revoke credential: %w",
 				cfg.ServerID, cfg.InboundTag, reconcileErr))
@@ -1350,8 +1503,9 @@ func (h *PackageDeleteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	type packageDeleteRollback struct {
-		user     storage.User
-		children authorizationChildState
+		user                storage.User
+		children            authorizationChildState
+		hadManagedCreations bool
 	}
 	assigner := NewPackageAssignHandler(h.repo, h.remoteManage, h.pusher)
 	helper := &ServiceAuthorizationHandler{
@@ -1376,12 +1530,24 @@ func (h *PackageDeleteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			http.Error(w, captureErr.Error(), http.StatusInternalServerError)
 			return
 		}
-		snapshots = append(snapshots, packageDeleteRollback{user: latest, children: children})
+		hadManagedCreations, creationErr := userHasManagedNodeCreations(leasedCtx, h.repo, username)
+		if creationErr != nil {
+			http.Error(w, creationErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		snapshots = append(snapshots, packageDeleteRollback{
+			user: latest, children: children, hadManagedCreations: hadManagedCreations,
+		})
 	}
 
 	rollback := func(applied []packageDeleteRollback) error {
 		var rollbackErrs []error
 		for i := len(applied) - 1; i >= 0; i-- {
+			if applied[i].hadManagedCreations {
+				// Dedicated inbounds/private offers may already be gone. Leaving this
+				// user unbound is the only truthful, recoverable state.
+				continue
+			}
 			warnings, restoreErr := helper.restorePackageAuthorization(
 				leasedCtx, applied[i].user, applied[i].children, "package-delete-rollback",
 			)
@@ -3229,6 +3395,19 @@ func removePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHandler
 			return err
 		}
 		defer release()
+		ownedByCreation, err := repo.HasUserManagedNodeCreationForInbound(
+			leasedCtx, cfg.Username, cfg.ServerID, cfg.InboundTag,
+		)
+		if err != nil {
+			return err
+		}
+		if ownedByCreation {
+			// A user-managed creation owns the whole inbound and its deny-first
+			// credential snapshot even before offer/selection promotion. Generic
+			// package cleanup must not consume that crash-recovery provenance.
+			retained = true
+			return nil
+		}
 
 		hasManagedAccess, notAfter, err := repo.HasEffectiveUserInboundAccess(
 			leasedCtx, cfg.Username, cfg.ServerID, cfg.InboundTag, 0, time.Now().UTC(),
@@ -3841,7 +4020,9 @@ func generateCredential(protocol string, user storage.User, method, inboundTag s
 		cred["email"] = email
 		cred["level"] = 0
 	case "socks", "http":
-		cred["user"] = user.Username
+		// Xray exposes SOCKS/HTTP account.user as the limiter identity. Keep it
+		// aligned with every other managed protocol and the per-inbound bucket key.
+		cred["user"] = email
 		cred["pass"] = uuid.New().String()[:16]
 	default:
 		return nil, "", fmt.Errorf("unsupported protocol: %s", protocol)

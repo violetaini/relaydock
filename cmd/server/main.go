@@ -641,6 +641,10 @@ func main() {
 	mux.Handle("/api/user/managed-nodes", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodes)))
 	mux.Handle("/api/user/managed-nodes/{id}", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNode)))
 	mux.Handle("/api/user/managed-nodes/{id}/retry", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeRetry)))
+	mux.Handle("/api/user/managed-node-creation", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeCreation)))
+	mux.Handle("/api/user/managed-node-creation/{id}", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeCreationItem)))
+	mux.Handle("/api/user/managed-node-creation/reality-domains", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeCreationRealityDomains)))
+	mux.Handle("/api/user/managed-node-creation/x25519", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeCreationX25519)))
 
 	// Forwarding management: admins define ordered server routes and grants;
 	// users can only create forwards against their own effective grants and

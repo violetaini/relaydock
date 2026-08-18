@@ -2241,6 +2241,7 @@ func validateInboundClientsSelfOnly(ctx context.Context, inboundReq map[string]i
 	if settings == nil {
 		return ""
 	}
+	tag := strings.TrimSpace(wireGuardStringValue(inbound["tag"]))
 	check := func(entries []interface{}, idField string) string {
 		for _, e := range entries {
 			m, ok := e.(map[string]interface{})
@@ -2252,7 +2253,7 @@ func validateInboundClientsSelfOnly(ctx context.Context, inboundReq map[string]i
 			if identity == "" {
 				identity, _ = m[idField].(string)
 			}
-			if identity != username {
+			if !managedInboundIdentityBelongsToUser(identity, username, tag) {
 				return fmt.Sprintf("节点只能添加你自己(%s)的用户配置,检测到非法用户 %q", username, identity)
 			}
 		}
@@ -2274,6 +2275,14 @@ func validateInboundClientsSelfOnly(ctx context.Context, inboundReq map[string]i
 		}
 	}
 	return ""
+}
+
+func managedInboundIdentityBelongsToUser(identity, username, inboundTag string) bool {
+	identity, username, inboundTag = strings.TrimSpace(identity), strings.TrimSpace(username), strings.TrimSpace(inboundTag)
+	if identity == "" || username == "" {
+		return false
+	}
+	return identity == username || inboundTag != "" && identity == username+"__"+inboundTag
 }
 
 // validateInboundTLS 兜底校验入站 TLS 证书完整性。Hysteria2 / VLESS+TLS / Trojan+TLS 等
@@ -2904,6 +2913,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 						Port:          int(port),
 						Inbound:       inboundAny,
 						NodeName:      customNodeName,
+						OwnerUsername: managedNodeOwner(r.Context()),
 						ForwardNodeID: int64(forwardNodeID),
 						IPVersion:     ipVersion,
 						RelayServer:   relayServer,
@@ -3324,6 +3334,31 @@ func (h *RemoteManageHandler) rollbackWSSInboundAdd(ctx context.Context, serverI
 	return errors.New(message)
 }
 
+type managedNodeMutationIDContextKey struct{}
+
+type managedNodeOwnerContextKey struct{}
+
+func withManagedNodeMutationID(ctx context.Context, mutationID string) context.Context {
+	mutationID = strings.TrimSpace(mutationID)
+	if mutationID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, managedNodeMutationIDContextKey{}, mutationID)
+}
+
+func withManagedNodeOwner(ctx context.Context, username string) context.Context {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, managedNodeOwnerContextKey{}, username)
+}
+
+func managedNodeOwner(ctx context.Context) string {
+	username, _ := ctx.Value(managedNodeOwnerContextKey{}).(string)
+	return strings.TrimSpace(username)
+}
+
 // HandleCreateManagedNode creates a remote inbound and only reports success when
 // the corresponding database node exists. The legacy raw inbound endpoint keeps
 // its low-level semantics; this endpoint is the transactional UI workflow.
@@ -3354,7 +3389,11 @@ func (h *RemoteManageHandler) HandleCreateManagedNode(w http.ResponseWriter, r *
 		return
 	}
 	request["action"] = "add"
-	mutationID := "managed-node:" + uuid.NewString()
+	mutationID, _ := r.Context().Value(managedNodeMutationIDContextKey{}).(string)
+	mutationID = strings.TrimSpace(mutationID)
+	if mutationID == "" {
+		mutationID = "managed-node:" + uuid.NewString()
+	}
 	request["mutation_id"] = mutationID
 	nodeName, _ := request["node_name"].(string)
 	nodeName = strings.TrimSpace(nodeName)
@@ -3511,7 +3550,9 @@ func managedNodeResponseSuccess(recorder *managedNodeResponseRecorder) (bool, st
 
 func (h *RemoteManageHandler) rollbackManagedNode(r *http.Request, serverID int64, serverName, tag, mutationID string) error {
 	rollbackBody, _ := json.Marshal(map[string]interface{}{"action": "remove", "tag": tag, "mutation_id": mutationID})
-	rollbackRequest := r.Clone(context.Background())
+	// Preserve authorization/server-lease values while allowing rollback to
+	// finish after the originating HTTP request is canceled.
+	rollbackRequest := r.Clone(context.WithoutCancel(r.Context()))
 	rollbackRequest.Body = io.NopCloser(bytes.NewReader(rollbackBody))
 	rollbackRequest.ContentLength = int64(len(rollbackBody))
 	rollbackRequest.URL = cloneURLWithQuery(r, serverID)
@@ -4457,7 +4498,7 @@ func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, ser
 			if cm == nil {
 				continue
 			}
-			if e, _ := cm["email"].(string); e == username {
+			if e, _ := cm["email"].(string); managedInboundIdentityBelongsToUser(e, username, tag) {
 				hasAdmin = true
 				adminIndex = clientIndex
 				break

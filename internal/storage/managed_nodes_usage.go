@@ -439,6 +439,9 @@ func (r *TrafficRepository) ListManagedNodeCatalog(ctx context.Context, username
 		}
 		grantState := grant.StateAt(now, userEnabled != 0, grantBilled)
 		for _, offer := range offers {
+			if offer.OwnerUsername != "" && (offer.OwnerUsername != username || offer.GrantID == nil || *offer.GrantID != grant.ID) {
+				continue
+			}
 			selection, selected := selectionByOffer[offer.ID]
 			if !offer.Enabled && !selected {
 				continue

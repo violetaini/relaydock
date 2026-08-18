@@ -3163,6 +3163,9 @@ CREATE TABLE IF NOT EXISTS announcement_bot_deliveries (
 	if err := r.migrateDirectNodeGrants(); err != nil {
 		return err
 	}
+	if err := r.migrateUserManagedNodeCreations(); err != nil {
+		return err
+	}
 	if err := r.migrateManagedInboundResources(); err != nil {
 		return err
 	}
@@ -13778,6 +13781,13 @@ WHERE EXISTS(
 	}
 	if unsafeDirectGrant != 0 {
 		return "", errors.New("remote server has active or unreconciled direct node grants; revoke them before deletion")
+	}
+	var userCreatedNodes int
+	if err := querier.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_managed_node_creations WHERE server_id=?`, id).Scan(&userCreatedNodes); err != nil {
+		return "", fmt.Errorf("check user-created server nodes: %w", err)
+	}
+	if userCreatedNodes != 0 {
+		return "", errors.New("remote server has user-created nodes; revoke their server grants first")
 	}
 	return name, nil
 }

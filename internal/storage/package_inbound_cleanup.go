@@ -112,3 +112,25 @@ WHERE id = ?`, stored.Username, stored.ServerID, stored.InboundTag, nodeID,
 	}
 	return &source, nil
 }
+
+// DeletePackageInboundCredentialCleanupSourceForPromotion removes only the
+// deny tombstone after a real managed selection has been durably created. The
+// credential row is deliberately retained and becomes the selection's stable
+// credential snapshot during reconciliation.
+func (r *TrafficRepository) DeletePackageInboundCredentialCleanupSourceForPromotion(ctx context.Context, sourceID, credentialConfigID int64) error {
+	if sourceID <= 0 || credentialConfigID <= 0 {
+		return ErrManagedInvalidArgument
+	}
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
+	result, err := r.db.ExecContext(ctx, `DELETE FROM user_inbound_access_sources
+WHERE id=? AND source_type=? AND source_id=? AND desired_state=?`, sourceID,
+		ManagedSourceLegacyReview, credentialConfigID, ManagedDesiredInactive)
+	if err != nil {
+		return fmt.Errorf("delete promoted credential cleanup source: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return ErrManagedAccessSourceNotFound
+	}
+	return nil
+}

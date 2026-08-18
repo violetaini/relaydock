@@ -195,6 +195,16 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 		}
 		nodeOwners[ref.InboundTag][node.Username] = struct{}{}
 	}
+	deletingCreationOwners := make(map[string]struct{})
+	creations, err := h.repo.ListUserManagedNodeCreations(ctx, "", 0)
+	if err != nil {
+		return fmt.Errorf("list deleting user-managed inbound owners: %w", err)
+	}
+	for _, creation := range creations {
+		if creation.ServerID == serverID && creation.State == storage.UserManagedNodeDeleting {
+			deletingCreationOwners[creation.InboundTag+"\x00"+creation.Username] = struct{}{}
+		}
+	}
 	loadObserved := func() (map[string]map[string]interface{}, error) {
 		if observed != nil {
 			return observed, nil
@@ -281,6 +291,9 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 			return fmt.Errorf("load inbound credential limit state for %s: %w", config.Username, limitErr)
 		}
 		_, ownsNode := nodeOwners[config.InboundTag][config.Username]
+		if _, deleting := deletingCreationOwners[config.InboundTag+"\x00"+config.Username]; deleting {
+			ownsNode = false
+		}
 		hasAccess := ownsNode
 		if !hasAccess {
 			hasManaged, _, managedErr := h.repo.HasEffectiveUserInboundAccess(

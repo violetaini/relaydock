@@ -555,11 +555,18 @@ func (h *ServiceAuthorizationHandler) applyPackage(ctx context.Context, username
 	if err != nil {
 		return nil, "failed", err
 	}
+	hadManagedCreations, err := userHasManagedNodeCreations(ctx, h.repo, username)
+	if err != nil {
+		return nil, "failed", err
+	}
 	if err := h.repo.PreparePackageAuthorizationTransition(ctx, username); err != nil {
 		return nil, "failed", err
 	}
 	cleanupWarnings := h.reconcileAuthorizationTombstones(ctx, username, storage.GrantSourceManual, actor)
 	if len(cleanupWarnings) > 0 {
+		if hadManagedCreations {
+			return nil, "failed", fmt.Errorf("custom authorization cleanup remains pending: %s", strings.Join(cleanupWarnings, "; "))
+		}
 		restoreErr := h.restoreCustomAuthorization(ctx, username, snapshot, actor)
 		return nil, rollbackResultStatus(restoreErr), errors.Join(fmt.Errorf("custom authorization cleanup is incomplete: %s", strings.Join(cleanupWarnings, "; ")), restoreErr)
 	}
@@ -567,6 +574,9 @@ func (h *ServiceAuthorizationHandler) applyPackage(ctx context.Context, username
 	warnings, assignErr := h.packages.AssignAndProvision(ctx, username, request.packageID, request.startsAt, request.expiresAt, request.isReset, request.resetDay)
 	if assignErr == nil {
 		return sortedWarnings(warnings), "applied", nil
+	}
+	if hadManagedCreations {
+		return nil, "failed", assignErr
 	}
 	restoreErr := h.restoreCustomAuthorization(ctx, username, snapshot, actor)
 	return nil, rollbackResultStatus(restoreErr), errors.Join(assignErr, restoreErr)
@@ -578,12 +588,40 @@ func (h *ServiceAuthorizationHandler) applyCustom(ctx context.Context, username 
 		return nil, "failed", err
 	}
 	if user.AuthorizationMode == storage.AuthorizationModePackage {
+		if user.PackageID <= 0 {
+			// A custom -> package switch can remain in this fail-closed state while
+			// manual child cleanup is pending. It is not an assigned package and
+			// therefore cannot go through package unbind/restore. Let an operator
+			// cancel the transition by first converging those manual tombstones.
+			cleanupWarnings := h.reconcileAuthorizationTombstones(ctx, username, storage.GrantSourceManual, actor)
+			if len(cleanupWarnings) > 0 {
+				return nil, "failed", fmt.Errorf("custom authorization cleanup remains pending: %s", strings.Join(cleanupWarnings, "; "))
+			}
+			if err := h.repo.CancelPackageAuthorizationTransition(ctx, username); err != nil {
+				return nil, "failed", fmt.Errorf("cancel package authorization transition: %w", err)
+			}
+			cleanupWarnings, provisionWarnings, applyErr := h.applyCustomDesired(ctx, username, request, actor)
+			if applyErr == nil && len(cleanupWarnings) == 0 {
+				return sortedWarnings(provisionWarnings), "applied", nil
+			}
+			if applyErr == nil {
+				applyErr = fmt.Errorf("custom authorization cleanup remains pending: %s", strings.Join(cleanupWarnings, "; "))
+			}
+			return nil, "failed", applyErr
+		}
 		previous := user
+		hadManagedCreations, creationErr := userHasManagedNodeCreations(ctx, h.repo, username)
+		if creationErr != nil {
+			return nil, "failed", creationErr
+		}
 		packageChildren, snapshotErr := h.captureAuthorizationChildState(ctx, username, storage.GrantSourcePackage)
 		if snapshotErr != nil {
 			return nil, "failed", snapshotErr
 		}
 		if err := unbindUserPackageWithOptions(ctx, h.repo, h.packages.remoteManage, h.packages.pusher, username, false); err != nil {
+			if hadManagedCreations {
+				return nil, "failed", err
+			}
 			restoreWarnings, restoreErr := h.restorePackageAuthorization(ctx, previous, packageChildren, actor)
 			if len(restoreWarnings) > 0 {
 				restoreErr = errors.Join(restoreErr, fmt.Errorf("package restore warnings: %s", strings.Join(restoreWarnings, "; ")))
@@ -592,6 +630,9 @@ func (h *ServiceAuthorizationHandler) applyCustom(ctx context.Context, username 
 		}
 		packageCleanupWarnings := h.reconcileAuthorizationTombstones(ctx, username, storage.GrantSourcePackage, actor)
 		if len(packageCleanupWarnings) > 0 {
+			if hadManagedCreations {
+				return nil, "failed", fmt.Errorf("package authorization cleanup remains pending: %s", strings.Join(packageCleanupWarnings, "; "))
+			}
 			restoreWarnings, restoreErr := h.restorePackageAuthorization(ctx, previous, packageChildren, actor)
 			if len(restoreWarnings) > 0 {
 				restoreErr = errors.Join(restoreErr, fmt.Errorf("package restore warnings: %s", strings.Join(restoreWarnings, "; ")))
@@ -605,6 +646,12 @@ func (h *ServiceAuthorizationHandler) applyCustom(ctx context.Context, username 
 				provisionWarnings = append(provisionWarnings, cleanupErr.Error())
 			}
 			return sortedWarnings(provisionWarnings), "applied", nil
+		}
+		if hadManagedCreations {
+			if applyErr == nil {
+				applyErr = fmt.Errorf("custom authorization cleanup remains pending: %s", strings.Join(cleanupWarnings, "; "))
+			}
+			return nil, "failed", applyErr
 		}
 		cleanupRestoreWarnings, provisionRestoreWarnings, cleanupRestoreErr := h.applyCustomDesired(ctx, username, emptyCustomAuthorizationRequest(), actor)
 		restoreWarnings, restoreErr := h.restorePackageAuthorization(ctx, previous, packageChildren, actor)

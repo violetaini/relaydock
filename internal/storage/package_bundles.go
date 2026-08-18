@@ -223,11 +223,14 @@ WHERE s.grant_id=? AND s.desired_enabled=1`, id)
 				}
 			}
 			if entry.MaxActiveNodes > 0 {
-				var activeSelections int
+				var activeSelections, creatingReservations int
 				if queryErr := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_node_selections WHERE grant_id=? AND desired_enabled=1`, id).Scan(&activeSelections); queryErr != nil {
 					return nil, fmt.Errorf("count active package selections: %w", queryErr)
 				}
-				if activeSelections > entry.MaxActiveNodes {
+				if queryErr := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_managed_node_creations WHERE grant_id=? AND state='creating'`, id).Scan(&creatingReservations); queryErr != nil {
+					return nil, fmt.Errorf("count package creation reservations: %w", queryErr)
+				}
+				if activeSelections+creatingReservations > entry.MaxActiveNodes {
 					return nil, ErrManagedActiveNodeLimit
 				}
 			}
@@ -421,11 +424,14 @@ func revokePackageBundleGrantsTx(ctx context.Context, tx *sql.Tx, username strin
 }
 
 func removePackageServerGrantTx(ctx context.Context, tx *sql.Tx, grantID int64, now time.Time) error {
-	var children int
+	var children, ownedCreations int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_node_selections WHERE grant_id=?`, grantID).Scan(&children); err != nil {
 		return err
 	}
-	if children == 0 {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_managed_node_creations WHERE grant_id=?`, grantID).Scan(&ownedCreations); err != nil {
+		return err
+	}
+	if children == 0 && ownedCreations == 0 {
 		_, err := tx.ExecContext(ctx, `DELETE FROM user_server_grants WHERE id=? AND source_type='package'`, grantID)
 		return err
 	}

@@ -393,6 +393,13 @@ WHERE username = ? AND (
 	if pendingSources != 0 {
 		return false, nil
 	}
+	var pendingCreatedNodes int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_managed_node_creations WHERE username=?`, username).Scan(&pendingCreatedNodes); err != nil {
+		return false, err
+	}
+	if pendingCreatedNodes != 0 {
+		return false, nil
+	}
 	var pendingRoutedRevokes int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_subaccounts
 WHERE username = ? AND (revoke_pending = 1 OR activation_pending = 1)`, username).Scan(&pendingRoutedRevokes); err != nil {

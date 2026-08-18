@@ -93,8 +93,14 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 		nodeName = fmt.Sprintf("[%s] %s:%d", server.Name, event.Protocol, event.Port)
 	}
 
-	// 系统节点归属的 username(真实 admin,不是字面值 "admin")
-	sysOwner := l.repo.GetSystemNodeOwner(ctx)
+	// Administrator-created nodes retain the system owner. The restricted
+	// user-managed path supplies a validated owner for its dedicated inbound.
+	nodeOwner := strings.TrimSpace(event.OwnerUsername)
+	if nodeOwner == "" {
+		nodeOwner = l.repo.GetSystemNodeOwner(ctx)
+	} else if _, err := l.repo.GetUser(ctx, nodeOwner); err != nil {
+		return fmt.Errorf("读取节点所有者 %s 失败: %w", nodeOwner, err)
+	}
 
 	// 转换为 Clash 配置
 	clashConfig, err := l.inboundToClash(event.ServerID, event.Inbound)
@@ -146,7 +152,7 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 	}
 
 	// admin 已同步过的同 server 节点(按 server-host + protocol + port 去重)
-	existingNodes, err := l.repo.ListNodes(ctx, sysOwner)
+	existingNodes, err := l.repo.ListNodes(ctx, nodeOwner)
 	if err != nil {
 		return fmt.Errorf("读取现有节点失败: %w", err)
 	}
@@ -184,7 +190,7 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 			continue
 		}
 		node := storage.Node{
-			Username:          sysOwner,
+			Username:          nodeOwner,
 			NodeName:          name,
 			Protocol:          event.Protocol,
 			ClashConfig:       cfg,
@@ -207,7 +213,7 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 		}
 		takenNames[name] = true
 		log.Printf("[NodeSync] Created node: %s", name)
-		l.prependNodeOrder(ctx, sysOwner, created.ID)
+		l.prependNodeOrder(ctx, nodeOwner, created.ID)
 	}
 	return errors.Join(createErrors...)
 }

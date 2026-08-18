@@ -30,6 +30,7 @@ type ManagedNodesHandler struct {
 	remoteManage    *RemoteManageHandler
 	limiter         *LimiterConfigPusher
 	guardHTTPClient *http.Client
+	realityResolver func(context.Context, string) error
 	reconcileMu     sync.Mutex
 	reconcileRunMu  sync.Mutex
 	reconcileWG     sync.WaitGroup
@@ -39,6 +40,7 @@ func NewManagedNodesHandler(repo *storage.TrafficRepository, remoteManage *Remot
 	return &ManagedNodesHandler{
 		repo: repo, remoteManage: remoteManage, limiter: limiter,
 		guardHTTPClient: &http.Client{Timeout: 4 * time.Second},
+		realityResolver: validatePublicUserManagedRealityDomain,
 	}
 }
 
@@ -220,6 +222,7 @@ func writeManagedError(w http.ResponseWriter, err error) {
 	case errors.Is(err, storage.ErrSelfServiceNodeOfferNotFound),
 		errors.Is(err, storage.ErrUserServerGrantNotFound),
 		errors.Is(err, storage.ErrUserNodeSelectionNotFound),
+		errors.Is(err, storage.ErrUserManagedNodeCreationNotFound),
 		errors.Is(err, storage.ErrManagedAccessSourceNotFound),
 		errors.Is(err, storage.ErrUserNotFound),
 		errors.Is(err, storage.ErrRemoteServerNotFound):
@@ -798,6 +801,7 @@ func (h *ManagedNodesHandler) reconcileAll(ctx context.Context) {
 	if _, err := h.repo.ExpireDirectUserInboundAccessSources(ctx, now, 200); err != nil {
 		log.Printf("[ManagedNodes] expire direct sources failed: %v", err)
 	}
+	h.reconcileUserManagedNodeCreations(ctx, now)
 	const wireGuardDirectGrantPageSize = 200
 	var afterWireGuardGrantID int64
 	for {
@@ -852,6 +856,27 @@ func (h *ManagedNodesHandler) reconcileAll(ctx context.Context) {
 		log.Printf("[ManagedNodes] retry private routed activation failed: %v", activationErr)
 	}
 	h.finalizeReadyUserDeletions(ctx)
+}
+
+func (h *ManagedNodesHandler) reconcileUserManagedNodeCreations(ctx context.Context, now time.Time) {
+	creations, err := h.repo.ListUserManagedNodeCreations(ctx, "", 0)
+	if err != nil {
+		log.Printf("[ManagedNodes] list user-created nodes failed: %v", err)
+		return
+	}
+	for _, creation := range creations {
+		if creation.State == storage.UserManagedNodeCreating {
+			if promoted, _ := h.recoverAndPromoteUserManagedNodeCreation(ctx, creation); promoted != nil {
+				creation = *promoted
+			}
+		}
+		// Re-read authorization and ownership while holding the user -> server
+		// leases. An administrator may restore a grant between the initial list
+		// and this point; stale observations must never delete a restored node.
+		if err := h.cleanupUserManagedNodeCreationIfStillInvalid(ctx, creation, now, "reconciler"); err != nil {
+			log.Printf("[ManagedNodes] cleanup user-created node=%d user=%s failed: %v", creation.ID, creation.Username, err)
+		}
+	}
 }
 
 func (h *ManagedNodesHandler) finalizeReadyUserDeletions(ctx context.Context) {
@@ -1340,6 +1365,19 @@ func (h *ManagedNodesHandler) syncGrantSources(ctx context.Context, grant storag
 		}
 		if reconcileErr := h.reconcileSource(ctx, *source); reconcileErr != nil {
 			errorsFound = append(errorsFound, reconcileErr)
+		}
+	}
+	creations, creationErr := h.repo.ListUserManagedNodeCreations(ctx, grant.Username, grant.ID)
+	if creationErr != nil {
+		errorsFound = append(errorsFound, creationErr)
+	} else {
+		for _, creation := range creations {
+			// The grant passed to syncGrantSources can become stale after its
+			// update lease is released. Re-read the current grant and node under
+			// user -> server leases before deleting a dedicated inbound.
+			if cleanupErr := h.cleanupUserManagedNodeCreationIfStillInvalid(ctx, creation, time.Now().UTC(), actor); cleanupErr != nil {
+				errorsFound = append(errorsFound, cleanupErr)
+			}
 		}
 	}
 	if h.limiter != nil {

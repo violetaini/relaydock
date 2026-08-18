@@ -231,6 +231,9 @@ WHERE username = ? AND server_id = ?`, username, offer.ServerID))
 	if err != nil {
 		return nil, fmt.Errorf("get grant for activation: %w", err)
 	}
+	if offer.OwnerUsername != "" && (offer.OwnerUsername != username || offer.GrantID == nil || *offer.GrantID != grant.ID) {
+		return nil, ErrSelfServiceNodeOfferNotFound
+	}
 	var userEnabled, nodeEnabled int
 	var nodeType, nodeProtocol, nodeClashConfig, originalServer, serverName, xrayMode, nodeInbound string
 	if err := tx.QueryRowContext(ctx, `SELECT u.is_active, n.enabled,

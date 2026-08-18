@@ -71,15 +71,20 @@ var (
 )
 
 type SelfServiceNodeOffer struct {
-	ID         int64     `json:"id"`
-	NodeID     int64     `json:"node_id"`
-	ServerID   int64     `json:"server_id"`
-	InboundTag string    `json:"inbound_tag"`
-	Enabled    bool      `json:"enabled"`
-	SortOrder  int       `json:"sort_order"`
-	CreatedBy  string    `json:"created_by"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID         int64  `json:"id"`
+	NodeID     int64  `json:"node_id"`
+	ServerID   int64  `json:"server_id"`
+	InboundTag string `json:"inbound_tag"`
+	// OwnerUsername is empty for administrator-published catalog entries. A
+	// non-empty owner marks a dedicated inbound created by that user; it must
+	// never be offered to another account that happens to share the server.
+	OwnerUsername string    `json:"owner_username,omitempty"`
+	GrantID       *int64    `json:"grant_id,omitempty"`
+	Enabled       bool      `json:"enabled"`
+	SortOrder     int       `json:"sort_order"`
+	CreatedBy     string    `json:"created_by"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type UserServerGrant struct {
@@ -207,6 +212,8 @@ CREATE TABLE IF NOT EXISTS self_service_node_offers (
     node_id INTEGER NOT NULL UNIQUE,
     server_id INTEGER NOT NULL,
     inbound_tag TEXT NOT NULL,
+    owner_username TEXT NOT NULL DEFAULT '',
+    grant_id INTEGER,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
     sort_order INTEGER NOT NULL DEFAULT 0,
     created_by TEXT NOT NULL,
@@ -330,6 +337,15 @@ CREATE TABLE IF NOT EXISTS remote_server_guard_secrets (
 	}
 	if err := r.ensureTableColumn("user_server_grants", "allowed_protocols_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return fmt.Errorf("migrate managed grant protocol whitelist: %w", err)
+	}
+	if err := r.ensureTableColumn("self_service_node_offers", "owner_username", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate private self-service offer owner: %w", err)
+	}
+	if err := r.ensureTableColumn("self_service_node_offers", "grant_id", "INTEGER"); err != nil {
+		return fmt.Errorf("migrate private self-service offer grant: %w", err)
+	}
+	if _, err := r.db.Exec(`CREATE INDEX IF NOT EXISTS idx_self_service_node_offers_owner ON self_service_node_offers(owner_username, grant_id)`); err != nil {
+		return fmt.Errorf("migrate private self-service offer index: %w", err)
 	}
 	if err := r.ensureTableColumn("user_server_grants", "allowed_protocol_profiles_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return fmt.Errorf("migrate managed grant protocol profile whitelist: %w", err)
@@ -794,22 +810,35 @@ func normalizeGrant(g UserServerGrant) (UserServerGrant, error) {
 func scanSelfServiceNodeOffer(s rowScanner) (SelfServiceNodeOffer, error) {
 	var offer SelfServiceNodeOffer
 	var enabled int
-	err := s.Scan(&offer.ID, &offer.NodeID, &offer.ServerID, &offer.InboundTag, &enabled,
+	var grantID sql.NullInt64
+	err := s.Scan(&offer.ID, &offer.NodeID, &offer.ServerID, &offer.InboundTag, &offer.OwnerUsername, &grantID, &enabled,
 		&offer.SortOrder, &offer.CreatedBy, &offer.CreatedAt, &offer.UpdatedAt)
+	if grantID.Valid {
+		offer.GrantID = &grantID.Int64
+	}
 	offer.Enabled = enabled != 0
 	return offer, err
 }
 
-const selectSelfServiceNodeOffer = `SELECT id, node_id, server_id, inbound_tag, enabled,
+const selectSelfServiceNodeOffer = `SELECT id, node_id, server_id, inbound_tag,
+       COALESCE(owner_username, ''), grant_id, enabled,
        sort_order, created_by, created_at, updated_at
 FROM self_service_node_offers`
 
 func (r *TrafficRepository) CreateSelfServiceNodeOffer(ctx context.Context, nodeID, serverID int64, createdBy string) (*SelfServiceNodeOffer, error) {
+	return r.createSelfServiceNodeOffer(ctx, nodeID, serverID, createdBy, "", nil)
+}
+
+func (r *TrafficRepository) createSelfServiceNodeOffer(ctx context.Context, nodeID, serverID int64, createdBy, ownerUsername string, grantID *int64) (*SelfServiceNodeOffer, error) {
 	if err := managedInitialized(r); err != nil {
 		return nil, err
 	}
 	createdBy = strings.TrimSpace(createdBy)
+	ownerUsername = strings.TrimSpace(ownerUsername)
 	if nodeID <= 0 || serverID <= 0 || createdBy == "" {
+		return nil, ErrManagedInvalidArgument
+	}
+	if ownerUsername == "" && grantID != nil || ownerUsername != "" && (grantID == nil || *grantID <= 0) {
 		return nil, ErrManagedInvalidArgument
 	}
 
@@ -861,10 +890,14 @@ WHERE n.id = ?`, serverID, nodeID).Scan(
 	}
 
 	now := time.Now().UTC()
+	var grantValue any
+	if grantID != nil {
+		grantValue = *grantID
+	}
 	result, err := r.db.ExecContext(ctx, `
 INSERT INTO self_service_node_offers
-    (node_id, server_id, inbound_tag, enabled, sort_order, created_by, created_at, updated_at)
-VALUES (?, ?, ?, 1, 0, ?, ?, ?)`, nodeID, serverID, inboundTag, createdBy, now, now)
+    (node_id, server_id, inbound_tag, owner_username, grant_id, enabled, sort_order, created_by, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?)`, nodeID, serverID, inboundTag, ownerUsername, grantValue, createdBy, now, now)
 	if managedUniqueViolation(err) {
 		return nil, ErrSelfServiceNodeOfferExists
 	}
@@ -876,6 +909,18 @@ VALUES (?, ?, ?, 1, 0, ?, ?, ?)`, nodeID, serverID, inboundTag, createdBy, now, 
 		return nil, fmt.Errorf("read self-service node offer id: %w", err)
 	}
 	return r.GetSelfServiceNodeOffer(ctx, id)
+}
+
+// CreatePrivateSelfServiceNodeOffer publishes a dedicated inbound only to its
+// owner. The grant link is immutable and is used by lifecycle cleanup after a
+// package is revoked or expires.
+func (r *TrafficRepository) CreatePrivateSelfServiceNodeOffer(ctx context.Context, nodeID int64, grant UserServerGrant, username string) (*SelfServiceNodeOffer, error) {
+	username = strings.TrimSpace(username)
+	if username == "" || grant.ID <= 0 || grant.Username != username || grant.ServerID <= 0 {
+		return nil, ErrManagedInvalidArgument
+	}
+	grantID := grant.ID
+	return r.createSelfServiceNodeOffer(ctx, nodeID, grant.ServerID, username, username, &grantID)
 }
 
 // SelfServiceNodeProtocolEligible is the single protocol-safety policy used by
@@ -1440,12 +1485,16 @@ SET desired_enabled = 0, updated_at = ? WHERE id = ? AND desired_enabled = 1`, n
 		}
 	}
 	if grant.MaxActiveNodes > 0 {
-		var active int
+		var active, creatingReservations int
 		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_node_selections
 WHERE grant_id = ? AND desired_enabled = 1`, grant.ID).Scan(&active); err != nil {
 			return nil, fmt.Errorf("count active managed selections: %w", err)
 		}
-		if active > grant.MaxActiveNodes {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_managed_node_creations
+WHERE grant_id = ? AND state = 'creating'`, grant.ID).Scan(&creatingReservations); err != nil {
+			return nil, fmt.Errorf("count managed creation reservations: %w", err)
+		}
+		if active+creatingReservations > grant.MaxActiveNodes {
 			return nil, ErrManagedActiveNodeLimit
 		}
 	}
@@ -1583,6 +1632,13 @@ func (r *TrafficRepository) DeleteUserServerGrant(ctx context.Context, id, expec
 	}
 	if version != expectedVersion {
 		return ErrManagedVersionConflict
+	}
+	var ownedCreations int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_managed_node_creations WHERE grant_id=?`, id).Scan(&ownedCreations); err != nil {
+		return fmt.Errorf("count user-created nodes before grant delete: %w", err)
+	}
+	if ownedCreations != 0 {
+		return ErrManagedResourceInUse
 	}
 	// The handler removes the remote clients first. Once that succeeds, purge the
 	// local managed graph atomically while leaving the audit record intact.

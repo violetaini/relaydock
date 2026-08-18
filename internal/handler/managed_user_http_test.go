@@ -211,3 +211,62 @@ func TestManagedUserHTTPProvisioningSelectionIsNotEffective(t *testing.T) {
 		t.Fatalf("provisioning selection became effective: %v", ids)
 	}
 }
+
+func TestManagedUserHTTPPackageGrantListsCatalogBeforeSelection(t *testing.T) {
+	fixture := newEffectiveAuthorizationFixture(t)
+	ctx := context.Background()
+	offer, err := fixture.repo.CreateSelfServiceNodeOffer(ctx, fixture.node.ID, fixture.server.ID, "admin")
+	if err != nil {
+		t.Fatalf("CreateSelfServiceNodeOffer: %v", err)
+	}
+	packageID, err := fixture.repo.CreatePackage(ctx, storage.Package{
+		Name: "managed-catalog-package", TrafficLimitBytes: 1024, CycleDays: 30,
+		ServerGrants: []storage.PackageServerGrant{{
+			ServerID: fixture.server.ID, MaxActiveNodes: 2,
+			BillingMode: storage.ManagedBillingDownload, ResetPolicy: storage.ManagedResetNone, ResetDay: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreatePackage: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := fixture.repo.AssignPackageBundleToUser(ctx, "alice", packageID,
+		now.Add(-time.Hour), now.Add(time.Hour), false, 1); err != nil {
+		t.Fatalf("AssignPackageBundleToUser: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	request := managedUserHTTPRequest(http.MethodGet, "/api/user/managed-nodes", "alice", "")
+	NewManagedNodesHandler(fixture.repo, nil, nil).HandleUserManagedNodes(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var payload struct {
+		Success  bool                      `json:"success"`
+		Grants   []storage.UserServerGrant `json:"grants"`
+		Selected []json.RawMessage         `json:"selected"`
+		Catalog  []struct {
+			OfferID   int64 `json:"offer_id"`
+			NodeID    int64 `json:"node_id"`
+			GrantID   int64 `json:"grant_id"`
+			CanCreate bool  `json:"can_create"`
+			Selected  bool  `json:"selected"`
+		} `json:"catalog"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, response.Body.String())
+	}
+	if !payload.Success || len(payload.Grants) != 1 || len(payload.Selected) != 0 || len(payload.Catalog) != 1 {
+		t.Fatalf("unexpected package catalog response: %s", response.Body.String())
+	}
+	entry := payload.Catalog[0]
+	if entry.OfferID != offer.ID || entry.NodeID != fixture.node.ID ||
+		entry.GrantID != payload.Grants[0].ID || !entry.CanCreate || entry.Selected {
+		t.Fatalf("package offer is not creatable before selection: response=%s", response.Body.String())
+	}
+	if payload.Grants[0].SourceType != storage.GrantSourcePackage ||
+		payload.Grants[0].SourcePackageID == nil || *payload.Grants[0].SourcePackageID != packageID {
+		t.Fatalf("catalog grant lost package provenance: %+v", payload.Grants[0])
+	}
+}
