@@ -374,3 +374,27 @@ func TestUserPermissionsMergeAuthorizationDerivedPages(t *testing.T) {
 		t.Fatalf("service entitlements=%+v", body.Entitlements)
 	}
 }
+
+func TestUserPermissionsGlobalAPITokenDoesNotResolveSyntheticUser(t *testing.T) {
+	fixture := newEffectiveAuthorizationFixture(t)
+	request := httptest.NewRequest(http.MethodGet, "/api/user/permissions", nil)
+	request = request.WithContext(auth.ContextWithGlobalAPIToken(request.Context()))
+	response := httptest.NewRecorder()
+
+	NewUserPermissionsHandler(fixture.repo).UserGet(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("global API token status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		IsAdmin bool                    `json:"is_admin"`
+		Pages   []string                `json:"pages"`
+		Service UserServiceEntitlements `json:"service_entitlements"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode permissions: %v", err)
+	}
+	if !body.IsAdmin || len(body.Service.pages()) != 0 {
+		t.Fatalf("global API token permissions=%+v", body)
+	}
+}

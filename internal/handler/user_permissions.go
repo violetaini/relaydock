@@ -237,7 +237,7 @@ func (h *UserPermissionsHandler) UserGet(w http.ResponseWriter, r *http.Request)
 	// admin 看全部页面(不受策略限制),配额不适用。
 	isAdmin := userIsAdmin(ctx, h.repo, username)
 	entitlements := UserServiceEntitlements{}
-	if username != "" {
+	if username != "" && !auth.IsGlobalAPIToken(ctx) {
 		var err error
 		entitlements, err = ResolveUserServiceEntitlements(ctx, h.repo, username, time.Now().UTC())
 		if err != nil {
