@@ -744,23 +744,22 @@ func (h *TGBotAPIHandler) userNodes(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "username 必填")
 		return
 	}
-	user, err := h.repo.GetUser(r.Context(), username)
-	if err != nil {
+	nodeIDs, err := ResolveEffectiveUserNodeIDs(r.Context(), h.repo, username, time.Now().UTC())
+	if errors.Is(err, storage.ErrUserNotFound) {
 		writeJSONError(w, http.StatusNotFound, "user not found")
 		return
 	}
-	if user.PackageID == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"success": true, "nodes": []any{}})
-		return
-	}
-	pkg, err := h.repo.GetPackage(r.Context(), user.PackageID)
-	if err != nil || pkg == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"success": true, "nodes": []any{}})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "resolve user nodes failed")
 		return
 	}
 
 	// 一次拉所有 server,做 name → status 查找表
-	servers, _ := h.repo.ListRemoteServers(r.Context())
+	servers, err := h.repo.ListRemoteServers(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "resolve server status failed")
+		return
+	}
 	serverStatus := make(map[string]string, len(servers))
 	for _, s := range servers {
 		serverStatus[s.Name] = s.Status
@@ -777,8 +776,8 @@ func (h *TGBotAPIHandler) userNodes(w http.ResponseWriter, r *http.Request) {
 		NodeType     string `json:"node_type,omitempty"`
 		Enabled      bool   `json:"enabled"`
 	}
-	out := make([]nodeOut, 0, len(pkg.Nodes))
-	for _, nid := range pkg.Nodes {
+	out := make([]nodeOut, 0, len(nodeIDs))
+	for _, nid := range nodeIDs {
 		n, err := h.repo.GetNodeByID(r.Context(), nid)
 		if err != nil {
 			continue

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/storage"
@@ -45,6 +46,21 @@ var validUserPages = map[string]bool{
 	"subscribe-files": true, // 订阅管理
 	"custom-rules":    true, // 覆写管理
 	"nodes":           true, // 节点管理(普通用户:只读自己导入的+套餐节点、可导入、用于出站)
+}
+
+func stableUserPageUnion(configured, effective []string) []string {
+	pages := make([]string, 0, len(configured)+len(effective))
+	seen := make(map[string]bool, cap(pages))
+	for _, group := range [][]string{configured, effective} {
+		for _, page := range group {
+			if page == "" || seen[page] {
+				continue
+			}
+			seen[page] = true
+			pages = append(pages, page)
+		}
+	}
+	return pages
 }
 
 // UserPermissionsConfig 是全局用户权限策略。
@@ -220,6 +236,16 @@ func (h *UserPermissionsHandler) UserGet(w http.ResponseWriter, r *http.Request)
 
 	// admin 看全部页面(不受策略限制),配额不适用。
 	isAdmin := userIsAdmin(ctx, h.repo, username)
+	entitlements := UserServiceEntitlements{}
+	if username != "" {
+		var err error
+		entitlements, err = ResolveUserServiceEntitlements(ctx, h.repo, username, time.Now().UTC())
+		if err != nil {
+			writeJSONResp(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "获取有效服务授权失败"})
+			return
+		}
+	}
+	pages := stableUserPageUnion(cfg.Pages, entitlements.pages())
 
 	usedTpl, _ := h.repo.CountUserTemplates(ctx, username)
 	ovrScripts, _ := h.repo.CountUserOverrideScripts(ctx, username)
@@ -231,7 +257,8 @@ func (h *UserPermissionsHandler) UserGet(w http.ResponseWriter, r *http.Request)
 	writeJSONResp(w, http.StatusOK, map[string]any{
 		"success":                 true,
 		"is_admin":                isAdmin,
-		"pages":                   cfg.Pages,
+		"pages":                   pages,
+		"service_entitlements":    entitlements,
 		"routed_outbound_enabled": cfg.RoutedOutboundEnabled,
 		"quota": map[string]any{
 			"template":        map[string]int{"used": usedTpl, "max": cfg.QuotaTemplate},

@@ -45,60 +45,16 @@ func (h *UserNodesHandler) HandleListNodes(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	user, err := h.repo.GetUser(ctx, username)
+	nodeIDs, err := ResolveEffectiveUserNodeIDs(ctx, h.repo, username, time.Now().UTC())
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "获取用户失败")
+		writeJSONError(w, http.StatusInternalServerError, "获取有效节点失败")
 		return
-	}
-	nodeIDs := make([]int64, 0)
-	seen := make(map[int64]bool)
-	packageAllowed := packageAssignmentActive(user, time.Now())
-	if packageAllowed {
-		if overLimit, limitErr := h.repo.IsUserOverLimit(ctx, username); limitErr != nil || overLimit {
-			packageAllowed = false
-		}
-	}
-	if packageAllowed {
-		pkg, packageErr := h.repo.GetPackage(ctx, user.PackageID)
-		if packageErr == nil && pkg != nil {
-			for _, nodeID := range pkg.Nodes {
-				if !seen[nodeID] {
-					nodeIDs = append(nodeIDs, nodeID)
-					seen[nodeID] = true
-				}
-			}
-		}
-	}
-	managedNodeIDs, err := effectiveManagedNodeIDs(ctx, h.repo, username)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "获取自选节点失败")
-		return
-	}
-	for _, nodeID := range managedNodeIDs {
-		if !seen[nodeID] {
-			nodeIDs = append(nodeIDs, nodeID)
-			seen[nodeID] = true
-		}
-	}
-	directNodeIDs, err := h.repo.ListEffectiveDirectNodeIDs(ctx, username, time.Now().UTC())
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "获取固定授权节点失败")
-		return
-	}
-	for _, nodeID := range directNodeIDs {
-		if !seen[nodeID] {
-			nodeIDs = append(nodeIDs, nodeID)
-			seen[nodeID] = true
-		}
 	}
 
 	var nodes []userNodeInfo
 	for _, nodeID := range nodeIDs {
 		node, err := h.repo.GetNodeByID(ctx, nodeID)
-		if err != nil || !node.Enabled {
-			continue
-		}
-		if node.InboundTag == "" || node.OriginalServer == "" {
+		if err != nil {
 			continue
 		}
 		nodes = append(nodes, userNodeInfo{

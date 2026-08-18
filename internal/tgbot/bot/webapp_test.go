@@ -112,6 +112,18 @@ func TestRegistrationUsernameRuleMatchesMaster(t *testing.T) {
 	}
 }
 
+func TestStatusPanelDoesNotPresentLookupFailureAsZeroServers(t *testing.T) {
+	if !strings.Contains(webAppHTML, "if(d.status_error)") {
+		t.Fatal("Mini App does not render the server status lookup error")
+	}
+	if !strings.Contains(webAppHTML, "else if(!ns.length)") {
+		t.Fatal("Mini App no-data state is not distinct from a lookup failure")
+	}
+	if !strings.Contains(webAppHTML, "var title=d.status_error?") || !strings.Contains(webAppHTML, "状态 · 暂不可用") {
+		t.Fatal("Mini App lookup failure still presents a numeric zero status")
+	}
+}
+
 func TestDevPreviewRequiresLoopbackPeerAndHost(t *testing.T) {
 	service := &Service{cfg: config.Config{
 		TGBotToken:       testBotToken,

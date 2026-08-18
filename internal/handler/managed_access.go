@@ -11,13 +11,42 @@ import (
 // lists and subscriptions. Desired state is authoritative, so revocation takes
 // effect locally even while an offline Agent is still being reconciled.
 func effectiveManagedNodeIDs(ctx context.Context, repo *storage.TrafficRepository, username string) ([]int64, error) {
-	entries, err := repo.ListManagedNodeCatalog(ctx, username, time.Now().UTC())
+	return effectiveManagedNodeIDsAt(ctx, repo, username, time.Now().UTC())
+}
+
+func effectiveManagedNodeIDsAt(ctx context.Context, repo *storage.TrafficRepository, username string, now time.Time) ([]int64, error) {
+	user, err := repo.GetUser(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	if !user.IsActive {
+		return []int64{}, nil
+	}
+	packageActive := false
+	switch user.AuthorizationMode {
+	case storage.AuthorizationModeCustom:
+	case storage.AuthorizationModePackage:
+		packageActive, err = effectivePackageAssignment(ctx, repo, user, now)
+		if err != nil {
+			return nil, err
+		}
+		if !packageActive {
+			return []int64{}, nil
+		}
+	default:
+		return []int64{}, nil
+	}
+
+	entries, err := repo.ListManagedNodeCatalog(ctx, username, now.UTC())
 	if err != nil {
 		return nil, err
 	}
 	ids := make([]int64, 0, len(entries))
 	seen := make(map[int64]bool, len(entries))
 	for _, entry := range entries {
+		if !authorizationSourceMatches(user, packageActive, entry.Grant.SourceType, entry.Grant.SourcePackageID) {
+			continue
+		}
 		if !entry.Offer.Enabled || entry.Selection == nil || !entry.Selection.DesiredEnabled ||
 			entry.GrantStatus != storage.ManagedGrantActive || entry.AccessSource == nil ||
 			entry.AccessSource.NodeID != entry.Offer.NodeID || entry.AccessSource.ServerID != entry.Offer.ServerID ||

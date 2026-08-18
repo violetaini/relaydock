@@ -354,8 +354,10 @@ function renderStatus(d){
  var on=ns.filter(function(n){return n.status==="online";}).length;
  var kind=d.status_kind==="server"?"服务器":"节点";
  var adminServers=d.is_admin&&d.status_kind==="server";
- var h='<div class="card"><div class="title">'+kind+'状态 · 在线 '+on+'/'+ns.length+'</div>';
- if(!ns.length)h+='<div class="muted">暂无'+kind+'。</div>';
+ var title=d.status_error?kind+'状态 · 暂不可用':kind+'状态 · 在线 '+on+'/'+ns.length;
+ var h='<div class="card"><div class="title">'+title+'</div>';
+	if(d.status_error)h+='<div class="muted">'+esc(d.status_error)+'</div>';
+	else if(!ns.length)h+='<div class="muted">暂无'+kind+'。</div>';
  ns.forEach(function(n){var ic,lb,col;
   if(n.status==="online"){ic='<span class="dot" style="background:var(--ok)"></span>';lb="在线";col="var(--ok)";}
   else if(n.status==="unknown"){ic='<span class="qm">?</span>';lb="外部";col="var(--unknown)";}

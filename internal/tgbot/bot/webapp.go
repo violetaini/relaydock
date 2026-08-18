@@ -298,6 +298,8 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 				"name": n.Name, "protocol": n.Protocol, "status": st,
 			})
 		}
+	} else {
+		resp["status_error"] = "节点状态暂时不可用，请稍后刷新"
 	}
 	resp["node_status"] = nodeStatus
 
@@ -322,6 +324,10 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 
 	// 管理员主页始终使用全局视图：订阅管理第一条、所有非零流量节点、全部服务器状态。
 	if s.cfg.IsAdmin(tgID) {
+		// The admin status panel replaces the user-node view below. Do not let a
+		// failed preliminary user-node lookup leave a stale error beside a
+		// successfully loaded server list.
+		delete(resp, "status_error")
 		resp["subscriptions"] = []map[string]any{}
 		if sv, err := s.client.GetAdminSubview(ctx, username); err == nil && sv != nil {
 			if sv.Subscription != nil {
@@ -357,6 +363,8 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 					"xray_running": server.XrayRunning,
 				})
 			}
+		} else {
+			resp["status_error"] = "服务器状态暂时不可用，请稍后刷新"
 		}
 		resp["node_status"] = serverStatuses
 		resp["status_kind"] = "server"
