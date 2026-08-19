@@ -698,7 +698,7 @@ func (r *TrafficRepository) ReorderSubscribeFiles(ctx context.Context, ids []int
 
 func (r *TrafficRepository) GetUserPackageSubscription(ctx context.Context, username string) (SubscribeFile, error) {
 	var file SubscribeFile
-	row := r.db.QueryRowContext(ctx, `SELECT `+subscribeFileSelectCols+`
+	row := r.db.QueryRowContext(ctx, `SELECT `+subscribeFileSelectClause("sf")+`
 		FROM subscribe_files sf
 		INNER JOIN user_subscriptions us ON sf.id = us.subscription_id
 		WHERE us.username = ? AND sf.type = ?

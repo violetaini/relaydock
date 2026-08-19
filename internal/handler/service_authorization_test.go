@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -163,6 +164,54 @@ func TestServiceAuthorizationSwitchPackageToCustomAdoptsPackageTombstone(t *test
 	grants, err := fixture.repo.ListUserServerGrants(ctx, "alice")
 	if err != nil || len(grants) != 1 || !grants[0].Enabled || grants[0].SourceType != storage.GrantSourceManual {
 		t.Fatalf("package tombstone was not adopted: grants=%+v err=%v", grants, err)
+	}
+}
+
+func TestServiceAuthorizationSwitchPackageToCustomDeletesPackageSubscriptionWithoutWarning(t *testing.T) {
+	fixture := newServiceAuthorizationFixture(t)
+	t.Setenv("ARCWAY_SUBSCRIPTION_LOCK_DIR", t.TempDir())
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	packageID, err := fixture.repo.CreatePackage(ctx, storage.Package{
+		Name: "subscription-package", TrafficLimitBytes: 1024, CycleDays: 30, ResetDay: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.packages.AssignAndProvision(ctx, "alice", packageID, now.Add(-time.Hour), now.Add(24*time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
+	file, err := fixture.repo.CreateSubscribeFile(ctx, storage.SubscribeFile{
+		Name: "alice package", Type: storage.SubscribeTypePackage,
+		Filename: "service-authorization-alice.yaml", CreatedBy: "alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.repo.AssignSubscriptionToUser(ctx, "alice", file.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	response := fixture.batchRequest(t, map[string]any{
+		"usernames": []string{"alice"}, "mode": storage.AuthorizationModeCustom,
+		"custom": map[string]any{
+			"fixed_node_grants": []any{}, "server_grants": []any{}, "forwarding_grants": []any{},
+		},
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Results []serviceAuthorizationResult `json:"results"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Results) != 1 || len(payload.Results[0].Warnings) != 0 {
+		t.Fatalf("unexpected authorization result: %+v", payload.Results)
+	}
+	if _, err := fixture.repo.GetUserPackageSubscription(ctx, "alice"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("package subscription was not deleted: %v", err)
 	}
 }
 

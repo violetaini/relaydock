@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -739,6 +740,14 @@ func (h *ServiceAuthorizationHandler) deletePackageSubscription(ctx context.Cont
 		return nil
 	}
 	if err := deleteSubscribeFileAndPhysical(ctx, h.repo, "subscribes", file); err != nil {
+		// The helper commits the database deletion before removing the physical
+		// file. Once the package subscription is no longer addressable, a later
+		// filesystem cleanup error must not be reported as an Agent provisioning
+		// warning for an otherwise successful authorization switch.
+		if _, lookupErr := h.repo.GetUserPackageSubscription(ctx, username); errors.Is(lookupErr, sql.ErrNoRows) {
+			log.Printf("[ServiceAuthorization] package subscription database cleanup completed for user=%s; deferred physical cleanup: %v", username, err)
+			return nil
+		}
 		return fmt.Errorf("delete package subscription: %w", err)
 	}
 	return nil
