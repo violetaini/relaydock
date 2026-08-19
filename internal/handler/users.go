@@ -107,6 +107,12 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 		entries := make([]userEntry, 0, len(users))
 		for _, user := range users {
 			scInfo := shortCodeMap[user.Username]
+			authorizationMode := user.AuthorizationMode
+			// package_id is the durable source of truth during legacy and
+			// in-flight migrations; never expose a stale custom mode to the UI.
+			if user.PackageID > 0 {
+				authorizationMode = storage.AuthorizationModePackage
+			}
 			entry := userEntry{
 				Username:            user.Username,
 				Email:               user.Email,
@@ -115,7 +121,7 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 				Role:                user.Role,
 				IsActive:            user.IsActive,
 				Remark:              user.Remark,
-				AuthorizationMode:   user.AuthorizationMode,
+				AuthorizationMode:   authorizationMode,
 				UserShortCode:       scInfo.UserShortCode,
 				CustomUserShortCode: scInfo.CustomUserShortCode,
 			}

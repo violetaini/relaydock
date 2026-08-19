@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -135,6 +136,68 @@ func TestPackageBundleMaterializesUpdatesAndRevokesGrants(t *testing.T) {
 	serverGrants, _ = repo.ListUserServerGrants(ctx, "alice")
 	if len(serverGrants) != 0 {
 		t.Fatalf("unused unassigned package server grant should be deleted: %+v", serverGrants)
+	}
+}
+
+func TestPackageServerGrantProtocolPolicyMaterializesAndRejectsSelection(t *testing.T) {
+	ctx, repo := context.Background(), packageBundleTestRepo(t)
+	_, server, node, offer := seedManagedNodesTest(t, repo)
+	node.ClashConfig = `{"type":"vless","network":"ws"}`
+	node.ParsedConfig = node.ClashConfig
+	if _, err := repo.UpdateNode(ctx, node); err != nil {
+		t.Fatalf("update managed node profile: %v", err)
+	}
+
+	pkgID, err := repo.CreatePackage(ctx, Package{
+		Name: "protocol-scoped-bundle", TrafficLimitBytes: 1024, CycleDays: 30, ResetDay: 1,
+		ServerGrants: []PackageServerGrant{{
+			ServerID: server.ID, MaxActiveNodes: 2, BillingMode: ManagedBillingDownload,
+			ResetPolicy: ManagedResetNone, AllowedProtocols: []string{"vless"},
+			AllowedProtocolProfiles: []string{"vless-wss"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create protocol-scoped package: %v", err)
+	}
+	start := time.Now().UTC().Add(-time.Minute)
+	if _, err := repo.AssignPackageBundleToUser(ctx, "alice", pkgID, start, start.Add(24*time.Hour), false, 1); err != nil {
+		t.Fatalf("assign protocol-scoped package: %v", err)
+	}
+
+	grants, err := repo.ListUserServerGrants(ctx, "alice")
+	if err != nil || len(grants) != 1 {
+		t.Fatalf("materialized grants=%+v err=%v", grants, err)
+	}
+	grant := grants[0]
+	if grant.SourceType != GrantSourcePackage || !reflect.DeepEqual(grant.AllowedProtocols, []string{"vless"}) ||
+		!reflect.DeepEqual(grant.AllowedProtocolProfiles, []string{"vless-wss"}) {
+		t.Fatalf("materialized protocol policy lost: %+v", grant)
+	}
+	catalog, err := repo.ListManagedNodeCatalog(ctx, "alice", start.Add(time.Minute))
+	if err != nil || len(catalog) != 1 {
+		t.Fatalf("catalog=%+v err=%v", catalog, err)
+	}
+	if catalog[0].CanCreate || catalog[0].DenyReason != "protocol_not_allowed" || catalog[0].ProtocolProfile != "vless-ws" {
+		t.Fatalf("disallowed profile escaped package policy: %+v", catalog[0])
+	}
+	if _, err := repo.ActivateUserNodeSelection(ctx, "alice", offer.ID, "alice", start.Add(time.Minute)); !errors.Is(err, ErrManagedProtocolNotAllowed) {
+		t.Fatalf("activation error=%v, want %v", err, ErrManagedProtocolNotAllowed)
+	}
+
+	stored, err := repo.GetPackage(ctx, pkgID)
+	if err != nil {
+		t.Fatalf("read package: %v", err)
+	}
+	stored.ServerGrants[0].AllowedProtocolProfiles = []string{"vless-ws"}
+	if _, err := repo.UpdatePackageBundle(ctx, *stored); err != nil {
+		t.Fatalf("update package protocol profile: %v", err)
+	}
+	grants, err = repo.ListUserServerGrants(ctx, "alice")
+	if err != nil || len(grants) != 1 || !reflect.DeepEqual(grants[0].AllowedProtocolProfiles, []string{"vless-ws"}) {
+		t.Fatalf("updated materialized protocol policy=%+v err=%v", grants, err)
+	}
+	if _, err := repo.ActivateUserNodeSelection(ctx, "alice", offer.ID, "alice", start.Add(2*time.Minute)); err != nil {
+		t.Fatalf("activation after allowing matching profile: %v", err)
 	}
 }
 

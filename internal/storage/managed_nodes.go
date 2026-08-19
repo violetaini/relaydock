@@ -1619,10 +1619,10 @@ func (r *TrafficRepository) DeleteUserServerGrant(ctx context.Context, id, expec
 		return fmt.Errorf("begin delete user server grant: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	var username string
+	var username, sourceType string
 	var serverID int64
 	var version int64
-	if err := tx.QueryRowContext(ctx, `SELECT username, server_id, version FROM user_server_grants WHERE id = ?`, id).Scan(&username, &serverID, &version); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT username, server_id, version, COALESCE(source_type,'manual') FROM user_server_grants WHERE id = ?`, id).Scan(&username, &serverID, &version, &sourceType); errors.Is(err, sql.ErrNoRows) {
 		return ErrUserServerGrantNotFound
 	} else if err != nil {
 		return fmt.Errorf("get grant before delete: %w", err)
@@ -1632,6 +1632,9 @@ func (r *TrafficRepository) DeleteUserServerGrant(ctx context.Context, id, expec
 	}
 	if version != expectedVersion {
 		return ErrManagedVersionConflict
+	}
+	if sourceType == GrantSourcePackage {
+		return ErrAuthorizationModeConflict
 	}
 	var ownedCreations int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_managed_node_creations WHERE grant_id=?`, id).Scan(&ownedCreations); err != nil {

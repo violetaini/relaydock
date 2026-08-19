@@ -411,10 +411,14 @@ func (h *ServiceAuthorizationHandler) writeCurrent(w http.ResponseWriter, r *htt
 		writeServiceAuthorizationError(w, err)
 		return
 	}
+	authorizationMode := user.AuthorizationMode
+	if user.PackageID > 0 {
+		authorizationMode = storage.AuthorizationModePackage
+	}
 	response := map[string]any{
 		"success":            true,
 		"username":           username,
-		"authorization_mode": user.AuthorizationMode,
+		"authorization_mode": authorizationMode,
 		"custom": map[string]any{
 			"fixed_node_grants": snapshot.fixed,
 			"server_grants":     snapshot.servers,
