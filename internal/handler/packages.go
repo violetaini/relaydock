@@ -1759,13 +1759,25 @@ func (h *PackageUnassignHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 
 // PackageAssignHandler 处理将包分配给用户的操作
 type PackageAssignHandler struct {
-	repo         *storage.TrafficRepository
-	remoteManage *RemoteManageHandler
-	pusher       *LimiterConfigPusher
-	managed      *ManagedNodesHandler
-	forwarding   *ForwardingHandler
-	reconcileMu  sync.Mutex
-	reconcileWG  sync.WaitGroup
+	repo             *storage.TrafficRepository
+	remoteManage     *RemoteManageHandler
+	pusher           *LimiterConfigPusher
+	managed          *ManagedNodesHandler
+	forwarding       *ForwardingHandler
+	reconcileMu      sync.Mutex
+	reconcileWG      sync.WaitGroup
+	reconcileStateMu sync.Mutex
+	reconciled       map[string]string
+}
+
+type packageReconcileSnapshot struct {
+	PackageID         int64
+	AuthorizationMode string
+	PackageStartDate  *time.Time
+	PackageEndDate    *time.Time
+	IsReset           bool
+	ResetDay          int
+	Package           *storage.Package
 }
 
 func NewPackageAssignHandler(repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher) *PackageAssignHandler {
@@ -1826,26 +1838,79 @@ func (h *PackageAssignHandler) reconcileAssignments(ctx context.Context) {
 		return
 	}
 	now := time.Now()
+	activeUsers := make(map[string]struct{}, len(users))
 	for _, user := range users {
 		if ctx.Err() != nil {
 			return
 		}
 		if !user.IsActive || user.PackageID <= 0 || user.PackageStartDate == nil || user.PackageEndDate == nil ||
-			now.Before(*user.PackageStartDate) || !now.Before(*user.PackageEndDate) {
+			user.AuthorizationMode != storage.AuthorizationModePackage || now.Before(*user.PackageStartDate) || !now.Before(*user.PackageEndDate) {
+			h.forgetReconciledPackage(user.Username)
 			continue
 		}
+		activeUsers[user.Username] = struct{}{}
 		var warnings []string
 		var reconcileErr error
 		var cleanupErr error
 		leaseErr := withStableUserPackageAuthorizationLease(ctx, h.repo, user.Username, []int64{user.PackageID}, func(leasedCtx context.Context, latest storage.User) error {
 			if latest.AuthorizationMode != storage.AuthorizationModePackage || latest.PackageID != user.PackageID ||
 				latest.PackageStartDate == nil || latest.PackageEndDate == nil {
+				h.forgetReconciledPackage(latest.Username)
 				return nil
 			}
+			pkg, packageErr := h.repo.GetPackage(leasedCtx, latest.PackageID)
+			if packageErr != nil {
+				reconcileErr = packageErr
+				return nil
+			}
+			fingerprint, fingerprintErr := packageReconcileFingerprint(latest, pkg)
+			if fingerprintErr != nil {
+				reconcileErr = fingerprintErr
+				return nil
+			}
+			complete, completeErr := h.packageFixedNodeCredentialsComplete(leasedCtx, latest.Username, pkg)
+			if completeErr != nil {
+				reconcileErr = completeErr
+				return nil
+			}
+			if complete && h.reconciledPackageMatches(latest.Username, fingerprint) {
+				cleanupErr = h.reconcileStalePackageNodeAccessLocked(leasedCtx, latest.Username)
+				if cleanupErr != nil {
+					h.forgetReconciledPackage(latest.Username)
+				}
+				return nil
+			}
+
+			h.forgetReconciledPackage(latest.Username)
 			warnings, reconcileErr = h.assignAndProvisionLocked(leasedCtx, user.Username, latest.PackageID,
 				*latest.PackageStartDate, *latest.PackageEndDate, latest.IsReset, latest.ResetDay)
 			if reconcileErr == nil {
-				cleanupErr = h.reconcileStalePackageNodeAccess(leasedCtx, user.Username)
+				cleanupErr = h.reconcileStalePackageNodeAccessLocked(leasedCtx, user.Username)
+			}
+			if reconcileErr == nil && cleanupErr == nil && len(warnings) == 0 {
+				refreshedUser, refreshErr := h.repo.GetUser(leasedCtx, latest.Username)
+				if refreshErr != nil {
+					reconcileErr = refreshErr
+					return nil
+				}
+				refreshedPackage, refreshErr := h.repo.GetPackage(leasedCtx, refreshedUser.PackageID)
+				if refreshErr != nil {
+					reconcileErr = refreshErr
+					return nil
+				}
+				complete, refreshErr = h.packageFixedNodeCredentialsComplete(leasedCtx, refreshedUser.Username, refreshedPackage)
+				if refreshErr != nil {
+					reconcileErr = refreshErr
+					return nil
+				}
+				if complete {
+					fingerprint, refreshErr = packageReconcileFingerprint(refreshedUser, refreshedPackage)
+					if refreshErr != nil {
+						reconcileErr = refreshErr
+						return nil
+					}
+					h.rememberReconciledPackage(refreshedUser.Username, fingerprint)
+				}
 			}
 			return nil
 		})
@@ -1855,6 +1920,144 @@ func (h *PackageAssignHandler) reconcileAssignments(ctx context.Context) {
 		if reconcileErr != nil || cleanupErr != nil || len(warnings) > 0 {
 			log.Printf("[PackageReconcile] user=%s package=%d warnings=%v provision_err=%v cleanup_err=%v",
 				user.Username, user.PackageID, warnings, reconcileErr, cleanupErr)
+		}
+	}
+	h.pruneReconciledPackages(activeUsers)
+}
+
+func packageReconcileFingerprint(user storage.User, pkg *storage.Package) (string, error) {
+	snapshot := packageReconcileSnapshot{
+		PackageID: user.PackageID, AuthorizationMode: user.AuthorizationMode,
+		PackageStartDate: user.PackageStartDate, PackageEndDate: user.PackageEndDate,
+		IsReset: user.IsReset, ResetDay: user.ResetDay, Package: pkg,
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return "", fmt.Errorf("encode package reconciliation fingerprint: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func (h *PackageAssignHandler) packageFixedNodeCredentialsComplete(ctx context.Context, username string, pkg *storage.Package) (bool, error) {
+	if pkg == nil {
+		return false, errors.New("package template is unavailable")
+	}
+	seenInbounds := make(map[string]struct{}, len(pkg.Nodes))
+	for _, nodeID := range pkg.Nodes {
+		node, err := h.repo.GetNodeByID(ctx, nodeID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNodeNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		if !node.Enabled {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(node.NodeType), "routed") {
+			subaccount, err := h.repo.GetUserSubaccount(ctx, node.ID, username)
+			if err != nil {
+				return false, err
+			}
+			if subaccount == nil || !subaccount.IsActive || subaccount.RevokePending || subaccount.ActivationPending ||
+				!packageRoutedCredentialComplete(ctx, h.repo, node, *subaccount) {
+				return false, nil
+			}
+			continue
+		}
+		if strings.TrimSpace(node.InboundTag) == "" || strings.TrimSpace(node.OriginalServer) == "" ||
+			!supportsPerUserInboundCredential(node.Protocol) {
+			continue
+		}
+		if canonicalManagedProtocol(node.Protocol) == "wireguard" {
+			provisionable, err := h.repo.ManagedWireGuardNodeProvisionable(ctx, node.ID)
+			if err != nil {
+				return false, err
+			}
+			if !provisionable {
+				return false, nil
+			}
+		}
+		server, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer)
+		if err != nil {
+			if errors.Is(err, storage.ErrRemoteServerNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		key := fmt.Sprintf("%d|%s", server.ID, node.InboundTag)
+		if _, duplicate := seenInbounds[key]; duplicate {
+			continue
+		}
+		seenInbounds[key] = struct{}{}
+		config, err := h.repo.GetUserInboundConfig(ctx, username, server.ID, node.InboundTag)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if canonicalManagedProtocol(config.Protocol) != canonicalManagedProtocol(node.Protocol) {
+			return false, nil
+		}
+		credentialJSON, ok := subscriptionCredentialJSON(ctx, h.repo, *config)
+		if !ok {
+			return false, nil
+		}
+		var proxy map[string]any
+		if err := json.Unmarshal([]byte(node.ClashConfig), &proxy); err != nil || proxy == nil {
+			return false, nil
+		}
+		if !applyUserCredentials(proxy, node, map[credKey]string{{serverName: node.OriginalServer, inboundTag: node.InboundTag}: credentialJSON}) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func packageRoutedCredentialComplete(ctx context.Context, repo *storage.TrafficRepository, node storage.Node, subaccount storage.UserSubaccount) bool {
+	clashJSON := strings.TrimSpace(node.ClashConfig)
+	if node.ParentNodeID != nil && *node.ParentNodeID > 0 {
+		if parent, err := repo.GetNodeByID(ctx, *node.ParentNodeID); err == nil && parent.Enabled && strings.TrimSpace(parent.ClashConfig) != "" {
+			clashJSON = parent.ClashConfig
+		}
+	}
+	var proxy map[string]any
+	var credential map[string]any
+	if clashJSON == "" || json.Unmarshal([]byte(clashJSON), &proxy) != nil || proxy == nil ||
+		json.Unmarshal([]byte(subaccount.CredentialJSON), &credential) != nil || credential == nil {
+		return false
+	}
+	return applyCredToProxy(proxy, node.Protocol, credential)
+}
+
+func (h *PackageAssignHandler) reconciledPackageMatches(username, fingerprint string) bool {
+	h.reconcileStateMu.Lock()
+	defer h.reconcileStateMu.Unlock()
+	return h.reconciled != nil && h.reconciled[username] == fingerprint
+}
+
+func (h *PackageAssignHandler) rememberReconciledPackage(username, fingerprint string) {
+	h.reconcileStateMu.Lock()
+	defer h.reconcileStateMu.Unlock()
+	if h.reconciled == nil {
+		h.reconciled = make(map[string]string)
+	}
+	h.reconciled[username] = fingerprint
+}
+
+func (h *PackageAssignHandler) forgetReconciledPackage(username string) {
+	h.reconcileStateMu.Lock()
+	defer h.reconcileStateMu.Unlock()
+	delete(h.reconciled, username)
+}
+
+func (h *PackageAssignHandler) pruneReconciledPackages(activeUsers map[string]struct{}) {
+	h.reconcileStateMu.Lock()
+	defer h.reconcileStateMu.Unlock()
+	for username := range h.reconciled {
+		if _, active := activeUsers[username]; !active {
+			delete(h.reconciled, username)
 		}
 	}
 }
@@ -2131,6 +2334,8 @@ func (h *PackageAssignHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 // AssignAndProvision 绑定套餐并真正下发(给套餐节点 inbound 加用户凭据 + 批量推服务器 + 重启 xray + 推限速)。
 // 抽自 ServeHTTP,供 web /api/admin/packages/assign 与 TGBOT 注册/兑换共用,确保两条路都生效。
 func (h *PackageAssignHandler) AssignAndProvision(ctx context.Context, username string, packageID int64, startDate, endDate time.Time, isReset bool, resetDay int) ([]string, error) {
+	h.forgetReconciledPackage(username)
+	defer h.forgetReconciledPackage(username)
 	var warnings []string
 	err := withStableUserPackageAuthorizationLease(ctx, h.repo, username, []int64{packageID}, func(leasedCtx context.Context, _ storage.User) error {
 		var assignErr error

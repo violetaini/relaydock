@@ -624,6 +624,91 @@ func TestSamePackageAssignmentRepairsMissingInboundCredential(t *testing.T) {
 	}
 }
 
+func TestPackageReconcilerSkipsStableAssignmentAndRepairsDeletedCredential(t *testing.T) {
+	agent := &packageLeaseAgent{}
+	repo, server, remote, dbPath := newPackageLeaseFixtureWithDBPath(t, agent)
+	ctx := context.Background()
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "stable-managed", Protocol: "vless", OriginalServer: server.Name, InboundTag: "vless-in",
+		ClashConfig: `{"name":"stable-managed","type":"vless","server":"edge.example.test","port":443,"uuid":"owner-id"}`,
+		Enabled:     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "stable-reconcile-package", TrafficLimitBytes: 1024, CycleDays: 30, Nodes: []int64{node.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, start, end, false, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	inspector, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspector.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = inspector.Close() })
+	readDataVersion := func() int64 {
+		t.Helper()
+		var version int64
+		if err := inspector.QueryRowContext(ctx, `PRAGMA data_version`).Scan(&version); err != nil {
+			t.Fatalf("read sqlite data_version: %v", err)
+		}
+		return version
+	}
+
+	assign := NewPackageAssignHandler(repo, remote, nil)
+	assign.reconcileAssignments(ctx)
+	if config, configErr := repo.GetUserInboundConfig(ctx, "alice", server.ID, "vless-in"); configErr != nil || config == nil {
+		t.Fatalf("first reconciliation did not provision credential: config=%+v err=%v", config, configErr)
+	}
+	firstAgentWrites := agent.addClientCalls.Load()
+	if firstAgentWrites == 0 {
+		t.Fatal("first reconciliation made no Agent add-client write")
+	}
+	databaseVersion := readDataVersion()
+
+	assign.reconcileAssignments(ctx)
+	if got := agent.addClientCalls.Load(); got != firstAgentWrites {
+		t.Fatalf("stable second reconciliation made Agent writes: before=%d after=%d", firstAgentWrites, got)
+	}
+	if got := readDataVersion(); got != databaseVersion {
+		t.Fatalf("stable second reconciliation changed database: before data_version=%d after=%d", databaseVersion, got)
+	}
+
+	if err := repo.DeleteUserInboundConfig(ctx, "alice", server.ID, "vless-in"); err != nil {
+		t.Fatal(err)
+	}
+	assign.reconcileAssignments(ctx)
+	if config, configErr := repo.GetUserInboundConfig(ctx, "alice", server.ID, "vless-in"); configErr != nil || config == nil {
+		t.Fatalf("deleted credential was not repaired: config=%+v err=%v", config, configErr)
+	}
+	if got := agent.addClientCalls.Load(); got != firstAgentWrites+1 {
+		t.Fatalf("credential repair Agent writes=%d, want %d", got, firstAgentWrites+1)
+	}
+
+	pkg, err := repo.GetPackage(ctx, packageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Nodes = nil
+	if err := repo.UpdatePackage(ctx, *pkg); err != nil {
+		t.Fatal(err)
+	}
+	assign.reconcileAssignments(ctx)
+	if config, configErr := repo.GetUserInboundConfig(ctx, "alice", server.ID, "vless-in"); !errors.Is(configErr, sql.ErrNoRows) || config != nil {
+		t.Fatalf("template removal left credential behind: config=%+v err=%v", config, configErr)
+	}
+	if got := agent.removeClientCalls.Load(); got != 1 {
+		t.Fatalf("template removal made %d Agent remove-client writes, want 1", got)
+	}
+}
+
 func TestPackageReconcilerRevokesInboundRemovedFromTemplate(t *testing.T) {
 	agent := &packageLeaseAgent{}
 	repo, server, remote := newPackageLeaseFixture(t, agent)

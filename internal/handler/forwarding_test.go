@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
@@ -236,6 +237,40 @@ func TestUserForwardDTOBillsUploadMode(t *testing.T) {
 	dto := fixture.handler.userForwardDTO(ctx, *forward)
 	if dto.UplinkBytes != 30 || dto.DownlinkBytes != 70 || dto.BilledBytes != 30 {
 		t.Fatalf("upload DTO usage=%d/%d billed=%d want=30/70 billed=30", dto.UplinkBytes, dto.DownlinkBytes, dto.BilledBytes)
+	}
+}
+
+func TestHandleUserTunnelGrantsIncludesPerForwardLimits(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	input := *fixture.grant
+	input.PerForwardSpeedMbps = 42.5
+	if _, err := fixture.repo.UpdateUserTunnelGrant(
+		context.Background(), fixture.grant.PublicID, "alice", input, fixture.grant.Version, "admin",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/user/tunnel-grants", nil)
+	request = request.WithContext(auth.ContextWithUsername(request.Context(), "alice"))
+	response := httptest.NewRecorder()
+	fixture.handler.HandleUserTunnelGrants(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Grants []struct {
+			PerForwardSpeedMbps       float64 `json:"per_forward_speed_mbps"`
+			PerForwardConnectionLimit int     `json:"per_forward_connection_limit"`
+		} `json:"grants"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Grants) != 1 {
+		t.Fatalf("grants=%+v want one grant", payload.Grants)
+	}
+	if payload.Grants[0].PerForwardSpeedMbps != 42.5 || payload.Grants[0].PerForwardConnectionLimit != 0 {
+		t.Fatalf("per-forward limits=%+v want speed=42.5 connection=0", payload.Grants[0])
 	}
 }
 

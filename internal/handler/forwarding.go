@@ -582,25 +582,32 @@ func (h *ForwardingHandler) reconcileGrantForwards(ctx context.Context, grant *s
 }
 
 type userTunnelGrantResponse struct {
-	ID                     string     `json:"id"`
-	TunnelID               string     `json:"tunnel_id"`
-	Name                   string     `json:"name"`
-	TunnelName             string     `json:"tunnel_name"`
-	Description            string     `json:"description"`
-	State                  string     `json:"state"`
-	Route                  []string   `json:"route"`
-	StartsAt               time.Time  `json:"starts_at"`
-	ExpiresAt              *time.Time `json:"expires_at,omitempty"`
-	MaxActiveForwards      int        `json:"max_active_forwards"`
-	ActiveForwardCount     int        `json:"active_forward_count"`
-	TrafficLimitBytes      int64      `json:"traffic_limit_bytes"`
-	UsedBytes              int64      `json:"used_bytes"`
-	BillingMode            string     `json:"billing_mode"`
-	TrafficMultiplierMilli int        `json:"traffic_multiplier_milli"`
+	ID                        string     `json:"id"`
+	TunnelID                  string     `json:"tunnel_id"`
+	Name                      string     `json:"name"`
+	TunnelName                string     `json:"tunnel_name"`
+	Description               string     `json:"description"`
+	State                     string     `json:"state"`
+	Route                     []string   `json:"route"`
+	StartsAt                  time.Time  `json:"starts_at"`
+	ExpiresAt                 *time.Time `json:"expires_at,omitempty"`
+	MaxActiveForwards         int        `json:"max_active_forwards"`
+	ActiveForwardCount        int        `json:"active_forward_count"`
+	PerForwardSpeedMbps       float64    `json:"per_forward_speed_mbps"`
+	PerForwardConnectionLimit int        `json:"per_forward_connection_limit"`
+	TrafficLimitBytes         int64      `json:"traffic_limit_bytes"`
+	UsedBytes                 int64      `json:"used_bytes"`
+	BillingMode               string     `json:"billing_mode"`
+	TrafficMultiplierMilli    int        `json:"traffic_multiplier_milli"`
 }
 
 func userGrantResponse(g storage.UserTunnelGrant) userTunnelGrantResponse {
-	out := userTunnelGrantResponse{ID: g.PublicID, State: g.State, StartsAt: g.StartsAt, ExpiresAt: g.ExpiresAt, MaxActiveForwards: g.MaxActiveForwards, ActiveForwardCount: g.ActiveForwardCount, TrafficLimitBytes: g.TrafficLimitBytes, UsedBytes: g.UsedBytes}
+	out := userTunnelGrantResponse{
+		ID: g.PublicID, State: g.State, StartsAt: g.StartsAt, ExpiresAt: g.ExpiresAt,
+		MaxActiveForwards: g.MaxActiveForwards, ActiveForwardCount: g.ActiveForwardCount,
+		PerForwardSpeedMbps: g.PerForwardSpeedMbps, PerForwardConnectionLimit: g.PerForwardConnectionLimit,
+		TrafficLimitBytes: g.TrafficLimitBytes, UsedBytes: g.UsedBytes,
+	}
 	if g.Tunnel != nil {
 		out.TunnelID, out.Name, out.TunnelName, out.Description = g.Tunnel.PublicID, g.Tunnel.Name, g.Tunnel.Name, g.Tunnel.Description
 		out.BillingMode, out.TrafficMultiplierMilli = g.Tunnel.BillingMode, g.Tunnel.TrafficMultiplierMilli
