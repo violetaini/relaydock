@@ -130,7 +130,7 @@ func TestUserListHidesRetiredAggregatesAndReturnsDetailedOverrides(t *testing.T)
 	if err := repo.UpdateUserLimitOverrides(context.Background(), "alice", &speed, &devices); err != nil {
 		t.Fatalf("UpdateUserLimitOverrides: %v", err)
 	}
-	if err := repo.UpdateUserNodeLimits(context.Background(), "alice", map[int64]float64{7: 8}, map[int64]int{7: 2}); err != nil {
+	if err := repo.UpdateUserNodeLimitsWithTraffic(context.Background(), "alice", map[int64]float64{7: 8}, map[int64]float64{7: 3.5}, map[int64]int{7: 2}); err != nil {
 		t.Fatalf("UpdateUserNodeLimits: %v", err)
 	}
 	response := httptest.NewRecorder()
@@ -140,13 +140,14 @@ func TestUserListHidesRetiredAggregatesAndReturnsDetailedOverrides(t *testing.T)
 	}
 	var payload struct {
 		Users []struct {
-			Username                 string            `json:"username"`
-			TrafficLimit             int64             `json:"traffic_limit"`
-			TrafficLimitOverrideGB   *float64          `json:"traffic_limit_override_gb"`
-			SpeedLimitOverride       *float64          `json:"speed_limit_override"`
-			DeviceLimitOverride      *int              `json:"device_limit_override"`
-			NodeSpeedLimitOverrides  map[int64]float64 `json:"node_speed_limit_overrides"`
-			NodeDeviceLimitOverrides map[int64]int     `json:"node_device_limit_overrides"`
+			Username                  string            `json:"username"`
+			TrafficLimit              int64             `json:"traffic_limit"`
+			TrafficLimitOverrideGB    *float64          `json:"traffic_limit_override_gb"`
+			SpeedLimitOverride        *float64          `json:"speed_limit_override"`
+			DeviceLimitOverride       *int              `json:"device_limit_override"`
+			NodeSpeedLimitOverrides   map[int64]float64 `json:"node_speed_limit_overrides"`
+			NodeTrafficLimitOverrides map[int64]float64 `json:"node_traffic_limit_overrides"`
+			NodeDeviceLimitOverrides  map[int64]int     `json:"node_device_limit_overrides"`
 		} `json:"users"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
@@ -155,7 +156,8 @@ func TestUserListHidesRetiredAggregatesAndReturnsDetailedOverrides(t *testing.T)
 	if len(payload.Users) != 1 || payload.Users[0].Username != "alice" || payload.Users[0].TrafficLimit != 0 ||
 		payload.Users[0].TrafficLimitOverrideGB != nil || payload.Users[0].SpeedLimitOverride != nil ||
 		payload.Users[0].DeviceLimitOverride == nil || *payload.Users[0].DeviceLimitOverride != 4 ||
-		payload.Users[0].NodeSpeedLimitOverrides[7] != 8 || payload.Users[0].NodeDeviceLimitOverrides[7] != 2 {
+		payload.Users[0].NodeSpeedLimitOverrides[7] != 8 || payload.Users[0].NodeTrafficLimitOverrides[7] != 3.5 ||
+		payload.Users[0].NodeDeviceLimitOverrides[7] != 2 {
 		t.Fatalf("unexpected user list payload: %+v", payload.Users)
 	}
 }

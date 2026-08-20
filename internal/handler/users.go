@@ -41,9 +41,10 @@ type userEntry struct {
 	SpeedLimitOverride  *float64 `json:"speed_limit_override"`
 	DeviceLimitOverride *int     `json:"device_limit_override"`
 	// nil=继承套餐,0=显式不限,>0=用户覆盖;TrafficLimit 是已解析后的有效值。
-	TrafficLimitOverrideGB   *float64          `json:"traffic_limit_override_gb"`
-	NodeSpeedLimitOverrides  map[int64]float64 `json:"node_speed_limit_overrides,omitempty"`
-	NodeDeviceLimitOverrides map[int64]int     `json:"node_device_limit_overrides,omitempty"`
+	TrafficLimitOverrideGB    *float64          `json:"traffic_limit_override_gb"`
+	NodeSpeedLimitOverrides   map[int64]float64 `json:"node_speed_limit_overrides,omitempty"`
+	NodeTrafficLimitOverrides map[int64]float64 `json:"node_traffic_limit_overrides,omitempty"`
+	NodeDeviceLimitOverrides  map[int64]int     `json:"node_device_limit_overrides,omitempty"`
 	// 短码:user_short_code 是系统自动生成的;custom_user_short_code 非空时优先生效。
 	// 前端用 user_short_code 显示"当前生效",custom_user_short_code 作为编辑输入框的回填值。
 	UserShortCode       string `json:"user_short_code"`
@@ -129,6 +130,7 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 			// values remain valid detailed overrides in either authorization mode.
 			entry.DeviceLimitOverride = user.DeviceLimitOverride
 			entry.NodeSpeedLimitOverrides = user.NodeSpeedLimitOverrides
+			entry.NodeTrafficLimitOverrides = user.NodeTrafficLimitOverrides
 			entry.NodeDeviceLimitOverrides = user.NodeDeviceLimitOverrides
 			if user.PackageID > 0 {
 				pid := user.PackageID

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -83,4 +84,52 @@ func TestUserTrafficLimitOverrideMigrationAndPackageLifecycle(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = repo.Close() })
 	assertOverride(nil)
+}
+
+func TestUserNodeTrafficLimitOverridesMigratePersistAndList(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node-traffic-limit-overrides.db")
+	repo, err := NewTrafficRepository(path)
+	if err != nil {
+		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	ctx := context.Background()
+	if err := repo.CreateUser(ctx, "alice", "alice@example.test", "Alice", "hash", RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	traffic := map[int64]float64{7: 0, 8: 1.25}
+	if err := repo.UpdateUserNodeLimitsWithTraffic(ctx, "alice", map[int64]float64{7: 8}, traffic, map[int64]int{7: 2}); err != nil {
+		t.Fatalf("UpdateUserNodeLimitsWithTraffic: %v", err)
+	}
+	assertStored := func(repo *TrafficRepository) {
+		t.Helper()
+		user, err := repo.GetUser(ctx, "alice")
+		if err != nil {
+			t.Fatalf("GetUser: %v", err)
+		}
+		if value, ok := user.NodeTrafficLimitOverrides[7]; !ok || value != 0 || user.NodeTrafficLimitOverrides[8] != 1.25 {
+			t.Fatalf("GetUser node traffic overrides=%v", user.NodeTrafficLimitOverrides)
+		}
+		users, err := repo.ListUsers(ctx, 10)
+		if err != nil || len(users) != 1 || users[0].NodeTrafficLimitOverrides[8] != 1.25 {
+			t.Fatalf("ListUsers=%+v err=%v", users, err)
+		}
+	}
+	assertStored(repo)
+	if err := repo.UpdateUserNodeLimitsWithTraffic(ctx, "alice", nil, map[int64]float64{8: math.Inf(1)}, nil); err == nil {
+		t.Fatal("infinite traffic override was accepted")
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, err = NewTrafficRepository(path)
+	if err != nil {
+		t.Fatalf("idempotent reopen migration: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	assertStored(repo)
+	var columns int
+	if err := repo.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('users') WHERE name='node_traffic_limit_overrides'`).Scan(&columns); err != nil || columns != 1 {
+		t.Fatalf("node traffic override column count=%d err=%v", columns, err)
+	}
 }

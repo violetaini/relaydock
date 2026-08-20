@@ -2481,6 +2481,9 @@ CREATE INDEX IF NOT EXISTS idx_remote_server_install_tickets_server
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN node_device_limits TEXT DEFAULT '{}'")
 	_, _ = r.db.Exec("ALTER TABLE users ADD COLUMN node_speed_limit_overrides TEXT DEFAULT '{}'")
 	_, _ = r.db.Exec("ALTER TABLE users ADD COLUMN node_device_limit_overrides TEXT DEFAULT '{}'")
+	if err := r.ensureUserColumn("node_traffic_limit_overrides", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
+		return fmt.Errorf("migrate users.node_traffic_limit_overrides: %w", err)
+	}
 	if _, err := r.db.Exec("UPDATE packages SET traffic_limit_bytes = 0, speed_limit_mbps = 0, auto_speed_limit_json = '' WHERE traffic_limit_bytes != 0 OR speed_limit_mbps != 0 OR COALESCE(auto_speed_limit_json, '') != ''"); err != nil {
 		return fmt.Errorf("normalize legacy package aggregate limits: %w", err)
 	}
@@ -5274,6 +5277,9 @@ type User struct {
 	TrafficLimitOverride *int64
 	// 用户级 per-node 限速覆盖。map 含 key 即生效:0 = 显式不限速;>0 = 该值;不含 key = 沿用上层。
 	NodeSpeedLimitOverrides map[int64]float64
+	// 用户级 per-node 流量覆盖，单位 GB。map 含 key 即生效:0 = 显式不限流量;
+	// >0 = 该节点当前用户流量周期的额度;不含 key = 沿用套餐节点额度。
+	NodeTrafficLimitOverrides map[int64]float64
 	// 用户级 per-node 客户端数覆盖。语义同上。
 	NodeDeviceLimitOverrides map[int64]int
 	TOTPSecret               string
@@ -5374,14 +5380,14 @@ func (r *TrafficRepository) GetUser(ctx context.Context, username string) (User,
 		return user, errors.New("username is required")
 	}
 
-	row := r.db.QueryRowContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), COALESCE(totp_secret, ''), COALESCE(totp_enabled, 0), COALESCE(recovery_codes, '[]'), created_at, updated_at FROM users WHERE username = ? LIMIT 1`, username)
+	row := r.db.QueryRowContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_traffic_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), COALESCE(totp_secret, ''), COALESCE(totp_enabled, 0), COALESCE(recovery_codes, '[]'), created_at, updated_at FROM users WHERE username = ? LIMIT 1`, username)
 	var active, isReset, totpEnabled int
 	var startDate, endDate sql.NullTime
 	var speedOverride sql.NullFloat64
 	var deviceOverride sql.NullInt64
 	var trafficOverride sql.NullInt64
-	var nodeSpeedJSON, nodeDeviceJSON string
-	if err := row.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.PackageID, &user.AuthorizationMode, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &user.TOTPSecret, &totpEnabled, &user.RecoveryCodes, &user.CreatedAt, &user.UpdatedAt); err != nil {
+	var nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON string
+	if err := row.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.PackageID, &user.AuthorizationMode, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &user.TOTPSecret, &totpEnabled, &user.RecoveryCodes, &user.CreatedAt, &user.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return user, ErrUserNotFound
 		}
@@ -5417,6 +5423,9 @@ func (r *TrafficRepository) GetUser(ctx context.Context, username string) (User,
 	if nodeSpeedJSON != "" && nodeSpeedJSON != "{}" {
 		unmarshalStringKeyedMap(nodeSpeedJSON, &user.NodeSpeedLimitOverrides)
 	}
+	if nodeTrafficJSON != "" && nodeTrafficJSON != "{}" {
+		unmarshalStringKeyedMap(nodeTrafficJSON, &user.NodeTrafficLimitOverrides)
+	}
 	if nodeDeviceJSON != "" && nodeDeviceJSON != "{}" {
 		unmarshalStringKeyedIntMap(nodeDeviceJSON, &user.NodeDeviceLimitOverrides)
 	}
@@ -5434,7 +5443,7 @@ func (r *TrafficRepository) ListUsers(ctx context.Context, limit int) ([]User, e
 		limit = 10
 	}
 
-	rows, err := r.db.QueryContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users ORDER BY created_at ASC LIMIT ?`, limit)
+	rows, err := r.db.QueryContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_traffic_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users ORDER BY created_at ASC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}
@@ -5448,8 +5457,8 @@ func (r *TrafficRepository) ListUsers(ctx context.Context, limit int) ([]User, e
 		var speedOverride sql.NullFloat64
 		var deviceOverride sql.NullInt64
 		var trafficOverride sql.NullInt64
-		var nodeSpeedJSON, nodeDeviceJSON string
-		if err := rows.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.Remark, &user.PackageID, &user.AuthorizationMode, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &user.CreatedAt, &user.UpdatedAt); err != nil {
+		var nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON string
+		if err := rows.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.Remark, &user.PackageID, &user.AuthorizationMode, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &user.CreatedAt, &user.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		if user.Nickname == "" {
@@ -5480,6 +5489,9 @@ func (r *TrafficRepository) ListUsers(ctx context.Context, limit int) ([]User, e
 		}
 		if nodeSpeedJSON != "" && nodeSpeedJSON != "{}" {
 			unmarshalStringKeyedMap(nodeSpeedJSON, &user.NodeSpeedLimitOverrides)
+		}
+		if nodeTrafficJSON != "" && nodeTrafficJSON != "{}" {
+			unmarshalStringKeyedMap(nodeTrafficJSON, &user.NodeTrafficLimitOverrides)
 		}
 		if nodeDeviceJSON != "" && nodeDeviceJSON != "{}" {
 			unmarshalStringKeyedIntMap(nodeDeviceJSON, &user.NodeDeviceLimitOverrides)
@@ -9210,8 +9222,9 @@ func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, usern
 	defer tx.Rollback()
 	var oldPackageID int64
 	var oldStartDate, oldEndDate sql.NullTime
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0), package_start_date, package_end_date FROM users WHERE username = ?`, username).
-		Scan(&oldPackageID, &oldStartDate, &oldEndDate); errors.Is(err, sql.ErrNoRows) {
+	var nodeTrafficOverridesJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0), package_start_date, package_end_date, COALESCE(node_traffic_limit_overrides, '{}') FROM users WHERE username = ?`, username).
+		Scan(&oldPackageID, &oldStartDate, &oldEndDate, &nodeTrafficOverridesJSON); errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrUserNotFound
 	} else if err != nil {
 		return nil, err
@@ -9242,9 +9255,29 @@ func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, usern
 	if affected == 0 {
 		return nil, ErrUserNotFound
 	}
+	var nodeTrafficOverrides map[int64]float64
+	unmarshalStringKeyedMap(nodeTrafficOverridesJSON, &nodeTrafficOverrides)
 	hasNodeTrafficQuota := false
-	for _, limitGB := range pkg.NodeTrafficLimits {
+	for nodeID, limitGB := range pkg.NodeTrafficLimits {
+		if override, ok := nodeTrafficOverrides[nodeID]; ok {
+			limitGB = override
+		}
 		hasNodeTrafficQuota = hasNodeTrafficQuota || limitGB > 0
+	}
+	if !hasNodeTrafficQuota {
+		for nodeID, limitGB := range nodeTrafficOverrides {
+			if limitGB > 0 {
+				for _, packageNodeID := range pkg.Nodes {
+					if nodeID == packageNodeID {
+						hasNodeTrafficQuota = true
+						break
+					}
+				}
+			}
+			if hasNodeTrafficQuota {
+				break
+			}
+		}
 	}
 	windowChanged := oldPackageID != packageID || !oldStartDate.Valid || !oldEndDate.Valid ||
 		!oldStartDate.Time.Equal(startDate) || !oldEndDate.Time.Equal(endDate)
@@ -10605,7 +10638,7 @@ func (r *TrafficRepository) ResolveNodeNameByEmail(ctx context.Context, serverNa
 
 func (r *TrafficRepository) ListUsersWithPackage(ctx context.Context) ([]User, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), last_reset_at, package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users WHERE package_id IS NOT NULL AND package_id > 0 AND authorization_mode = 'package'`)
+		`SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), last_reset_at, package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_traffic_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users WHERE package_id IS NOT NULL AND package_id > 0 AND authorization_mode = 'package'`)
 	if err != nil {
 		return nil, err
 	}
@@ -10618,8 +10651,8 @@ func (r *TrafficRepository) ListUsersWithPackage(ctx context.Context) ([]User, e
 		var speedOverride sql.NullFloat64
 		var deviceOverride sql.NullInt64
 		var trafficOverride sql.NullInt64
-		var nodeSpeedJSON, nodeDeviceJSON string
-		if err := rows.Scan(&u.Username, &u.PasswordHash, &u.Email, &u.Nickname, &u.AvatarURL, &u.Role, &active, &u.Remark, &u.PackageID, &u.AuthorizationMode, &isReset, &u.ResetDay, &lastResetAt, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeDeviceJSON, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		var nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON string
+		if err := rows.Scan(&u.Username, &u.PasswordHash, &u.Email, &u.Nickname, &u.AvatarURL, &u.Role, &active, &u.Remark, &u.PackageID, &u.AuthorizationMode, &isReset, &u.ResetDay, &lastResetAt, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, err
 		}
 		u.IsActive = active != 0
@@ -10647,6 +10680,9 @@ func (r *TrafficRepository) ListUsersWithPackage(ctx context.Context) ([]User, e
 		}
 		if nodeSpeedJSON != "" && nodeSpeedJSON != "{}" {
 			unmarshalStringKeyedMap(nodeSpeedJSON, &u.NodeSpeedLimitOverrides)
+		}
+		if nodeTrafficJSON != "" && nodeTrafficJSON != "{}" {
+			unmarshalStringKeyedMap(nodeTrafficJSON, &u.NodeTrafficLimitOverrides)
 		}
 		if nodeDeviceJSON != "" && nodeDeviceJSON != "{}" {
 			unmarshalStringKeyedIntMap(nodeDeviceJSON, &u.NodeDeviceLimitOverrides)
@@ -10807,17 +10843,29 @@ func (r *TrafficRepository) GetUserWeightedTraffic(ctx context.Context, username
 // fixed package node. Billable bytes are frozen at collection time, so changing
 // a multiplier does not retroactively rewrite usage already consumed.
 func (r *TrafficRepository) GetUserPackageNodeTraffic(ctx context.Context, username string, pkg *Package) (map[int64]int64, error) {
+	if pkg == nil {
+		return nil, errors.New("package is required")
+	}
+	return r.GetUserNodeTraffic(ctx, username, pkg.Nodes, pkg)
+}
+
+// GetUserNodeTraffic returns current user-cycle usage attributed to the given
+// fixed node IDs. Package users retain their collection-time billing weights;
+// custom users pass nil for pkg and use the ordinary 1x user traffic measure.
+func (r *TrafficRepository) GetUserNodeTraffic(ctx context.Context, username string, nodeIDs []int64, pkg *Package) (map[int64]int64, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
 	username = strings.TrimSpace(username)
-	if username == "" || pkg == nil {
-		return nil, errors.New("username and package are required")
+	if username == "" {
+		return nil, errors.New("username is required")
 	}
 	usage := make(map[int64]int64)
-	allowed := make(map[int64]bool, len(pkg.Nodes))
-	for _, nodeID := range pkg.Nodes {
-		allowed[nodeID] = true
+	allowed := make(map[int64]bool, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if nodeID > 0 {
+			allowed[nodeID] = true
+		}
 	}
 	if len(allowed) == 0 {
 		return usage, nil
@@ -10916,9 +10964,16 @@ WHERE email = ?
 		if nodeID <= 0 || !allowed[nodeID] {
 			continue
 		}
-		bytes := billedBytes
-		if initialized == 0 {
-			multiplier := pkg.MultiplierForNode(nodeID) * float64(pkg.TrafficMultiplier())
+		// Custom authorization has no package multiplier. A user may switch from
+		// package to custom within the same traffic cycle, so do not reuse the
+		// previously materialized package-billable value in that mode.
+		bytes := rawBytes
+		if pkg != nil {
+			bytes = billedBytes
+		}
+		if pkg != nil && initialized == 0 {
+			multiplier := 1.0
+			multiplier = pkg.MultiplierForNode(nodeID) * float64(pkg.TrafficMultiplier())
 			bytes = billTrafficBytes(rawBytes, multiplier)
 		}
 		usage[nodeID] = saturatingTrafficAdd(usage[nodeID], bytes)
@@ -11073,7 +11128,7 @@ func (r *TrafficRepository) UpdateUserTrafficLimitOverride(ctx context.Context, 
 	return nil
 }
 
-// UpdateUserNodeLimits 写用户级 per-node 限速 / 客户端数覆盖。
+// UpdateUserNodeLimits 写用户级 per-node 限速 / 客户端数覆盖，并保留逐节点流量覆盖。
 // 序列化用 serializeNodeFloatMap/IntMap(nodes 传 nil 不过滤,用户可能切换套餐)。
 // nil map / 空 map → 存 "{}"。
 func (r *TrafficRepository) UpdateUserNodeLimits(ctx context.Context, username string, speedOverrides map[int64]float64, deviceOverrides map[int64]int) error {
@@ -11091,6 +11146,38 @@ func (r *TrafficRepository) UpdateUserNodeLimits(ctx context.Context, username s
 		speedJSON, deviceJSON, username)
 	if err != nil {
 		return fmt.Errorf("update user node limits: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
+// UpdateUserNodeLimitsWithTraffic atomically replaces all user-level per-node
+// overrides. Traffic values use GB; a present zero explicitly disables an
+// inherited package quota while an absent key inherits it.
+func (r *TrafficRepository) UpdateUserNodeLimitsWithTraffic(ctx context.Context, username string, speedOverrides, trafficOverrides map[int64]float64, deviceOverrides map[int64]int) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("username is required")
+	}
+	for nodeID, limitGB := range trafficOverrides {
+		if nodeID <= 0 || math.IsNaN(limitGB) || math.IsInf(limitGB, 0) || limitGB < 0 || limitGB > float64(math.MaxInt64)/(1024*1024*1024) {
+			return errors.New("node traffic limit override must be a finite non-negative GB value")
+		}
+	}
+	speedJSON := serializeNodeFloatMap(speedOverrides, nil)
+	trafficJSON := serializeNodeFloatMap(trafficOverrides, nil)
+	deviceJSON := serializeNodeIntMap(deviceOverrides, nil)
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE users SET node_speed_limit_overrides = ?, node_traffic_limit_overrides = ?, node_device_limit_overrides = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`,
+		speedJSON, trafficJSON, deviceJSON, username)
+	if err != nil {
+		return fmt.Errorf("update user node limits with traffic: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {

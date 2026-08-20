@@ -26,22 +26,21 @@ func NewTrafficLimitEnforcer(repo *storage.TrafficRepository, remoteManage *Remo
 	return &TrafficLimitEnforcer{repo: repo, remoteManage: remoteManage, pusher: pusher, nodeQuotaState: make(map[string]string)}
 }
 
-func packageNodeQuotaState(pkg *storage.Package, usage map[int64]int64) string {
-	if pkg == nil || !hasNonZeroLimit(pkg.NodeTrafficLimits) {
+func nodeQuotaState(user *storage.User, pkg *storage.Package, usage map[int64]int64) string {
+	limits := effectiveNodeTrafficLimits(user, pkg)
+	if len(limits) == 0 {
 		return ""
 	}
-	ids := make([]int64, 0, len(pkg.NodeTrafficLimits))
-	for nodeID, limitGB := range pkg.NodeTrafficLimits {
-		if limitGB > 0 {
-			ids = append(ids, nodeID)
-		}
+	ids := make([]int64, 0, len(limits))
+	for nodeID := range limits {
+		ids = append(ids, nodeID)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	var state strings.Builder
 	for _, nodeID := range ids {
 		state.WriteString(strconv.FormatInt(nodeID, 10))
 		state.WriteByte(':')
-		if packageNodeTrafficExceeded(pkg, usage, nodeID) {
+		if userNodeTrafficExceeded(user, pkg, usage, nodeID) {
 			state.WriteByte('1')
 		} else {
 			state.WriteByte('0')
@@ -51,21 +50,26 @@ func packageNodeQuotaState(pkg *storage.Package, usage map[int64]int64) string {
 	return state.String()
 }
 
-func (e *TrafficLimitEnforcer) refreshPackageNodeQuotas(ctx context.Context, user storage.User, pkg *storage.Package) {
-	if e == nil || e.pusher == nil || pkg == nil {
+func (e *TrafficLimitEnforcer) refreshNodeQuotas(ctx context.Context, user storage.User, pkg *storage.Package) {
+	if e == nil || e.pusher == nil {
 		return
 	}
-	hasQuota := hasNonZeroLimit(pkg.NodeTrafficLimits)
+	limits := effectiveNodeTrafficLimits(&user, pkg)
+	hasQuota := len(limits) > 0
 	usage := map[int64]int64{}
 	if hasQuota {
+		nodeIDs := make([]int64, 0, len(limits))
+		for nodeID := range limits {
+			nodeIDs = append(nodeIDs, nodeID)
+		}
 		var err error
-		usage, err = e.repo.GetUserPackageNodeTraffic(ctx, user.Username, pkg)
+		usage, err = e.repo.GetUserNodeTraffic(ctx, user.Username, nodeIDs, pkg)
 		if err != nil {
 			log.Printf("[TrafficLimitEnforcer] Failed to read node quota usage for %s: %v", user.Username, err)
 			return
 		}
 	}
-	state := packageNodeQuotaState(pkg, usage)
+	state := nodeQuotaState(&user, pkg, usage)
 	e.nodeQuotaMu.Lock()
 	previous, seen := e.nodeQuotaState[user.Username]
 	e.nodeQuotaMu.Unlock()
@@ -253,7 +257,7 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 		// Fixed-node traffic quotas are enforced as per-inbound denied buckets.
 		// Publish only on the initial observation or an over/under transition;
 		// failed Agent acknowledgements remain uncached and are retried next pass.
-		e.refreshPackageNodeQuotas(ctx, user, pkg)
+		e.refreshNodeQuotas(ctx, user, pkg)
 
 		// Aggregate traffic enforcement is retired. Keep this compatibility path
 		// to restore users left blocked by a legacy aggregate limit.
@@ -312,6 +316,20 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 			log.Printf("[TrafficLimitEnforcer] User %s back under limit (%d/%d bytes), restoring inbounds",
 				user.Username, usedWeighted, limitBytes)
 			e.restoreOverLimitUserIfAllowed(ctx, user.Username, billableTraffic, pkgCache)
+		}
+	}
+
+	// Custom direct-node quotas use the same per-user traffic cycle as package
+	// quotas. Custom authorization has no automatic renewal window, so its cycle
+	// changes only through the existing explicit user-traffic reset operation.
+	customUsers, customErr := e.repo.ListUsers(ctx, int(^uint(0)>>1))
+	if customErr != nil {
+		log.Printf("[TrafficLimitEnforcer] Failed to list custom users for node quotas: %v", customErr)
+	} else {
+		for _, user := range customUsers {
+			if user.AuthorizationMode == storage.AuthorizationModeCustom {
+				e.refreshNodeQuotas(ctx, user, nil)
+			}
 		}
 	}
 

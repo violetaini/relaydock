@@ -3,8 +3,10 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +19,82 @@ type nodeQuotaAgent struct {
 	denied      []bool
 	inboundTags []string
 	records     []nodeQuotaRecord
+}
+
+func TestUserFixedNodeTrafficOverridePrecedenceAndCheckedRefresh(t *testing.T) {
+	ctx := context.Background()
+	agentState := &nodeQuotaAgent{}
+	agent := httptest.NewServer(agentState)
+	t.Cleanup(agent.Close)
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "owner", storage.RoleAdmin)
+	createManagedSecurityTestUser(t, repo, "alice", storage.RoleUser)
+	server := &storage.RemoteServer{
+		Name: "user-quota-edge", Token: "user-quota-token", IPAddress: "127.0.0.1",
+		ListenPort: remoteAgentTestPort(t, agent.URL), XrayMode: "embedded",
+		ConnectionMode: storage.ConnectionModePush, Status: storage.RemoteServerStatusConnected,
+	}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "owner", NodeName: "user-quota", Protocol: "vless", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "quota-in",
+		ClashConfig: `{"name":"quota","type":"vless","server":"127.0.0.1","port":443,"uuid":"owner"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packageID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "user-quota-package", CycleDays: 30, Nodes: []int64{node.ID},
+		NodeTrafficLimits: map[int64]float64{node.ID: 100.0 / userTrafficLimitBytesPerGB},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := repo.AssignPackageToUser(ctx, "alice", packageID, now, now.Add(30*24*time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+		Username: "alice", ServerID: server.ID, InboundTag: node.InboundTag, Protocol: "vless",
+		CredentialJSON: `{"id":"alice","email":"alice__quota-in"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, uplink := range []int64{0, 100} {
+		if err := repo.UpsertUserTrafficBatch(ctx, server.ID, []storage.UserTrafficSample{{
+			Email: "alice__quota-in", Username: "alice", Uplink: uplink, BillingMultiplier: 1,
+		}}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pusher := NewLimiterConfigPusher(repo, nil)
+	handler := NewUserNodeLimitsHandler(repo, pusher, nil)
+	apply := func(overrides string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"username":"alice","node_speed_overrides":{},"node_traffic_overrides":%s,"node_device_overrides":{}}`, overrides)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/admin/users/node-limits", strings.NewReader(body)))
+		if response.Code != http.StatusOK {
+			t.Fatalf("update overrides=%s status=%d body=%s", overrides, response.Code, response.Body.String())
+		}
+	}
+
+	offset := len(agentState.recordsSince(0))
+	apply(fmt.Sprintf(`{"%d":%g}`, node.ID, 200.0/userTrafficLimitBytesPerGB))
+	assertNodeQuotaRecords(t, agentState.recordsSince(offset), map[string]bool{"quota-in": false})
+	offset += len(agentState.recordsSince(offset))
+	apply(fmt.Sprintf(`{"%d":0}`, node.ID))
+	assertNodeQuotaRecords(t, agentState.recordsSince(offset), map[string]bool{"quota-in": false})
+	offset += len(agentState.recordsSince(offset))
+	apply(`{}`)
+	assertNodeQuotaRecords(t, agentState.recordsSince(offset), map[string]bool{"quota-in": true})
+	user, err := repo.GetUser(ctx, "alice")
+	if err != nil || len(user.NodeTrafficLimitOverrides) != 0 {
+		t.Fatalf("stored user overrides=%v err=%v", user.NodeTrafficLimitOverrides, err)
+	}
 }
 
 type nodeQuotaRecord struct {
@@ -267,4 +345,84 @@ func TestPackageFixedNodeTrafficQuotaIsIndependentAndRefreshesChecked(t *testing
 	}
 	enforcer.CheckAll(ctx)
 	assertNodeQuotaRecords(t, agentState.recordsSince(offset), map[string]bool{"quota-a": false, "quota-b": false})
+}
+
+func TestCustomDirectFixedNodeTrafficQuotaUsesUserCycle(t *testing.T) {
+	ctx := context.Background()
+	agentState := &nodeQuotaAgent{}
+	agent := httptest.NewServer(agentState)
+	t.Cleanup(agent.Close)
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "owner", storage.RoleAdmin)
+	createManagedSecurityTestUser(t, repo, "alice", storage.RoleUser)
+	server := &storage.RemoteServer{
+		Name: "custom-quota-edge", Token: "custom-quota-token", IPAddress: "127.0.0.1",
+		ListenPort: remoteAgentTestPort(t, agent.URL), XrayMode: "embedded",
+		ConnectionMode: storage.ConnectionModePush, Status: storage.RemoteServerStatusConnected,
+	}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "owner", NodeName: "custom-quota", Protocol: "vless", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "quota-in",
+		ClashConfig: `{"name":"custom-quota","type":"vless","server":"127.0.0.1","port":443,"uuid":"owner"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, _, err := repo.UpsertManualUserNodeGrant(ctx, "alice", node.ID, nil, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveUserInboundConfig(ctx, storage.UserInboundConfig{
+		Username: "alice", ServerID: server.ID, InboundTag: node.InboundTag, Protocol: "vless",
+		CredentialJSON: `{"id":"alice","email":"alice__quota-in"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	config, err := repo.GetUserInboundConfig(ctx, "alice", server.ID, node.InboundTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetUserNodeGrantCredential(ctx, grant.Grant.ID, config.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.MarkUserInboundAccessSourceApplied(ctx, grant.Source.ID, grant.Source.Generation, storage.ManagedObservedActive, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateUserNodeLimitsWithTraffic(ctx, "alice", nil,
+		map[int64]float64{node.ID: 100.0 / userTrafficLimitBytesPerGB}, nil); err != nil {
+		t.Fatal(err)
+	}
+	writeTraffic := func(uplink int64) {
+		t.Helper()
+		if err := repo.UpsertUserTrafficBatch(ctx, server.ID, []storage.UserTrafficSample{{
+			Email: "alice__quota-in", Username: "alice", Uplink: uplink, BillingMultiplier: 3,
+		}}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTraffic(0)
+
+	enforcer := NewTrafficLimitEnforcer(repo, nil, NewLimiterConfigPusher(repo, nil))
+	offset := 0
+	enforcer.CheckAll(ctx)
+	records := agentState.recordsSince(offset)
+	assertNodeQuotaRecords(t, records, map[string]bool{"quota-in": false})
+	offset += len(records)
+	writeTraffic(100)
+	usage, err := repo.GetUserNodeTraffic(ctx, "alice", []int64{node.ID}, nil)
+	if err != nil || usage[node.ID] != 100 {
+		t.Fatalf("custom node usage=%v err=%v, want raw 100 bytes without a package multiplier", usage, err)
+	}
+	enforcer.CheckAll(ctx)
+	records = agentState.recordsSince(offset)
+	assertNodeQuotaRecords(t, records, map[string]bool{"quota-in": true})
+	offset += len(records)
+	if err := repo.ResetUserTrafficCycle(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	enforcer.CheckAll(ctx)
+	assertNodeQuotaRecords(t, agentState.recordsSince(offset), map[string]bool{"quota-in": false})
 }

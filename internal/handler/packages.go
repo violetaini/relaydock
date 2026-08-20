@@ -106,11 +106,18 @@ func requirePackageNodeTrafficCapabilities(ctx context.Context, repo *storage.Tr
 	if pkg == nil || !hasNonZeroLimit(pkg.NodeTrafficLimits) {
 		return nil
 	}
+	return requireNodeTrafficCapabilities(ctx, repo, pusher, pkg.NodeTrafficLimits)
+}
+
+func requireNodeTrafficCapabilities(ctx context.Context, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, limits map[int64]float64) error {
+	if !hasNonZeroLimit(limits) {
+		return nil
+	}
 	if pusher == nil {
 		return errors.New("fixed-node traffic quotas require an available limiter pusher")
 	}
 	serverIDs := make(map[int64]bool)
-	for nodeID, limitGB := range pkg.NodeTrafficLimits {
+	for nodeID, limitGB := range limits {
 		if limitGB <= 0 {
 			continue
 		}

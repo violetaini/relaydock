@@ -131,11 +131,47 @@ func strictestPositiveInt(current, next int) int {
 	return next
 }
 
-func packageNodeTrafficExceeded(pkg *storage.Package, usage map[int64]int64, nodeID int64) bool {
-	if pkg == nil || nodeID <= 0 {
+func nodeTrafficLimitGB(user *storage.User, pkg *storage.Package, nodeID int64) (float64, bool) {
+	if nodeID <= 0 {
+		return 0, false
+	}
+	if user != nil {
+		if limitGB, ok := user.NodeTrafficLimitOverrides[nodeID]; ok {
+			return limitGB, true
+		}
+	}
+	if pkg == nil {
+		return 0, false
+	}
+	return pkg.TrafficLimitGBForNode(nodeID)
+}
+
+func effectiveNodeTrafficLimits(user *storage.User, pkg *storage.Package) map[int64]float64 {
+	limits := make(map[int64]float64)
+	if pkg != nil {
+		for nodeID, limitGB := range pkg.NodeTrafficLimits {
+			if nodeID > 0 && limitGB > 0 && !math.IsNaN(limitGB) && !math.IsInf(limitGB, 0) {
+				limits[nodeID] = limitGB
+			}
+		}
+	}
+	if user != nil {
+		for nodeID, limitGB := range user.NodeTrafficLimitOverrides {
+			if nodeID <= 0 || limitGB <= 0 || math.IsNaN(limitGB) || math.IsInf(limitGB, 0) {
+				delete(limits, nodeID)
+				continue
+			}
+			limits[nodeID] = limitGB
+		}
+	}
+	return limits
+}
+
+func userNodeTrafficExceeded(user *storage.User, pkg *storage.Package, usage map[int64]int64, nodeID int64) bool {
+	if nodeID <= 0 {
 		return false
 	}
-	limitGB, ok := pkg.TrafficLimitGBForNode(nodeID)
+	limitGB, ok := nodeTrafficLimitGB(user, pkg, nodeID)
 	if !ok || limitGB <= 0 || math.IsNaN(limitGB) || math.IsInf(limitGB, 0) {
 		return false
 	}
@@ -396,7 +432,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 	// 缓存 user 对象(指针)和套餐(指针);**不预算限速值** — 现在同一用户在不同 inbound 上限速可能不同,
 	// 推迟到内层按 (user, pkg, node_id) lookup。
 	userMap := make(map[string]*storage.User)
-	packageNodeUsage := make(map[string]map[int64]int64)
+	nodeTrafficUsage := make(map[string]map[int64]int64)
 	pendingDeletionUsers := make(map[string]bool)
 	pendingDisableUsers := make(map[string]bool)
 	overLimitUsers := make(map[string]bool)
@@ -424,19 +460,26 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		pendingDeletionUsers[username] = deletionPending
 		pendingDisableUsers[username] = disablePending
 		overLimitUsers[username] = overLimit
-		if user.PackageID > 0 {
+		var pkg *storage.Package
+		if user.AuthorizationMode == storage.AuthorizationModePackage && user.PackageID > 0 {
 			if _, ok := pkgCache[user.PackageID]; !ok {
-				if pkg, err := p.repo.GetPackage(ctx, user.PackageID); err == nil {
-					pkgCache[user.PackageID] = pkg
+				if loaded, err := p.repo.GetPackage(ctx, user.PackageID); err == nil {
+					pkgCache[user.PackageID] = loaded
 				}
 			}
-			if pkg := pkgCache[user.PackageID]; pkg != nil && hasNonZeroLimit(pkg.NodeTrafficLimits) {
-				usage, usageErr := p.repo.GetUserPackageNodeTraffic(ctx, username, pkg)
-				if usageErr != nil {
-					return nil, fmt.Errorf("load package node traffic for %s: %w", username, usageErr)
-				}
-				packageNodeUsage[username] = usage
+			pkg = pkgCache[user.PackageID]
+		}
+		limits := effectiveNodeTrafficLimits(&user, pkg)
+		if len(limits) > 0 {
+			nodeIDs := make([]int64, 0, len(limits))
+			for nodeID := range limits {
+				nodeIDs = append(nodeIDs, nodeID)
 			}
+			usage, usageErr := p.repo.GetUserNodeTraffic(ctx, username, nodeIDs, pkg)
+			if usageErr != nil {
+				return nil, fmt.Errorf("load node traffic for %s: %w", username, usageErr)
+			}
+			nodeTrafficUsage[username] = usage
 		}
 	}
 	managedLimits, err := p.buildManagedLimiterLimits(ctx, serverID, now)
@@ -586,11 +629,11 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			continue
 		}
 		var pkg *storage.Package
-		if user.PackageID > 0 {
+		if user.AuthorizationMode == storage.AuthorizationModePackage && user.PackageID > 0 {
 			pkg = pkgCache[user.PackageID]
 		}
 		ref := physicalByTag[c.InboundTag] // 不存在时 NodeID=0,resolveLimit 容错
-		nodeTrafficDenied := hasPackageAccess && packageNodeTrafficExceeded(pkg, packageNodeUsage[c.Username], ref.NodeID)
+		nodeTrafficDenied := (hasPackageAccess || hasDirectAccess) && userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[c.Username], ref.NodeID)
 		speedMbps, deviceLimit := float64(0), 0
 		physicalNodeID := ref.NodeID
 		managedLimit, hasManagedLimit := managedLimits[managedLimiterKey{username: c.Username, inboundTag: c.InboundTag}]
@@ -663,12 +706,12 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			continue
 		}
 		var pkg *storage.Package
-		if user.PackageID > 0 {
+		if user.AuthorizationMode == storage.AuthorizationModePackage && user.PackageID > 0 {
 			pkg = pkgCache[user.PackageID]
 		}
 		ref := routedByTag[sa.InboundTag]
 		speedMbps, deviceLimit := resolveLimit(user, pkg, ref.NodeID, ref.ParentID)
-		nodeTrafficDenied := packageNodeTrafficExceeded(pkg, packageNodeUsage[sa.Username], ref.NodeID)
+		nodeTrafficDenied := userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[sa.Username], ref.NodeID)
 		var speedBytes uint64
 		if speedMbps > 0 {
 			speedBytes = uint64(speedMbps * 1000000 / 8)
