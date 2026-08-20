@@ -585,6 +585,7 @@ func main() {
 
 	// 限速配置推送器
 	limiterPusher := handler.NewLimiterConfigPusher(repo, remoteWSHandler)
+	packageCreateHandler.SetLimiterPusher(limiterPusher)
 	limiterPusher.SetCapabilityManager(capabilityManager)
 	remoteWSHandler.SetLimiterPusher(limiterPusher)
 	remoteWSHandler.SetCapabilityManager(capabilityManager)
@@ -650,6 +651,7 @@ func main() {
 	// users can only create forwards against their own effective grants and
 	// managed-node access. Remote mutations go through the signed expiry guard.
 	forwardingHandler := handler.NewForwardingHandler(repo, handler.NewForwardingGuardDeployer(managedNodesHandler))
+	forwardingHandler.SetLimiterPusher(limiterPusher)
 	forwardingReconcileCtx, stopForwardingReconciler := context.WithCancel(context.Background())
 	forwardingHandler.StartReconciler(forwardingReconcileCtx)
 	mux.Handle("/api/admin/tunnel-templates", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminTunnelTemplates)))

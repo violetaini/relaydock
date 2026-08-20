@@ -92,34 +92,32 @@ func (s *Service) handleTraffic(ctx context.Context, b *bot.Bot, update *models.
 		return
 	}
 
+	_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: chatID,
+		Text: formatTrafficSummary(
+			summary.Username,
+			summary.Package,
+			summary.Traffic.CycleUplink,
+			summary.Traffic.CycleDownlink,
+			summary.Traffic.TotalUplink,
+			summary.Traffic.TotalDownlink,
+		),
+	})
+}
+
+func formatTrafficSummary(username string, pkg map[string]any, cycleUp, cycleDown, totalUp, totalDown int64) string {
 	pkgName := "未绑定"
-	limitGB := 0.0
-	if summary.Package != nil && len(summary.Package) > 0 {
-		if v, ok := summary.Package["name"].(string); ok {
-			pkgName = v
-		}
-		if v, ok := summary.Package["traffic_limit_gb"].(float64); ok {
-			limitGB = v
-		}
+	if v, ok := pkg["name"].(string); ok {
+		pkgName = v
 	}
-	usedBytes := summary.Traffic.CycleUplink + summary.Traffic.CycleDownlink
-	pct := 0.0
-	if limitGB > 0 {
-		pct = float64(usedBytes) / (limitGB * 1024 * 1024 * 1024) * 100
-	}
-
-	text := fmt.Sprintf(
-		"流量统计 — %s\n套餐: %s\n本周期已用: %s",
-		summary.Username, pkgName, humanBytes(usedBytes),
+	return fmt.Sprintf(
+		"流量统计 — %s\n套餐: %s\n本周期已用: %s\n累计 ↑%s ↓%s",
+		username,
+		pkgName,
+		humanBytes(cycleUp+cycleDown),
+		humanBytes(totalUp),
+		humanBytes(totalDown),
 	)
-	if limitGB > 0 {
-		text += fmt.Sprintf(" / %.0f GB (%.1f%%)", limitGB, pct)
-	}
-	text += fmt.Sprintf("\n累计 ↑%s ↓%s",
-		humanBytes(summary.Traffic.TotalUplink),
-		humanBytes(summary.Traffic.TotalDownlink))
-
-	_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: text})
 }
 
 // handleNodes 列套餐节点 + 服务器在线状态。

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/netip"
 	"sort"
@@ -44,9 +45,7 @@ func (p *LimiterConfigPusher) SetCapabilityManager(manager *capabilities.Manager
 // resolveLimit 按 4 段优先级算用户在指定节点上的限速 + 客户端数:
 //
 //	user.NodeSpeedLimitOverrides[node_id]  ← 用户级 per-node(map 含 key 即生效)
-//	  ?? user.SpeedLimitOverride           ← 用户级全局
 //	  ?? pkg.NodeSpeedLimits[node_id]      ← 套餐级 per-node(含 routed→父 一次跳)
-//	  ?? pkg.SpeedLimitMbps                ← 套餐通用
 //	  ?? 0 (unlimited)
 //
 // 每一层用 "map 是否含 key" / "指针是否非 nil" 判断;**不能用 value > 0 判断**,
@@ -86,8 +85,6 @@ func resolveManagedLimiterLimit(user *storage.User, grant storage.UserServerGran
 	speed := grant.SpeedLimitMbps
 	if selection.SpeedLimitOverrideMbps != nil {
 		speed = *selection.SpeedLimitOverrideMbps
-	} else if speed <= 0 && user != nil && user.SpeedLimitOverride != nil {
-		speed = *user.SpeedLimitOverride
 	}
 	connections := grant.ConnectionLimit
 	if selection.ConnectionLimitOverride != nil {
@@ -132,6 +129,100 @@ func strictestPositiveInt(current, next int) int {
 		return current
 	}
 	return next
+}
+
+func packageNodeTrafficExceeded(pkg *storage.Package, usage map[int64]int64, nodeID int64) bool {
+	if pkg == nil || nodeID <= 0 {
+		return false
+	}
+	limitGB, ok := pkg.TrafficLimitGBForNode(nodeID)
+	if !ok || limitGB <= 0 || math.IsNaN(limitGB) || math.IsInf(limitGB, 0) {
+		return false
+	}
+	limitBytes := int64(math.Round(limitGB * userTrafficLimitBytesPerGB))
+	return trafficLimitExceeded(usage[nodeID], limitBytes)
+}
+
+func forwardingSpeedBytes(speedMbps float64) (uint64, error) {
+	if math.IsNaN(speedMbps) || math.IsInf(speedMbps, 0) || speedMbps < 0 {
+		return 0, storage.ErrForwardingInvalid
+	}
+	bytesPerSecond := speedMbps * 1000000 / 8
+	if bytesPerSecond > float64(^uint64(0)) {
+		return 0, storage.ErrForwardingInvalid
+	}
+	return uint64(math.Round(bytesPerSecond)), nil
+}
+
+func requireForwardingSpeedCapability(ctx context.Context, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, tunnelID int64, speedMbps float64) error {
+	nodeLimit, err := forwardingSpeedBytes(speedMbps)
+	if err != nil {
+		return err
+	}
+	if nodeLimit == 0 {
+		return nil
+	}
+	if repo == nil || pusher == nil {
+		return fmt.Errorf("%w: forwarding speed limits require an available limiter pusher", ErrForwardTunnelCapability)
+	}
+	tunnel, err := repo.GetTunnelTemplateByID(ctx, tunnelID)
+	if err != nil {
+		return err
+	}
+	if len(tunnel.Hops) == 0 {
+		return storage.ErrForwardingInvalid
+	}
+	entryServer, err := repo.GetRemoteServer(ctx, tunnel.Hops[0].ServerID)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(strings.TrimSpace(entryServer.XrayMode), "embedded") {
+		return fmt.Errorf("%w: forwarding speed limits require embedded Xray on the entry server", ErrForwardTunnelCapability)
+	}
+	probe := []WSLimiterConfigPayload{{
+		InboundSharedLimit: true,
+		NodeLimit:          nodeLimit,
+		Users:              []WSUserLimitInfo{},
+		WireGuardPeers:     []WSWireGuardPeerIdentity{},
+	}}
+	if err := pusher.requireLimiterCapabilities(ctx, entryServer, probe); err != nil {
+		return fmt.Errorf("%w: entry server %d cannot enforce forwarding speed: %v", ErrForwardTunnelCapability, entryServer.ID, err)
+	}
+	return nil
+}
+
+func (p *LimiterConfigPusher) buildForwardingLimiterSnapshots(ctx context.Context, serverID int64) ([]WSLimiterConfigPayload, error) {
+	forwards, err := p.repo.ListForwardReconcileCandidates(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list forwarding limiter resources: %w", err)
+	}
+	snapshots := make([]WSLimiterConfigPayload, 0)
+	for i := range forwards {
+		forward := &forwards[i]
+		if len(forward.Hops) == 0 || forward.Hops[0].ServerID != serverID {
+			continue
+		}
+		tag := strings.TrimSpace(forward.Hops[0].ResourceTag)
+		if tag == "" {
+			return nil, fmt.Errorf("forward %s has no entry inbound tag", forward.PublicID)
+		}
+		var nodeLimit uint64
+		if forward.DesiredState == storage.ForwardDesiredActive {
+			grant, grantErr := p.repo.GetUserTunnelGrantByID(ctx, forward.GrantID)
+			if grantErr != nil {
+				return nil, fmt.Errorf("load forwarding grant %d: %w", forward.GrantID, grantErr)
+			}
+			nodeLimit, err = forwardingSpeedBytes(grant.PerForwardSpeedMbps)
+			if err != nil {
+				return nil, fmt.Errorf("forward %s speed limit: %w", forward.PublicID, err)
+			}
+		}
+		snapshots = append(snapshots, WSLimiterConfigPayload{
+			InboundTag: tag, NodeLimit: nodeLimit, InboundSharedLimit: true,
+			Users: []WSUserLimitInfo{}, WireGuardPeers: []WSWireGuardPeerIdentity{},
+		})
+	}
+	return snapshots, nil
 }
 
 // buildManagedLimiterLimits returns desired-active selection limits whose
@@ -203,22 +294,11 @@ func resolveLimit(user *storage.User, pkg *storage.Package, nodeID, parentID int
 				break
 			}
 		}
-		if user.SpeedLimitOverride != nil {
-			speedMbps = *user.SpeedLimitOverride
-			break
-		}
 		if pkg != nil {
 			if v, ok := pkg.SpeedLimitMbpsForNode(nodeID, &parentID); ok {
 				speedMbps = v
 				break
 			}
-			speedMbps = pkg.SpeedLimitMbps
-		}
-	case user != nil:
-		if user.SpeedLimitOverride != nil {
-			speedMbps = *user.SpeedLimitOverride
-		} else if pkg != nil {
-			speedMbps = pkg.SpeedLimitMbps
 		}
 	}
 
@@ -316,6 +396,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 	// 缓存 user 对象(指针)和套餐(指针);**不预算限速值** — 现在同一用户在不同 inbound 上限速可能不同,
 	// 推迟到内层按 (user, pkg, node_id) lookup。
 	userMap := make(map[string]*storage.User)
+	packageNodeUsage := make(map[string]map[int64]int64)
 	pendingDeletionUsers := make(map[string]bool)
 	pendingDisableUsers := make(map[string]bool)
 	overLimitUsers := make(map[string]bool)
@@ -348,6 +429,13 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 				if pkg, err := p.repo.GetPackage(ctx, user.PackageID); err == nil {
 					pkgCache[user.PackageID] = pkg
 				}
+			}
+			if pkg := pkgCache[user.PackageID]; pkg != nil && hasNonZeroLimit(pkg.NodeTrafficLimits) {
+				usage, usageErr := p.repo.GetUserPackageNodeTraffic(ctx, username, pkg)
+				if usageErr != nil {
+					return nil, fmt.Errorf("load package node traffic for %s: %w", username, usageErr)
+				}
+				packageNodeUsage[username] = usage
 			}
 		}
 	}
@@ -502,6 +590,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			pkg = pkgCache[user.PackageID]
 		}
 		ref := physicalByTag[c.InboundTag] // 不存在时 NodeID=0,resolveLimit 容错
+		nodeTrafficDenied := hasPackageAccess && packageNodeTrafficExceeded(pkg, packageNodeUsage[c.Username], ref.NodeID)
 		speedMbps, deviceLimit := float64(0), 0
 		physicalNodeID := ref.NodeID
 		managedLimit, hasManagedLimit := managedLimits[managedLimiterKey{username: c.Username, inboundTag: c.InboundTag}]
@@ -526,7 +615,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if speedMbps > 0 {
 			speedBytes = uint64(speedMbps * 1000000 / 8)
 		}
-		if hasDeletionResidual || hasDisableResidual || hasOverLimitPackageResidual || hasManagedRevocationResidual ||
+		if hasDeletionResidual || hasDisableResidual || hasOverLimitPackageResidual || hasManagedRevocationResidual || nodeTrafficDenied ||
 			hasWireGuardCredentialResidual {
 			speedBytes = revocationResidualDenySpeedBytes
 			deviceLimit = revocationResidualDenyConnectionLimit
@@ -540,7 +629,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			SpeedLimit: speedBytes,
 			// 物理节点自身即 group 的物理节点(ref.NodeID);其路由出站子账户在下面用 ParentID 归到同一 group。
 			DeviceLimit: deviceLimit,
-			Denied:      hasDeletionResidual || hasDisableResidual || hasOverLimitPackageResidual || hasManagedRevocationResidual || hasWireGuardCredentialResidual,
+			Denied:      hasDeletionResidual || hasDisableResidual || hasOverLimitPackageResidual || hasManagedRevocationResidual || nodeTrafficDenied || hasWireGuardCredentialResidual,
 			ConnGroup:   connGroupKey(user.Username, physicalNodeID),
 		})
 		if strings.EqualFold(strings.TrimSpace(c.Protocol), "wireguard") {
@@ -579,6 +668,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		}
 		ref := routedByTag[sa.InboundTag]
 		speedMbps, deviceLimit := resolveLimit(user, pkg, ref.NodeID, ref.ParentID)
+		nodeTrafficDenied := packageNodeTrafficExceeded(pkg, packageNodeUsage[sa.Username], ref.NodeID)
 		var speedBytes uint64
 		if speedMbps > 0 {
 			speedBytes = uint64(speedMbps * 1000000 / 8)
@@ -588,7 +678,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		// removal are acknowledged. The row is intentionally still returned by
 		// the repository while revoke_pending=1 so a checked snapshot can replace
 		// the prior normal bucket instead of silently dropping it.
-		subaccountDenied := !user.IsActive || overLimitUsers[sa.Username] || sa.RevokePending ||
+		subaccountDenied := !user.IsActive || overLimitUsers[sa.Username] || sa.RevokePending || nodeTrafficDenied ||
 			pendingDisableUsers[sa.Username] || pendingDeletionUsers[sa.Username]
 		if subaccountDenied {
 			speedBytes = revocationResidualDenySpeedBytes
@@ -647,6 +737,22 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			AutoSpeedRules: rules,
 		})
 	}
+	forwardingSnapshots, err := p.buildForwardingLimiterSnapshots(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	existingTags := make(map[string]bool, len(payloads))
+	for _, payload := range payloads {
+		existingTags[payload.InboundTag] = true
+	}
+	for _, payload := range forwardingSnapshots {
+		if existingTags[payload.InboundTag] {
+			return nil, fmt.Errorf("forwarding inbound tag %s conflicts with an existing limiter snapshot", payload.InboundTag)
+		}
+		existingTags[payload.InboundTag] = true
+		payloads = append(payloads, payload)
+	}
+	sort.Slice(payloads, func(i, j int) bool { return payloads[i].InboundTag < payloads[j].InboundTag })
 
 	return payloads, nil
 }
@@ -839,11 +945,14 @@ func (p *LimiterConfigPusher) pushToServerLeasedUnlocked(ctx context.Context, se
 		log.Printf("[LimiterPush] Failed to push config for server %d: %v", serverID, err)
 		return
 	}
-
 	// Legacy package refreshes remain best-effort and retain the published
 	// one-way WS protocol. Managed provisioning uses PushToServerChecked below.
 	if p.wsHandler != nil {
 		if _, ok := p.wsHandler.GetConnectionByServerID(serverID); ok {
+			if err := p.requireLimiterCapabilities(ctx, server, configs); err != nil {
+				log.Printf("[LimiterPush] Refusing unsupported limiter snapshot for server %d: %v", serverID, err)
+				return
+			}
 			if err := p.wsHandler.SendLimiterConfig(serverID, configs); err == nil {
 				return
 			} else {
@@ -919,13 +1028,12 @@ func (p *LimiterConfigPusher) pushToServerCheckedLeasedUnlocked(ctx context.Cont
 	if err != nil {
 		return err
 	}
-
 	// Prefer WS RPC because the reply is produced after the Agent's HTTP handler
 	// returns. If the transport disappears, replay the full snapshots over HTTP.
 	if p.wsHandler != nil {
 		if connection, ok := p.wsHandler.GetConnectionByServerID(serverID); ok && connection.Capabilities.RPC {
-			if limiterSnapshotsContainDenied(configs) && !connection.Capabilities.LimiterDeniedV1 {
-				return errors.New("Agent lacks limiter_denied_v1 capability; upgrade and reconnect relaydock-agent")
+			if err := p.requireLimiterCapabilities(ctx, server, configs); err != nil {
+				return err
 			}
 			for _, cfg := range configs {
 				body, marshalErr := json.Marshal(cfg)
@@ -987,12 +1095,22 @@ func limiterSnapshotsContainDenied(configs []WSLimiterConfigPayload) bool {
 	return false
 }
 
-// requireLimiterDeniedCapability prevents a legacy Agent from acknowledging a
-// payload while silently ignoring denied=true. An active WS handshake is the
-// authority for the running process; only an Agent without a WS connection is
-// probed through system/info before an HTTP limiter delivery.
-func (p *LimiterConfigPusher) requireLimiterDeniedCapability(ctx context.Context, server *storage.RemoteServer, configs []WSLimiterConfigPayload) error {
-	if !limiterSnapshotsContainDenied(configs) {
+func limiterSnapshotsContainForwardingSpeed(configs []WSLimiterConfigPayload) bool {
+	for _, config := range configs {
+		if config.InboundSharedLimit && config.NodeLimit > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// requireLimiterCapabilities prevents a legacy Agent from acknowledging a
+// payload while silently ignoring a mandatory policy field. An active WS
+// handshake is authoritative; otherwise system/info is probed before HTTP.
+func (p *LimiterConfigPusher) requireLimiterCapabilities(ctx context.Context, server *storage.RemoteServer, configs []WSLimiterConfigPayload) error {
+	requireDenied := limiterSnapshotsContainDenied(configs)
+	requireForwardingSpeed := limiterSnapshotsContainForwardingSpeed(configs)
+	if !requireDenied && !requireForwardingSpeed {
 		return nil
 	}
 	if p == nil {
@@ -1003,10 +1121,13 @@ func (p *LimiterConfigPusher) requireLimiterDeniedCapability(ctx context.Context
 	}
 	if p.wsHandler != nil {
 		if connection, connected := p.wsHandler.GetConnectionByServerID(server.ID); connected {
-			if connection.Capabilities.LimiterDeniedV1 {
-				return nil
+			if requireDenied && !connection.Capabilities.LimiterDeniedV1 {
+				return errors.New("Agent lacks limiter_denied_v1 capability; upgrade and reconnect relaydock-agent")
 			}
-			return errors.New("Agent lacks limiter_denied_v1 capability; upgrade and reconnect relaydock-agent")
+			if requireForwardingSpeed && !connection.Capabilities.ForwardingSpeedLimitV1 {
+				return errors.New("Agent lacks forwarding_speed_limit_v1 capability; upgrade and reconnect relaydock-agent")
+			}
+			return nil
 		}
 	}
 	hdr := http.Header{}
@@ -1014,34 +1135,40 @@ func (p *LimiterConfigPusher) requireLimiterDeniedCapability(ctx context.Context
 	hdr.Set("User-Agent", version.AgentUserAgent)
 	resp, err := tryHTTPWithFallback(ctx, p.httpClient, server, http.MethodGet, "/api/child/system/info", nil, hdr)
 	if err != nil {
-		return fmt.Errorf("verify limiter_denied_v1 capability: %w", err)
+		return fmt.Errorf("verify Agent limiter capabilities: %w", err)
 	}
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	closeErr := resp.Body.Close()
 	if readErr != nil {
-		return fmt.Errorf("read limiter_denied_v1 capability: %w", readErr)
+		return fmt.Errorf("read Agent limiter capabilities: %w", readErr)
 	}
 	if closeErr != nil {
-		return fmt.Errorf("close limiter_denied_v1 capability response: %w", closeErr)
+		return fmt.Errorf("close Agent limiter capability response: %w", closeErr)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("verify limiter_denied_v1 capability returned HTTP %d", resp.StatusCode)
+		return fmt.Errorf("verify Agent limiter capabilities returned HTTP %d", resp.StatusCode)
 	}
 	var info struct {
 		Success      bool              `json:"success"`
 		Capabilities AgentCapabilities `json:"capabilities"`
 	}
 	if err := json.Unmarshal(body, &info); err != nil {
-		return fmt.Errorf("decode Agent limiter_denied_v1 capability: %w", err)
+		return fmt.Errorf("decode Agent limiter capabilities: %w", err)
 	}
-	if !info.Success || !info.Capabilities.LimiterDeniedV1 {
+	if !info.Success {
+		return errors.New("Agent limiter capability probe was not acknowledged")
+	}
+	if requireDenied && !info.Capabilities.LimiterDeniedV1 {
 		return errors.New("Agent lacks limiter_denied_v1 capability; upgrade relaydock-agent")
+	}
+	if requireForwardingSpeed && !info.Capabilities.ForwardingSpeedLimitV1 {
+		return errors.New("Agent lacks forwarding_speed_limit_v1 capability; upgrade relaydock-agent")
 	}
 	return nil
 }
 
 func (p *LimiterConfigPusher) pushViaHTTP(ctx context.Context, server *storage.RemoteServer, configs []WSLimiterConfigPayload) error {
-	if err := p.requireLimiterDeniedCapability(ctx, server, configs); err != nil {
+	if err := p.requireLimiterCapabilities(ctx, server, configs); err != nil {
 		return err
 	}
 	hdr := http.Header{}
@@ -1080,7 +1207,7 @@ func (p *LimiterConfigPusher) pushViaHTTP(ctx context.Context, server *storage.R
 }
 
 func (p *LimiterConfigPusher) pushViaHTTPChecked(ctx context.Context, server *storage.RemoteServer, configs []WSLimiterConfigPayload) error {
-	if err := p.requireLimiterDeniedCapability(ctx, server, configs); err != nil {
+	if err := p.requireLimiterCapabilities(ctx, server, configs); err != nil {
 		return err
 	}
 	hdr := http.Header{}
@@ -1173,6 +1300,44 @@ func (p *LimiterConfigPusher) PushToAllServersForUser(ctx context.Context, usern
 	for sid := range serverIDs {
 		p.PushToServer(ctx, sid)
 	}
+}
+
+// PushToAllServersForUserChecked publishes a quota transition and only returns
+// after each affected Agent has acknowledged the full-replace snapshot.
+func (p *LimiterConfigPusher) PushToAllServersForUserChecked(ctx context.Context, username string) error {
+	if p == nil || p.repo == nil {
+		return errors.New("limiter pusher is unavailable")
+	}
+	if p.capabilityManager != nil && !p.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
+		return errors.New("limiter capability is unavailable")
+	}
+	configs, err := p.repo.GetUserInboundConfigs(ctx, username)
+	if err != nil {
+		return err
+	}
+	serverIDs := make(map[int64]bool)
+	for _, config := range configs {
+		serverIDs[config.ServerID] = true
+	}
+	if subIDs, err := p.repo.ListServerIDsForUserSubaccounts(ctx, username); err == nil {
+		for _, serverID := range subIDs {
+			serverIDs[serverID] = true
+		}
+	} else {
+		return err
+	}
+	ordered := make([]int64, 0, len(serverIDs))
+	for serverID := range serverIDs {
+		ordered = append(ordered, serverID)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	var joined error
+	for _, serverID := range ordered {
+		if err := p.PushToServerChecked(ctx, serverID); err != nil {
+			joined = errors.Join(joined, fmt.Errorf("server %d: %w", serverID, err))
+		}
+	}
+	return joined
 }
 
 // PushToAllEmbeddedServers 给所有 embedded 模式远程服务器重推限速配置。

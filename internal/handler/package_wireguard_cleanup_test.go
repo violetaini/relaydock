@@ -149,7 +149,7 @@ func TestPackageTemplateWireGuardLimiterFailureRestoresOldAccessBeforeCommit(t *
 	}
 	_, payloads := agent.snapshot()
 	limit, ok := wireGuardRevokeLatestUserLimit(payloads)
-	if !ok || limit.Denied || limit.SpeedLimit != 625000 || limit.DeviceLimit != 2 {
+	if !ok || limit.Denied || limit.SpeedLimit != 0 || limit.DeviceLimit != 2 {
 		t.Fatalf("failed preflight did not restore normal package policy: limit=%+v found=%v", limit, ok)
 	}
 }
@@ -268,7 +268,7 @@ func TestPackageWireGuardUnbindLimiterFailureKeepsOldPackageAndPeer(t *testing.T
 	}
 	_, payloads := agent.snapshot()
 	limit, ok := wireGuardRevokeLatestUserLimit(payloads)
-	if !ok || limit.SpeedLimit != 625000 || limit.DeviceLimit != 2 {
+	if !ok || limit.SpeedLimit != 0 || limit.DeviceLimit != 2 {
 		t.Fatalf("old package policy was not restored: limit=%+v found=%v payloads=%#v", limit, ok, payloads)
 	}
 }

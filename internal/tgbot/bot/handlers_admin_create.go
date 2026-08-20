@@ -127,7 +127,7 @@ func (s *Service) showPackageButtons(ctx context.Context, b *bot.Bot, chatID int
 	rows := make([][]models.InlineKeyboardButton, 0, len(pkgs)+2)
 	for _, p := range pkgs {
 		rows = append(rows, []models.InlineKeyboardButton{{
-			Text:         fmt.Sprintf("%s(%.0f GB / %d 天)", p.Name, p.TrafficLimitGB, p.CycleDays),
+			Text:         formatPackageChoice(p),
 			CallbackData: fmt.Sprintf("iv:p:%d", p.ID),
 		}})
 	}
@@ -136,6 +136,10 @@ func (s *Service) showPackageButtons(ctx context.Context, b *bot.Bot, chatID int
 		[]models.InlineKeyboardButton{{Text: "取消", CallbackData: "iv:x"}},
 	)
 	s.editTextKB(ctx, b, chatID, msgID, "选择要绑定的套餐:", &models.InlineKeyboardMarkup{InlineKeyboard: rows})
+}
+
+func formatPackageChoice(pkg mmwxclient.Package) string {
+	return fmt.Sprintf("%s (%d 天)", pkg.Name, pkg.CycleDays)
 }
 
 // showDurationButtons 列出有效期供选择。

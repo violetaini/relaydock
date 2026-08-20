@@ -125,7 +125,8 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 				UserShortCode:       scInfo.UserShortCode,
 				CustomUserShortCode: scInfo.CustomUserShortCode,
 			}
-			entry.SpeedLimitOverride = user.SpeedLimitOverride
+			// Aggregate traffic and speed are retired. Device and per-node
+			// values remain valid detailed overrides in either authorization mode.
 			entry.DeviceLimitOverride = user.DeviceLimitOverride
 			entry.NodeSpeedLimitOverrides = user.NodeSpeedLimitOverrides
 			entry.NodeDeviceLimitOverrides = user.NodeDeviceLimitOverrides
@@ -142,10 +143,6 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 				}
 				entry.TrafficLimit = resolveTrafficLimitBytes(&user, pkgPtr)
 				entry.TrafficLimitGB = float64(entry.TrafficLimit) / userTrafficLimitBytesPerGB
-				if user.TrafficLimitOverride != nil {
-					gb := float64(*user.TrafficLimitOverride) / userTrafficLimitBytesPerGB
-					entry.TrafficLimitOverrideGB = &gb
-				}
 				used := trafficMap[user.Username]
 				if pkg, ok := pkgMap[pid]; ok {
 					entry.TrafficMultiplier = pkg.TrafficMultiplier()
@@ -919,10 +916,13 @@ func NewUserLimitsHandler(repo *storage.TrafficRepository, pusher *LimiterConfig
 			writeError(w, http.StatusBadRequest, errors.New("username is required"))
 			return
 		}
-
-		// DeviceLimit 是连接数限制,不依赖 limiter 能力。
-		if body.SpeedLimitOverride != nil && *body.SpeedLimitOverride > 0 && capabilityManager != nil && !capabilityManager.HasFeature(capabilities.FeatureLimiter) {
-			http.Error(w, "当前构建未启用限速器", http.StatusForbidden)
+		_, err := repo.GetUser(r.Context(), body.Username)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		if body.SpeedLimitOverride != nil {
+			writeError(w, http.StatusConflict, errors.New("aggregate user speed limits are retired; configure a detailed resource limit"))
 			return
 		}
 

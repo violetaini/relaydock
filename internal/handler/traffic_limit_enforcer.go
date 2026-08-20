@@ -5,19 +5,85 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
 type TrafficLimitEnforcer struct {
-	repo         *storage.TrafficRepository
-	remoteManage *RemoteManageHandler
-	pusher       *LimiterConfigPusher
+	repo           *storage.TrafficRepository
+	remoteManage   *RemoteManageHandler
+	pusher         *LimiterConfigPusher
+	nodeQuotaMu    sync.Mutex
+	nodeQuotaState map[string]string
 }
 
 func NewTrafficLimitEnforcer(repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher) *TrafficLimitEnforcer {
-	return &TrafficLimitEnforcer{repo: repo, remoteManage: remoteManage, pusher: pusher}
+	return &TrafficLimitEnforcer{repo: repo, remoteManage: remoteManage, pusher: pusher, nodeQuotaState: make(map[string]string)}
+}
+
+func packageNodeQuotaState(pkg *storage.Package, usage map[int64]int64) string {
+	if pkg == nil || !hasNonZeroLimit(pkg.NodeTrafficLimits) {
+		return ""
+	}
+	ids := make([]int64, 0, len(pkg.NodeTrafficLimits))
+	for nodeID, limitGB := range pkg.NodeTrafficLimits {
+		if limitGB > 0 {
+			ids = append(ids, nodeID)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	var state strings.Builder
+	for _, nodeID := range ids {
+		state.WriteString(strconv.FormatInt(nodeID, 10))
+		state.WriteByte(':')
+		if packageNodeTrafficExceeded(pkg, usage, nodeID) {
+			state.WriteByte('1')
+		} else {
+			state.WriteByte('0')
+		}
+		state.WriteByte(';')
+	}
+	return state.String()
+}
+
+func (e *TrafficLimitEnforcer) refreshPackageNodeQuotas(ctx context.Context, user storage.User, pkg *storage.Package) {
+	if e == nil || e.pusher == nil || pkg == nil {
+		return
+	}
+	hasQuota := hasNonZeroLimit(pkg.NodeTrafficLimits)
+	usage := map[int64]int64{}
+	if hasQuota {
+		var err error
+		usage, err = e.repo.GetUserPackageNodeTraffic(ctx, user.Username, pkg)
+		if err != nil {
+			log.Printf("[TrafficLimitEnforcer] Failed to read node quota usage for %s: %v", user.Username, err)
+			return
+		}
+	}
+	state := packageNodeQuotaState(pkg, usage)
+	e.nodeQuotaMu.Lock()
+	previous, seen := e.nodeQuotaState[user.Username]
+	e.nodeQuotaMu.Unlock()
+	// A package that never had a fixed-node quota needs no initial policy push.
+	// Keep the empty transition only when it clears a previously published deny.
+	if !hasQuota && (!seen || previous == "") {
+		return
+	}
+	if seen && previous == state {
+		return
+	}
+	if err := e.pusher.PushToAllServersForUserChecked(ctx, user.Username); err != nil {
+		log.Printf("[TrafficLimitEnforcer] Failed to publish node quota state for %s: %v", user.Username, err)
+		return
+	}
+	e.nodeQuotaMu.Lock()
+	e.nodeQuotaState[user.Username] = state
+	e.nodeQuotaMu.Unlock()
 }
 
 func (e *TrafficLimitEnforcer) Start(ctx context.Context, interval time.Duration) {
@@ -184,8 +250,13 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 			}
 		}
 
-		// A present user override wins even when it is zero (explicit unlimited).
-		// Keep this after the reset block so unlimited users still reset cycles.
+		// Fixed-node traffic quotas are enforced as per-inbound denied buckets.
+		// Publish only on the initial observation or an over/under transition;
+		// failed Agent acknowledgements remain uncached and are retried next pass.
+		e.refreshPackageNodeQuotas(ctx, user, pkg)
+
+		// Aggregate traffic enforcement is retired. Keep this compatibility path
+		// to restore users left blocked by a legacy aggregate limit.
 		limitBytes := resolveTrafficLimitBytes(&user, pkg)
 		if limitBytes <= 0 {
 			// Switching an already-blocked user to explicit unlimited must restore

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"strings"
 	"time"
@@ -1116,7 +1117,7 @@ func normalizeTunnelGrant(g *UserTunnelGrant) error {
 	if g.SourceType == "" {
 		g.SourceType = GrantSourceManual
 	}
-	if g.Username == "" || g.TunnelID <= 0 || g.MaxActiveForwards < 0 || g.PerForwardSpeedMbps < 0 || g.PerForwardConnectionLimit < 0 || g.TrafficLimitBytes < 0 || g.StartsAt.IsZero() || g.AllowCustomPublicTarget {
+	if g.Username == "" || g.TunnelID <= 0 || g.MaxActiveForwards < 0 || g.PerForwardSpeedMbps < 0 || math.IsNaN(g.PerForwardSpeedMbps) || math.IsInf(g.PerForwardSpeedMbps, 0) || g.PerForwardConnectionLimit < 0 || g.TrafficLimitBytes < 0 || g.StartsAt.IsZero() || g.AllowCustomPublicTarget {
 		return ErrForwardingInvalid
 	}
 	g.AllowManagedTarget = true

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -356,7 +357,8 @@ func (h *ServiceAuthorizationHandler) validateCustomRequest(ctx context.Context,
 	seenServers := make(map[int64]struct{}, len(*request.ServerGrants))
 	for _, grant := range *request.ServerGrants {
 		if grant.ServerID <= 0 || !grant.Enabled || grant.StartsAt.IsZero() || grant.MaxActiveNodes < 0 ||
-			grant.SpeedLimitMbps < 0 || grant.ConnectionLimit < 0 || grant.TrafficLimitBytes < 0 {
+			grant.SpeedLimitMbps < 0 || math.IsNaN(grant.SpeedLimitMbps) || math.IsInf(grant.SpeedLimitMbps, 0) ||
+			grant.ConnectionLimit < 0 || grant.TrafficLimitBytes < 0 {
 			return fmt.Errorf("%w: invalid server grant", storage.ErrManagedInvalidArgument)
 		}
 		if _, duplicate := seenServers[grant.ServerID]; duplicate {
@@ -379,7 +381,8 @@ func (h *ServiceAuthorizationHandler) validateCustomRequest(ctx context.Context,
 	seenTunnels := make(map[int64]struct{}, len(*request.ForwardingGrants))
 	for _, grant := range *request.ForwardingGrants {
 		if grant.TunnelID <= 0 || !grant.Enabled || grant.StartsAt.IsZero() || grant.MaxActiveForwards < 0 ||
-			grant.PerForwardSpeedMbps != 0 || grant.PerForwardConnectionLimit != 0 || grant.TrafficLimitBytes < 0 || grant.AllowCustomPublicTarget {
+			grant.PerForwardSpeedMbps < 0 || math.IsNaN(grant.PerForwardSpeedMbps) || math.IsInf(grant.PerForwardSpeedMbps, 0) ||
+			grant.PerForwardConnectionLimit != 0 || grant.TrafficLimitBytes < 0 || grant.AllowCustomPublicTarget {
 			return fmt.Errorf("%w: invalid forwarding grant", storage.ErrForwardingInvalid)
 		}
 		if _, duplicate := seenTunnels[grant.TunnelID]; duplicate {
@@ -387,6 +390,9 @@ func (h *ServiceAuthorizationHandler) validateCustomRequest(ctx context.Context,
 		}
 		seenTunnels[grant.TunnelID] = struct{}{}
 		if _, err := h.repo.GetTunnelTemplateByID(ctx, grant.TunnelID); err != nil {
+			return err
+		}
+		if err := requireForwardingSpeedCapability(ctx, h.repo, h.forwarding.limiterPusher, grant.TunnelID, grant.PerForwardSpeedMbps); err != nil {
 			return err
 		}
 		if grant.ExpiresAt != nil && !grant.ExpiresAt.After(grant.StartsAt) {
@@ -648,7 +654,7 @@ func (h *ServiceAuthorizationHandler) applyCustom(ctx context.Context, username 
 		cleanupWarnings, provisionWarnings, applyErr := h.applyCustomDesired(ctx, username, request, actor)
 		if applyErr == nil && len(cleanupWarnings) == 0 {
 			if cleanupErr := h.deletePackageSubscription(ctx, username); cleanupErr != nil {
-				provisionWarnings = append(provisionWarnings, cleanupErr.Error())
+				log.Printf("[ServiceAuthorization] package subscription cleanup remains pending for user=%s after successful custom authorization switch: %v", username, cleanupErr)
 			}
 			return sortedWarnings(provisionWarnings), "applied", nil
 		}

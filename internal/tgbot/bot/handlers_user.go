@@ -84,8 +84,7 @@ func displayUserSummary(role, username, email string, isActive bool,
 	pkgLine := "套餐: 未绑定"
 	if pkg != nil && len(pkg) > 0 {
 		name, _ := pkg["name"].(string)
-		limitGB, _ := pkg["traffic_limit_gb"].(float64)
-		pkgLine = fmt.Sprintf("套餐: %s (%.0f GB)", name, limitGB)
+		pkgLine = fmt.Sprintf("套餐: %s", name)
 	}
 	expireLine := ""
 	if pkgEndDate != "" {

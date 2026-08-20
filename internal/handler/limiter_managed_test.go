@@ -76,7 +76,7 @@ func (a *delayedLimiterSnapshotAgent) appliedSnapshot() []uint64 {
 	return append([]uint64(nil), a.applied...)
 }
 
-func newSerializedLimiterPushFixture(t *testing.T) (*storage.TrafficRepository, *storage.RemoteServer, *LimiterConfigPusher, *delayedLimiterSnapshotAgent) {
+func newSerializedLimiterPushFixture(t *testing.T) (*storage.TrafficRepository, *storage.RemoteServer, *LimiterConfigPusher, *delayedLimiterSnapshotAgent, int64) {
 	t.Helper()
 	ctx := context.Background()
 	agentState := newDelayedLimiterSnapshotAgent()
@@ -118,10 +118,10 @@ func newSerializedLimiterPushFixture(t *testing.T) (*storage.TrafficRepository, 
 		t.Fatalf("save credential: %v", err)
 	}
 	oldSpeed := float64(8)
-	if err := repo.UpdateUserLimitOverrides(ctx, "alice", &oldSpeed, nil); err != nil {
+	if err := repo.UpdateUserNodeLimits(ctx, "alice", map[int64]float64{node.ID: oldSpeed}, nil); err != nil {
 		t.Fatalf("set old speed: %v", err)
 	}
-	return repo, server, NewLimiterConfigPusher(repo, nil), agentState
+	return repo, server, NewLimiterConfigPusher(repo, nil), agentState, node.ID
 }
 
 func TestLimiterPushSerializesBuildThroughDeliveryPerServer(t *testing.T) {
@@ -143,7 +143,7 @@ func TestLimiterPushSerializesBuildThroughDeliveryPerServer(t *testing.T) {
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			repo, server, pusher, agent := newSerializedLimiterPushFixture(t)
+			repo, server, pusher, agent, nodeID := newSerializedLimiterPushFixture(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			pushCtx := ctx
@@ -165,7 +165,7 @@ func TestLimiterPushSerializesBuildThroughDeliveryPerServer(t *testing.T) {
 				t.Fatalf("first limiter snapshot did not arrive: %v", ctx.Err())
 			}
 			newSpeed := float64(16)
-			if err := repo.UpdateUserLimitOverrides(ctx, "alice", &newSpeed, nil); err != nil {
+			if err := repo.UpdateUserNodeLimits(ctx, "alice", map[int64]float64{nodeID: newSpeed}, nil); err != nil {
 				t.Fatalf("set new speed: %v", err)
 			}
 			secondDone := make(chan error, 1)
@@ -332,8 +332,8 @@ func TestManagedSelectionLimitsFeedLimiterAndDormantCredentialIsCleared(t *testi
 		t.Fatalf("build global fallback limiter: %v", err)
 	}
 	userLimit = findLimiterUser(t, configs, "vless-in", "alice__vless-in")
-	if userLimit.SpeedLimit != 1_500_000 || userLimit.DeviceLimit != 7 {
-		t.Fatalf("user global fallback not applied: %#v", userLimit)
+	if userLimit.SpeedLimit != 0 || userLimit.DeviceLimit != 7 {
+		t.Fatalf("retired global speed or retained device fallback changed: %#v", userLimit)
 	}
 
 	if _, err := repo.DeactivateUserNodeSelection(ctx, "alice", activation.Selection.ID, "alice",
@@ -360,7 +360,7 @@ func TestMergeManagedLimiterLimitUsesMostRestrictivePositiveValue(t *testing.T) 
 	}
 }
 
-func TestLegacyPackageLimitRemainsIndependentFromManagedLimits(t *testing.T) {
+func TestRetiredAggregateSpeedIsIgnoredButDetailedOverridesApply(t *testing.T) {
 	ctx := context.Background()
 	repo := newManagedSecurityTestRepo(t)
 	createManagedSecurityTestUser(t, repo, "owner", storage.RoleAdmin)
@@ -393,13 +393,32 @@ func TestLegacyPackageLimitRemainsIndependentFromManagedLimits(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save package credential: %v", err)
 	}
+	legacySpeed := 12.0
+	deviceOverride := 7
+	if err := repo.UpdateUserLimitOverrides(ctx, "alice", &legacySpeed, &deviceOverride); err != nil {
+		t.Fatalf("seed legacy aggregate overrides: %v", err)
+	}
+	if err := repo.UpdateUserNodeLimits(ctx, "alice", map[int64]float64{node.ID: 8}, map[int64]int{node.ID: 5}); err != nil {
+		t.Fatalf("set detailed node overrides: %v", err)
+	}
 
 	configs, err := NewLimiterConfigPusher(repo, nil).BuildLimiterConfigForServer(ctx, server.ID)
 	if err != nil {
 		t.Fatalf("build package limiter: %v", err)
 	}
 	userLimit := findLimiterUser(t, configs, "vless-in", "alice__vless-in")
-	if userLimit.SpeedLimit != 2_500_000 || userLimit.DeviceLimit != 3 {
-		t.Fatalf("legacy package limits changed: %#v", userLimit)
+	if userLimit.SpeedLimit != 1_000_000 || userLimit.DeviceLimit != 5 {
+		t.Fatalf("detailed node overrides not applied: %#v", userLimit)
+	}
+	if err := repo.UpdateUserNodeLimits(ctx, "alice", map[int64]float64{}, map[int64]int{}); err != nil {
+		t.Fatalf("clear detailed node overrides: %v", err)
+	}
+	configs, err = NewLimiterConfigPusher(repo, nil).BuildLimiterConfigForServer(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("build package limiter after clearing details: %v", err)
+	}
+	userLimit = findLimiterUser(t, configs, "vless-in", "alice__vless-in")
+	if userLimit.SpeedLimit != 0 || userLimit.DeviceLimit != 7 {
+		t.Fatalf("retired aggregate speed or retained device override changed: %#v", userLimit)
 	}
 }

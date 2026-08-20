@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/netip"
 	"sort"
@@ -24,6 +25,7 @@ import (
 type ForwardingHandler struct {
 	repo            *storage.TrafficRepository
 	deployer        ForwardTunnelDeployer
+	limiterPusher   *LimiterConfigPusher
 	reconcileMu     sync.Mutex
 	reconcileCancel context.CancelFunc
 	reconcileWG     sync.WaitGroup
@@ -31,6 +33,10 @@ type ForwardingHandler struct {
 
 func NewForwardingHandler(repo *storage.TrafficRepository, deployer ForwardTunnelDeployer) *ForwardingHandler {
 	return &ForwardingHandler{repo: repo, deployer: deployer}
+}
+
+func (h *ForwardingHandler) SetLimiterPusher(pusher *LimiterConfigPusher) {
+	h.limiterPusher = pusher
 }
 
 // ForwardTunnelSpec is the controller-to-Agent contract. The expiry-guard
@@ -361,10 +367,12 @@ func (h *ForwardingHandler) grantModel(ctx context.Context, username string, req
 		}
 		tunnelID = t.ID
 	}
-	// Limiter support for raw tunnel inbounds is not present in the current Agent;
-	// reject non-zero limits instead of claiming they are enforced.
-	if req.PerForwardSpeedMbps != 0 || req.PerForwardConnectionLimit != 0 || req.AllowCustomPublicTarget {
+	if math.IsNaN(req.PerForwardSpeedMbps) || math.IsInf(req.PerForwardSpeedMbps, 0) || req.PerForwardSpeedMbps < 0 ||
+		req.PerForwardConnectionLimit != 0 || req.AllowCustomPublicTarget {
 		return storage.UserTunnelGrant{}, storage.ErrForwardingInvalid
+	}
+	if err := requireForwardingSpeedCapability(ctx, h.repo, h.limiterPusher, tunnelID, req.PerForwardSpeedMbps); err != nil {
+		return storage.UserTunnelGrant{}, err
 	}
 	enabled := true
 	if req.Enabled != nil {
@@ -1211,6 +1219,20 @@ func (h *ForwardingHandler) deployForwardOnce(ctx context.Context, f *storage.Us
 		if specErr != nil {
 			err = specErr
 		} else {
+			if i == 0 {
+				grant, grantErr := h.repo.GetUserTunnelGrantByID(leased, f.GrantID)
+				if grantErr != nil {
+					err = grantErr
+				} else if grant.PerForwardSpeedMbps > 0 && h.limiterPusher == nil {
+					err = errors.New("forwarding speed limiter is unavailable")
+				} else if h.limiterPusher != nil {
+					// The aggregate entry bucket must be acknowledged before the Guard
+					// opens the public listener. This keeps first-packet traffic limited.
+					err = h.limiterPusher.pushToServerCheckedLeased(leased, hop.ServerID)
+				}
+			}
+		}
+		if err == nil {
 			err = h.deployer.Apply(leased, spec)
 		}
 		if err != nil {
@@ -1367,6 +1389,11 @@ func (h *ForwardingHandler) suspendForwardLocked(ctx context.Context, f *storage
 	if err = h.deployer.Suspend(leased, updated.Hops[0].ServerID, updated.Hops[0].ResourceID, updated.Hops[0].Generation); err != nil {
 		return err
 	}
+	if h.limiterPusher != nil {
+		if err = h.limiterPusher.pushToServerCheckedLeased(leased, updated.Hops[0].ServerID); err != nil {
+			return fmt.Errorf("clear forwarding speed limiter: %w", err)
+		}
+	}
 	_ = h.repo.MarkUserForwardHop(ctx, updated.Hops[0].ID, storage.ForwardObservedSuspended, true, "")
 	return h.repo.MarkUserForwardDeployment(ctx, updated.ID, storage.ForwardObservedSuspended, true, "", "")
 }
@@ -1451,6 +1478,11 @@ func (h *ForwardingHandler) deleteForwardLocked(ctx context.Context, f *storage.
 			return err
 		}
 		_ = h.repo.MarkUserForwardHop(ctx, updated.Hops[i].ID, storage.ForwardObservedSuspended, true, "")
+	}
+	if h.limiterPusher != nil && len(updated.Hops) > 0 {
+		if err = h.limiterPusher.pushToServerCheckedLeased(leased, updated.Hops[0].ServerID); err != nil {
+			return fmt.Errorf("clear forwarding speed limiter: %w", err)
+		}
 	}
 	return h.repo.FinalizeUserForwardDelete(ctx, updated.ID)
 }
@@ -1562,6 +1594,12 @@ func (h *ForwardingHandler) systemSuspendForwardLocked(ctx context.Context, f *s
 		_ = h.repo.MarkUserForwardSystemState(ctx, updated.ID, storage.ForwardObservedError, reason, "suspend_failed", err.Error())
 		return err
 	}
+	if h.limiterPusher != nil {
+		if err := h.limiterPusher.pushToServerCheckedLeased(leased, hop.ServerID); err != nil {
+			_ = h.repo.MarkUserForwardSystemState(ctx, updated.ID, storage.ForwardObservedError, reason, "limiter_clear_failed", err.Error())
+			return fmt.Errorf("clear forwarding speed limiter: %w", err)
+		}
+	}
 	_ = h.repo.MarkUserForwardHop(ctx, hop.ID, storage.ForwardObservedSuspended, true, "")
 	return h.repo.MarkUserForwardSystemState(ctx, updated.ID, storage.ForwardObservedSuspended, reason, "", "")
 }
@@ -1595,6 +1633,12 @@ func (h *ForwardingHandler) retryInactiveForwardSuspendLocked(ctx context.Contex
 	if err := h.deployer.Suspend(leased, hop.ServerID, hop.ResourceID, hop.Generation); err != nil {
 		_ = h.repo.MarkUserForwardDeployment(ctx, f.ID, storage.ForwardObservedError, false, "suspend_failed", err.Error())
 		return err
+	}
+	if h.limiterPusher != nil {
+		if err := h.limiterPusher.pushToServerCheckedLeased(leased, hop.ServerID); err != nil {
+			_ = h.repo.MarkUserForwardDeployment(ctx, f.ID, storage.ForwardObservedError, false, "limiter_clear_failed", err.Error())
+			return fmt.Errorf("clear forwarding speed limiter: %w", err)
+		}
 	}
 	_ = h.repo.MarkUserForwardHop(ctx, hop.ID, storage.ForwardObservedSuspended, true, "")
 	return h.repo.MarkUserForwardDeployment(ctx, f.ID, storage.ForwardObservedSuspended, true, "", "")

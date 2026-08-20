@@ -138,18 +138,28 @@ func (s *Service) finishRegistration(ctx context.Context, b *bot.Bot,
 		return
 	}
 
-	pkgInfo := ""
-	if resp.Package != nil && len(resp.Package) > 0 {
-		name, _ := resp.Package["package_name"].(string)
-		gb, _ := resp.Package["traffic_limit_gb"].(float64)
-		days, _ := resp.Package["cycle_days"].(float64)
-		end, _ := resp.Package["end_date"].(string)
-		pkgInfo = fmt.Sprintf("\n套餐:%s (%.0f GB / %.0f 天),到期 %s", name, gb, days, end)
-	}
+	pkgInfo := formatRegistrationPackage(resp.Package)
 
 	_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: chatID,
 		Text: fmt.Sprintf("✅ 注册成功\n\n账号:%s\n初始密码:%s%s\n\n建议尽快登录 web 改密码。\n/me /sub /traffic /nodes /unbind /help",
 			resp.Username, resp.InitialPassword, pkgInfo),
 	})
+}
+
+func formatRegistrationPackage(pkg map[string]any) string {
+	if len(pkg) == 0 {
+		return ""
+	}
+	name, _ := pkg["package_name"].(string)
+	days, _ := pkg["cycle_days"].(float64)
+	end, _ := pkg["end_date"].(string)
+	text := fmt.Sprintf("\n套餐:%s", name)
+	if days > 0 {
+		text += fmt.Sprintf(" (%.0f 天)", days)
+	}
+	if end != "" {
+		text += ",到期 " + end
+	}
+	return text
 }

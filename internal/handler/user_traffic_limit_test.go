@@ -38,23 +38,26 @@ func newUserTrafficLimitTestRepo(t *testing.T) (*storage.TrafficRepository, stor
 
 func TestResolveTrafficLimitBytesAndBoundary(t *testing.T) {
 	pkg := &storage.Package{TrafficLimitBytes: 100}
-	if got := resolveTrafficLimitBytes(nil, pkg); got != 100 {
-		t.Fatalf("inherited limit=%d, want 100", got)
+	if got := resolveTrafficLimitBytes(nil, pkg); got != 0 {
+		t.Fatalf("retired package aggregate limit=%d, want 0", got)
 	}
 	zero := int64(0)
-	if got := resolveTrafficLimitBytes(&storage.User{TrafficLimitOverride: &zero}, pkg); got != 0 {
+	if got := resolveTrafficLimitBytes(&storage.User{AuthorizationMode: storage.AuthorizationModePackage, PackageID: 1, TrafficLimitOverride: &zero}, pkg); got != 0 {
 		t.Fatalf("explicit unlimited=%d, want 0", got)
 	}
 	override := int64(75)
-	if got := resolveTrafficLimitBytes(&storage.User{TrafficLimitOverride: &override}, pkg); got != 75 {
-		t.Fatalf("override=%d, want 75", got)
+	if got := resolveTrafficLimitBytes(&storage.User{AuthorizationMode: storage.AuthorizationModePackage, PackageID: 1, TrafficLimitOverride: &override}, pkg); got != 0 {
+		t.Fatalf("package-mode legacy override=%d, want 0", got)
+	}
+	if got := resolveTrafficLimitBytes(&storage.User{AuthorizationMode: storage.AuthorizationModeCustom, TrafficLimitOverride: &override}, pkg); got != 0 {
+		t.Fatalf("custom legacy override=%d, want 0", got)
 	}
 	if trafficLimitExceeded(99, 100) || !trafficLimitExceeded(100, 100) || trafficLimitExceeded(1000, 0) {
 		t.Fatal("traffic limit boundary semantics changed")
 	}
 }
 
-func TestUserTrafficLimitHandlerPreservesThreeStates(t *testing.T) {
+func TestUserTrafficLimitHandlerOnlyClearsLegacyOverride(t *testing.T) {
 	repo, _, _ := newUserTrafficLimitTestRepo(t)
 	if err := repo.CreateUser(context.Background(), "bob", "bob@example.test", "Bob", "hash", storage.RoleUser, ""); err != nil {
 		t.Fatalf("CreateUser bob: %v", err)
@@ -64,13 +67,16 @@ func TestUserTrafficLimitHandlerPreservesThreeStates(t *testing.T) {
 		name       string
 		body       string
 		wantStatus int
-		want       *int64
+		wantNil    bool
 	}{
-		{name: "positive override", body: `{"username":"alice","traffic_limit_override_gb":12.5}`, wantStatus: http.StatusOK, want: int64Ptr(12.5 * userTrafficLimitBytesPerGB)},
-		{name: "explicit unlimited", body: `{"username":"alice","traffic_limit_override_gb":0}`, wantStatus: http.StatusOK, want: int64Ptr(0)},
-		{name: "inherit package", body: `{"username":"alice","traffic_limit_override_gb":null}`, wantStatus: http.StatusOK, want: nil},
-		{name: "negative rejected", body: `{"username":"alice","traffic_limit_override_gb":-1}`, wantStatus: http.StatusBadRequest, want: nil},
-		{name: "package required", body: `{"username":"bob","traffic_limit_override_gb":10}`, wantStatus: http.StatusConflict, want: nil},
+		{name: "positive retired", body: `{"username":"alice","traffic_limit_override_gb":12.5}`, wantStatus: http.StatusBadRequest},
+		{name: "zero retired", body: `{"username":"alice","traffic_limit_override_gb":0}`, wantStatus: http.StatusBadRequest},
+		{name: "null clears", body: `{"username":"alice","traffic_limit_override_gb":null}`, wantStatus: http.StatusOK, wantNil: true},
+		{name: "custom positive retired", body: `{"username":"bob","traffic_limit_override_gb":10}`, wantStatus: http.StatusBadRequest},
+	}
+	legacy := int64(123)
+	if err := repo.UpdateUserTrafficLimitOverride(context.Background(), "alice", &legacy); err != nil {
+		t.Fatal(err)
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -80,33 +86,29 @@ func TestUserTrafficLimitHandlerPreservesThreeStates(t *testing.T) {
 			if response.Code != tt.wantStatus {
 				t.Fatalf("status=%d want=%d body=%s", response.Code, tt.wantStatus, response.Body.String())
 			}
-			if tt.wantStatus != http.StatusOK {
+			if tt.wantStatus != http.StatusOK || !tt.wantNil {
 				return
 			}
 			user, err := repo.GetUser(context.Background(), "alice")
 			if err != nil {
 				t.Fatalf("GetUser: %v", err)
 			}
-			if tt.want == nil {
-				if user.TrafficLimitOverride != nil {
-					t.Fatalf("override=%v, want nil", *user.TrafficLimitOverride)
-				}
-			} else if user.TrafficLimitOverride == nil || *user.TrafficLimitOverride != *tt.want {
-				t.Fatalf("override=%v, want %d", user.TrafficLimitOverride, *tt.want)
+			if user.TrafficLimitOverride != nil {
+				t.Fatalf("override=%v, want nil", *user.TrafficLimitOverride)
 			}
 		})
 	}
 }
 
-func TestSubscriptionTrafficHeaderUsesEffectiveOverride(t *testing.T) {
+func TestSubscriptionTrafficHeaderIgnoresLegacyPackageOverride(t *testing.T) {
 	repo, user, pkg := newUserTrafficLimitTestRepo(t)
 	handler := &PackageSubscribeHandler{repo: repo}
 	override := int64(25 * userTrafficLimitBytesPerGB)
 	user.TrafficLimitOverride = &override
 	response := httptest.NewRecorder()
 	handler.writeTrafficHeader(context.Background(), response, user, pkg)
-	if got := response.Header().Get("subscription-userinfo"); !strings.Contains(got, "total=26843545600") {
-		t.Fatalf("subscription-userinfo=%q, want override total", got)
+	if got := response.Header().Get("subscription-userinfo"); got != "" {
+		t.Fatalf("legacy package override emitted subscription-userinfo=%q", got)
 	}
 
 	zero := int64(0)
@@ -118,11 +120,18 @@ func TestSubscriptionTrafficHeaderUsesEffectiveOverride(t *testing.T) {
 	}
 }
 
-func TestUserListReturnsEffectiveTrafficOverride(t *testing.T) {
+func TestUserListHidesRetiredAggregatesAndReturnsDetailedOverrides(t *testing.T) {
 	repo, _, _ := newUserTrafficLimitTestRepo(t)
 	override := int64(12.5 * userTrafficLimitBytesPerGB)
 	if err := repo.UpdateUserTrafficLimitOverride(context.Background(), "alice", &override); err != nil {
 		t.Fatalf("UpdateUserTrafficLimitOverride: %v", err)
+	}
+	speed, devices := 12.0, 4
+	if err := repo.UpdateUserLimitOverrides(context.Background(), "alice", &speed, &devices); err != nil {
+		t.Fatalf("UpdateUserLimitOverrides: %v", err)
+	}
+	if err := repo.UpdateUserNodeLimits(context.Background(), "alice", map[int64]float64{7: 8}, map[int64]int{7: 2}); err != nil {
+		t.Fatalf("UpdateUserNodeLimits: %v", err)
 	}
 	response := httptest.NewRecorder()
 	NewUserListHandler(repo).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/admin/users", nil))
@@ -131,21 +140,27 @@ func TestUserListReturnsEffectiveTrafficOverride(t *testing.T) {
 	}
 	var payload struct {
 		Users []struct {
-			Username               string   `json:"username"`
-			TrafficLimit           int64    `json:"traffic_limit"`
-			TrafficLimitOverrideGB *float64 `json:"traffic_limit_override_gb"`
+			Username                 string            `json:"username"`
+			TrafficLimit             int64             `json:"traffic_limit"`
+			TrafficLimitOverrideGB   *float64          `json:"traffic_limit_override_gb"`
+			SpeedLimitOverride       *float64          `json:"speed_limit_override"`
+			DeviceLimitOverride      *int              `json:"device_limit_override"`
+			NodeSpeedLimitOverrides  map[int64]float64 `json:"node_speed_limit_overrides"`
+			NodeDeviceLimitOverrides map[int64]int     `json:"node_device_limit_overrides"`
 		} `json:"users"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode user list: %v", err)
 	}
-	if len(payload.Users) != 1 || payload.Users[0].Username != "alice" || payload.Users[0].TrafficLimit != override ||
-		payload.Users[0].TrafficLimitOverrideGB == nil || *payload.Users[0].TrafficLimitOverrideGB != 12.5 {
+	if len(payload.Users) != 1 || payload.Users[0].Username != "alice" || payload.Users[0].TrafficLimit != 0 ||
+		payload.Users[0].TrafficLimitOverrideGB != nil || payload.Users[0].SpeedLimitOverride != nil ||
+		payload.Users[0].DeviceLimitOverride == nil || *payload.Users[0].DeviceLimitOverride != 4 ||
+		payload.Users[0].NodeSpeedLimitOverrides[7] != 8 || payload.Users[0].NodeDeviceLimitOverrides[7] != 2 {
 		t.Fatalf("unexpected user list payload: %+v", payload.Users)
 	}
 }
 
-func TestUnlimitedOverrideClearsPersistedOverLimitState(t *testing.T) {
+func TestLegacyPackageTrafficOverrideDoesNotSetOverLimitState(t *testing.T) {
 	repo, _, _ := newUserTrafficLimitTestRepo(t)
 	ctx := context.Background()
 	server := &storage.RemoteServer{
@@ -168,21 +183,42 @@ func TestUnlimitedOverrideClearsPersistedOverLimitState(t *testing.T) {
 	enforcer := NewTrafficLimitEnforcer(repo, nil, nil)
 	enforcer.CheckAll(ctx)
 	over, err := repo.IsUserOverLimit(ctx, "alice")
-	if err != nil || !over {
-		t.Fatalf("over-limit state=(%v,%v), want true at boundary", over, err)
-	}
-	zero := int64(0)
-	if err := repo.UpdateUserTrafficLimitOverride(ctx, "alice", &zero); err != nil {
-		t.Fatalf("UpdateUserTrafficLimitOverride: %v", err)
-	}
-	enforcer.CheckAll(ctx)
-	over, err = repo.IsUserOverLimit(ctx, "alice")
 	if err != nil || over {
-		t.Fatalf("over-limit state=(%v,%v), want false", over, err)
+		t.Fatalf("legacy aggregate override set over-limit state=(%v,%v)", over, err)
 	}
 }
 
-func int64Ptr(value float64) *int64 {
-	converted := int64(value)
-	return &converted
+func TestUserLimitsAllowDeviceButRejectAggregateSpeed(t *testing.T) {
+	repo, _, _ := newUserTrafficLimitTestRepo(t)
+	handler := NewUserLimitsHandler(repo, nil, nil)
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/admin/users/limits",
+		strings.NewReader(`{"username":"alice","device_limit_override":4}`)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("device override status=%d body=%s", response.Code, response.Body.String())
+	}
+	user, err := repo.GetUser(context.Background(), "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.DeviceLimitOverride == nil || *user.DeviceLimitOverride != 4 || user.SpeedLimitOverride != nil {
+		t.Fatalf("stored package user limits=%+v", user)
+	}
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/admin/users/limits",
+		strings.NewReader(`{"username":"alice","speed_limit_override":5,"device_limit_override":4}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("aggregate speed status=%d want=%d body=%s", response.Code, http.StatusConflict, response.Body.String())
+	}
+	if err := repo.CreateUser(context.Background(), "custom", "custom@example.test", "Custom", "hash", storage.RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/admin/users/limits",
+		strings.NewReader(`{"username":"custom","speed_limit_override":5}`)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("custom aggregate speed status=%d want=%d body=%s", response.Code, http.StatusConflict, response.Body.String())
+	}
 }

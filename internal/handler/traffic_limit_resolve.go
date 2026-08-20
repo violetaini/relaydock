@@ -2,15 +2,11 @@ package handler
 
 import "github.com/violetaini/relaydock/internal/storage"
 
-// resolveTrafficLimitBytes returns the effective package total traffic cap.
-// A user override is authoritative whenever present, including an explicit zero.
+// resolveTrafficLimitBytes retains the old call shape while aggregate traffic
+// is retired. Fixed nodes, managed servers, and forwarding grants each enforce
+// their own resource quota.
 func resolveTrafficLimitBytes(user *storage.User, pkg *storage.Package) int64 {
-	if user != nil && user.TrafficLimitOverride != nil {
-		return *user.TrafficLimitOverride
-	}
-	if pkg != nil {
-		return pkg.TrafficLimitBytes
-	}
+	_, _ = user, pkg
 	return 0
 }
 

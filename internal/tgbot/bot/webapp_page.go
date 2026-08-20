@@ -305,13 +305,14 @@ function renderHome(d){
  h+='</div>';
  var t=d.traffic;
  if(t){
-  var used=Number(t.cycle_used)||0,limit=(Number(t.limit_gb)||0)*1073741824,pct=limit>0?Math.min(100,used/limit*100):0;
+  var used=Number(t.cycle_used)||0;
   var dl=t.days_left!=null?Number(t.days_left):null;
   h+='<div class="card"><div class="title">流量 · '+esc(t.package_name||"未绑定套餐")+'</div>';
-  h+='<div class="row" style="margin:0"><span class="big">'+hb(used)+'</span><span class="muted">'+(limit>0?"/ "+(t.limit_gb)+" GB":"")+'</span></div>';
-  if(limit>0){
-   h+='<div class="bar"><i style="width:'+pct.toFixed(1)+'%"></i></div>';
-   h+='<div class="row" style="margin:6px 0 0"><span class="muted">已用 '+pct.toFixed(1)+'%</span>'+(dl!=null?'<span class="'+(dl<=7?"warn":"muted")+'">剩 '+dl+' 天</span>':'<span></span>')+'</div>';
+  h+='<div class="row" style="margin:0"><span class="muted">本周期已用</span><span class="big">'+hb(used)+'</span></div>';
+  if(t.end_date||dl!=null){
+   var expiry=t.end_date?'到期 '+esc(t.end_date):'';
+   if(dl!=null)expiry+=(expiry?' · ':'')+(dl<0?'已过期':'剩 '+dl+' 天');
+   h+='<div class="row" style="margin:6px 0 0"><span class="muted">套餐周期</span><span class="'+(dl!=null&&dl<=7?"warn":"muted")+'">'+expiry+'</span></div>';
   }
   h+='<div class="row" style="margin:4px 0 0"><span class="muted">累计</span><span class="muted">↑'+hb(t.total_up)+' ↓'+hb(t.total_down)+'</span></div>';
   h+='</div>';
@@ -410,7 +411,7 @@ function renderInvites(){
  h+='<div class="muted" style="margin-bottom:4px">套餐</div>';
  h+='<select id="i-pkg" class="inp" style="margin-top:0">';
  h+='<option value="0">不绑套餐</option>';
- pkgs.forEach(function(p){h+='<option value="'+p.id+'">'+esc(p.name)+'('+(p.traffic_limit_gb)+'GB/'+(p.cycle_days)+'天)</option>';});
+ pkgs.forEach(function(p){h+='<option value="'+p.id+'">'+esc(p.name)+' ('+(p.cycle_days)+'天)</option>';});
  h+='</select>';
  h+='<div class="muted" style="margin:10px 0 4px">有效期</div><div class="seg" id="i-dur">';
  [1,3,6,12].forEach(function(m,i){h+='<button class="'+(i==0?"active":"")+'" onclick="__durpick(this,'+m+')">'+(m==12?"1年":m+"月")+'</button>';});
@@ -545,7 +546,7 @@ function renderUserList(){
  if(!list.length){document.getElementById("u-list").innerHTML='<div class="muted" style="padding:6px 0">无匹配用户。</div>';return;}
  list.forEach(function(u,i){var hasPkg=!!u.package_id;
   h+='<div class="st" style="flex-direction:column;align-items:stretch;gap:6px">';
-  h+='<div style="display:flex;justify-content:space-between;gap:8px"><div style="min-width:0"><div style="font-weight:600">'+esc(u.username)+(u.nickname?' <span class="muted" style="font-weight:400">'+esc(u.nickname)+'</span>':'')+'</div><div class="muted" style="font-size:12px">'+esc(u.package_name||"未绑套餐")+(hasPkg?' · '+hb(u.traffic_used||0)+(u.traffic_limit?' / '+hb(u.traffic_limit):''):'')+'</div></div>';
+  h+='<div style="display:flex;justify-content:space-between;gap:8px"><div style="min-width:0"><div style="font-weight:600">'+esc(u.username)+(u.nickname?' <span class="muted" style="font-weight:400">'+esc(u.nickname)+'</span>':'')+'</div><div class="muted" style="font-size:12px">'+esc(u.package_name||"未绑套餐")+(hasPkg?' · 本周期已用 '+hb(u.traffic_used||0):'')+'</div></div>';
   h+='<div style="text-align:right;font-size:12px;white-space:nowrap">'+uBadge(u.package_end_date,hasPkg)+(u.package_end_date?'<div class="muted">'+esc(u.package_end_date)+'</div>':'')+'</div></div>';
 	 if(hasPkg){h+='<div class="seg" style="margin-top:2px">';[30,60,90].forEach(function(dd){h+='<button onclick="__extendUser('+jsa(u.username)+','+dd+',this)">+'+dd+'天</button>';});h+='</div>';}
   h+='<div style="display:flex;gap:6px"><select id="pk-'+i+'" class="inp" style="margin-top:0;flex:1">';

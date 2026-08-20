@@ -238,18 +238,14 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 			"is_active": summary.IsActive,
 			"email":     summary.Email,
 		}
-		pkgName, limitGB := "", 0.0
+		pkgName := ""
 		if summary.Package != nil {
 			if v, ok := summary.Package["name"].(string); ok {
 				pkgName = v
 			}
-			if v, ok := summary.Package["traffic_limit_gb"].(float64); ok {
-				limitGB = v
-			}
 		}
 		traffic := map[string]any{
 			"package_name": pkgName,
-			"limit_gb":     limitGB,
 			"cycle_used":   summary.Traffic.CycleUplink + summary.Traffic.CycleDownlink,
 			"total_up":     summary.Traffic.TotalUplink,
 			"total_down":   summary.Traffic.TotalDownlink,

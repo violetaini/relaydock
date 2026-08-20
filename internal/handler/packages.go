@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/big"
 	"net/http"
 	"net/netip"
@@ -57,6 +58,7 @@ func (h *PackageListHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // PackageCreateHandler 处理创建新的包模板
 type PackageCreateHandler struct {
 	repo              *storage.TrafficRepository
+	pusher            *LimiterConfigPusher
 	capabilityManager *capabilities.Manager
 }
 
@@ -66,6 +68,10 @@ func NewPackageCreateHandler(repo *storage.TrafficRepository) *PackageCreateHand
 
 func (h *PackageCreateHandler) SetCapabilityManager(manager *capabilities.Manager) {
 	h.capabilityManager = manager
+}
+
+func (h *PackageCreateHandler) SetLimiterPusher(pusher *LimiterConfigPusher) {
+	h.pusher = pusher
 }
 
 // hasNonZeroLimit 任何一项 > 0 都算"启用限速"。0 表示显式不限速,不算"启用"。
@@ -87,24 +93,78 @@ func hasNonZeroIntLimit(m map[int64]int) bool {
 	return false
 }
 
+func validNodeTrafficLimits(m map[int64]float64) bool {
+	for nodeID, gb := range m {
+		if nodeID <= 0 || math.IsNaN(gb) || math.IsInf(gb, 0) || gb < 0 || gb > float64(math.MaxInt64)/(1024*1024*1024) {
+			return false
+		}
+	}
+	return true
+}
+
+func requirePackageNodeTrafficCapabilities(ctx context.Context, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, pkg *storage.Package) error {
+	if pkg == nil || !hasNonZeroLimit(pkg.NodeTrafficLimits) {
+		return nil
+	}
+	if pusher == nil {
+		return errors.New("fixed-node traffic quotas require an available limiter pusher")
+	}
+	serverIDs := make(map[int64]bool)
+	for nodeID, limitGB := range pkg.NodeTrafficLimits {
+		if limitGB <= 0 {
+			continue
+		}
+		node, err := repo.GetNodeByID(ctx, nodeID)
+		if err != nil {
+			return err
+		}
+		server, err := repo.GetRemoteServerByName(ctx, node.OriginalServer)
+		if err != nil {
+			return err
+		}
+		serverIDs[server.ID] = true
+	}
+	for serverID := range serverIDs {
+		server, err := repo.GetRemoteServer(ctx, serverID)
+		if err != nil {
+			return err
+		}
+		probe := []WSLimiterConfigPayload{{Users: []WSUserLimitInfo{{Denied: true}}}}
+		if err := pusher.requireLimiterCapabilities(ctx, server, probe); err != nil {
+			return fmt.Errorf("server %d cannot enforce fixed-node traffic quotas: %w", serverID, err)
+		}
+	}
+	return nil
+}
+
+func requirePackageForwardingSpeedCapabilities(ctx context.Context, repo *storage.TrafficRepository, pusher *LimiterConfigPusher, grants []storage.PackageForwardingGrant) error {
+	for _, grant := range grants {
+		if err := requireForwardingSpeedCapability(ctx, repo, pusher, grant.TunnelID, grant.PerForwardSpeedMbps); err != nil {
+			return fmt.Errorf("tunnel %d forwarding speed: %w", grant.TunnelID, err)
+		}
+	}
+	return nil
+}
+
 type createPackageRequest struct {
-	Name             string                           `json:"name"`
-	Description      string                           `json:"description"`
-	TrafficLimitGB   float64                          `json:"traffic_limit_gb"`
-	CycleDays        int                              `json:"cycle_days"`
-	IsReset          bool                             `json:"is_reset"`
-	ResetDay         int                              `json:"reset_day"`
-	Nodes            []int64                          `json:"nodes"`
-	NodeMultipliers  map[int64]float64                `json:"node_multipliers"`   // node_id → 倍率
-	NodeSpeedLimits  map[int64]float64                `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeDeviceLimits map[int64]int                    `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
-	SpeedLimitMbps   float64                          `json:"speed_limit_mbps"`
-	DeviceLimit      int                              `json:"device_limit"`
-	AutoSpeedRules   []storage.AutoSpeedLimitRule     `json:"auto_speed_rules"`
-	ServerGrants     []storage.PackageServerGrant     `json:"server_grants"`
-	ForwardingGrants []storage.PackageForwardingGrant `json:"forwarding_grants"`
-	TrafficMode      string                           `json:"traffic_mode"`
-	TemplateFilename string                           `json:"template_filename"` // 空 = 走系统默认
+	Name              string                           `json:"name"`
+	Description       string                           `json:"description"`
+	TrafficLimitGB    float64                          `json:"traffic_limit_gb"`
+	CycleDays         int                              `json:"cycle_days"`
+	IsReset           bool                             `json:"is_reset"`
+	ResetDay          int                              `json:"reset_day"`
+	Nodes             []int64                          `json:"nodes"`
+	NodeMultipliers   map[int64]float64                `json:"node_multipliers"`    // node_id → 倍率
+	NodeSpeedLimits   map[int64]float64                `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeTrafficLimits map[int64]float64                `json:"node_traffic_limits"` // 套餐固定节点独立流量额度 (GB);0/缺省=不限
+	NodeDeviceLimits  map[int64]int                    `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	SpeedLimitMbps    float64                          `json:"speed_limit_mbps"`
+	DeviceLimit       int                              `json:"device_limit"`
+	AutoSpeedRules    []storage.AutoSpeedLimitRule     `json:"auto_speed_rules"`
+	ServerGrants      []storage.PackageServerGrant     `json:"server_grants"`
+	ForwardingGrants  []storage.PackageForwardingGrant `json:"forwarding_grants"`
+	TrafficMode       string                           `json:"traffic_mode"`
+	TemplateFilename  string                           `json:"template_filename"` // 空 = 走系统默认
 }
 
 // validatePackageTemplateFilename 非空时校验 rule_templates 下文件存在。空字符串直接通过(表示用系统默认)。
@@ -179,12 +239,12 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if req.TrafficLimitGB < 0 {
-		http.Error(w, "Traffic limit cannot be negative", http.StatusBadRequest)
+	if !validNodeTrafficLimits(req.NodeTrafficLimits) {
+		http.Error(w, "Node traffic limits must be finite non-negative GB values", http.StatusBadRequest)
 		return
 	}
 
-	if (req.SpeedLimitMbps > 0 || len(req.AutoSpeedRules) > 0 || hasNonZeroLimit(req.NodeSpeedLimits) || hasNonZeroIntLimit(req.NodeDeviceLimits)) && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
+	if (hasNonZeroLimit(req.NodeSpeedLimits) || hasNonZeroIntLimit(req.NodeDeviceLimits) || hasNonZeroLimit(req.NodeTrafficLimits)) && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
 		http.Error(w, "当前构建未启用限速器", http.StatusForbidden)
 		return
 	}
@@ -222,22 +282,27 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	pkg := storage.Package{
 		Name:              req.Name,
 		Description:       req.Description,
-		TrafficLimitGB:    req.TrafficLimitGB,
-		TrafficLimitBytes: int64(req.TrafficLimitGB * 1024 * 1024 * 1024),
+		TrafficLimitGB:    0,
+		TrafficLimitBytes: 0,
 		CycleDays:         req.CycleDays,
 		IsReset:           req.IsReset,
 		ResetDay:          req.ResetDay,
 		Nodes:             nodes,
 		NodeMultipliers:   req.NodeMultipliers,
 		NodeSpeedLimits:   req.NodeSpeedLimits,
+		NodeTrafficLimits: req.NodeTrafficLimits,
 		NodeDeviceLimits:  req.NodeDeviceLimits,
-		SpeedLimitMbps:    req.SpeedLimitMbps,
+		SpeedLimitMbps:    0,
 		DeviceLimit:       req.DeviceLimit,
-		AutoSpeedRules:    req.AutoSpeedRules,
+		AutoSpeedRules:    []storage.AutoSpeedLimitRule{},
 		ServerGrants:      req.ServerGrants,
 		ForwardingGrants:  req.ForwardingGrants,
 		TrafficMode:       trafficMode,
 		TemplateFilename:  strings.TrimSpace(req.TemplateFilename),
+	}
+	if err := requirePackageForwardingSpeedCapabilities(r.Context(), h.repo, h.pusher, pkg.ForwardingGrants); err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
 	}
 
 	id, err := h.repo.CreatePackage(r.Context(), pkg)
@@ -372,31 +437,52 @@ func (h *PackageUpdateHandler) SetCapabilityManager(manager *capabilities.Manage
 
 func NewPackageUpdateHandler(repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher) *PackageUpdateHandler {
 	managed := NewManagedNodesHandler(repo, remoteManage, pusher)
+	forwarding := NewForwardingHandler(repo, NewForwardingGuardDeployer(managed))
+	forwarding.SetLimiterPusher(pusher)
 	return &PackageUpdateHandler{
 		repo: repo, remoteManage: remoteManage, pusher: pusher, managed: managed,
-		forwarding: NewForwardingHandler(repo, NewForwardingGuardDeployer(managed)),
+		forwarding: forwarding,
 	}
 }
 
+func reconcilePackageForwardingGrants(ctx context.Context, repo *storage.TrafficRepository, forwarding *ForwardingHandler, username string, packageID int64) error {
+	if repo == nil || forwarding == nil || packageID <= 0 {
+		return nil
+	}
+	grants, err := repo.ListUserTunnelGrants(ctx, username)
+	if err != nil {
+		return err
+	}
+	for i := range grants {
+		grant := &grants[i]
+		if grant.Enabled && grant.SourceType == storage.GrantSourcePackage &&
+			grant.SourcePackageID != nil && *grant.SourcePackageID == packageID {
+			forwarding.reconcileGrantForwards(ctx, grant)
+		}
+	}
+	return nil
+}
+
 type updatePackageRequest struct {
-	ID               int64                            `json:"id"`
-	Name             string                           `json:"name"`
-	Description      string                           `json:"description"`
-	TrafficLimitGB   float64                          `json:"traffic_limit_gb"`
-	CycleDays        int                              `json:"cycle_days"`
-	IsReset          *bool                            `json:"is_reset"`  // 指针:请求未携带时保留库中旧值,不按零值覆盖
-	ResetDay         *int                             `json:"reset_day"` // 同上
-	Nodes            []int64                          `json:"nodes"`
-	NodeMultipliers  map[int64]float64                `json:"node_multipliers"`   // node_id → 倍率
-	NodeSpeedLimits  map[int64]float64                `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeDeviceLimits map[int64]int                    `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
-	SpeedLimitMbps   float64                          `json:"speed_limit_mbps"`
-	DeviceLimit      int                              `json:"device_limit"`
-	AutoSpeedRules   []storage.AutoSpeedLimitRule     `json:"auto_speed_rules"`
-	ServerGrants     []storage.PackageServerGrant     `json:"server_grants"`
-	ForwardingGrants []storage.PackageForwardingGrant `json:"forwarding_grants"`
-	TrafficMode      string                           `json:"traffic_mode"`
-	TemplateFilename string                           `json:"template_filename"` // 空 = 走系统默认
+	ID                int64                            `json:"id"`
+	Name              string                           `json:"name"`
+	Description       string                           `json:"description"`
+	TrafficLimitGB    float64                          `json:"traffic_limit_gb"`
+	CycleDays         int                              `json:"cycle_days"`
+	IsReset           *bool                            `json:"is_reset"`  // 指针:请求未携带时保留库中旧值,不按零值覆盖
+	ResetDay          *int                             `json:"reset_day"` // 同上
+	Nodes             []int64                          `json:"nodes"`
+	NodeMultipliers   map[int64]float64                `json:"node_multipliers"`    // node_id → 倍率
+	NodeSpeedLimits   map[int64]float64                `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeTrafficLimits map[int64]float64                `json:"node_traffic_limits"` // 套餐固定节点独立流量额度 (GB);0/缺省=不限
+	NodeDeviceLimits  map[int64]int                    `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	SpeedLimitMbps    float64                          `json:"speed_limit_mbps"`
+	DeviceLimit       int                              `json:"device_limit"`
+	AutoSpeedRules    []storage.AutoSpeedLimitRule     `json:"auto_speed_rules"`
+	ServerGrants      []storage.PackageServerGrant     `json:"server_grants"`
+	ForwardingGrants  []storage.PackageForwardingGrant `json:"forwarding_grants"`
+	TrafficMode       string                           `json:"traffic_mode"`
+	TemplateFilename  string                           `json:"template_filename"` // 空 = 走系统默认
 }
 
 func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -422,12 +508,12 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if req.TrafficLimitGB < 0 {
-		http.Error(w, "Traffic limit cannot be negative", http.StatusBadRequest)
+	if !validNodeTrafficLimits(req.NodeTrafficLimits) {
+		http.Error(w, "Node traffic limits must be finite non-negative GB values", http.StatusBadRequest)
 		return
 	}
 
-	if (req.SpeedLimitMbps > 0 || len(req.AutoSpeedRules) > 0 || hasNonZeroLimit(req.NodeSpeedLimits) || hasNonZeroIntLimit(req.NodeDeviceLimits)) && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
+	if (hasNonZeroLimit(req.NodeSpeedLimits) || hasNonZeroIntLimit(req.NodeDeviceLimits) || hasNonZeroLimit(req.NodeTrafficLimits)) && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
 		http.Error(w, "当前构建未启用限速器", http.StatusForbidden)
 		return
 	}
@@ -496,22 +582,27 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		ID:                req.ID,
 		Name:              req.Name,
 		Description:       req.Description,
-		TrafficLimitGB:    req.TrafficLimitGB,
-		TrafficLimitBytes: int64(req.TrafficLimitGB * 1024 * 1024 * 1024),
+		TrafficLimitGB:    0,
+		TrafficLimitBytes: 0,
 		CycleDays:         req.CycleDays,
 		IsReset:           isReset,
 		ResetDay:          resetDay,
 		Nodes:             nodes,
 		NodeMultipliers:   req.NodeMultipliers,
 		NodeSpeedLimits:   req.NodeSpeedLimits,
+		NodeTrafficLimits: req.NodeTrafficLimits,
 		NodeDeviceLimits:  req.NodeDeviceLimits,
-		SpeedLimitMbps:    req.SpeedLimitMbps,
+		SpeedLimitMbps:    0,
 		DeviceLimit:       req.DeviceLimit,
-		AutoSpeedRules:    req.AutoSpeedRules,
+		AutoSpeedRules:    []storage.AutoSpeedLimitRule{},
 		ServerGrants:      req.ServerGrants,
 		ForwardingGrants:  req.ForwardingGrants,
 		TrafficMode:       trafficMode,
 		TemplateFilename:  strings.TrimSpace(req.TemplateFilename),
+	}
+	if err := requirePackageForwardingSpeedCapabilities(packageCtx, h.repo, h.pusher, pkg.ForwardingGrants); err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
 	}
 
 	boundUsers, err := h.repo.ListUsersWithPackage(packageCtx)
@@ -523,6 +614,12 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	for _, user := range boundUsers {
 		if user.PackageID == req.ID {
 			boundUsernames = append(boundUsernames, user.Username)
+		}
+	}
+	if len(boundUsernames) > 0 {
+		if err := requirePackageNodeTrafficCapabilities(packageCtx, h.repo, h.pusher, &pkg); err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
 		}
 	}
 	if h.afterUserSnapshotForTest != nil {
@@ -584,6 +681,9 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			updateCtx, user.Username, storage.GrantSourcePackage, "package-template",
 		); len(cleanupWarnings) > 0 {
 			bundleWarnings[user.Username] = append(bundleWarnings[user.Username], cleanupWarnings...)
+		}
+		if reconcileErr := reconcilePackageForwardingGrants(updateCtx, h.repo, h.forwarding, user.Username, req.ID); reconcileErr != nil {
+			bundleWarnings[user.Username] = append(bundleWarnings[user.Username], reconcileErr.Error())
 		}
 	}
 
@@ -1663,9 +1763,11 @@ type PackageAssignHandler struct {
 
 func NewPackageAssignHandler(repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher) *PackageAssignHandler {
 	managed := NewManagedNodesHandler(repo, remoteManage, pusher)
+	forwarding := NewForwardingHandler(repo, NewForwardingGuardDeployer(managed))
+	forwarding.SetLimiterPusher(pusher)
 	return &PackageAssignHandler{
 		repo: repo, remoteManage: remoteManage, pusher: pusher, managed: managed,
-		forwarding: NewForwardingHandler(repo, NewForwardingGuardDeployer(managed)),
+		forwarding: forwarding,
 	}
 }
 
@@ -2048,6 +2150,12 @@ func (h *PackageAssignHandler) assignAndProvisionLocked(ctx context.Context, use
 	if err != nil {
 		return nil, err
 	}
+	if err := requirePackageNodeTrafficCapabilities(ctx, h.repo, h.pusher, targetPackage); err != nil {
+		return nil, err
+	}
+	if err := requirePackageForwardingSpeedCapabilities(ctx, h.repo, h.pusher, targetPackage.ForwardingGrants); err != nil {
+		return nil, err
+	}
 	if err := validatePackageNodeProtocolConflicts(ctx, h.repo, targetPackage.Nodes); err != nil {
 		return nil, err
 	}
@@ -2171,6 +2279,9 @@ func (h *PackageAssignHandler) assignAndProvisionLocked(ctx context.Context, use
 				return nil, errors.Join(switchErr, restoreErr)
 			}
 		}
+	}
+	if reconcileErr := reconcilePackageForwardingGrants(ctx, h.repo, h.forwarding, username, packageID); reconcileErr != nil {
+		warnings = append(warnings, fmt.Sprintf("转发授权刷新待重试: %v", reconcileErr))
 	}
 
 	// Always reconcile every package node, including same-package renewal. This

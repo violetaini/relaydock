@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -789,7 +790,8 @@ func normalizeGrant(g UserServerGrant) (UserServerGrant, error) {
 	if g.ExpiresAt != nil && !g.ExpiresAt.After(g.StartsAt) {
 		return g, fmt.Errorf("%w: expires_at must be after starts_at", ErrManagedInvalidArgument)
 	}
-	if g.MaxActiveNodes < 0 || g.SpeedLimitMbps < 0 || g.ConnectionLimit < 0 || g.TrafficLimitBytes < 0 {
+	if g.MaxActiveNodes < 0 || g.SpeedLimitMbps < 0 || math.IsNaN(g.SpeedLimitMbps) || math.IsInf(g.SpeedLimitMbps, 0) ||
+		g.ConnectionLimit < 0 || g.TrafficLimitBytes < 0 {
 		return g, fmt.Errorf("%w: limits cannot be negative", ErrManagedInvalidArgument)
 	}
 	if g.BillingMode != ManagedBillingDownload && g.BillingMode != ManagedBillingBoth {

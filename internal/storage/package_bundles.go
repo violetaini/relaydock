@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -13,6 +14,18 @@ import (
 // validateAndNormalizePackageBundle validates resource references and applies
 // the same defaults used by individually-created grants.
 func (r *TrafficRepository) validateAndNormalizePackageBundle(ctx context.Context, pkg *Package) error {
+	// Aggregate package traffic/speed limits were retired in favor of explicit
+	// resource limits. Keep the legacy fields readable, but never persist a new
+	// non-zero value from old API clients.
+	pkg.TrafficLimitGB = 0
+	pkg.TrafficLimitBytes = 0
+	pkg.SpeedLimitMbps = 0
+	pkg.AutoSpeedRules = []AutoSpeedLimitRule{}
+	for nodeID, gb := range pkg.NodeTrafficLimits {
+		if nodeID <= 0 || math.IsNaN(gb) || math.IsInf(gb, 0) || gb < 0 || gb > float64(math.MaxInt64)/(1024*1024*1024) {
+			return fmt.Errorf("invalid package traffic limit for node %d", nodeID)
+		}
+	}
 	seenServers := make(map[int64]struct{}, len(pkg.ServerGrants))
 	for i := range pkg.ServerGrants {
 		entry := &pkg.ServerGrants[i]
@@ -54,7 +67,7 @@ func (r *TrafficRepository) validateAndNormalizePackageBundle(ctx context.Contex
 	seenTunnels := make(map[int64]struct{}, len(pkg.ForwardingGrants))
 	for i := range pkg.ForwardingGrants {
 		entry := &pkg.ForwardingGrants[i]
-		if _, duplicate := seenTunnels[entry.TunnelID]; entry.TunnelID <= 0 || duplicate {
+		if _, duplicate := seenTunnels[entry.TunnelID]; entry.TunnelID <= 0 || duplicate || entry.PerForwardConnectionLimit != 0 {
 			return fmt.Errorf("invalid package forwarding grant for tunnel %d", entry.TunnelID)
 		}
 		seenTunnels[entry.TunnelID] = struct{}{}

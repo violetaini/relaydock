@@ -107,6 +107,9 @@ type AgentCapabilities struct {
 	// as an explicit connection rejection, including existing unlimited users.
 	// A legacy Agent can ACK the same JSON while silently ignoring this field.
 	LimiterDeniedV1 bool `json:"limiter_denied_v1,omitempty"`
+	// ForwardingSpeedLimitV1 supports an aggregate, tag-scoped limiter bucket
+	// for a managed forwarding entry inbound.
+	ForwardingSpeedLimitV1 bool `json:"forwarding_speed_limit_v1,omitempty"`
 	// AgentUninstallV2 表示 Agent 支持两阶段安全自卸载。主控在接单回执后
 	// 继续等待一次性 callback 确认清理完成，随后才删除服务器记录。
 	AgentUninstallV2 bool `json:"agent_uninstall_v2,omitempty"`
@@ -180,11 +183,12 @@ func AggregateUserConnCounts() map[string]int64 {
 
 // WSLimiterConfigPayload 表示限速配置下发消息 (Master -> Agent)
 type WSLimiterConfigPayload struct {
-	InboundTag     string                       `json:"inbound_tag"`
-	NodeLimit      uint64                       `json:"node_limit"`
-	Users          []WSUserLimitInfo            `json:"users"`
-	WireGuardPeers []WSWireGuardPeerIdentity    `json:"wireguard_peers"`
-	AutoSpeedRules []storage.AutoSpeedLimitRule `json:"auto_speed_rules,omitempty"`
+	InboundTag         string                       `json:"inbound_tag"`
+	NodeLimit          uint64                       `json:"node_limit"`
+	InboundSharedLimit bool                         `json:"inbound_shared_limit,omitempty"`
+	Users              []WSUserLimitInfo            `json:"users"`
+	WireGuardPeers     []WSWireGuardPeerIdentity    `json:"wireguard_peers"`
+	AutoSpeedRules     []storage.AutoSpeedLimitRule `json:"auto_speed_rules,omitempty"`
 }
 
 // WSWireGuardPeerIdentity maps the source address observed inside a WireGuard
@@ -1455,6 +1459,9 @@ func (h *RemoteWSHandler) SendLimiterConfig(serverID int64, configs []WSLimiterC
 	defer wsConn.mu.Unlock()
 	if limiterSnapshotsContainDenied(configs) && !wsConn.Capabilities.LimiterDeniedV1 {
 		return errors.New("Agent lacks limiter_denied_v1 capability; upgrade and reconnect relaydock-agent")
+	}
+	if limiterSnapshotsContainForwardingSpeed(configs) && !wsConn.Capabilities.ForwardingSpeedLimitV1 {
+		return errors.New("Agent lacks forwarding_speed_limit_v1 capability; upgrade and reconnect relaydock-agent")
 	}
 
 	for _, cfg := range configs {

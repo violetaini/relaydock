@@ -249,7 +249,8 @@ func TestWireGuardPackageLimiterMapsPeerAddressToIndependentUserPolicy(t *testin
 		t.Fatalf("create node: %v", err)
 	}
 	packageID, err := repo.CreatePackage(ctx, storage.Package{
-		Name: "wg-limiter", Nodes: []int64{node.ID}, SpeedLimitMbps: 8, DeviceLimit: 2,
+		Name: "wg-limiter", Nodes: []int64{node.ID}, DeviceLimit: 2,
+		NodeSpeedLimits: map[int64]float64{node.ID: 8},
 	})
 	if err != nil {
 		t.Fatalf("create package: %v", err)

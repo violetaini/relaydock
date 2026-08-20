@@ -55,7 +55,9 @@ func TestUserTrafficLimitOverrideMigrationAndPackageLifecycle(t *testing.T) {
 	if err := repo.AssignPackageToUser(ctx, "alice", packageA, now, now.Add(60*24*time.Hour), false, 1); err != nil {
 		t.Fatalf("renew package A: %v", err)
 	}
-	assertOverride(&override)
+	// Aggregate limits are retired, so every package assignment/renewal clears
+	// legacy rows instead of carrying them into the new authorization window.
+	assertOverride(nil)
 	if err := repo.AssignPackageToUser(ctx, "alice", packageB, now, now.Add(30*24*time.Hour), false, 1); err != nil {
 		t.Fatalf("switch to package B: %v", err)
 	}

@@ -3,13 +3,12 @@ package handler
 import (
 	"context"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
-func TestPackageSubscriptionHeaderUsesCurrentBillingCycle(t *testing.T) {
+func TestPackageSubscriptionHeaderIsAbsentWithoutAggregateTotal(t *testing.T) {
 	repo, user, pkg := newUserTrafficLimitTestRepo(t)
 	ctx := context.Background()
 	server := &storage.RemoteServer{Name: "cycle-edge", Token: "cycle-edge-token"}
@@ -30,8 +29,8 @@ func TestPackageSubscriptionHeaderUsesCurrentBillingCycle(t *testing.T) {
 	handler := &PackageSubscribeHandler{repo: repo}
 	response := httptest.NewRecorder()
 	handler.writeTrafficHeader(ctx, response, user, pkg)
-	if got := response.Header().Get("subscription-userinfo"); !strings.Contains(got, "download=150") {
-		t.Fatalf("subscription-userinfo = %q, want current-cycle download=150", got)
+	if got := response.Header().Get("subscription-userinfo"); got != "" {
+		t.Fatalf("subscription-userinfo = %q, want no aggregate traffic header", got)
 	}
 
 	if err := repo.ResetUserTrafficCycle(ctx, user.Username); err != nil {
@@ -39,7 +38,7 @@ func TestPackageSubscriptionHeaderUsesCurrentBillingCycle(t *testing.T) {
 	}
 	response = httptest.NewRecorder()
 	handler.writeTrafficHeader(ctx, response, user, pkg)
-	if got := response.Header().Get("subscription-userinfo"); !strings.Contains(got, "download=0") {
-		t.Fatalf("subscription-userinfo after reset = %q, want download=0", got)
+	if got := response.Header().Get("subscription-userinfo"); got != "" {
+		t.Fatalf("subscription-userinfo after reset = %q, want no aggregate traffic header", got)
 	}
 }

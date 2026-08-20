@@ -306,8 +306,11 @@ type Package struct {
 	NodeMultipliers   map[int64]float64 `json:"node_multipliers,omitempty"` // node_id → 倍率;遗留套餐为 nil = 全部按 1
 	SpeedLimitMbps    float64           `json:"speed_limit_mbps"`           // 限速 (Mbps)，0=不限
 	DeviceLimit       int               `json:"device_limit"`               // 设备数限制，0=不限
-	// 套餐级 per-node 限速覆盖。map 含 key 即生效:0 = 显式不限速,>0 = 该值;不含 key = 继承 SpeedLimitMbps。
+	// 套餐级 per-node 限速覆盖。map 含 key 即生效:0 = 显式不限速,>0 = 该值;不含 key = 不限速。
 	NodeSpeedLimits map[int64]float64 `json:"node_speed_limits,omitempty"`
+	// 套餐固定节点独立流量额度，单位 GB。0/缺省均表示该节点不限流量；
+	// 套餐总流量字段保留仅用于旧 API/数据库兼容，不再作为回退额度。
+	NodeTrafficLimits map[int64]float64 `json:"node_traffic_limits,omitempty"`
 	// 套餐级 per-node 客户端数覆盖。语义同上。
 	NodeDeviceLimits map[int64]int            `json:"node_device_limits,omitempty"`
 	AutoSpeedRules   []AutoSpeedLimitRule     `json:"auto_speed_rules,omitempty"`
@@ -524,6 +527,17 @@ func (p *Package) SpeedLimitMbpsForNode(nodeID int64, parentNodeID *int64) (floa
 		}
 	}
 	return 0, false
+}
+
+// TrafficLimitGBForNode returns the independent fixed-node traffic quota.
+// Unlike speed/device settings, traffic does not inherit from a physical
+// parent: each selected physical or routed node owns a distinct usage bucket.
+func (p *Package) TrafficLimitGBForNode(nodeID int64) (float64, bool) {
+	if p == nil {
+		return 0, false
+	}
+	v, ok := p.NodeTrafficLimits[nodeID]
+	return v, ok
 }
 
 // DeviceLimitForNode 返回某节点在该套餐内的客户端数,以及 map 是否含 key。语义同 SpeedLimitMbpsForNode。
@@ -2443,7 +2457,8 @@ CREATE INDEX IF NOT EXISTS idx_remote_server_install_tickets_server
 		return err
 	}
 
-	// 套餐限速字段
+	// 套餐总限速/总流量列保留用于数据库和旧客户端兼容，但产品模型已改为
+	// 资源明细额度。启动迁移会清除历史聚合值，避免旧值继续被误展示或执行。
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN speed_limit_mbps REAL NOT NULL DEFAULT 0")
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN device_limit INTEGER NOT NULL DEFAULT 0")
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN auto_speed_limit_json TEXT DEFAULT ''")
@@ -2462,9 +2477,16 @@ CREATE INDEX IF NOT EXISTS idx_remote_server_install_tickets_server
 
 	// 套餐/用户 per-node 限速 + 客户端数(map[node_id] → 值;0=显式不限速,不含 key=继承上层)
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN node_speed_limits TEXT DEFAULT '{}'")
+	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN node_traffic_limits TEXT DEFAULT '{}'")
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN node_device_limits TEXT DEFAULT '{}'")
 	_, _ = r.db.Exec("ALTER TABLE users ADD COLUMN node_speed_limit_overrides TEXT DEFAULT '{}'")
 	_, _ = r.db.Exec("ALTER TABLE users ADD COLUMN node_device_limit_overrides TEXT DEFAULT '{}'")
+	if _, err := r.db.Exec("UPDATE packages SET traffic_limit_bytes = 0, speed_limit_mbps = 0, auto_speed_limit_json = '' WHERE traffic_limit_bytes != 0 OR speed_limit_mbps != 0 OR COALESCE(auto_speed_limit_json, '') != ''"); err != nil {
+		return fmt.Errorf("normalize legacy package aggregate limits: %w", err)
+	}
+	if _, err := r.db.Exec("UPDATE users SET traffic_limit_override = NULL, speed_limit_override = NULL WHERE traffic_limit_override IS NOT NULL OR speed_limit_override IS NOT NULL"); err != nil {
+		return fmt.Errorf("clear legacy user aggregate limits: %w", err)
+	}
 
 	// 批量入站表 - 跟踪跨多个服务器批量添加的入站
 	const batchInboundsSchema = `
@@ -8625,7 +8647,7 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
 		       is_reset, reset_day, COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
-		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
+		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		ORDER BY created_at DESC
 	`
@@ -8640,10 +8662,10 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 	for rows.Next() {
 		var pkg Package
 		var isReset int
-		var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
+		var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 		err := rows.Scan(&pkg.ID, &pkg.Name, &pkg.Description, &pkg.TrafficLimitBytes,
 			&pkg.CycleDays, &isReset, &pkg.ResetDay, &nodesJSON, &pkg.SpeedLimitMbps, &pkg.DeviceLimit,
-			&autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode, &pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
+			&autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode, &pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("scan package: %w", err)
 		}
@@ -8664,6 +8686,9 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 		}
 		if nodeSpeedJSON != "" && nodeSpeedJSON != "{}" {
 			unmarshalStringKeyedMap(nodeSpeedJSON, &pkg.NodeSpeedLimits)
+		}
+		if nodeTrafficJSON != "" && nodeTrafficJSON != "{}" {
+			unmarshalStringKeyedMap(nodeTrafficJSON, &pkg.NodeTrafficLimits)
 		}
 		if nodeDeviceJSON != "" && nodeDeviceJSON != "{}" {
 			unmarshalStringKeyedIntMap(nodeDeviceJSON, &pkg.NodeDeviceLimits)
@@ -8720,18 +8745,18 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
 		       is_reset, reset_day, COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
-		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
+		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		WHERE id = ?
 	`
 
 	var pkg Package
 	var isReset int
-	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
+	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 	err := r.db.QueryRowContext(ctx, query, id).Scan(&pkg.ID, &pkg.Name, &pkg.Description,
 		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &nodesJSON,
 		&pkg.SpeedLimitMbps, &pkg.DeviceLimit, &autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode,
-		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
+		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPackageNotFound
@@ -8756,6 +8781,9 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 	}
 	if nodeSpeedJSON != "" && nodeSpeedJSON != "{}" {
 		unmarshalStringKeyedMap(nodeSpeedJSON, &pkg.NodeSpeedLimits)
+	}
+	if nodeTrafficJSON != "" && nodeTrafficJSON != "{}" {
+		unmarshalStringKeyedMap(nodeTrafficJSON, &pkg.NodeTrafficLimits)
 	}
 	if nodeDeviceJSON != "" && nodeDeviceJSON != "{}" {
 		unmarshalStringKeyedIntMap(nodeDeviceJSON, &pkg.NodeDeviceLimits)
@@ -8784,18 +8812,18 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
 		       is_reset, reset_day, COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
-		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
+		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		WHERE name = ?
 	`
 
 	var pkg Package
 	var isReset int
-	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
+	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 	err := r.db.QueryRowContext(ctx, query, name).Scan(&pkg.ID, &pkg.Name, &pkg.Description,
 		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &nodesJSON,
 		&pkg.SpeedLimitMbps, &pkg.DeviceLimit, &autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode,
-		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
+		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPackageNotFound
@@ -8820,6 +8848,9 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 	}
 	if nodeSpeedJSON != "" && nodeSpeedJSON != "{}" {
 		unmarshalStringKeyedMap(nodeSpeedJSON, &pkg.NodeSpeedLimits)
+	}
+	if nodeTrafficJSON != "" && nodeTrafficJSON != "{}" {
+		unmarshalStringKeyedMap(nodeTrafficJSON, &pkg.NodeTrafficLimits)
 	}
 	if nodeDeviceJSON != "" && nodeDeviceJSON != "{}" {
 		unmarshalStringKeyedIntMap(nodeDeviceJSON, &pkg.NodeDeviceLimits)
@@ -8865,6 +8896,7 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	nodeMultJSON := serializeNodeMultipliers(pkg.NodeMultipliers, pkg.Nodes)
 	// per-node 限速 / 客户端数:跟 nodes 白名单过滤,0 值保留(显式不限速)
 	nodeSpeedJSON := serializeNodeFloatMap(pkg.NodeSpeedLimits, pkg.Nodes)
+	nodeTrafficJSON := serializeNodeFloatMap(pkg.NodeTrafficLimits, pkg.Nodes)
 	nodeDeviceJSON := serializeNodeIntMap(pkg.NodeDeviceLimits, pkg.Nodes)
 	serverGrantsJSON, forwardingGrantsJSON, err := encodePackageBundle(pkg)
 	if err != nil {
@@ -8878,8 +8910,8 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	}
 
 	const query = `
-		INSERT INTO packages (name, description, traffic_limit_bytes, cycle_days, is_reset, reset_day, nodes, speed_limit_mbps, device_limit, auto_speed_limit_json, short_code, traffic_mode, template_filename, node_multipliers, node_speed_limits, node_device_limits, server_grants, forwarding_grants)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO packages (name, description, traffic_limit_bytes, cycle_days, is_reset, reset_day, nodes, speed_limit_mbps, device_limit, auto_speed_limit_json, short_code, traffic_mode, template_filename, node_multipliers, node_speed_limits, node_traffic_limits, node_device_limits, server_grants, forwarding_grants)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	isReset := 0
@@ -8893,7 +8925,7 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	}
 
 	result, err := r.db.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
-		pkg.CycleDays, isReset, pkg.ResetDay, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, shortCode, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON)
+		pkg.CycleDays, isReset, pkg.ResetDay, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, shortCode, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON)
 	if err != nil {
 		return 0, fmt.Errorf("create package: %w", err)
 	}
@@ -8951,6 +8983,7 @@ func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package
 
 	nodeMultJSON := serializeNodeMultipliers(pkg.NodeMultipliers, pkg.Nodes)
 	nodeSpeedJSON := serializeNodeFloatMap(pkg.NodeSpeedLimits, pkg.Nodes)
+	nodeTrafficJSON := serializeNodeFloatMap(pkg.NodeTrafficLimits, pkg.Nodes)
 	nodeDeviceJSON := serializeNodeIntMap(pkg.NodeDeviceLimits, pkg.Nodes)
 	serverGrantsJSON, forwardingGrantsJSON, err := encodePackageBundle(pkg)
 	if err != nil {
@@ -8962,7 +8995,7 @@ func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package
 		SET name = ?, description = ?, traffic_limit_bytes = ?, cycle_days = ?,
 		    is_reset = ?, reset_day = ?, nodes = ?, speed_limit_mbps = ?, device_limit = ?,
 		    auto_speed_limit_json = ?, traffic_mode = ?, template_filename = ?, node_multipliers = ?,
-		    node_speed_limits = ?, node_device_limits = ?, server_grants = ?, forwarding_grants = ?, updated_at = CURRENT_TIMESTAMP
+		    node_speed_limits = ?, node_traffic_limits = ?, node_device_limits = ?, server_grants = ?, forwarding_grants = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
 	`
 
@@ -8982,7 +9015,7 @@ func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
-		pkg.CycleDays, isReset, pkg.ResetDay, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON, pkg.ID)
+		pkg.CycleDays, isReset, pkg.ResetDay, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON, pkg.ID)
 	if err != nil {
 		return nil, fmt.Errorf("update package: %w", err)
 	}
@@ -9156,17 +9189,16 @@ func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, usern
 	if err != nil {
 		return nil, err
 	}
-
 	var isResetInt int
 	if isReset {
 		isResetInt = 1
 	}
 
-	// 覆写属于当前套餐周期:续期同一套餐时保留,换套餐时清除。
-	// `IS NOT` 是 SQLite 的 null-safe 比较,旧 package_id 为 NULL 时也会正确清除。
+	// Package aggregate traffic/speed limits are retired. Clear legacy user
+	// overrides on every assignment so stale rows cannot re-enter policy.
 	const query = `
 		UPDATE users
-		SET traffic_limit_override = CASE WHEN package_id IS NOT ? THEN NULL ELSE traffic_limit_override END,
+		SET traffic_limit_override = NULL, speed_limit_override = NULL,
 		    package_id = ?, authorization_mode = 'package', package_start_date = ?, package_end_date = ?, is_reset = ?, reset_day = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE username = ?
 	`
@@ -9177,7 +9209,9 @@ func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, usern
 	}
 	defer tx.Rollback()
 	var oldPackageID int64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0) FROM users WHERE username = ?`, username).Scan(&oldPackageID); errors.Is(err, sql.ErrNoRows) {
+	var oldStartDate, oldEndDate sql.NullTime
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(package_id, 0), package_start_date, package_end_date FROM users WHERE username = ?`, username).
+		Scan(&oldPackageID, &oldStartDate, &oldEndDate); errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrUserNotFound
 	} else if err != nil {
 		return nil, err
@@ -9195,7 +9229,7 @@ func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, usern
 	if err := packageNodesConflictWithManualSelections(ctx, tx, username, pkg.Nodes); err != nil {
 		return nil, err
 	}
-	result, err := tx.ExecContext(ctx, query, packageID, packageID, startDate, endDate, isResetInt, resetDay, username)
+	result, err := tx.ExecContext(ctx, query, packageID, startDate, endDate, isResetInt, resetDay, username)
 	if err != nil {
 		return nil, fmt.Errorf("assign package to user: %w", err)
 	}
@@ -9207,6 +9241,22 @@ func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, usern
 
 	if affected == 0 {
 		return nil, ErrUserNotFound
+	}
+	hasNodeTrafficQuota := false
+	for _, limitGB := range pkg.NodeTrafficLimits {
+		hasNodeTrafficQuota = hasNodeTrafficQuota || limitGB > 0
+	}
+	windowChanged := oldPackageID != packageID || !oldStartDate.Valid || !oldEndDate.Valid ||
+		!oldStartDate.Time.Equal(startDate) || !oldEndDate.Time.Equal(endDate)
+	if hasNodeTrafficQuota && windowChanged && (oldPackageID != packageID || !isReset) {
+		var cycleResetAt *time.Time
+		if isReset {
+			resetAt := startDate.UTC()
+			cycleResetAt = &resetAt
+		}
+		if err := resetUserTrafficCycleTx(ctx, tx, username, cycleResetAt); err != nil {
+			return nil, fmt.Errorf("start fixed-node traffic quota cycle: %w", err)
+		}
 	}
 	warnings, err := r.syncPackageBundleGrantsTx(ctx, tx, username, oldPackageID, pkg, startDate, endDate)
 	if err != nil {
@@ -9247,7 +9297,7 @@ func (r *TrafficRepository) RemovePackageFromUser(ctx context.Context, username 
 	const query = `
 		UPDATE users
 		SET package_id = NULL, authorization_mode = 'custom', package_start_date = NULL, package_end_date = NULL, is_reset = 0, reset_day = 1,
-		    traffic_limit_override = NULL, updated_at = CURRENT_TIMESTAMP
+		    traffic_limit_override = NULL, speed_limit_override = NULL, updated_at = CURRENT_TIMESTAMP
 		WHERE username = ?
 	`
 
@@ -10751,6 +10801,132 @@ func (r *TrafficRepository) GetUserWeightedTraffic(ctx context.Context, username
 		return 0, fmt.Errorf("scan user_email_traffic: %w", err)
 	}
 	return int64(weighted), nil
+}
+
+// GetUserPackageNodeTraffic returns current-cycle billable usage for each
+// fixed package node. Billable bytes are frozen at collection time, so changing
+// a multiplier does not retroactively rewrite usage already consumed.
+func (r *TrafficRepository) GetUserPackageNodeTraffic(ctx context.Context, username string, pkg *Package) (map[int64]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	username = strings.TrimSpace(username)
+	if username == "" || pkg == nil {
+		return nil, errors.New("username and package are required")
+	}
+	usage := make(map[int64]int64)
+	allowed := make(map[int64]bool, len(pkg.Nodes))
+	for _, nodeID := range pkg.Nodes {
+		allowed[nodeID] = true
+	}
+	if len(allowed) == 0 {
+		return usage, nil
+	}
+
+	serverNames := make(map[int64]string)
+	rows, err := r.db.QueryContext(ctx, `SELECT id, name FROM remote_servers`)
+	if err != nil {
+		return nil, fmt.Errorf("list package node traffic servers: %w", err)
+	}
+	for rows.Next() {
+		var id int64
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan package node traffic server: %w", err)
+		}
+		serverNames[id] = name
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	subaccountNodes := make(map[string]int64)
+	rows, err = r.db.QueryContext(ctx, `SELECT email, routed_node_id FROM user_subaccounts WHERE username = ?`, username)
+	if err != nil {
+		return nil, fmt.Errorf("list package node traffic subaccounts: %w", err)
+	}
+	for rows.Next() {
+		var email string
+		var nodeID int64
+		if err := rows.Scan(&email, &nodeID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		subaccountNodes[email] = nodeID
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	physicalByServerTag := make(map[string]int64)
+	rows, err = r.db.QueryContext(ctx, `SELECT id, COALESCE(original_server,''), COALESCE(inbound_tag,'')
+FROM nodes WHERE COALESCE(node_type,'physical') != 'routed' AND parent_node_id IS NULL`)
+	if err != nil {
+		return nil, fmt.Errorf("list package physical nodes: %w", err)
+	}
+	for rows.Next() {
+		var nodeID int64
+		var serverName, tag string
+		if err := rows.Scan(&nodeID, &serverName, &tag); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if serverName != "" && tag != "" {
+			physicalByServerTag[serverName+"\x00"+tag] = nodeID
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	esc := escapeLikePattern(username)
+	rows, err = r.db.QueryContext(ctx, `SELECT server_id, email,
+       MAX(uplink - cycle_base_uplink, 0) + MAX(downlink - cycle_base_downlink, 0),
+       billable_bytes, billable_initialized
+FROM user_email_traffic
+WHERE email = ?
+   OR email LIKE ? ESCAPE '\'
+   OR email LIKE ? ESCAPE '\'
+   OR email IN (SELECT email FROM user_subaccounts WHERE username = ?)
+   OR billable_username = ?`, username, esc+`\_\_%`, esc+`-%`, username, username)
+	if err != nil {
+		return nil, fmt.Errorf("query package node traffic: %w", err)
+	}
+	defer rows.Close()
+	prefix := username + "__"
+	for rows.Next() {
+		var serverID, rawBytes, billedBytes int64
+		var initialized int
+		var email string
+		if err := rows.Scan(&serverID, &email, &rawBytes, &billedBytes, &initialized); err != nil {
+			return nil, fmt.Errorf("scan package node traffic: %w", err)
+		}
+		nodeID := subaccountNodes[email]
+		if nodeID == 0 && strings.HasPrefix(email, prefix) {
+			tag := strings.TrimPrefix(email, prefix)
+			nodeID = physicalByServerTag[serverNames[serverID]+"\x00"+tag]
+		}
+		if nodeID <= 0 || !allowed[nodeID] {
+			continue
+		}
+		bytes := billedBytes
+		if initialized == 0 {
+			multiplier := pkg.MultiplierForNode(nodeID) * float64(pkg.TrafficMultiplier())
+			bytes = billTrafficBytes(rawBytes, multiplier)
+		}
+		usage[nodeID] = saturatingTrafficAdd(usage[nodeID], bytes)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate package node traffic: %w", err)
+	}
+	return usage, nil
 }
 
 // ListUserBillableTraffic returns the current-cycle counters already weighted
@@ -14613,21 +14789,7 @@ func (r *TrafficRepository) GetUserTrafficByUsername(ctx context.Context, userna
 //
 // user_email_traffic 走基线而非清零:把 uplink/downlink 的当前值抬进 cycle_base_*,判定只看差值。
 // 这样 total_* 的历史累计得以保留,collector 的 `uplink = uplink + delta` 累加逻辑也无需改动。
-func (r *TrafficRepository) resetUserTrafficCycle(ctx context.Context, username string, automaticResetAt *time.Time) error {
-	if r == nil || r.db == nil {
-		return errors.New("traffic repository not initialized")
-	}
-
-	if username == "" {
-		return errors.New("username is required")
-	}
-
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin reset user traffic cycle: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
+func resetUserTrafficCycleTx(ctx context.Context, tx *sql.Tx, username string, automaticResetAt *time.Time) error {
 	const userStmt = `UPDATE user_traffic SET uplink = 0, downlink = 0, cycle_start = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE username = ?`
 	if _, err := tx.ExecContext(ctx, userStmt, username); err != nil {
 		return fmt.Errorf("reset user traffic cycle: %w", err)
@@ -14658,6 +14820,27 @@ func (r *TrafficRepository) resetUserTrafficCycle(ctx context.Context, username 
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM user_traffic_threshold_notified WHERE username = ?`, username); err != nil {
 		return fmt.Errorf("clear user traffic threshold notification: %w", err)
+	}
+	return nil
+}
+
+func (r *TrafficRepository) resetUserTrafficCycle(ctx context.Context, username string, automaticResetAt *time.Time) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+
+	if username == "" {
+		return errors.New("username is required")
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin reset user traffic cycle: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := resetUserTrafficCycleTx(ctx, tx, username, automaticResetAt); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {

@@ -282,10 +282,6 @@ func formatDailyTraffic(u mmwxclient.NotifyUser) string {
 	usedBytes := u.CycleUplink + u.CycleDownlink
 	text := fmt.Sprintf("📊 每日流量播报 — %s\n套餐: %s\n本周期已用: %s",
 		u.Username, pkgName, humanBytes(usedBytes))
-	if u.TrafficLimitGB > 0 {
-		pct := float64(usedBytes) / (u.TrafficLimitGB * 1024 * 1024 * 1024) * 100
-		text += fmt.Sprintf(" / %.0f GB (%.1f%%)", u.TrafficLimitGB, pct)
-	}
 	text += fmt.Sprintf("\n累计 ↑%s ↓%s", humanBytes(u.TotalUplink), humanBytes(u.TotalDownlink))
 	return text
 }

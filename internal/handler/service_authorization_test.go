@@ -215,6 +215,70 @@ func TestServiceAuthorizationSwitchPackageToCustomDeletesPackageSubscriptionWith
 	}
 }
 
+func TestServiceAuthorizationSwitchPackageToCustomCleanupFailureIsNotProvisionWarning(t *testing.T) {
+	fixture := newServiceAuthorizationFixture(t)
+	t.Setenv("ARCWAY_SUBSCRIPTION_LOCK_DIR", t.TempDir())
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	packageID, err := fixture.repo.CreatePackage(ctx, storage.Package{
+		Name: "cleanup-failure-package", TrafficLimitBytes: 1024, CycleDays: 30, ResetDay: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.packages.AssignAndProvision(ctx, "alice", packageID, now.Add(-time.Hour), now.Add(24*time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
+	file, err := fixture.repo.CreateSubscribeFile(ctx, storage.SubscribeFile{
+		Name: "alice package cleanup failure", Type: storage.SubscribeTypePackage,
+		Filename: "service-authorization-alice-cleanup-failure.yaml", CreatedBy: "alice",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.repo.AssignSubscriptionToUser(ctx, "alice", file.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", fixture.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`CREATE TRIGGER reject_package_subscription_cleanup
+BEFORE DELETE ON user_subscriptions
+WHEN OLD.username='alice'
+BEGIN SELECT RAISE(ABORT, 'forced subscription cleanup failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	response := fixture.batchRequest(t, map[string]any{
+		"usernames": []string{"alice"}, "mode": storage.AuthorizationModeCustom,
+		"custom": map[string]any{
+			"fixed_node_grants": []any{}, "server_grants": []any{}, "forwarding_grants": []any{},
+		},
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Results []serviceAuthorizationResult `json:"results"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Results) != 1 || payload.Results[0].Status != "applied" || len(payload.Results[0].Warnings) != 0 {
+		t.Fatalf("unexpected authorization result: %+v", payload.Results)
+	}
+	user, err := fixture.repo.GetUser(ctx, "alice")
+	if err != nil || user.AuthorizationMode != storage.AuthorizationModeCustom || user.PackageID != 0 {
+		t.Fatalf("custom authorization was not applied: user=%+v err=%v", user, err)
+	}
+	if _, err := fixture.repo.GetUserPackageSubscription(ctx, "alice"); err != nil {
+		t.Fatalf("failed cleanup should leave subscription available for retry: %v", err)
+	}
+}
+
 func TestServiceAuthorizationPackageToCustomDBFailureRestoresPackage(t *testing.T) {
 	fixture := newServiceAuthorizationFixture(t)
 	ctx := context.Background()
