@@ -288,24 +288,44 @@ const (
 	TrafficMethodUp   = "up"
 	TrafficMethodDown = "down"
 	TrafficMethodBoth = "both"
+
+	NodeTrafficResetMonthly   = "monthly"
+	NodeTrafficResetQuarterly = "quarterly"
+	NodeTrafficResetYearly    = "yearly"
 )
+
+// NormalizeNodeTrafficResetPeriod keeps old API clients compatible: an omitted
+// period continues to mean monthly whenever is_reset is enabled.
+func NormalizeNodeTrafficResetPeriod(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return NodeTrafficResetMonthly, nil
+	}
+	switch value {
+	case NodeTrafficResetMonthly, NodeTrafficResetQuarterly, NodeTrafficResetYearly:
+		return value, nil
+	default:
+		return "", fmt.Errorf("invalid node traffic reset period %q", value)
+	}
+}
 
 // Package is an optional entitlement bundle template. Nodes are granted
 // directly, while server and forwarding entries materialize as source-tracked
 // grants when the package is assigned to a user.
 type Package struct {
-	ID                int64             `json:"id"`
-	Name              string            `json:"name"`
-	Description       string            `json:"description"`
-	TrafficLimitGB    float64           `json:"traffic_limit_gb"`           // GB 流量限制
-	TrafficLimitBytes int64             `json:"-"`                          // 流量限制（以字节为单位）（仅限内部使用）
-	CycleDays         int               `json:"cycle_days"`                 // 包裹持续时间（天）
-	IsReset           bool              `json:"is_reset"`                   // 流量是否按月重置
-	ResetDay          int               `json:"reset_day"`                  // 重置的月份日期 (1-31)
-	Nodes             []int64           `json:"nodes"`                      // 关联节点 ID
-	NodeMultipliers   map[int64]float64 `json:"node_multipliers,omitempty"` // node_id → 倍率;遗留套餐为 nil = 全部按 1
-	SpeedLimitMbps    float64           `json:"speed_limit_mbps"`           // 限速 (Mbps)，0=不限
-	DeviceLimit       int               `json:"device_limit"`               // 设备数限制，0=不限
+	ID                     int64             `json:"id"`
+	Name                   string            `json:"name"`
+	Description            string            `json:"description"`
+	TrafficLimitGB         float64           `json:"traffic_limit_gb"`           // GB 流量限制
+	TrafficLimitBytes      int64             `json:"-"`                          // 流量限制（以字节为单位）（仅限内部使用）
+	CycleDays              int               `json:"cycle_days"`                 // 包裹持续时间（天）
+	IsReset                bool              `json:"is_reset"`                   // 是否启用固定节点流量定期重置
+	ResetDay               int               `json:"reset_day"`                  // 重置的月份日期 (1-31)
+	NodeTrafficResetPeriod string            `json:"node_traffic_reset_period"`  // monthly / quarterly / yearly
+	Nodes                  []int64           `json:"nodes"`                      // 关联节点 ID
+	NodeMultipliers        map[int64]float64 `json:"node_multipliers,omitempty"` // node_id → 倍率;遗留套餐为 nil = 全部按 1
+	SpeedLimitMbps         float64           `json:"speed_limit_mbps"`           // 限速 (Mbps)，0=不限
+	DeviceLimit            int               `json:"device_limit"`               // 设备数限制，0=不限
 	// 套餐级 per-node 限速覆盖。map 含 key 即生效:0 = 显式不限速,>0 = 该值;不含 key = 不限速。
 	NodeSpeedLimits map[int64]float64 `json:"node_speed_limits,omitempty"`
 	// 套餐固定节点独立流量额度，单位 GB。0/缺省均表示该节点不限流量；
@@ -2105,6 +2125,7 @@ CREATE TABLE IF NOT EXISTS packages (
     cycle_days INTEGER NOT NULL DEFAULT 30,
     is_reset INTEGER NOT NULL DEFAULT 0,
     reset_day INTEGER NOT NULL DEFAULT 1,
+    node_traffic_reset_period TEXT NOT NULL DEFAULT 'monthly',
     nodes TEXT DEFAULT '[]',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -2114,6 +2135,9 @@ CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(name);
 
 	if _, err := r.db.Exec(packagesSchema); err != nil {
 		return fmt.Errorf("migrate packages: %w", err)
+	}
+	if err := r.ensureTableColumn("packages", "node_traffic_reset_period", "TEXT NOT NULL DEFAULT 'monthly'"); err != nil {
+		return fmt.Errorf("migrate package node traffic reset period: %w", err)
 	}
 
 	// 如果不存在，则将节点列添加到包表中
@@ -2153,6 +2177,9 @@ ALTER TABLE users ADD COLUMN package_end_date TIMESTAMP;
 	_, _ = r.db.Exec("ALTER TABLE users ADD COLUMN package_end_date TIMESTAMP")
 	_, _ = r.db.Exec("ALTER TABLE users ADD COLUMN is_reset INTEGER NOT NULL DEFAULT 0")
 	_, _ = r.db.Exec("ALTER TABLE users ADD COLUMN reset_day INTEGER NOT NULL DEFAULT 1")
+	if err := r.ensureTableColumn("users", "node_traffic_reset_period", "TEXT NOT NULL DEFAULT 'monthly'"); err != nil {
+		return fmt.Errorf("migrate user node traffic reset period: %w", err)
+	}
 
 	// 系统设置表 - 存储全局系统配置
 	const systemSettingsSchema = `
@@ -5252,20 +5279,21 @@ type RuleVersionContent struct {
 
 // 用户代表存储在存储库中的经过身份验证的帐户。
 type User struct {
-	Username          string
-	PasswordHash      string
-	Email             string
-	Nickname          string
-	AvatarURL         string
-	Role              string
-	IsActive          bool
-	Remark            string
-	PackageID         int64
-	AuthorizationMode string
-	IsReset           bool
-	ResetDay          int
+	Username               string
+	PasswordHash           string
+	Email                  string
+	Nickname               string
+	AvatarURL              string
+	Role                   string
+	IsActive               bool
+	Remark                 string
+	PackageID              int64
+	AuthorizationMode      string
+	IsReset                bool
+	ResetDay               int
+	NodeTrafficResetPeriod string
 	// LastResetAt 记录上次按 reset_day 自动重置流量周期的时间。
-	// CheckAll 用它做"本月是否已重置"判定,避免 enforcer 每 5 min 跑一次时同一天反复 reset。
+	// CheckAll 用它做"本周期是否已重置"判定,避免 enforcer 每 5 min 跑一次时反复 reset。
 	// 空 = 从未重置过(刚装 / 刚分配套餐),CheckAll 在 reset_day 到了之后会触发首次 reset。
 	LastResetAt         *time.Time
 	PackageStartDate    *time.Time
@@ -5380,14 +5408,14 @@ func (r *TrafficRepository) GetUser(ctx context.Context, username string) (User,
 		return user, errors.New("username is required")
 	}
 
-	row := r.db.QueryRowContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_traffic_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), COALESCE(totp_secret, ''), COALESCE(totp_enabled, 0), COALESCE(recovery_codes, '[]'), created_at, updated_at FROM users WHERE username = ? LIMIT 1`, username)
+	row := r.db.QueryRowContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), COALESCE(node_traffic_reset_period, 'monthly'), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_traffic_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), COALESCE(totp_secret, ''), COALESCE(totp_enabled, 0), COALESCE(recovery_codes, '[]'), created_at, updated_at FROM users WHERE username = ? LIMIT 1`, username)
 	var active, isReset, totpEnabled int
 	var startDate, endDate sql.NullTime
 	var speedOverride sql.NullFloat64
 	var deviceOverride sql.NullInt64
 	var trafficOverride sql.NullInt64
 	var nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON string
-	if err := row.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.PackageID, &user.AuthorizationMode, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &user.TOTPSecret, &totpEnabled, &user.RecoveryCodes, &user.CreatedAt, &user.UpdatedAt); err != nil {
+	if err := row.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.PackageID, &user.AuthorizationMode, &isReset, &user.ResetDay, &user.NodeTrafficResetPeriod, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &user.TOTPSecret, &totpEnabled, &user.RecoveryCodes, &user.CreatedAt, &user.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return user, ErrUserNotFound
 		}
@@ -5443,7 +5471,7 @@ func (r *TrafficRepository) ListUsers(ctx context.Context, limit int) ([]User, e
 		limit = 10
 	}
 
-	rows, err := r.db.QueryContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_traffic_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users ORDER BY created_at ASC LIMIT ?`, limit)
+	rows, err := r.db.QueryContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), COALESCE(node_traffic_reset_period, 'monthly'), package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_traffic_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users ORDER BY created_at ASC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}
@@ -5458,7 +5486,7 @@ func (r *TrafficRepository) ListUsers(ctx context.Context, limit int) ([]User, e
 		var deviceOverride sql.NullInt64
 		var trafficOverride sql.NullInt64
 		var nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON string
-		if err := rows.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.Remark, &user.PackageID, &user.AuthorizationMode, &isReset, &user.ResetDay, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &user.CreatedAt, &user.UpdatedAt); err != nil {
+		if err := rows.Scan(&user.Username, &user.PasswordHash, &user.Email, &user.Nickname, &user.AvatarURL, &user.Role, &active, &user.Remark, &user.PackageID, &user.AuthorizationMode, &isReset, &user.ResetDay, &user.NodeTrafficResetPeriod, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &user.CreatedAt, &user.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		if user.Nickname == "" {
@@ -8658,7 +8686,7 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
-		       is_reset, reset_day, COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
+		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
 		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		ORDER BY created_at DESC
@@ -8676,7 +8704,7 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 		var isReset int
 		var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 		err := rows.Scan(&pkg.ID, &pkg.Name, &pkg.Description, &pkg.TrafficLimitBytes,
-			&pkg.CycleDays, &isReset, &pkg.ResetDay, &nodesJSON, &pkg.SpeedLimitMbps, &pkg.DeviceLimit,
+			&pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON, &pkg.SpeedLimitMbps, &pkg.DeviceLimit,
 			&autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode, &pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("scan package: %w", err)
@@ -8756,7 +8784,7 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
-		       is_reset, reset_day, COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
+		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
 		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		WHERE id = ?
@@ -8766,7 +8794,7 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 	var isReset int
 	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 	err := r.db.QueryRowContext(ctx, query, id).Scan(&pkg.ID, &pkg.Name, &pkg.Description,
-		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &nodesJSON,
+		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON,
 		&pkg.SpeedLimitMbps, &pkg.DeviceLimit, &autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode,
 		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 	if err != nil {
@@ -8823,7 +8851,7 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
-		       is_reset, reset_day, COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
+		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
 		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		WHERE name = ?
@@ -8833,7 +8861,7 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 	var isReset int
 	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 	err := r.db.QueryRowContext(ctx, query, name).Scan(&pkg.ID, &pkg.Name, &pkg.Description,
-		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &nodesJSON,
+		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON,
 		&pkg.SpeedLimitMbps, &pkg.DeviceLimit, &autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode,
 		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 	if err != nil {
@@ -8922,8 +8950,8 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	}
 
 	const query = `
-		INSERT INTO packages (name, description, traffic_limit_bytes, cycle_days, is_reset, reset_day, nodes, speed_limit_mbps, device_limit, auto_speed_limit_json, short_code, traffic_mode, template_filename, node_multipliers, node_speed_limits, node_traffic_limits, node_device_limits, server_grants, forwarding_grants)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO packages (name, description, traffic_limit_bytes, cycle_days, is_reset, reset_day, node_traffic_reset_period, nodes, speed_limit_mbps, device_limit, auto_speed_limit_json, short_code, traffic_mode, template_filename, node_multipliers, node_speed_limits, node_traffic_limits, node_device_limits, server_grants, forwarding_grants)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	isReset := 0
@@ -8937,7 +8965,7 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	}
 
 	result, err := r.db.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
-		pkg.CycleDays, isReset, pkg.ResetDay, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, shortCode, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON)
+		pkg.CycleDays, isReset, pkg.ResetDay, pkg.NodeTrafficResetPeriod, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, shortCode, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON)
 	if err != nil {
 		return 0, fmt.Errorf("create package: %w", err)
 	}
@@ -9005,7 +9033,7 @@ func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package
 	const query = `
 		UPDATE packages
 		SET name = ?, description = ?, traffic_limit_bytes = ?, cycle_days = ?,
-		    is_reset = ?, reset_day = ?, nodes = ?, speed_limit_mbps = ?, device_limit = ?,
+		    is_reset = ?, reset_day = ?, node_traffic_reset_period = ?, nodes = ?, speed_limit_mbps = ?, device_limit = ?,
 		    auto_speed_limit_json = ?, traffic_mode = ?, template_filename = ?, node_multipliers = ?,
 		    node_speed_limits = ?, node_traffic_limits = ?, node_device_limits = ?, server_grants = ?, forwarding_grants = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
@@ -9027,7 +9055,7 @@ func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
-		pkg.CycleDays, isReset, pkg.ResetDay, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON, pkg.ID)
+		pkg.CycleDays, isReset, pkg.ResetDay, pkg.NodeTrafficResetPeriod, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON, pkg.ID)
 	if err != nil {
 		return nil, fmt.Errorf("update package: %w", err)
 	}
@@ -9039,6 +9067,11 @@ func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package
 
 	if affected == 0 {
 		return nil, ErrPackageNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE users
+SET node_traffic_reset_period = ?, updated_at = CURRENT_TIMESTAMP
+WHERE package_id = ? AND authorization_mode = 'package'`, pkg.NodeTrafficResetPeriod, pkg.ID); err != nil {
+		return nil, fmt.Errorf("sync package node traffic reset period: %w", err)
 	}
 	warnings := make(map[string][]string)
 	rows, err := tx.QueryContext(ctx, `SELECT username, package_start_date, package_end_date FROM users WHERE package_id=?`, pkg.ID)
@@ -9211,7 +9244,7 @@ func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, usern
 	const query = `
 		UPDATE users
 		SET traffic_limit_override = NULL, speed_limit_override = NULL,
-		    package_id = ?, authorization_mode = 'package', package_start_date = ?, package_end_date = ?, is_reset = ?, reset_day = ?, updated_at = CURRENT_TIMESTAMP
+		    package_id = ?, authorization_mode = 'package', package_start_date = ?, package_end_date = ?, is_reset = ?, reset_day = ?, node_traffic_reset_period = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE username = ?
 	`
 
@@ -9242,7 +9275,7 @@ func (r *TrafficRepository) AssignPackageBundleToUser(ctx context.Context, usern
 	if err := packageNodesConflictWithManualSelections(ctx, tx, username, pkg.Nodes); err != nil {
 		return nil, err
 	}
-	result, err := tx.ExecContext(ctx, query, packageID, startDate, endDate, isResetInt, resetDay, username)
+	result, err := tx.ExecContext(ctx, query, packageID, startDate, endDate, isResetInt, resetDay, pkg.NodeTrafficResetPeriod, username)
 	if err != nil {
 		return nil, fmt.Errorf("assign package to user: %w", err)
 	}
@@ -9329,7 +9362,7 @@ func (r *TrafficRepository) RemovePackageFromUser(ctx context.Context, username 
 	defer tx.Rollback()
 	const query = `
 		UPDATE users
-		SET package_id = NULL, authorization_mode = 'custom', package_start_date = NULL, package_end_date = NULL, is_reset = 0, reset_day = 1,
+		SET package_id = NULL, authorization_mode = 'custom', package_start_date = NULL, package_end_date = NULL, is_reset = 0, reset_day = 1, node_traffic_reset_period = 'monthly',
 		    traffic_limit_override = NULL, speed_limit_override = NULL, updated_at = CURRENT_TIMESTAMP
 		WHERE username = ?
 	`
@@ -10638,7 +10671,7 @@ func (r *TrafficRepository) ResolveNodeNameByEmail(ctx context.Context, serverNa
 
 func (r *TrafficRepository) ListUsersWithPackage(ctx context.Context) ([]User, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), last_reset_at, package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_traffic_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users WHERE package_id IS NOT NULL AND package_id > 0 AND authorization_mode = 'package'`)
+		`SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), authorization_mode, COALESCE(is_reset, 0), COALESCE(reset_day, 1), COALESCE(node_traffic_reset_period, 'monthly'), last_reset_at, package_start_date, package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_traffic_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users WHERE package_id IS NOT NULL AND package_id > 0 AND authorization_mode = 'package'`)
 	if err != nil {
 		return nil, err
 	}
@@ -10652,7 +10685,7 @@ func (r *TrafficRepository) ListUsersWithPackage(ctx context.Context) ([]User, e
 		var deviceOverride sql.NullInt64
 		var trafficOverride sql.NullInt64
 		var nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON string
-		if err := rows.Scan(&u.Username, &u.PasswordHash, &u.Email, &u.Nickname, &u.AvatarURL, &u.Role, &active, &u.Remark, &u.PackageID, &u.AuthorizationMode, &isReset, &u.ResetDay, &lastResetAt, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		if err := rows.Scan(&u.Username, &u.PasswordHash, &u.Email, &u.Nickname, &u.AvatarURL, &u.Role, &active, &u.Remark, &u.PackageID, &u.AuthorizationMode, &isReset, &u.ResetDay, &u.NodeTrafficResetPeriod, &lastResetAt, &startDate, &endDate, &speedOverride, &deviceOverride, &trafficOverride, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, err
 		}
 		u.IsActive = active != 0
@@ -14953,7 +14986,7 @@ func (r *TrafficRepository) ResetUserTrafficCycleAt(ctx context.Context, usernam
 }
 
 // UpdateUserLastResetAt 记录用户最近一次按 reset_day 触发的流量周期重置时间。
-// CheckAll 用这个时间戳判定"本月是否已重置过",确保 enforcer 每 5 分钟跑一次时同一天不反复 reset。
+// CheckAll 用这个时间戳判定"本周期是否已重置过",确保 enforcer 每 5 分钟跑一次时不反复 reset。
 func (r *TrafficRepository) UpdateUserLastResetAt(ctx context.Context, username string, t time.Time) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
@@ -14990,7 +15023,7 @@ func (r *TrafficRepository) UpdateUserResetDay(ctx context.Context, username str
 }
 
 // UpdateRemoteServerLastTrafficResetAt 记录服务器最近一次按 traffic_reset_day 自动重置流量的时间。
-// enforcer 用它判定"本月是否已重置过",避免每轮 CheckAll(默认 2 分钟)反复 reset。
+// enforcer 用它判定"本周期是否已重置过",避免每轮 CheckAll(默认 2 分钟)反复 reset。
 func (r *TrafficRepository) UpdateRemoteServerLastTrafficResetAt(ctx context.Context, id int64, t time.Time) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")

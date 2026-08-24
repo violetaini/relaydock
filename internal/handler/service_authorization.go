@@ -436,6 +436,7 @@ func (h *ServiceAuthorizationHandler) writeCurrent(w http.ResponseWriter, r *htt
 		response["package"] = map[string]any{
 			"package_id": user.PackageID, "start_date": user.PackageStartDate,
 			"expire_date": user.PackageEndDate, "is_reset": user.IsReset, "reset_day": user.ResetDay,
+			"node_traffic_reset_period": user.NodeTrafficResetPeriod,
 		}
 	}
 	writeJSON(w, http.StatusOK, response)

@@ -14,6 +14,11 @@ import (
 // validateAndNormalizePackageBundle validates resource references and applies
 // the same defaults used by individually-created grants.
 func (r *TrafficRepository) validateAndNormalizePackageBundle(ctx context.Context, pkg *Package) error {
+	resetPeriod, err := NormalizeNodeTrafficResetPeriod(pkg.NodeTrafficResetPeriod)
+	if err != nil {
+		return err
+	}
+	pkg.NodeTrafficResetPeriod = resetPeriod
 	// Aggregate package traffic/speed limits were retired in favor of explicit
 	// resource limits. Keep the legacy fields readable, but never persist a new
 	// non-zero value from old API clients.

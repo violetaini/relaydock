@@ -109,20 +109,52 @@ func (e *TrafficLimitEnforcer) Start(ctx context.Context, interval time.Duration
 	}
 }
 
-// shouldResetThisMonth 判断当前时刻是否应触发用户的本月流量重置。
-//
-// 规则:
-//  1. 必须 user.IsReset=true,resetDay∈[1,31]
-//  2. 当月的"有效重置日" = min(resetDay, 当月最后一天) — 处理 reset_day=31 但 2 月只有 28 天的边界
-//  3. now.Day() >= 有效重置日 才进入触发窗口
-//  4. lastResetAt 为 nil(从未重置过)或不在本月 → 应该重置;否则跳过(避免同月反复)
-//
-// 注:用 now 的本地时区(time.Now() 默认)。生产环境 server 时区需配为本地时区,否则用户感知的"7号"会偏移。
+// shouldResetNaturalPeriod checks the boundary of the current natural month,
+// quarter, or year. Quarterly boundaries start in January/April/July/October;
+// yearly boundaries start in January. A day beyond the boundary month's length
+// is clamped to its final day.
+func shouldResetNaturalPeriod(now time.Time, isReset bool, resetDay int, period string, lastResetAt *time.Time) bool {
+	if !isReset || resetDay <= 0 || resetDay > 31 {
+		return false
+	}
+	period, err := storage.NormalizeNodeTrafficResetPeriod(period)
+	if err != nil {
+		return false
+	}
+	boundaryMonth := now.Month()
+	switch period {
+	case storage.NodeTrafficResetQuarterly:
+		boundaryMonth = time.Month(((int(now.Month())-1)/3)*3 + 1)
+	case storage.NodeTrafficResetYearly:
+		boundaryMonth = time.January
+	}
+	lastDayOfMonth := time.Date(now.Year(), boundaryMonth+1, 0, 0, 0, 0, 0, now.Location()).Day()
+	effectiveDay := resetDay
+	if effectiveDay > lastDayOfMonth {
+		effectiveDay = lastDayOfMonth
+	}
+	boundary := time.Date(now.Year(), boundaryMonth, effectiveDay, 0, 0, 0, 0, now.Location())
+	if now.Before(boundary) {
+		return false
+	}
+	if lastResetAt == nil {
+		return true
+	}
+	last := lastResetAt.In(now.Location())
+	samePeriod := last.Year() == now.Year()
+	switch period {
+	case storage.NodeTrafficResetMonthly:
+		samePeriod = samePeriod && last.Month() == now.Month()
+	case storage.NodeTrafficResetQuarterly:
+		samePeriod = samePeriod && (int(last.Month())-1)/3 == (int(now.Month())-1)/3
+	}
+	return !samePeriod
+}
+
 func shouldResetThisMonth(now time.Time, isReset bool, resetDay int, lastResetAt *time.Time) bool {
 	if !isReset || resetDay <= 0 || resetDay > 31 {
 		return false
 	}
-	// 当月最后一天 = 下月第 0 天
 	lastDayOfMonth := time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, now.Location()).Day()
 	effectiveDay := resetDay
 	if effectiveDay > lastDayOfMonth {
@@ -131,11 +163,7 @@ func shouldResetThisMonth(now time.Time, isReset bool, resetDay int, lastResetAt
 	if now.Day() < effectiveDay {
 		return false
 	}
-	if lastResetAt == nil {
-		return true
-	}
-	// 同年同月 = 本月已经 reset 过,跳过
-	return lastResetAt.Year() != now.Year() || lastResetAt.Month() != now.Month()
+	return lastResetAt == nil || lastResetAt.Year() != now.Year() || lastResetAt.Month() != now.Month()
 }
 
 func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
@@ -234,11 +262,11 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 			}
 		}
 
-		// 每月流量周期自动重置 — 到 reset_day 当天 0 点之后(实际由 enforcer ticker 触发,粒度=interval)
+		// 自然周期流量自动重置 — 到周期边界的 reset_day 之后触发，延迟运行会自动补重置。
 		// 触发后立刻把当前周期 uplink/downlink 归 0 + cycle_start=now,并写 last_reset_at 防止同月反复。
 		// 还原"超额"标志:重置后用户应该重新有流量配额,wasOverLimit → 立即恢复入站。
-		if shouldResetThisMonth(now, user.IsReset, user.ResetDay, user.LastResetAt) {
-			log.Printf("[TrafficLimitEnforcer] User %s monthly reset (day=%d, last=%v)", user.Username, user.ResetDay, user.LastResetAt)
+		if shouldResetNaturalPeriod(now, user.IsReset, user.ResetDay, user.NodeTrafficResetPeriod, user.LastResetAt) {
+			log.Printf("[TrafficLimitEnforcer] User %s %s reset (day=%d, last=%v)", user.Username, user.NodeTrafficResetPeriod, user.ResetDay, user.LastResetAt)
 			if err := e.repo.ResetUserTrafficCycleAt(ctx, user.Username, now); err != nil {
 				log.Printf("[TrafficLimitEnforcer] Failed to reset user %s: %v", user.Username, err)
 			} else {
@@ -247,7 +275,7 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 				wasOver, _ := e.repo.IsUserOverLimit(ctx, user.Username)
 				restorePending, _ := e.repo.IsUserOverLimitRevokePending(ctx, user.Username)
 				if wasOver || restorePending {
-					log.Printf("[TrafficLimitEnforcer] User %s back under limit after monthly reset, restoring inbounds", user.Username)
+					log.Printf("[TrafficLimitEnforcer] User %s back under limit after periodic reset, restoring inbounds", user.Username)
 					e.restoreOverLimitUserIfAllowed(ctx, user.Username, billableTraffic, pkgCache)
 				}
 				// limiter 配置在 agent 端按 user_traffic 累计算,重置归零后下次 push 自然刷新
