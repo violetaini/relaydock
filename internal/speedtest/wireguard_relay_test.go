@@ -14,28 +14,29 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestConfiguredMihomoWireGuardEgressPort(t *testing.T) {
+func TestConfiguredMihomoWireGuardRelayPort(t *testing.T) {
 	t.Run("disabled when empty", func(t *testing.T) {
-		t.Setenv(mihomoWireGuardEgressPortEnv, "")
-		port, enabled, err := configuredMihomoWireGuardEgressPort()
+		t.Setenv(mihomoWireGuardRelayPortEnv, "")
+		t.Setenv("ARCWAY_MIHOMO_WIREGUARD_EGRESS_PORT", "443")
+		port, enabled, err := configuredMihomoWireGuardRelayPort()
 		if err != nil || enabled || port != 0 {
 			t.Fatalf("configured port = (%d, %v, %v), want disabled", port, enabled, err)
 		}
 	})
 
 	t.Run("valid", func(t *testing.T) {
-		t.Setenv(mihomoWireGuardEgressPortEnv, " 443 ")
-		port, enabled, err := configuredMihomoWireGuardEgressPort()
-		if err != nil || !enabled || port != 443 {
-			t.Fatalf("configured port = (%d, %v, %v), want (443, true, nil)", port, enabled, err)
+		t.Setenv(mihomoWireGuardRelayPortEnv, " 39443 ")
+		port, enabled, err := configuredMihomoWireGuardRelayPort()
+		if err != nil || !enabled || port != 39443 {
+			t.Fatalf("configured port = (%d, %v, %v), want (39443, true, nil)", port, enabled, err)
 		}
 	})
 
 	for _, value := range []string{"0", "65536", "not-a-port"} {
 		t.Run("invalid "+value, func(t *testing.T) {
-			t.Setenv(mihomoWireGuardEgressPortEnv, value)
-			if _, _, err := configuredMihomoWireGuardEgressPort(); err == nil {
-				t.Fatalf("configuredMihomoWireGuardEgressPort() accepted %q", value)
+			t.Setenv(mihomoWireGuardRelayPortEnv, value)
+			if _, _, err := configuredMihomoWireGuardRelayPort(); err == nil {
+				t.Fatalf("configuredMihomoWireGuardRelayPort() accepted %q", value)
 			}
 		})
 	}
@@ -45,8 +46,8 @@ func TestMihomoWireGuardRelayUsesFixedSourcePortAndValidatesRemote(t *testing.T)
 	resetProcessWireGuardRelayHubForTest(t)
 	remote := listenUDP4(t)
 	defer remote.Close()
-	egressPort := unusedUDP4Port(t)
-	t.Setenv(mihomoWireGuardEgressPortEnv, strconv.Itoa(egressPort))
+	relayPort := unusedUDP4Port(t)
+	t.Setenv(mihomoWireGuardRelayPortEnv, strconv.Itoa(relayPort))
 
 	proxy := map[string]interface{}{
 		"name": "wireguard-probe", "type": "wireguard",
@@ -81,8 +82,8 @@ func TestMihomoWireGuardRelayUsesFixedSourcePortAndValidatesRemote(t *testing.T)
 	if string(forwarded) != string(initiation) {
 		t.Fatalf("forwarded initiation = %x, want %x", forwarded, initiation)
 	}
-	if upstreamSource.Port != egressPort {
-		t.Fatalf("upstream source port = %d, want configured %d", upstreamSource.Port, egressPort)
+	if upstreamSource.Port != relayPort {
+		t.Fatalf("upstream source port = %d, want local relay %d", upstreamSource.Port, relayPort)
 	}
 
 	response := wireGuardTestPacket(2, 0x50607080, clientIndex)
@@ -106,8 +107,8 @@ func TestMihomoWireGuardRelayRoutesConcurrentSameEndpointFlowsAndCleansUp(t *tes
 	resetProcessWireGuardRelayHubForTest(t)
 	remote := listenUDP4(t)
 	defer remote.Close()
-	egressPort := unusedUDP4Port(t)
-	t.Setenv(mihomoWireGuardEgressPortEnv, strconv.Itoa(egressPort))
+	relayPort := unusedUDP4Port(t)
+	t.Setenv(mihomoWireGuardRelayPortEnv, strconv.Itoa(relayPort))
 
 	remotePort := remote.LocalAddr().(*net.UDPAddr).Port
 	proxies := []map[string]interface{}{
@@ -193,7 +194,7 @@ func TestMihomoWireGuardRelayRoutesConcurrentSameEndpointFlowsAndCleansUp(t *tes
 }
 
 func TestPrepareMihomoWireGuardRelaysSkipsDialerAndFullPeerConfigs(t *testing.T) {
-	t.Setenv(mihomoWireGuardEgressPortEnv, "54321")
+	t.Setenv(mihomoWireGuardRelayPortEnv, "54321")
 	proxies := []map[string]interface{}{
 		{
 			"type": "wireguard", "server": "203.0.113.10", "port": 51820,
@@ -228,8 +229,8 @@ func TestStartMihomoLatencySessionRewritesOnlyItsWireGuardCopy(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	t.Chdir(root)
 	helper, helperErrors := writeMihomoLatencyHelper(t)
-	egressPort := unusedUDP4Port(t)
-	t.Setenv(mihomoWireGuardEgressPortEnv, strconv.Itoa(egressPort))
+	relayPort := unusedUDP4Port(t)
+	t.Setenv(mihomoWireGuardRelayPortEnv, strconv.Itoa(relayPort))
 
 	proxy := map[string]interface{}{
 		"name": "arcway-probe-1", "type": "wireguard", "server": "127.0.0.1", "port": 51820,
@@ -260,8 +261,8 @@ func TestStartMihomoLatencySessionBypassesRelayForSelectedWireGuardProxy(t *test
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	t.Chdir(root)
 	helper, helperErrors := writeMihomoLatencyHelper(t)
-	egressPort := unusedUDP4Port(t)
-	t.Setenv(mihomoWireGuardEgressPortEnv, strconv.Itoa(egressPort))
+	relayPort := unusedUDP4Port(t)
+	t.Setenv(mihomoWireGuardRelayPortEnv, strconv.Itoa(relayPort))
 
 	external := map[string]interface{}{
 		"name": "arcway-probe-1", "type": "wireguard", "server": "127.0.0.2", "port": 51820,

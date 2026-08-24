@@ -1,5 +1,5 @@
 [Unit]
-Description=RelayDock Mihomo WireGuard relay input allowance
+Description=RelayDock Mihomo WireGuard relay egress NAT
 After=network-online.target
 Wants=network-online.target
 Before=arcway.service

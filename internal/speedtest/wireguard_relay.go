@@ -13,7 +13,7 @@ import (
 	"sync"
 )
 
-const mihomoWireGuardEgressPortEnv = "ARCWAY_MIHOMO_WIREGUARD_EGRESS_PORT"
+const mihomoWireGuardRelayPortEnv = "ARCWAY_MIHOMO_WIREGUARD_RELAY_PORT"
 
 type wireGuardRelayRouteKey struct {
 	endpoint string
@@ -32,7 +32,8 @@ type wireGuardRelayConfigError struct {
 func (e *wireGuardRelayConfigError) Error() string { return e.err.Error() }
 func (e *wireGuardRelayConfigError) Unwrap() error { return e.err }
 
-// wireGuardRelayHub owns the single fixed-port Internet-facing UDP socket.
+// wireGuardRelayHub owns the single fixed-port local UDP socket. Deployment
+// NAT may publish a different source port for its endpoint-specific flows.
 // Individual Mihomo WireGuard proxies get separate loopback listeners so their
 // first handshake can be associated with the original remote endpoint.
 type wireGuardRelayHub struct {
@@ -62,20 +63,20 @@ var processWireGuardRelayHubState struct {
 	port int
 }
 
-func configuredMihomoWireGuardEgressPort() (int, bool, error) {
-	raw, exists := os.LookupEnv(mihomoWireGuardEgressPortEnv)
+func configuredMihomoWireGuardRelayPort() (int, bool, error) {
+	raw, exists := os.LookupEnv(mihomoWireGuardRelayPortEnv)
 	if !exists || strings.TrimSpace(raw) == "" {
 		return 0, false, nil
 	}
 	port, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil || port < 1 || port > 65535 {
-		return 0, false, fmt.Errorf("%s 必须是 1 到 65535 之间的 UDP 端口", mihomoWireGuardEgressPortEnv)
+		return 0, false, fmt.Errorf("%s 必须是 1 到 65535 之间的 UDP 端口", mihomoWireGuardRelayPortEnv)
 	}
 	return port, true, nil
 }
 
 func prepareMihomoWireGuardRelays(ctx context.Context, proxies []map[string]interface{}, hosts map[string]string) ([]io.Closer, error) {
-	port, enabled, err := configuredMihomoWireGuardEgressPort()
+	port, enabled, err := configuredMihomoWireGuardRelayPort()
 	if err != nil || !enabled {
 		return nil, err
 	}

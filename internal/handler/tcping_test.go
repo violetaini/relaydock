@@ -353,6 +353,73 @@ func TestTCPingExternalWireGuardUsesImportedPeerForMihomo(t *testing.T) {
 	}
 }
 
+func TestTCPingImportedWireGuardWithLegacyInboundCoordinatesUsesStoredIdentity(t *testing.T) {
+	repo := newTCPingTestRepository(t)
+	createTCPingAdmin(t, repo)
+	serverPublicKey, _ := wireGuardTCPingTestKeyPair(t, 0x44)
+	_, clientPrivateKey := wireGuardTCPingTestKeyPair(t, 0x45)
+	config, err := json.Marshal(map[string]interface{}{
+		"name": "Legacy imported WG", "type": "wireguard", "server": "203.0.113.52", "port": 51820,
+		"private-key": clientPrivateKey, "public-key": serverPublicKey, "ip": "10.78.0.2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := repo.CreateNode(context.Background(), storage.Node{
+		Username: "admin", NodeName: "Legacy imported WG", Protocol: "wireguard",
+		ParsedConfig: string(config), ClashConfig: string(config), Enabled: true,
+		OriginalServer: "Legacy matched host", InboundTag: "legacy-wg-in",
+	})
+	if err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+	if node.InboundMutationID != "" {
+		t.Fatalf("legacy imported node unexpectedly has a managed generation: %+v", node)
+	}
+
+	remote := &fakeRemoteNodeProbeClient{err: errors.New("legacy imported WireGuard must not call Agent")}
+	prober := &fakeProtocolLatencyProber{results: []speedtest.ProtocolLatencyResult{{Latency: 22.75}}}
+	handler := newTCPingHandler(repo, remote, false, prober)
+	body, err := json.Marshal(TCPingRequest{NodeID: node.ID, Timeout: 5000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/tcping", bytes.NewReader(body))
+	request = request.WithContext(auth.ContextWithUsername(request.Context(), "admin"))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response TCPingResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Success || response.Latency != 22.75 || response.Probe != "mihomo_url_test" || response.Error != "" {
+		t.Fatalf("unexpected response: %+v", response)
+	}
+
+	prober.mu.Lock()
+	if len(prober.targets) != 1 {
+		prober.mu.Unlock()
+		t.Fatalf("targets=%d want 1", len(prober.targets))
+	}
+	target := prober.targets[0]
+	prober.mu.Unlock()
+	if len(target.WireGuardRelayBypass) != 1 || !target.WireGuardRelayBypass[0] {
+		t.Fatalf("legacy imported WireGuard did not bypass the managed relay: %+v", target.WireGuardRelayBypass)
+	}
+	if target.ClashConfig != node.ClashConfig {
+		t.Fatalf("Mihomo did not receive the imported WireGuard identity\ngot:  %s\nwant: %s", target.ClashConfig, node.ClashConfig)
+	}
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	if len(remote.calls) != 0 {
+		t.Fatalf("legacy imported WireGuard unexpectedly called Agent: %+v", remote.calls)
+	}
+}
+
 func TestTCPingWireGuardRejectsManagedInboundWithoutServer(t *testing.T) {
 	_, privateKey := wireGuardTCPingTestKeyPair(t, 0x43)
 	config, err := json.Marshal(map[string]interface{}{
@@ -363,8 +430,9 @@ func TestTCPingWireGuardRejectsManagedInboundWithoutServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := &tcpingHandler{}
-	_, err = handler.mihomoProbeConfigForNode(context.Background(), storage.Node{
+	_, _, err = handler.mihomoProbeConfigForNode(context.Background(), storage.Node{
 		ID: 9, Protocol: "wireguard", ClashConfig: string(config), InboundTag: "wg-in",
+		InboundMutationID: "managed-wireguard:generation-1",
 	}, make(map[string]cachedWireGuardProbePeer), time.Second)
 	if err == nil || !strings.Contains(err.Error(), "缺少所属服务器") {
 		t.Fatalf("mihomoProbeConfigForNode() error = %v, want inconsistent managed association error", err)
@@ -816,7 +884,7 @@ func TestTCPingManagedWireGuardSanitizesAgentACKError(t *testing.T) {
 func TestMihomoProbeConfigRejectsProtocolMismatch(t *testing.T) {
 	handler := &tcpingHandler{}
 	config := `{"name":"spoofed","type":"wireguard","server":"127.0.0.1","port":51820,"private-key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}`
-	_, err := handler.mihomoProbeConfigForNode(context.Background(), storage.Node{
+	_, _, err := handler.mihomoProbeConfigForNode(context.Background(), storage.Node{
 		ID: 7, Protocol: "vless", ClashConfig: config,
 	}, make(map[string]cachedWireGuardProbePeer), time.Second)
 	if err == nil || !strings.Contains(err.Error(), "协议与 Mihomo 配置不一致") {

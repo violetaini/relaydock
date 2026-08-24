@@ -300,7 +300,7 @@ func (h *tcpingHandler) prepareMihomoLatencyTarget(ctx context.Context, resolved
 	wireGuardRelayBypass := make([]bool, 0, len(nodes))
 	hosts := make(map[string]string)
 	for _, node := range nodes {
-		config, err := h.mihomoProbeConfigForNode(ctx, node, wireGuardCache, timeout)
+		config, relayBypass, err := h.mihomoProbeConfigForNode(ctx, node, wireGuardCache, timeout)
 		if err != nil {
 			return speedtest.ProtocolLatencyTarget{}, err
 		}
@@ -323,8 +323,7 @@ func (h *tcpingHandler) prepareMihomoLatencyTarget(ctx context.Context, resolved
 			}
 		}
 		configs = append(configs, config)
-		wireGuardRelayBypass = append(wireGuardRelayBypass,
-			canonicalProbeProtocol(node.Protocol) == "wireguard" && strings.TrimSpace(node.InboundTag) == "")
+		wireGuardRelayBypass = append(wireGuardRelayBypass, relayBypass)
 	}
 	return speedtest.ProtocolLatencyTarget{
 		ClashConfig: configs[0], DialerChain: configs[1:], Hosts: hosts,
@@ -332,38 +331,75 @@ func (h *tcpingHandler) prepareMihomoLatencyTarget(ctx context.Context, resolved
 	}, nil
 }
 
-func (h *tcpingHandler) mihomoProbeConfigForNode(ctx context.Context, node storage.Node, cache map[string]cachedWireGuardProbePeer, timeout time.Duration) (string, error) {
+func (h *tcpingHandler) mihomoProbeConfigForNode(ctx context.Context, node storage.Node, cache map[string]cachedWireGuardProbePeer, timeout time.Duration) (string, bool, error) {
 	config := strings.TrimSpace(node.ClashConfig)
 	if config == "" {
 		config = strings.TrimSpace(node.ParsedConfig)
 	}
 	if config == "" {
-		return "", fmt.Errorf("节点 %d 缺少 Mihomo 配置", node.ID)
+		return "", false, fmt.Errorf("节点 %d 缺少 Mihomo 配置", node.ID)
 	}
 	config, _, _, _ = sanitizeManagedShadowsocksConfig(config)
 	configProtocol, err := mihomoProbeConfigProtocol(config)
 	if err != nil {
-		return "", fmt.Errorf("节点 %d 的 Mihomo 配置缺少有效协议类型", node.ID)
+		return "", false, fmt.Errorf("节点 %d 的 Mihomo 配置缺少有效协议类型", node.ID)
 	}
 	if canonicalProbeProtocolFamily(node.Protocol) != canonicalProbeProtocolFamily(configProtocol) {
-		return "", fmt.Errorf("节点 %d 的协议与 Mihomo 配置不一致", node.ID)
+		return "", false, fmt.Errorf("节点 %d 的协议与 Mihomo 配置不一致", node.ID)
 	}
 	if canonicalProbeProtocol(configProtocol) != "wireguard" {
-		return config, nil
+		return config, false, nil
 	}
-	if strings.TrimSpace(node.InboundTag) == "" {
-		return config, nil
+	usesStoredIdentity, err := h.wireGuardProbeUsesStoredIdentity(ctx, node)
+	if err != nil {
+		return "", false, err
+	}
+	if usesStoredIdentity {
+		return config, true, nil
 	}
 	if strings.TrimSpace(node.OriginalServer) == "" {
-		return "", errors.New("受管 WireGuard 入站缺少所属服务器，无法选择探测身份")
+		return "", false, errors.New("受管 WireGuard 入站缺少所属服务器，无法选择探测身份")
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	peer, err := h.ensureManagedWireGuardProbePeer(probeCtx, node, cache)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return buildWireGuardMihomoProbeConfig(config, peer)
+	config, err = buildWireGuardMihomoProbeConfig(config, peer)
+	return config, false, err
+}
+
+func (h *tcpingHandler) wireGuardProbeUsesStoredIdentity(ctx context.Context, node storage.Node) (bool, error) {
+	if canonicalProbeProtocol(node.Protocol) != "wireguard" {
+		return false, nil
+	}
+	if strings.TrimSpace(node.InboundTag) == "" {
+		return true, nil
+	}
+	mutationID := strings.TrimSpace(node.InboundMutationID)
+	if strings.HasPrefix(mutationID, "managed-wireguard:") &&
+		strings.TrimSpace(strings.TrimPrefix(mutationID, "managed-wireguard:")) != "" {
+		return false, nil
+	}
+	if h.repo == nil || strings.TrimSpace(node.OriginalServer) == "" {
+		return true, nil
+	}
+	server, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer)
+	if errors.Is(err, storage.ErrRemoteServerNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, errors.New("无法确认 WireGuard 节点的探测身份")
+	}
+	resource, err := h.repo.GetManagedInboundResourceByServerTag(ctx, server.ID, node.InboundTag)
+	if errors.Is(err, storage.ErrManagedInboundResourceNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, errors.New("无法确认 WireGuard 节点的探测身份")
+	}
+	return canonicalProbeProtocol(resource.Protocol) != "wireguard", nil
 }
 
 func mihomoProbeConfigProtocol(config string) (string, error) {
