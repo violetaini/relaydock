@@ -1,0 +1,1 @@
+function e(e,t=`both`){return e===`both`||e===`upload`||e===`download`?e:t===`both`||t===`upload`||t===`download`?t:`both`}function t(t){switch(e(t)){case`upload`:return`仅算上行`;case`download`:return`仅算下行`;default:return`双向`}}export{e as n,t};

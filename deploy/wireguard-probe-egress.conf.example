@@ -1,7 +1,7 @@
-# REMOTE_IPV4 REMOTE_UDP_PORT LOCAL_IPV4 RELAY_UDP_PORT PUBLIC_SOURCE_UDP_PORT
+# LOCAL_IPV4 RELAY_UDP_PORT PUBLIC_SOURCE_UDP_PORT
 #
-# Each line SNATs only one local relay-to-WireGuard endpoint tuple and permits
-# only its conntrack-restored replies. RELAY_UDP_PORT is the high local port
-# owned by Arcway; PUBLIC_SOURCE_UDP_PORT may be 443 even when another service
-# owns the unrelated public UDP listener.
-203.0.113.10 51820 198.51.100.20 39443 443
+# Each line SNATs traffic from one Arcway-owned local relay socket regardless
+# of the remote WireGuard endpoint and permits only its conntrack-restored
+# replies. PUBLIC_SOURCE_UDP_PORT may be 443 even when another service owns the
+# unrelated public UDP listener.
+198.51.100.20 39443 443

@@ -70,6 +70,11 @@ jobs:
           bash -n deploy/arcway-wireguard-probe-egress.sh scripts/wireguard_probe_egress_test.sh
           sudo bash scripts/wireguard_probe_egress_test.sh
 
+      - name: Verify native installer transaction
+        run: |
+          bash -n install.sh scripts/install_transaction_test.sh
+          sudo bash scripts/install_transaction_test.sh
+
       - name: Build server
         run: go build -trimpath -o /tmp/arcway ./cmd/server
 
@@ -285,6 +290,21 @@ jobs:
             "$GITHUB_REF_NAME" \
             "$GITHUB_SHA" \
             "$RELEASE_API_CONTRACT"
+
+      - name: Add native WireGuard probe relay assets
+        run: |
+          install -m 0755 \
+            deploy/arcway-wireguard-probe-egress.sh \
+            release-bundle/arcway-wireguard-probe-egress
+          install -m 0644 \
+            deploy/arcway-wireguard-probe-egress.service \
+            release-bundle/arcway-wireguard-probe-egress.service
+          install -m 0644 \
+            deploy/arcway-wireguard-probe-relay.conf \
+            release-bundle/arcway-wireguard-probe-relay.conf
+          install -m 0644 \
+            deploy/wireguard-probe-egress.conf.example \
+            release-bundle/arcway-wireguard-probe-egress.conf.example
 
       - name: Verify provenance and prepare checksums
         run: |

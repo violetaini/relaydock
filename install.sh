@@ -19,12 +19,25 @@ SERVICE_FILE="$SYSTEMD_UNIT_DIR/${SERVICE_NAME}.service"
 INSTALL_LOCK_FILE="${ARCWAY_INSTALL_LOCK_FILE:-/run/arcway-install.lock}"
 PANEL_SOURCE_IPS="${ARCWAY_PANEL_IPS:-}"
 DATABASE_PATH="${ARCWAY_DATABASE_PATH:-}"
+WIREGUARD_SERVICE_NAME="arcway-wireguard-probe-egress"
+WIREGUARD_RELAY_PORT="${ARCWAY_MIHOMO_WIREGUARD_RELAY_PORT:-39443}"
+WIREGUARD_PUBLIC_PORT="${ARCWAY_MIHOMO_WIREGUARD_PUBLIC_PORT:-443}"
+WIREGUARD_LOCAL_IPV4="${ARCWAY_MIHOMO_WIREGUARD_LOCAL_IPV4:-}"
+WIREGUARD_EGRESS_SCRIPT="$INSTALL_DIR/arcway-wireguard-probe-egress"
+WIREGUARD_SERVICE_FILE="$SYSTEMD_UNIT_DIR/${WIREGUARD_SERVICE_NAME}.service"
+WIREGUARD_DROPIN_DIR="$SYSTEMD_UNIT_DIR/${SERVICE_NAME}.service.d"
+WIREGUARD_DROPIN_FILE="$WIREGUARD_DROPIN_DIR/wireguard-probe-relay.conf"
+WIREGUARD_CONFIG_FILE="$CONFIG_DIR/wireguard-probe-egress.conf"
+WIREGUARD_CONFIG_EXAMPLE_FILE="$CONFIG_DIR/wireguard-probe-egress.conf.example"
 TMP_DIR=""
 UPDATE_TRANSACTION_ACTIVE=false
 UPDATE_BACKUP_DIR=""
 OLD_SERVICE_ACTIVE=false
 OLD_SERVICE_PRESENT=false
 OLD_SERVICE_ENABLE_STATE=""
+OLD_WIREGUARD_SERVICE_ACTIVE=false
+OLD_WIREGUARD_SERVICE_PRESENT=false
+OLD_WIREGUARD_SERVICE_ENABLE_STATE=""
 UPDATE_TRACKED_PATHS=()
 UPDATE_MANAGED_DIRS=()
 UPDATE_MANAGED_DIR_STATES=()
@@ -33,6 +46,15 @@ ATOMIC_STAGE_PATHS=()
 GUARD_PARENT_DIR=""
 OLD_GUARD_PARENT_PRESENT=false
 PRESERVE_TMP_DIR=false
+
+refresh_wireguard_paths() {
+    WIREGUARD_EGRESS_SCRIPT="$INSTALL_DIR/arcway-wireguard-probe-egress"
+    WIREGUARD_SERVICE_FILE="$SYSTEMD_UNIT_DIR/${WIREGUARD_SERVICE_NAME}.service"
+    WIREGUARD_DROPIN_DIR="$SYSTEMD_UNIT_DIR/${SERVICE_NAME}.service.d"
+    WIREGUARD_DROPIN_FILE="$WIREGUARD_DROPIN_DIR/wireguard-probe-relay.conf"
+    WIREGUARD_CONFIG_FILE="$CONFIG_DIR/wireguard-probe-egress.conf"
+    WIREGUARD_CONFIG_EXAMPLE_FILE="$CONFIG_DIR/wireguard-probe-egress.conf.example"
+}
 
 # 颜色输出
 RED='\033[0;31m'
@@ -104,6 +126,7 @@ detect_existing_installation_paths() {
     if [ -n "$existing_exec" ]; then
         echo_info "检测到现有安装布局: $INSTALL_DIR（数据目录: $DATA_DIR）"
     fi
+    refresh_wireguard_paths
 }
 
 acquire_install_lock() {
@@ -220,6 +243,8 @@ install_dependencies() {
     command -v jq >/dev/null 2>&1 || packages+=(jq)
     command -v systemctl >/dev/null 2>&1 || packages+=(systemd)
     command -v sha256sum >/dev/null 2>&1 || packages+=(coreutils)
+    command -v iptables >/dev/null 2>&1 || packages+=(iptables)
+    command -v ip >/dev/null 2>&1 || packages+=(iproute2)
 
     if [ "${#packages[@]}" -eq 0 ]; then
         echo_info "安装依赖已就绪"
@@ -271,6 +296,17 @@ download_binary() {
         fi
     done
 
+    for asset in \
+        arcway-wireguard-probe-egress \
+        arcway-wireguard-probe-egress.service \
+        arcway-wireguard-probe-relay.conf \
+        arcway-wireguard-probe-egress.conf.example; do
+        if ! wget -q "https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${asset}" -O "$TMP_DIR/$asset"; then
+            echo_error "下载 WireGuard 延迟探测出口资产失败: $asset"
+            exit 1
+        fi
+    done
+
     if ! wget -q "https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/checksums.txt" -O "$TMP_DIR/checksums.txt"; then
         echo_error "下载校验和失败"
         exit 1
@@ -278,7 +314,11 @@ download_binary() {
     for asset in \
         "$BINARY_NAME" \
         arcway-expiry-guard-linux-amd64 \
-        arcway-expiry-guard-linux-arm64; do
+        arcway-expiry-guard-linux-arm64 \
+        arcway-wireguard-probe-egress \
+        arcway-wireguard-probe-egress.service \
+        arcway-wireguard-probe-relay.conf \
+        arcway-wireguard-probe-egress.conf.example; do
         expected=$(awk -v name="$asset" '$2 == name { print $1; exit }' "$TMP_DIR/checksums.txt")
         actual=$(sha256sum "$TMP_DIR/$asset" | awk '{ print $1 }')
         if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
@@ -287,6 +327,144 @@ download_binary() {
         fi
     done
     echo_info "SHA-256 校验通过"
+}
+
+valid_ipv4() {
+    value=$1
+    first=""
+    second=""
+    third=""
+    fourth=""
+    extra=""
+    IFS=. read -r first second third fourth extra <<<"$value"
+    [ -z "$extra" ] && [ -n "$first" ] && [ -n "$second" ] && [ -n "$third" ] && [ -n "$fourth" ] || return 1
+    for octet in "$first" "$second" "$third" "$fourth"; do
+        case "$octet" in
+            0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
+            *) return 1 ;;
+        esac
+        [ "$((10#$octet))" -le 255 ] || return 1
+    done
+}
+
+valid_port() {
+    value=$1
+    case "$value" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$value" -ge 1 ] && [ "$value" -le 65535 ]
+}
+
+validate_wireguard_install_path() {
+    value=$1
+    label=$2
+    case "$value" in
+        /*) ;;
+        *)
+            echo_error "$label 必须是绝对路径: $value"
+            return 1
+            ;;
+    esac
+    case "$value" in
+        */../*|*/..|*/./*|*/.|*[!A-Za-z0-9_./:@+-]*)
+            echo_error "$label 包含 systemd unit 不支持的路径字符: $value"
+            return 1
+            ;;
+    esac
+}
+
+validate_wireguard_install_paths() {
+    validate_wireguard_install_path "$WIREGUARD_EGRESS_SCRIPT" "WireGuard 出口脚本路径"
+    validate_wireguard_install_path "$WIREGUARD_SERVICE_FILE" "WireGuard 服务路径"
+    validate_wireguard_install_path "$WIREGUARD_DROPIN_FILE" "WireGuard drop-in 路径"
+    validate_wireguard_install_path "$WIREGUARD_CONFIG_FILE" "WireGuard 配置路径"
+}
+
+resolve_wireguard_local_ipv4() {
+    validate_wireguard_install_paths
+    if ! valid_port "$WIREGUARD_RELAY_PORT" || ! valid_port "$WIREGUARD_PUBLIC_PORT" ||
+        [ "$WIREGUARD_RELAY_PORT" -eq "$WIREGUARD_PUBLIC_PORT" ]; then
+        echo_error "WireGuard 探测端口配置无效"
+        return 1
+    fi
+
+    if [ -z "$WIREGUARD_LOCAL_IPV4" ]; then
+        route_output=$(ip -4 route get 1.1.1.1 2>/dev/null | head -n 1 || true)
+        WIREGUARD_LOCAL_IPV4=$(printf '%s\n' "$route_output" | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }')
+    fi
+    if [ -z "$WIREGUARD_LOCAL_IPV4" ]; then
+        WIREGUARD_LOCAL_IPV4=$(ip -o -4 addr show scope global 2>/dev/null | awk 'NR == 1 { split($4, address, "/"); print address[1] }' || true)
+    fi
+    if ! valid_ipv4 "$WIREGUARD_LOCAL_IPV4"; then
+        echo_error "无法安全确定 WireGuard 延迟探测使用的本机 IPv4；可通过 ARCWAY_MIHOMO_WIREGUARD_LOCAL_IPV4 显式指定"
+        return 1
+    fi
+    case "$WIREGUARD_LOCAL_IPV4" in
+        0.*|127.*|169.254.*|22[4-9].*|23[0-9].*|24[0-9].*|25[0-5].*)
+            echo_error "WireGuard 延迟探测出口 IPv4 不可路由: $WIREGUARD_LOCAL_IPV4"
+            return 1
+            ;;
+    esac
+    if ! ip -o -4 addr show 2>/dev/null \
+        | awk '{ split($4, address, "/"); print address[1] }' \
+        | grep -Fqx "$WIREGUARD_LOCAL_IPV4"; then
+        echo_error "WireGuard 延迟探测出口 IPv4 未配置在本机接口上: $WIREGUARD_LOCAL_IPV4"
+        return 1
+    fi
+    WIREGUARD_RELAY_PORT=$((10#$WIREGUARD_RELAY_PORT))
+    WIREGUARD_PUBLIC_PORT=$((10#$WIREGUARD_PUBLIC_PORT))
+    echo_info "WireGuard 延迟探测出口 IPv4: $WIREGUARD_LOCAL_IPV4"
+}
+
+install_wireguard_probe_assets() {
+    echo_info "安装 WireGuard 延迟探测出口服务..."
+    resolve_wireguard_local_ipv4
+
+    atomic_install_file "$TMP_DIR/arcway-wireguard-probe-egress" "$WIREGUARD_EGRESS_SCRIPT" 0755
+    atomic_install_file "$TMP_DIR/arcway-wireguard-probe-egress.conf.example" "$WIREGUARD_CONFIG_EXAMPLE_FILE" 0644
+
+    new_atomic_stage "$WIREGUARD_CONFIG_FILE" config
+    staged_config=$ATOMIC_STAGE_PATH
+    {
+        printf '%s\n' '# LOCAL_IPV4 RELAY_UDP_PORT PUBLIC_SOURCE_UDP_PORT'
+        printf '%s %s %s\n' "$WIREGUARD_LOCAL_IPV4" "$WIREGUARD_RELAY_PORT" "$WIREGUARD_PUBLIC_PORT"
+    } >"$staged_config"
+    chmod 0600 "$staged_config"
+    mv -fT -- "$staged_config" "$WIREGUARD_CONFIG_FILE"
+
+    mkdir -p "$WIREGUARD_DROPIN_DIR"
+    new_atomic_stage "$WIREGUARD_SERVICE_FILE" service
+    staged_wireguard_unit=$ATOMIC_STAGE_PATH
+    cp -- "$TMP_DIR/arcway-wireguard-probe-egress.service" "$staged_wireguard_unit"
+    sed -i \
+        -e "s|^ExecStart=.*$|ExecStart=$WIREGUARD_EGRESS_SCRIPT apply $WIREGUARD_CONFIG_FILE|" \
+        -e "s|^ExecStartPost=.*$|ExecStartPost=$WIREGUARD_EGRESS_SCRIPT status $WIREGUARD_CONFIG_FILE|" \
+        -e "s|^ExecStop=.*$|ExecStop=$WIREGUARD_EGRESS_SCRIPT remove $WIREGUARD_CONFIG_FILE|" \
+        "$staged_wireguard_unit"
+    chmod 0644 "$staged_wireguard_unit"
+    mv -fT -- "$staged_wireguard_unit" "$WIREGUARD_SERVICE_FILE"
+
+    new_atomic_stage "$WIREGUARD_DROPIN_FILE" dropin
+    staged_wireguard_dropin=$ATOMIC_STAGE_PATH
+    cp -- "$TMP_DIR/arcway-wireguard-probe-relay.conf" "$staged_wireguard_dropin"
+    sed -i \
+        -e "s|^Environment=\"ARCWAY_MIHOMO_WIREGUARD_RELAY_PORT=.*\"$|Environment=\"ARCWAY_MIHOMO_WIREGUARD_RELAY_PORT=$WIREGUARD_RELAY_PORT\"|" \
+        -e "s|^ExecStartPre=.*$|ExecStartPre=$WIREGUARD_EGRESS_SCRIPT status $WIREGUARD_CONFIG_FILE|" \
+        "$staged_wireguard_dropin"
+    chmod 0644 "$staged_wireguard_dropin"
+    mv -fT -- "$staged_wireguard_dropin" "$WIREGUARD_DROPIN_FILE"
+
+    if ! arcway_test_failpoint after_wireguard_assets_swap; then
+        return 1
+    fi
+    if ! systemd-analyze verify "$SERVICE_FILE" "$WIREGUARD_SERVICE_FILE"; then
+        echo_error "RelayDock 与 WireGuard 探测出口 systemd 配置组合校验失败"
+        return 1
+    fi
+    if ! systemctl daemon-reload; then
+        echo_error "WireGuard 探测出口服务 daemon-reload 失败"
+        return 1
+    fi
 }
 
 # 安装二进制文件
@@ -355,6 +533,9 @@ begin_update_transaction() {
     OLD_SERVICE_ACTIVE=false
     OLD_SERVICE_PRESENT=false
     OLD_SERVICE_ENABLE_STATE=""
+    OLD_WIREGUARD_SERVICE_ACTIVE=false
+    OLD_WIREGUARD_SERVICE_PRESENT=false
+    OLD_WIREGUARD_SERVICE_ENABLE_STATE=""
     if systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1; then
         OLD_SERVICE_PRESENT=true
         OLD_SERVICE_ENABLE_STATE=$(systemctl is-enabled "${SERVICE_NAME}.service" 2>/dev/null || true)
@@ -371,6 +552,22 @@ begin_update_transaction() {
             OLD_SERVICE_ACTIVE=true
         fi
     fi
+    if systemctl cat "${WIREGUARD_SERVICE_NAME}.service" >/dev/null 2>&1; then
+        OLD_WIREGUARD_SERVICE_PRESENT=true
+        OLD_WIREGUARD_SERVICE_ENABLE_STATE=$(systemctl is-enabled "${WIREGUARD_SERVICE_NAME}.service" 2>/dev/null || true)
+        case "$OLD_WIREGUARD_SERVICE_ENABLE_STATE" in
+            enabled|enabled-runtime|disabled|static)
+                ;;
+            *)
+                echo_error "WireGuard 探测出口服务启用状态不受支持: ${OLD_WIREGUARD_SERVICE_ENABLE_STATE:-unknown}"
+                echo_error "尚未修改现有安装"
+                return 1
+                ;;
+        esac
+        if systemctl is-active --quiet "${WIREGUARD_SERVICE_NAME}.service" 2>/dev/null; then
+            OLD_WIREGUARD_SERVICE_ACTIVE=true
+        fi
+    fi
 
     UPDATE_TRACKED_PATHS=(
         "$INSTALL_DIR/$SERVICE_NAME"
@@ -378,6 +575,11 @@ begin_update_transaction() {
         "$GUARD_ASSET_DIR/arcway-expiry-guard-linux-amd64"
         "$GUARD_ASSET_DIR/arcway-expiry-guard-linux-arm64"
         "$SERVICE_FILE"
+        "$WIREGUARD_EGRESS_SCRIPT"
+        "$WIREGUARD_SERVICE_FILE"
+        "$WIREGUARD_DROPIN_FILE"
+        "$WIREGUARD_CONFIG_FILE"
+        "$WIREGUARD_CONFIG_EXAMPLE_FILE"
         "$DATA_DIR/.version"
     )
     UPDATE_MANAGED_DIRS=()
@@ -386,6 +588,7 @@ begin_update_transaction() {
     track_transaction_directory "$DATA_DIR"
     track_transaction_directory "$CONFIG_DIR"
     track_transaction_directory "$GUARD_ASSET_DIR"
+    track_transaction_directory "$WIREGUARD_DROPIN_DIR"
     GUARD_PARENT_DIR=$(dirname "$GUARD_ASSET_DIR")
     OLD_GUARD_PARENT_PRESENT=false
     if [ -d "$GUARD_PARENT_DIR" ]; then
@@ -403,16 +606,17 @@ begin_update_transaction() {
     UPDATE_TRANSACTION_ACTIVE=true
 }
 
-stop_service_for_transaction() {
-    service_unit="${SERVICE_NAME}.service"
+stop_unit_for_transaction() {
+    service_unit=$1
+    service_label=$2
     if ! systemctl cat "$service_unit" >/dev/null 2>&1; then
-        echo_info "服务未加载，无需停止"
+        echo_info "$service_label 未加载，无需停止"
         return 0
     fi
 
-    echo_info "停止服务..."
+    echo_info "停止$service_label..."
     if ! systemctl stop "$service_unit"; then
-        echo_error "停止服务失败，拒绝继续替换文件"
+        echo_error "停止$service_label失败，拒绝继续替换文件"
         return 1
     fi
 
@@ -424,7 +628,7 @@ stop_service_for_transaction() {
         fi
         case "$active_state" in
             inactive|failed)
-                echo_info "服务已停止（状态: $active_state）"
+                echo_info "$service_label 已停止（状态: $active_state）"
                 return 0
                 ;;
         esac
@@ -432,8 +636,16 @@ stop_service_for_transaction() {
         sleep 1
     done
 
-    echo_error "服务停止超时（当前状态: ${active_state:-unknown}），拒绝继续替换文件"
+    echo_error "$service_label 停止超时（当前状态: ${active_state:-unknown}），拒绝继续替换文件"
     return 1
+}
+
+stop_service_for_transaction() {
+    stop_unit_for_transaction "${SERVICE_NAME}.service" "RelayDock 服务"
+}
+
+stop_wireguard_service_for_transaction() {
+    stop_unit_for_transaction "${WIREGUARD_SERVICE_NAME}.service" "WireGuard 探测出口服务"
 }
 
 database_has_state() {
@@ -530,6 +742,20 @@ rollback_update_transaction() {
             rollback_failed=true
         fi
     fi
+    if systemctl cat "${WIREGUARD_SERVICE_NAME}.service" >/dev/null 2>&1; then
+        if ! stop_wireguard_service_for_transaction >/dev/null 2>&1; then
+            rollback_failed=true
+        fi
+        if ! systemctl disable "${WIREGUARD_SERVICE_NAME}.service" >/dev/null 2>&1; then
+            rollback_failed=true
+        fi
+        if ! systemctl disable --runtime "${WIREGUARD_SERVICE_NAME}.service" >/dev/null 2>&1; then
+            rollback_failed=true
+        fi
+        if ! systemctl unmask "${WIREGUARD_SERVICE_NAME}.service" >/dev/null 2>&1; then
+            rollback_failed=true
+        fi
+    fi
     for tracked_path in "${UPDATE_TRACKED_PATHS[@]}"; do
         backup_path="$UPDATE_BACKUP_DIR$tracked_path"
         if [ -e "$backup_path.arcway-missing" ]; then
@@ -564,6 +790,37 @@ rollback_update_transaction() {
     fi
     if ! systemctl daemon-reload >/dev/null 2>&1; then
         rollback_failed=true
+    fi
+    if [ "$OLD_WIREGUARD_SERVICE_PRESENT" = true ]; then
+        case "$OLD_WIREGUARD_SERVICE_ENABLE_STATE" in
+            enabled)
+                if ! systemctl enable "${WIREGUARD_SERVICE_NAME}.service" >/dev/null 2>&1; then
+                    rollback_failed=true
+                fi
+                ;;
+            enabled-runtime)
+                if ! systemctl enable --runtime "${WIREGUARD_SERVICE_NAME}.service" >/dev/null 2>&1; then
+                    rollback_failed=true
+                fi
+                ;;
+            disabled|static)
+                ;;
+            *)
+                rollback_failed=true
+                ;;
+        esac
+        restored_wireguard_enable_state=$(systemctl is-enabled "${WIREGUARD_SERVICE_NAME}.service" 2>/dev/null || true)
+        if [ "$restored_wireguard_enable_state" != "$OLD_WIREGUARD_SERVICE_ENABLE_STATE" ]; then
+            rollback_failed=true
+        fi
+        if [ "$OLD_WIREGUARD_SERVICE_ACTIVE" = true ]; then
+            if ! systemctl start "${WIREGUARD_SERVICE_NAME}.service" >/dev/null 2>&1 ||
+                ! systemctl is-active --quiet "${WIREGUARD_SERVICE_NAME}.service" >/dev/null 2>&1; then
+                rollback_failed=true
+            fi
+        elif systemctl is-active --quiet "${WIREGUARD_SERVICE_NAME}.service" >/dev/null 2>&1; then
+            rollback_failed=true
+        fi
     fi
     if [ "$OLD_SERVICE_PRESENT" = true ]; then
         case "$OLD_SERVICE_ENABLE_STATE" in
@@ -755,8 +1012,25 @@ update_systemd_service_settings() {
 }
 
 # 启动服务
+start_wireguard_probe_service() {
+    echo_info "启动 WireGuard 延迟探测出口服务..."
+    if ! systemctl enable "${WIREGUARD_SERVICE_NAME}.service"; then
+        echo_error "设置 WireGuard 探测出口服务开机启动失败"
+        return 1
+    fi
+    if ! systemctl start "${WIREGUARD_SERVICE_NAME}.service"; then
+        echo_error "启动 WireGuard 探测出口服务失败"
+        return 1
+    fi
+    if ! systemctl is-active --quiet "${WIREGUARD_SERVICE_NAME}.service"; then
+        echo_error "WireGuard 探测出口服务未进入活动状态"
+        return 1
+    fi
+}
+
 start_service() {
-    echo_info "启动服务..."
+    start_wireguard_probe_service
+    echo_info "启动 RelayDock 服务..."
     if ! systemctl enable "${SERVICE_NAME}.service"; then
         echo_error "设置服务开机启动失败"
         return 1
@@ -825,9 +1099,13 @@ update_service() {
 
     # 下载和校验必须先完成，网络失败时保持当前服务运行。
     download_binary
+    resolve_wireguard_local_ipv4
     begin_update_transaction
 
     if ! stop_service_for_transaction; then
+        return 1
+    fi
+    if ! stop_wireguard_service_for_transaction; then
         return 1
     fi
     snapshot_database_after_stop
@@ -862,6 +1140,7 @@ update_service() {
 
     # 在同目录暂存并校验 unit 后原子替换。
     update_systemd_service_settings "$PORT_INPUT"
+    install_wireguard_probe_assets
 
     if ! start_service; then
         return 1
@@ -899,6 +1178,16 @@ uninstall_service() {
 
     # 停止并禁用服务
     echo_info "停止并禁用服务..."
+    if systemctl cat "${WIREGUARD_SERVICE_NAME}.service" >/dev/null 2>&1; then
+        if ! systemctl stop "${WIREGUARD_SERVICE_NAME}.service"; then
+            echo_error "WireGuard 探测出口规则清理失败，已保留服务文件以便重试"
+            return 1
+        fi
+        if ! systemctl disable "${WIREGUARD_SERVICE_NAME}.service"; then
+            echo_error "WireGuard 探测出口服务禁用失败，已保留服务文件以便重试"
+            return 1
+        fi
+    fi
     systemctl stop ${SERVICE_NAME}.service || true
     systemctl disable ${SERVICE_NAME}.service || true
     echo_info "✓ 服务已停止"
@@ -931,14 +1220,15 @@ uninstall_service() {
 
     # 删除 systemd 服务文件
     echo_info "删除 systemd 服务..."
-    rm -f "$SERVICE_FILE"
+    rm -f "$SERVICE_FILE" "$WIREGUARD_SERVICE_FILE" "$WIREGUARD_DROPIN_FILE"
+    rmdir "$WIREGUARD_DROPIN_DIR" >/dev/null 2>&1 || true
     systemctl daemon-reload
     echo_info "✓ systemd 服务已删除"
     echo ""
 
     # 删除二进制文件
     echo_info "删除程序文件..."
-    rm -f "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak"
+    rm -f "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak" "$WIREGUARD_EGRESS_SCRIPT"
     rm -f "$INSTALL_DIR"/.arcway.arcway-stage.*
     rm -rf "$GUARD_ASSET_DIR"
     # Legacy speedtester assets are intentionally left untouched. They are no
@@ -976,9 +1266,13 @@ reinstall_service() {
 
     # 下载和校验必须先完成，网络失败时保持当前服务运行。
     download_binary
+    resolve_wireguard_local_ipv4
     begin_update_transaction
 
     if ! stop_service_for_transaction; then
+        return 1
+    fi
+    if ! stop_wireguard_service_for_transaction; then
         return 1
     fi
     snapshot_database_after_stop
@@ -993,6 +1287,7 @@ reinstall_service() {
     install_binary
     create_directories
     create_systemd_service
+    install_wireguard_probe_assets
 
     # 保存版本信息
     atomic_write_version "$DATA_DIR/.version"
@@ -1038,14 +1333,19 @@ main() {
         install_dependencies
         get_latest_version
         download_binary
+        resolve_wireguard_local_ipv4
         begin_update_transaction
         if ! stop_service_for_transaction; then
+            return 1
+        fi
+        if ! stop_wireguard_service_for_transaction; then
             return 1
         fi
         snapshot_database_after_stop
         install_binary
         create_directories
         create_systemd_service
+        install_wireguard_probe_assets
 
         # 保存版本信息
         atomic_write_version "$DATA_DIR/.version"

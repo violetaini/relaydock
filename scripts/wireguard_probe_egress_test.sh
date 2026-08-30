@@ -84,16 +84,16 @@ runtime_state="$test_root/runtime/rules.conf"
 
 write_one_rule() {
     cat >"$config" <<'EOF'
-# endpoint, local relay socket, and externally visible source port
-154.19.43.82 51821 23.145.248.44 39443 443
+# local relay socket and externally visible source port
+23.145.248.44 39443 443
 EOF
     chmod 0600 "$config"
 }
 
 write_two_rules() {
     cat >"$config" <<'EOF'
-154.19.43.82 51821 23.145.248.44 39443 443
-154.19.43.83 51822 23.145.248.44 39443 443
+23.145.248.44 39443 443
+23.145.248.44 39444 444
 EOF
     chmod 0600 "$config"
 }
@@ -129,18 +129,24 @@ write_one_rule
 run_script apply
 assert_rule_counts 1 1 "initial apply"
 [[ -s "$runtime_state" ]] || fail "apply did not write runtime state"
-grep -Fxq '154.19.43.82 51821 23.145.248.44 39443 443' "$runtime_state" || {
+grep -Fxq '23.145.248.44 39443 443' "$runtime_state" || {
     fail "runtime state did not preserve separate relay and public ports"
 }
-grep -Fq -- '-s 154.19.43.82 --sport 51821 -d 23.145.248.44 --dport 39443 -m conntrack --ctstate ESTABLISHED' \
-    "$mock_state/filter-INPUT" || fail "INPUT rule is not limited to the restored endpoint tuple"
-grep -Fq -- '-s 23.145.248.44 --sport 39443 -d 154.19.43.82 --dport 51821' \
-    "$mock_state/nat-POSTROUTING" || fail "SNAT rule is not limited to the relay endpoint tuple"
+grep -Fq -- '-p udp -d 23.145.248.44 --dport 39443 -m conntrack --ctstate ESTABLISHED' \
+    "$mock_state/filter-INPUT" || fail "INPUT rule is not limited to conntrack-restored relay replies"
+grep -Fq -- '-p udp -s 23.145.248.44 --sport 39443 -m comment' \
+    "$mock_state/nat-POSTROUTING" || fail "SNAT rule is not limited to the local relay tuple"
 grep -Fq -- '-j SNAT --to-source 23.145.248.44:443' "$mock_state/nat-POSTROUTING" || {
     fail "SNAT rule does not publish UDP 443"
 }
+if grep -Fq -- '154.19.43.82' "$mock_state/filter-INPUT" "$mock_state/nat-POSTROUTING"; then
+    fail "generic rules unexpectedly pin a remote WireGuard endpoint"
+fi
 if grep -Eq -- 'PREROUTING|DNAT|--dport 443' "$mock_state/filter-INPUT"; then
     fail "INPUT rule exposed the public UDP port instead of the local relay port"
+fi
+if grep -Eq -- ' -d [^ ]+|--dport [0-9]+' "$mock_state/nat-POSTROUTING"; then
+    fail "SNAT rule restricts a remote destination instead of covering all endpoints"
 fi
 
 run_script apply
@@ -155,7 +161,7 @@ run_script apply
 assert_rule_counts 1 1 "missing INPUT repair"
 
 cat >"$config" <<'EOF'
-154.19.43.83 51822 23.145.248.44 39443 443
+23.145.248.44 39443 444
 EOF
 chmod 0600 "$config"
 if run_script apply >/dev/null 2>&1; then
@@ -168,13 +174,13 @@ assert_rule_counts 0 0 "remove"
 run_script remove
 
 write_two_rules
-if MOCK_IPTABLES_FAIL_INSERT_MATCH='--sport 51822' run_script apply >/dev/null 2>&1; then
+if MOCK_IPTABLES_FAIL_INSERT_MATCH='--dport 39444' run_script apply >/dev/null 2>&1; then
     fail "apply ignored an INPUT insertion failure"
 fi
 assert_rule_counts 0 0 "INPUT insertion rollback"
 [[ ! -e "$runtime_state" ]] || fail "failed apply wrote runtime state"
 
-if MOCK_IPTABLES_FAIL_INSERT_MATCH='--dport 51822' run_script apply >/dev/null 2>&1; then
+if MOCK_IPTABLES_FAIL_INSERT_MATCH='--sport 39444' run_script apply >/dev/null 2>&1; then
     fail "apply ignored a SNAT insertion failure"
 fi
 assert_rule_counts 0 0 "SNAT insertion rollback"
@@ -192,13 +198,13 @@ fi
 assert_rule_counts 2 2 "remove check failure"
 [[ -s "$runtime_state" ]] || fail "check failure deleted runtime state"
 
-if MOCK_IPTABLES_FAIL_DELETE_MATCH='--dport 51822' run_script remove >/dev/null 2>&1; then
+if MOCK_IPTABLES_FAIL_DELETE_MATCH='--to-source 23.145.248.44:444' run_script remove >/dev/null 2>&1; then
     fail "remove ignored a SNAT deletion failure"
 fi
 assert_rule_counts 2 2 "SNAT deletion rollback"
 [[ -s "$runtime_state" ]] || fail "failed remove deleted runtime state"
 
-if MOCK_IPTABLES_FAIL_DELETE_MATCH='--sport 51822' run_script remove >/dev/null 2>&1; then
+if MOCK_IPTABLES_FAIL_DELETE_MATCH='--dport 39444' run_script remove >/dev/null 2>&1; then
     fail "remove ignored an INPUT deletion failure"
 fi
 assert_rule_counts 2 2 "INPUT deletion rollback"
@@ -244,7 +250,7 @@ fi
 chown 0 "$config"
 
 cat >"$config" <<'EOF'
-999.19.43.82 51821 23.145.248.44 39443 443
+999.19.43.82 39443 443
 EOF
 chmod 0600 "$config"
 if run_script apply >/dev/null 2>&1; then
@@ -252,7 +258,7 @@ if run_script apply >/dev/null 2>&1; then
 fi
 
 cat >"$config" <<'EOF'
-154.19.43.82 51821 23.145.248.44 443 443
+23.145.248.44 443 443
 EOF
 chmod 0600 "$config"
 if run_script apply >/dev/null 2>&1; then
@@ -260,7 +266,7 @@ if run_script apply >/dev/null 2>&1; then
 fi
 
 cat >"$config" <<'EOF'
-154.19.43.82 51821 23.145.248.44 39443 0
+23.145.248.44 39443 0
 EOF
 chmod 0600 "$config"
 if run_script apply >/dev/null 2>&1; then
@@ -268,13 +274,44 @@ if run_script apply >/dev/null 2>&1; then
 fi
 
 cat >"$config" <<'EOF'
-154.19.43.82 51821 23.145.248.44 39443 443
-154.19.43.82 51821 23.145.248.44 39443 444
+23.145.248.44 39443 443
+23.145.248.44 39443 444
 EOF
 chmod 0600 "$config"
 if run_script apply >/dev/null 2>&1; then
-    fail "apply accepted conflicting SNAT targets for one endpoint tuple"
+    fail "apply accepted conflicting SNAT targets for one local relay tuple"
 fi
+
+cat >"$config" <<'EOF'
+154.19.43.82 51821 23.145.248.44 39443 443
+EOF
+chmod 0600 "$config"
+if run_script apply >/dev/null 2>&1; then
+    fail "apply accepted endpoint-specific five-field configuration"
+fi
+
+# Upgrade cleanup accepts the previous five-field state and removes its exact
+# endpoint-specific filter and NAT rules.
+cp -- "$config" "$runtime_state"
+chmod 0600 "$runtime_state"
+iptables_mock -w 10 -t nat -I POSTROUTING 1 \
+    -p udp -s 23.145.248.44 --sport 39443 -d 154.19.43.82 --dport 51821 \
+    -m comment --comment arcway-mihomo-wg-relay-snat-v1 \
+    -j SNAT --to-source 23.145.248.44:443
+iptables_mock -w 10 -I INPUT 1 \
+    -p udp -s 154.19.43.82 --sport 51821 -d 23.145.248.44 --dport 39443 \
+    -m conntrack --ctstate ESTABLISHED \
+    -m comment --comment arcway-mihomo-wg-relay-input-v1 -j ACCEPT
+assert_rule_counts 1 1 "endpoint-specific setup"
+run_script status
+if MOCK_IPTABLES_FAIL_DELETE_MATCH='--to-source 23.145.248.44:443' run_script remove >/dev/null 2>&1; then
+    fail "remove ignored an endpoint-specific SNAT deletion failure"
+fi
+assert_rule_counts 1 1 "endpoint-specific removal rollback"
+[[ -s "$runtime_state" ]] || fail "endpoint-specific rollback lost runtime state"
+run_script status
+run_script remove
+assert_rule_counts 0 0 "endpoint-specific removal"
 
 cat >"$config" <<'EOF'
 154.19.43.82 51821 23.145.248.44 443

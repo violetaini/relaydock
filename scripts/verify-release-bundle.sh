@@ -104,12 +104,19 @@ SPEEDTESTER_ASSETS=(
   relaydock-speedtester-windows-arm64.exe
 )
 FRONTEND_ASSETS=(relaydock-web.tar.gz)
+WIREGUARD_PROBE_ASSETS=(
+  arcway-wireguard-probe-egress
+  arcway-wireguard-probe-egress.service
+  arcway-wireguard-probe-relay.conf
+  arcway-wireguard-probe-egress.conf.example
+)
 RELEASE_ASSETS=(
   "${CONTROL_PLANE_ASSETS[@]}"
   "${GUARD_ASSETS[@]}"
   "${AGENT_ASSETS[@]}"
   "${SPEEDTESTER_ASSETS[@]}"
   "${FRONTEND_ASSETS[@]}"
+  "${WIREGUARD_PROBE_ASSETS[@]}"
 )
 MANIFEST_FILE=relaydock-release-manifest.json
 CHECKSUM_FILE=checksums.txt
@@ -257,12 +264,51 @@ verify_web_archive() (
 
 verify_web_archive
 
+verify_wireguard_probe_assets() {
+  cmp -s \
+    "$SCRIPT_DIR/../deploy/arcway-wireguard-probe-egress.sh" \
+    "$BUNDLE_DIR/arcway-wireguard-probe-egress" || {
+      echo "WireGuard probe egress script does not match the release source" >&2
+      exit 1
+    }
+  cmp -s \
+    "$SCRIPT_DIR/../deploy/arcway-wireguard-probe-egress.service" \
+    "$BUNDLE_DIR/arcway-wireguard-probe-egress.service" || {
+      echo "WireGuard probe egress unit does not match the release source" >&2
+      exit 1
+    }
+  cmp -s \
+    "$SCRIPT_DIR/../deploy/arcway-wireguard-probe-relay.conf" \
+    "$BUNDLE_DIR/arcway-wireguard-probe-relay.conf" || {
+      echo "WireGuard probe relay drop-in does not match the release source" >&2
+      exit 1
+    }
+  cmp -s \
+    "$SCRIPT_DIR/../deploy/wireguard-probe-egress.conf.example" \
+    "$BUNDLE_DIR/arcway-wireguard-probe-egress.conf.example" || {
+      echo "WireGuard probe egress example does not match the release source" >&2
+      exit 1
+    }
+
+  bash -n "$BUNDLE_DIR/arcway-wireguard-probe-egress"
+  grep -Fq 'ExecStart=' "$BUNDLE_DIR/arcway-wireguard-probe-egress.service"
+  grep -Fq 'ExecStop=' "$BUNDLE_DIR/arcway-wireguard-probe-egress.service"
+  grep -Fq 'ARCWAY_MIHOMO_WIREGUARD_RELAY_PORT=' "$BUNDLE_DIR/arcway-wireguard-probe-relay.conf"
+}
+
+verify_wireguard_probe_assets
+
 chmod 0755 \
   "$BUNDLE_DIR"/arcway-linux-* \
   "$BUNDLE_DIR"/arcway-darwin-* \
+  "$BUNDLE_DIR"/arcway-wireguard-probe-egress \
   "$BUNDLE_DIR"/arcway-expiry-guard-linux-* \
   "$BUNDLE_DIR"/relaydock-agent-linux-* \
   "$BUNDLE_DIR"/relaydock-speedtester-linux-*
+chmod 0644 \
+  "$BUNDLE_DIR"/arcway-wireguard-probe-egress.service \
+  "$BUNDLE_DIR"/arcway-wireguard-probe-relay.conf \
+  "$BUNDLE_DIR"/arcway-wireguard-probe-egress.conf.example
 
 EXPECTED_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/relaydock-release-manifest.XXXXXXXX")"
 EXPECTED_CHECKSUMS="$(mktemp "${TMPDIR:-/tmp}/relaydock-release-checksums.XXXXXXXX")"

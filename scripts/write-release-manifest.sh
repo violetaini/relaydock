@@ -62,6 +62,10 @@ CONTROL_PLANE_ASSETS=(
   arcway-darwin-amd64
   arcway-darwin-arm64
   arcway-windows-amd64.exe
+  arcway-wireguard-probe-egress
+  arcway-wireguard-probe-egress.service
+  arcway-wireguard-probe-relay.conf
+  arcway-wireguard-probe-egress.conf.example
 )
 GUARD_ASSETS=(
   arcway-expiry-guard-linux-amd64

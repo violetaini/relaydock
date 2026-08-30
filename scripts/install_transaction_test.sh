@@ -24,7 +24,21 @@ assert_file_equals() {
 }
 
 MOCK_BIN="$TEST_ROOT/mock-bin"
-mkdir -p "$MOCK_BIN"
+MOCK_RELEASE_ASSET_DIR="$TEST_ROOT/release-assets"
+mkdir -p "$MOCK_BIN" "$MOCK_RELEASE_ASSET_DIR"
+install -m 0755 \
+    "$REPO_ROOT/deploy/arcway-wireguard-probe-egress.sh" \
+    "$MOCK_RELEASE_ASSET_DIR/arcway-wireguard-probe-egress"
+install -m 0644 \
+    "$REPO_ROOT/deploy/arcway-wireguard-probe-egress.service" \
+    "$MOCK_RELEASE_ASSET_DIR/arcway-wireguard-probe-egress.service"
+install -m 0644 \
+    "$REPO_ROOT/deploy/arcway-wireguard-probe-relay.conf" \
+    "$MOCK_RELEASE_ASSET_DIR/arcway-wireguard-probe-relay.conf"
+install -m 0644 \
+    "$REPO_ROOT/deploy/wireguard-probe-egress.conf.example" \
+    "$MOCK_RELEASE_ASSET_DIR/arcway-wireguard-probe-egress.conf.example"
+export MOCK_RELEASE_ASSET_DIR
 
 cat > "$MOCK_BIN/apt-get" <<'EOF'
 #!/bin/bash
@@ -80,16 +94,44 @@ if [ "$asset" = "checksums.txt" ]; then
     for name in \
         arcway-linux-amd64 \
         arcway-expiry-guard-linux-amd64 \
-        arcway-expiry-guard-linux-arm64; do
-        digest=$(printf 'new-%s\n' "$name" | sha256sum | awk '{print $1}')
+        arcway-expiry-guard-linux-arm64 \
+        arcway-wireguard-probe-egress \
+        arcway-wireguard-probe-egress.service \
+        arcway-wireguard-probe-relay.conf \
+        arcway-wireguard-probe-egress.conf.example; do
+        if [ -f "$MOCK_RELEASE_ASSET_DIR/$name" ]; then
+            digest=$(sha256sum "$MOCK_RELEASE_ASSET_DIR/$name" | awk '{print $1}')
+        else
+            digest=$(printf 'new-%s\n' "$name" | sha256sum | awk '{print $1}')
+        fi
         if [ "${MOCK_BAD_CHECKSUM_ASSET:-}" = "$name" ]; then
             digest=0000000000000000000000000000000000000000000000000000000000000000
         fi
         printf '%s  %s\n' "$digest" "$name"
     done > "$output"
+elif [ -f "$MOCK_RELEASE_ASSET_DIR/$asset" ]; then
+    cp "$MOCK_RELEASE_ASSET_DIR/$asset" "$output"
 else
     printf 'new-%s\n' "$asset" > "$output"
 fi
+EOF
+
+cat > "$MOCK_BIN/ip" <<'EOF'
+#!/bin/bash
+if [ "${1:-}" = "-4" ] && [ "${2:-}" = "route" ] && [ "${3:-}" = "get" ]; then
+    printf '%s\n' '1.1.1.1 via 192.0.2.254 dev eth0 src 192.0.2.10 uid 0'
+    exit 0
+fi
+if [ "${1:-}" = "-o" ] && [ "${2:-}" = "-4" ]; then
+    printf '%s\n' '2: eth0    inet 192.0.2.10/24 scope global eth0'
+    exit 0
+fi
+exit 2
+EOF
+
+cat > "$MOCK_BIN/iptables" <<'EOF'
+#!/bin/bash
+exit 0
 EOF
 
 cat > "$MOCK_BIN/systemd-analyze" <<'EOF'
@@ -105,11 +147,25 @@ cat > "$MOCK_BIN/systemctl" <<'EOF'
 #!/bin/bash
 set -u
 state_dir=${MOCK_STATE_DIR:?}
-unit=${ARCWAY_SYSTEMD_UNIT_DIR:?}/arcway.service
 command=${1:-}
 shift || true
 
-if [ "${MOCK_FAIL_COMMAND:-}" = "$command" ] && [ ! -e "$state_dir/injected-$command" ]; then
+requested_unit=arcway.service
+for arg in "$@"; do
+    case "$arg" in
+        *.service) requested_unit=$arg ;;
+    esac
+done
+unit=${ARCWAY_SYSTEMD_UNIT_DIR:?}/$requested_unit
+if [ "$requested_unit" = "arcway-wireguard-probe-egress.service" ]; then
+    state_prefix=wireguard-
+else
+    state_prefix=
+fi
+enabled_file="$state_dir/${state_prefix}enabled"
+active_file="$state_dir/${state_prefix}active"
+
+if [ "${MOCK_FAIL_COMMAND:-}" = "$command" ] && [ "$requested_unit" = "arcway.service" ] && [ ! -e "$state_dir/injected-$command" ]; then
     if [ "$command" = start ] && [ -n "${MOCK_DATABASE_PATH:-}" ]; then
         printf '%s\n' migrated-database > "$MOCK_DATABASE_PATH"
         printf '%s\n' migrated-wal > "$MOCK_DATABASE_PATH-wal"
@@ -123,7 +179,11 @@ enable_state() {
     if [ -f "$unit" ] && grep -q '^# MOCK_STATIC=1$' "$unit"; then
         printf '%s\n' static
     else
-        cat "$state_dir/enabled"
+        if [ -f "$enabled_file" ]; then
+            cat "$enabled_file"
+        else
+            printf '%s\n' disabled
+        fi
     fi
 }
 
@@ -132,7 +192,8 @@ case "$command" in
         [ -f "$unit" ]
         ;;
     is-active)
-        state=$(cat "$state_dir/active")
+        state=inactive
+        [ ! -f "$active_file" ] || state=$(cat "$active_file")
         if [ "$state" = active ]; then
             [ "${1:-}" = "--quiet" ] || printf '%s\n' active
             exit 0
@@ -149,17 +210,17 @@ case "$command" in
         esac
         ;;
     show)
-        if [ "$(cat "$state_dir/active")" = active ]; then
+        if [ -f "$active_file" ] && [ "$(cat "$active_file")" = active ]; then
             printf '%s\n' active
         else
             printf '%s\n' inactive
         fi
         ;;
     stop)
-        printf '%s\n' inactive > "$state_dir/active"
+        printf '%s\n' inactive > "$active_file"
         ;;
     disable)
-        printf '%s\n' disabled > "$state_dir/enabled"
+        printf '%s\n' disabled > "$enabled_file"
         ;;
     unmask)
         :
@@ -176,13 +237,13 @@ case "$command" in
             exit 1
         fi
         if [ "$runtime" = true ]; then
-            printf '%s\n' enabled-runtime > "$state_dir/enabled"
+            printf '%s\n' enabled-runtime > "$enabled_file"
         else
-            printf '%s\n' enabled > "$state_dir/enabled"
+            printf '%s\n' enabled > "$enabled_file"
         fi
         ;;
     start)
-        printf '%s\n' active > "$state_dir/active"
+        printf '%s\n' active > "$active_file"
         ;;
     *)
         echo "unexpected systemctl command: $command $*" >&2
@@ -251,17 +312,41 @@ EOF
     cp "$data_dir/arcway.db-shm" "$expected_dir/arcway.db-shm"
 }
 
+make_old_wireguard_installation() {
+    case_root=$1
+    enable_state=${2:-enabled}
+    active_state=${3:-active}
+    mkdir -p "$case_root/systemd/arcway.service.d" "$case_root/config" "$case_root/expected"
+    printf '%s\n' old-wireguard-script > "$case_root/bin/arcway-wireguard-probe-egress"
+    printf '%s\n' old-wireguard-unit > "$case_root/systemd/arcway-wireguard-probe-egress.service"
+    printf '%s\n' old-wireguard-dropin > "$case_root/systemd/arcway.service.d/wireguard-probe-relay.conf"
+    printf '%s\n' '203.0.113.10 51820 192.0.2.10 39443 443' > "$case_root/config/wireguard-probe-egress.conf"
+    printf '%s\n' old-wireguard-example > "$case_root/config/wireguard-probe-egress.conf.example"
+    chmod 0755 "$case_root/bin/arcway-wireguard-probe-egress"
+    printf '%s\n' "$enable_state" > "$case_root/state/wireguard-enabled"
+    printf '%s\n' "$active_state" > "$case_root/state/wireguard-active"
+    cp "$case_root/bin/arcway-wireguard-probe-egress" "$case_root/expected/wireguard-script"
+    cp "$case_root/systemd/arcway-wireguard-probe-egress.service" "$case_root/expected/wireguard-unit"
+    cp "$case_root/systemd/arcway.service.d/wireguard-probe-relay.conf" "$case_root/expected/wireguard-dropin"
+    cp "$case_root/config/wireguard-probe-egress.conf" "$case_root/expected/wireguard-config"
+    cp "$case_root/config/wireguard-probe-egress.conf.example" "$case_root/expected/wireguard-example"
+}
+
 run_fault_case() {
     failpoint=$1
     expected_enabled=$2
     expected_active=$3
+    old_wireguard=${4:-false}
     case_root="$TEST_ROOT/$failpoint"
     make_old_installation "$case_root" "$expected_enabled" "$expected_active"
+    if [ "$old_wireguard" = true ]; then
+        make_old_wireguard_installation "$case_root" enabled-runtime active
+    fi
     script_failpoint=""
     systemctl_fail_command=""
     verify_fail=0
     case "$failpoint" in
-        after_binary_swap|after_first_guard_swap)
+        after_binary_swap|after_first_guard_swap|after_wireguard_assets_swap)
             script_failpoint=$failpoint
             ;;
         daemon_reload_failure)
@@ -307,6 +392,29 @@ run_fault_case() {
     assert_file_equals "$case_root/expected/arcway.db-wal" "$case_root/data/arcway.db-wal"
     assert_file_equals "$case_root/expected/arcway.db-shm" "$case_root/data/arcway.db-shm"
 
+    if [ "$old_wireguard" = true ]; then
+        assert_file_equals "$case_root/expected/wireguard-script" "$case_root/bin/arcway-wireguard-probe-egress"
+        assert_file_equals "$case_root/expected/wireguard-unit" "$case_root/systemd/arcway-wireguard-probe-egress.service"
+        assert_file_equals "$case_root/expected/wireguard-dropin" "$case_root/systemd/arcway.service.d/wireguard-probe-relay.conf"
+        assert_file_equals "$case_root/expected/wireguard-config" "$case_root/config/wireguard-probe-egress.conf"
+        assert_file_equals "$case_root/expected/wireguard-example" "$case_root/config/wireguard-probe-egress.conf.example"
+        [ "$(cat "$case_root/state/wireguard-enabled")" = enabled-runtime ] || fail "$failpoint did not restore WireGuard enable state"
+        [ "$(cat "$case_root/state/wireguard-active")" = active ] || fail "$failpoint did not restore WireGuard active state"
+    else
+        for path in \
+            "$case_root/bin/arcway-wireguard-probe-egress" \
+            "$case_root/systemd/arcway-wireguard-probe-egress.service" \
+            "$case_root/systemd/arcway.service.d/wireguard-probe-relay.conf" \
+            "$case_root/config/wireguard-probe-egress.conf" \
+            "$case_root/config/wireguard-probe-egress.conf.example"; do
+            [ ! -e "$path" ] || fail "$failpoint left a WireGuard probe asset: $path"
+        done
+        wireguard_enable_state=$(cat "$case_root/state/wireguard-enabled" 2>/dev/null || printf '%s\n' disabled)
+        wireguard_active_state=$(cat "$case_root/state/wireguard-active" 2>/dev/null || printf '%s\n' inactive)
+        [ "$wireguard_enable_state" = disabled ] || fail "$failpoint left the WireGuard service enabled"
+        [ "$wireguard_active_state" = inactive ] || fail "$failpoint left the WireGuard service active"
+    fi
+
     actual_enabled=$(PATH="$MOCK_BIN:/usr/bin:/bin" MOCK_STATE_DIR="$case_root/state" \
         ARCWAY_SYSTEMD_UNIT_DIR="$case_root/systemd" systemctl is-enabled arcway.service 2>/dev/null || true)
     [ "$actual_enabled" = "$expected_enabled" ] || fail "$failpoint enabled state: $actual_enabled, want $expected_enabled"
@@ -330,6 +438,56 @@ run_fault_case after_first_guard_swap enabled-runtime inactive
 run_fault_case daemon_reload_failure disabled active
 run_fault_case start_failure static inactive
 run_fault_case unit_verify_failure enabled active
+run_fault_case after_wireguard_assets_swap enabled active true
+
+# Static relay assets are rejected before the running installation is touched
+# when their release checksum does not match.
+BAD_RELAY_CHECKSUM_ROOT="$TEST_ROOT/bad-relay-checksum"
+make_old_installation "$BAD_RELAY_CHECKSUM_ROOT" enabled active
+set +e
+PATH="$MOCK_BIN:/usr/bin:/bin" \
+    MOCK_APT_MARKER="$BAD_RELAY_CHECKSUM_ROOT/apt-called" \
+    MOCK_BAD_CHECKSUM_ASSET=arcway-wireguard-probe-egress \
+    MOCK_STATE_DIR="$BAD_RELAY_CHECKSUM_ROOT/state" \
+    ARCWAY_INSTALL_DIR="$BAD_RELAY_CHECKSUM_ROOT/bin" \
+    ARCWAY_DATA_DIR="$BAD_RELAY_CHECKSUM_ROOT/data" \
+    ARCWAY_CONFIG_DIR="$BAD_RELAY_CHECKSUM_ROOT/config" \
+    ARCWAY_GUARD_ASSET_DIR="$BAD_RELAY_CHECKSUM_ROOT/lib/guard-assets" \
+    ARCWAY_SYSTEMD_UNIT_DIR="$BAD_RELAY_CHECKSUM_ROOT/systemd" \
+    ARCWAY_INSTALL_LOCK_FILE="$BAD_RELAY_CHECKSUM_ROOT/install.lock" \
+    bash "$INSTALL_SCRIPT" reinstall >"$BAD_RELAY_CHECKSUM_ROOT/output.log" 2>&1
+bad_relay_checksum_result=$?
+set -e
+[ "$bad_relay_checksum_result" -ne 0 ] || fail "bad WireGuard relay checksum unexpectedly succeeded"
+assert_file_equals "$BAD_RELAY_CHECKSUM_ROOT/expected/arcway" "$BAD_RELAY_CHECKSUM_ROOT/bin/arcway"
+[ "$(cat "$BAD_RELAY_CHECKSUM_ROOT/state/active")" = active ] || fail "checksum rejection stopped the current service"
+if grep -q '正在恢复原状态' "$BAD_RELAY_CHECKSUM_ROOT/output.log"; then
+    fail "checksum rejection entered a transaction"
+fi
+
+# An unsafe explicit egress address is also rejected during preflight.
+BAD_RELAY_IP_ROOT="$TEST_ROOT/bad-relay-ip"
+make_old_installation "$BAD_RELAY_IP_ROOT" enabled active
+set +e
+PATH="$MOCK_BIN:/usr/bin:/bin" \
+    MOCK_APT_MARKER="$BAD_RELAY_IP_ROOT/apt-called" \
+    MOCK_STATE_DIR="$BAD_RELAY_IP_ROOT/state" \
+    ARCWAY_INSTALL_DIR="$BAD_RELAY_IP_ROOT/bin" \
+    ARCWAY_DATA_DIR="$BAD_RELAY_IP_ROOT/data" \
+    ARCWAY_CONFIG_DIR="$BAD_RELAY_IP_ROOT/config" \
+    ARCWAY_GUARD_ASSET_DIR="$BAD_RELAY_IP_ROOT/lib/guard-assets" \
+    ARCWAY_SYSTEMD_UNIT_DIR="$BAD_RELAY_IP_ROOT/systemd" \
+    ARCWAY_INSTALL_LOCK_FILE="$BAD_RELAY_IP_ROOT/install.lock" \
+    ARCWAY_MIHOMO_WIREGUARD_LOCAL_IPV4=127.0.0.1 \
+    bash "$INSTALL_SCRIPT" reinstall >"$BAD_RELAY_IP_ROOT/output.log" 2>&1
+bad_relay_ip_result=$?
+set -e
+[ "$bad_relay_ip_result" -ne 0 ] || fail "unsafe WireGuard relay IP unexpectedly succeeded"
+assert_file_equals "$BAD_RELAY_IP_ROOT/expected/arcway" "$BAD_RELAY_IP_ROOT/bin/arcway"
+[ "$(cat "$BAD_RELAY_IP_ROOT/state/active")" = active ] || fail "IP preflight rejection stopped the current service"
+if grep -q '正在恢复原状态' "$BAD_RELAY_IP_ROOT/output.log"; then
+    fail "IP preflight rejection entered a transaction"
+fi
 
 # Unknown systemd enable states are rejected before the installed files or service are touched.
 UNSUPPORTED_ROOT="$TEST_ROOT/unsupported-enable-state"
@@ -383,7 +541,15 @@ grep -q '^old-agent-arm64$' "$SUCCESS_ROOT/lib/agent-assets/relaydock-agent-linu
 grep -q '^v-test$' "$SUCCESS_ROOT/data/.version" || fail "successful reinstall did not replace version file"
 [ "$(cat "$SUCCESS_ROOT/state/enabled")" = enabled ] || fail "successful reinstall is not enabled"
 [ "$(cat "$SUCCESS_ROOT/state/active")" = active ] || fail "successful reinstall is not active"
+[ "$(cat "$SUCCESS_ROOT/state/wireguard-enabled")" = enabled ] || fail "successful reinstall did not enable the WireGuard probe service"
+[ "$(cat "$SUCCESS_ROOT/state/wireguard-active")" = active ] || fail "successful reinstall did not start the WireGuard probe service"
 [ -s "$SUCCESS_ROOT/verify.log" ] || fail "successful reinstall did not verify staged unit"
+cmp -s "$MOCK_RELEASE_ASSET_DIR/arcway-wireguard-probe-egress" "$SUCCESS_ROOT/bin/arcway-wireguard-probe-egress" || fail "successful reinstall did not install the verified WireGuard script"
+cmp -s "$MOCK_RELEASE_ASSET_DIR/arcway-wireguard-probe-egress.conf.example" "$SUCCESS_ROOT/config/wireguard-probe-egress.conf.example" || fail "successful reinstall did not install the verified WireGuard example"
+[ "$(stat -c '%a' "$SUCCESS_ROOT/config/wireguard-probe-egress.conf")" = 600 ] || fail "WireGuard probe configuration is not private"
+grep -q '^192\.0\.2\.10 39443 443$' "$SUCCESS_ROOT/config/wireguard-probe-egress.conf" || fail "successful reinstall wrote the wrong WireGuard probe tuple"
+grep -Fq "ExecStart=$SUCCESS_ROOT/bin/arcway-wireguard-probe-egress apply $SUCCESS_ROOT/config/wireguard-probe-egress.conf" "$SUCCESS_ROOT/systemd/arcway-wireguard-probe-egress.service" || fail "WireGuard service does not use the detected custom installation paths"
+grep -Fq "ExecStartPre=$SUCCESS_ROOT/bin/arcway-wireguard-probe-egress status $SUCCESS_ROOT/config/wireguard-probe-egress.conf" "$SUCCESS_ROOT/systemd/arcway.service.d/wireguard-probe-relay.conf" || fail "RelayDock drop-in does not validate the managed WireGuard rules"
 grep -q '^Environment="PORT=19090"$' "$SUCCESS_ROOT/systemd/arcway.service" || fail "explicit PORT did not override the existing port"
 if grep -q '^Environment="ARCWAY_AGENT_ASSET_DIR=' "$SUCCESS_ROOT/systemd/arcway.service"; then
     fail "reinstall retained the obsolete Agent asset directory setting"
@@ -411,6 +577,7 @@ grep -q '^Environment="PORT=18080"$' "$INHERIT_PORT_ROOT/systemd/arcway.service"
 # A non-interactive uninstall preserves data unless deletion is explicitly requested.
 UNINSTALL_ROOT="$TEST_ROOT/uninstall-default"
 make_old_installation "$UNINSTALL_ROOT" enabled active
+make_old_wireguard_installation "$UNINSTALL_ROOT" enabled active
 mkdir -p "$UNINSTALL_ROOT/lib/speedtester-assets"
 printf '%s\n' legacy-speedtester > "$UNINSTALL_ROOT/lib/speedtester-assets/relaydock-speedtester-linux-amd64"
 PATH="$MOCK_BIN:/usr/bin:/bin" \
@@ -427,6 +594,12 @@ PATH="$MOCK_BIN:/usr/bin:/bin" \
 [ -e "$UNINSTALL_ROOT/lib/agent-assets/relaydock-agent-linux-amd64" ] || fail "uninstall removed the legacy Agent cache"
 [ -f "$UNINSTALL_ROOT/lib/speedtester-assets/relaydock-speedtester-linux-amd64" ] || fail "uninstall removed the legacy speedtester cache"
 [ ! -e "$UNINSTALL_ROOT/systemd/arcway.service" ] || fail "uninstall did not remove the systemd unit"
+[ ! -e "$UNINSTALL_ROOT/systemd/arcway-wireguard-probe-egress.service" ] || fail "uninstall did not remove the WireGuard service unit"
+[ ! -e "$UNINSTALL_ROOT/systemd/arcway.service.d/wireguard-probe-relay.conf" ] || fail "uninstall did not remove the WireGuard drop-in"
+[ ! -e "$UNINSTALL_ROOT/bin/arcway-wireguard-probe-egress" ] || fail "uninstall did not remove the WireGuard egress script"
+[ -f "$UNINSTALL_ROOT/config/wireguard-probe-egress.conf" ] || fail "data-preserving uninstall removed the WireGuard configuration"
+[ "$(cat "$UNINSTALL_ROOT/state/wireguard-enabled")" = disabled ] || fail "uninstall left the WireGuard service enabled"
+[ "$(cat "$UNINSTALL_ROOT/state/wireguard-active")" = inactive ] || fail "uninstall left the WireGuard service active"
 grep -q '保留数据模式' "$UNINSTALL_ROOT/output.log" || fail "uninstall did not report preserved data"
 
 # Uninstall leaves the entire legacy speedtester directory untouched.

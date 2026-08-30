@@ -67,6 +67,19 @@ for asset in "${RELEASE_ASSETS[@]}"; do
   printf 'test asset: %s\n' "$asset" >"$BUNDLE_DIR/$asset"
 done
 
+install -m 0755 \
+  "$PROJECT_ROOT/deploy/arcway-wireguard-probe-egress.sh" \
+  "$BUNDLE_DIR/arcway-wireguard-probe-egress"
+install -m 0644 \
+  "$PROJECT_ROOT/deploy/arcway-wireguard-probe-egress.service" \
+  "$BUNDLE_DIR/arcway-wireguard-probe-egress.service"
+install -m 0644 \
+  "$PROJECT_ROOT/deploy/arcway-wireguard-probe-relay.conf" \
+  "$BUNDLE_DIR/arcway-wireguard-probe-relay.conf"
+install -m 0644 \
+  "$PROJECT_ROOT/deploy/wireguard-probe-egress.conf.example" \
+  "$BUNDLE_DIR/arcway-wireguard-probe-egress.conf.example"
+
 cat >"$FAKE_BIN_DIR/go" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -137,7 +150,7 @@ const fs = require("fs");
 const manifest = JSON.parse(fs.readFileSync(process.argv.at(-1), "utf8"));
 const components = manifest.components;
 const expected = {
-  control_plane: ["1.2.3", 5],
+  control_plane: ["1.2.3", 9],
   web: ["v1.2.3", 1],
   guard_assets: ["1.2.3", 2],
 };
@@ -187,7 +200,7 @@ func main() {
 	}
 	control := manifest.Components[productrelease.ComponentControlPlane]
 	web := manifest.Components[productrelease.ComponentWeb]
-	if manifest.ReleaseID != "v1.2.3" || control.Version != "1.2.3" || !control.Changed || len(web.Assets) != 1 || web.Assets[0].Name != "relaydock-web.tar.gz" || web.Assets[0].Size < 1 || len(manifest.AssetNames()) != 8 {
+	if manifest.ReleaseID != "v1.2.3" || control.Version != "1.2.3" || !control.Changed || len(web.Assets) != 1 || web.Assets[0].Name != "relaydock-web.tar.gz" || web.Assets[0].Size < 1 || len(manifest.AssetNames()) != 12 {
 		panic(fmt.Sprintf("unexpected manifest: %+v", manifest))
 	}
 	metadataRaw, err := os.ReadFile(os.Args[2])
