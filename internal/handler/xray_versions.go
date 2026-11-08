@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	xrayCoreReleasesURL       = "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=30"
+	xrayCoreReleasesURL       = "https://api.github.com/repos/chitanda-project/chitanda/releases?per_page=30"
 	xrayCoreVersionsCacheTTL  = 15 * time.Minute
 	xrayCoreVersionsTimeout   = 10 * time.Second
 	xrayCoreVersionsMaxBody   = 8 << 20
@@ -40,6 +40,9 @@ type githubXrayCoreRelease struct {
 	Draft       bool   `json:"draft"`
 	Prerelease  bool   `json:"prerelease"`
 	PublishedAt string `json:"published_at"`
+	Assets      []struct {
+		Name string `json:"name"`
+	} `json:"assets"`
 }
 
 func cloneXrayCoreVersions(in []XrayCoreVersion) []XrayCoreVersion {
@@ -136,6 +139,18 @@ func (h *RemoteManageHandler) fetchOfficialXrayCoreVersions(parent context.Conte
 	for _, release := range releases {
 		version := strings.TrimSpace(release.TagName)
 		if release.Draft || !xrayCoreVersionPattern.MatchString(version) {
+			continue
+		}
+		isXray := strings.Contains(strings.ToLower(release.Name), "xray")
+		if !isXray {
+			for _, a := range release.Assets {
+				if strings.HasPrefix(a.Name, "Xray-") {
+					isXray = true
+					break
+				}
+			}
+		}
+		if !isXray {
 			continue
 		}
 		if _, duplicate := seen[version]; duplicate {

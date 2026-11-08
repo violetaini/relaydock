@@ -1627,6 +1627,76 @@ func parseSnellURL(uri string) (map[string]any, error) {
 }
 
 // Parse parses a single proxy URL and returns Clash format
+func parseChitandaURL(uri string) (map[string]any, error) {
+	content := strings.TrimPrefix(uri, "chitanda://")
+	name := "Chitanda Node"
+	mainPart := content
+
+	if idx := strings.LastIndex(content, "#"); idx != -1 {
+		mainPart = content[:idx]
+		name, _ = url.QueryUnescape(content[idx+1:])
+	}
+
+	var queryParams map[string]string
+	if idx := strings.Index(mainPart, "?"); idx != -1 {
+		queryParams = parseQueryParams(mainPart[idx+1:])
+		mainPart = mainPart[:idx]
+	}
+	mainPart = strings.TrimSuffix(mainPart, "/")
+
+	atIdx := strings.LastIndex(mainPart, "@")
+	if atIdx == -1 {
+		return nil, fmt.Errorf("invalid chitanda url: missing @")
+	}
+
+	psk := safeDecodeURIComponent(mainPart[:atIdx])
+	serverPart := mainPart[atIdx+1:]
+	server, port := parseServerPortWithDefault(serverPart, 443)
+
+	transport := strings.ToLower(strings.TrimSpace(queryParams["transport"]))
+	if transport == "" {
+		transport = "h2"
+	}
+
+	node := map[string]any{
+		"name":      name,
+		"type":      "chitanda",
+		"server":    server,
+		"port":      port,
+		"psk":       psk,
+		"transport": transport,
+		"udp":       true,
+	}
+
+	if path := queryParams["path"]; path != "" {
+		node["path"] = path
+	}
+	if sni := queryParams["sni"]; sni != "" {
+		node["sni"] = sni
+	}
+	if serverID := queryParams["server-id"]; serverID != "" {
+		node["server-id"] = serverID
+	}
+	if poolSize := queryParams["pool-size"]; poolSize != "" {
+		if ps, err := strconv.Atoi(poolSize); err == nil && ps > 0 {
+			node["pool-size"] = ps
+		}
+	}
+	if udpPoolSize := queryParams["udp-pool-size"]; udpPoolSize != "" {
+		if ups, err := strconv.Atoi(udpPoolSize); err == nil && ups > 0 {
+			node["udp-pool-size"] = ups
+		}
+	}
+	if skipCert := queryParams["skip-cert-verify"]; skipCert == "true" || skipCert == "1" {
+		node["skip-cert-verify"] = true
+	}
+	if udpStr := queryParams["udp"]; udpStr == "false" || udpStr == "0" {
+		node["udp"] = false
+	}
+
+	return node, nil
+}
+
 func Parse(uri string) (map[string]any, error) {
 	uri = strings.TrimSpace(uri)
 
@@ -1661,6 +1731,8 @@ func Parse(uri string) (map[string]any, error) {
 		return parseMieruURL(uri)
 	case strings.HasPrefix(uri, "snell://"):
 		return parseSnellURL(uri)
+	case strings.HasPrefix(uri, "chitanda://"):
+		return parseChitandaURL(uri)
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", uri)
 	}

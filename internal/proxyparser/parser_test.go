@@ -233,3 +233,24 @@ func TestParse_SubStoreBugFixes(t *testing.T) {
 		}
 	})
 }
+
+func TestParseChitanda(t *testing.T) {
+	uri := "chitanda://my-secret-key@168.138.209.1:11322?transport=h2&path=%2Fassets%2Fsync.bin&sni=status.chitanda.org&pool-size=4#Chitanda-Tokyo"
+	got, err := Parse(uri)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	want := map[string]any{
+		"name":      "Chitanda-Tokyo",
+		"type":      "chitanda",
+		"server":    "168.138.209.1",
+		"port":      11322,
+		"psk":       "my-secret-key",
+		"transport": "h2",
+		"path":      "/assets/sync.bin",
+		"sni":       "status.chitanda.org",
+		"pool-size": 4,
+		"udp":       true,
+	}
+	subset(t, "chitanda", got, want)
+}

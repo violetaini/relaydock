@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/violetaini/relaydock/internal/auth"
@@ -482,3 +483,112 @@ func (h *UserNodesHandler) rollbackAddedUserOutbound(ctx context.Context, server
 	}
 	h.rollbackAddedOutbound(ctx, serverID, outboundTag)
 }
+
+type PublicNodeResponseItem struct {
+	ID          int64    `json:"id"`
+	Name        string   `json:"name"`
+	Protocol    string   `json:"protocol"`
+	CountryCode string   `json:"country_code"`
+	Enabled     bool     `json:"enabled"`
+	Online      bool     `json:"online"`
+	Tags        []string `json:"tags"`
+	Link        string   `json:"link,omitempty"`
+}
+
+func inferCountryCodeFromName(name string) string {
+	nameUpper := strings.ToUpper(name)
+	switch {
+	case strings.Contains(name, "香港") || strings.Contains(nameUpper, "HK"):
+		return "HK"
+	case strings.Contains(name, "日本") || strings.Contains(name, "东京") || strings.Contains(name, "大阪") || strings.Contains(nameUpper, "JP"):
+		return "JP"
+	case strings.Contains(name, "台湾") || strings.Contains(name, "台北") || strings.Contains(nameUpper, "TW"):
+		return "TW"
+	case strings.Contains(name, "美国") || strings.Contains(name, "洛杉矶") || strings.Contains(name, "圣何塞") || strings.Contains(name, "硅谷") || strings.Contains(nameUpper, "US"):
+		return "US"
+	case strings.Contains(name, "俄罗斯") || strings.Contains(name, "莫斯科") || strings.Contains(nameUpper, "RU"):
+		return "RU"
+	case strings.Contains(name, "新加坡") || strings.Contains(name, "狮城") || strings.Contains(nameUpper, "SG"):
+		return "SG"
+	case strings.Contains(name, "韩国") || strings.Contains(name, "首尔") || strings.Contains(nameUpper, "KR"):
+		return "KR"
+	case strings.Contains(name, "英国") || strings.Contains(name, "伦敦") || strings.Contains(nameUpper, "UK") || strings.Contains(nameUpper, "GB"):
+		return "GB"
+	case strings.Contains(name, "德国") || strings.Contains(name, "法兰克福") || strings.Contains(nameUpper, "DE"):
+		return "DE"
+	default:
+		return "UN"
+	}
+}
+
+// HandlePublicNodes GET /api/user/nodes/public — 返回用户专享、脱敏并经过安全过滤的节点列表
+func (h *UserNodesHandler) HandlePublicNodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	ctx := r.Context()
+	username := auth.UsernameFromContext(ctx)
+	if username == "" {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	nodeIDs, err := ResolveEffectiveUserNodeIDs(ctx, h.repo, username, time.Now().UTC())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "获取有效节点失败")
+		return
+	}
+
+	servers, _ := h.repo.ListRemoteServers(ctx)
+	serverMap := make(map[string]storage.RemoteServer, len(servers))
+	for _, s := range servers {
+		serverMap[s.Name] = s
+	}
+
+	var list []PublicNodeResponseItem
+	for _, nodeID := range nodeIDs {
+		node, err := h.repo.GetNodeByID(ctx, nodeID)
+		if err != nil {
+			continue
+		}
+
+		cc := inferCountryCodeFromName(node.NodeName)
+		if cc == "UN" && len(node.Tag) == 2 {
+			cc = strings.ToUpper(node.Tag)
+		}
+		isOnline := node.Enabled
+		if s, ok := serverMap[node.OriginalServer]; ok {
+			if s.IPAddress != "" {
+				if geo := cachedOrQueueGeoIPCountryCode(s.IPAddress); geo != "" {
+					cc = geo
+				}
+			}
+			isOnline = node.Enabled && (s.Status == "online" || s.Status == "connected")
+		}
+
+		tags := node.Tags
+		if len(tags) == 0 && node.Tag != "" {
+			tags = []string{node.Tag}
+		}
+
+		list = append(list, PublicNodeResponseItem{
+			ID:          node.ID,
+			Name:        node.NodeName,
+			Protocol:    node.Protocol,
+			CountryCode: cc,
+			Enabled:     node.Enabled,
+			Online:      isOnline,
+			Tags:        tags,
+			Link:        node.RawURL,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"nodes":   list,
+	})
+}
+

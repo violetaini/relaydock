@@ -259,7 +259,7 @@ type ghRelease struct {
 }
 
 func fetchLatestRelease(ctx context.Context) (*ghRelease, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest", nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/chitanda-project/chitanda/releases?per_page=20", nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "relaydock-speedtest")
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
@@ -270,9 +270,23 @@ func fetchLatestRelease(ctx context.Context) (*ghRelease, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("查询 mihomo release HTTP %d", resp.StatusCode)
 	}
-	var rel ghRelease
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
 		return nil, err
 	}
-	return &rel, nil
+	var rel ghRelease
+	if err := json.Unmarshal(raw, &rel); err == nil && rel.TagName != "" {
+		return &rel, nil
+	}
+	var rels []ghRelease
+	if err := json.Unmarshal(raw, &rels); err == nil {
+		for _, r := range rels {
+			for _, a := range r.Assets {
+				if strings.HasPrefix(a.Name, "mihomo-") {
+					return &r, nil
+				}
+			}
+		}
+	}
+	return nil, fmt.Errorf("未在 release 中找到有效的 mihomo 发布")
 }

@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"log"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -31,6 +32,7 @@ func registerCommands(b *bot.Bot, s *Service) {
 // setMyCommands 注册 Telegram 命令菜单(输入 / 时弹出提示)。
 // 默认作用域给所有用户看普通命令;管理员的私聊额外追加 admin 命令。
 func (s *Service) setMyCommands(ctx context.Context, b *bot.Bot) error {
+	log.Printf("[TGBOT] Starting setMyCommands (admins: %v)...", s.cfg.AdminTGIDs)
 	userCmds := []models.BotCommand{
 		{Command: "start", Description: "用邀请码注册或绑定账号"},
 		{Command: "me", Description: "我的账号信息"},
@@ -58,7 +60,7 @@ func (s *Service) setMyCommands(ctx context.Context, b *bot.Bot) error {
 			Commands: adminCmds,
 			Scope:    &models.BotCommandScopeChat{ChatID: id},
 		}); err != nil {
-			return err
+			log.Printf("[TGBOT] Warning: SetMyCommands for admin %d (chat may not exist yet): %v", id, err)
 		}
 	}
 	return nil

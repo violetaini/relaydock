@@ -3,23 +3,30 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#f4f6f8" />
-    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#0a0e1a" />
+    <meta name="color-scheme" content="dark light" />
     <link id="app-favicon" rel="icon" type="image/png" href="/brand.png" sizes="32x32" />
     <title>RelayDock Console</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background-color: #0a0e1a;
+        color: #f8fafc;
+      }
+    </style>
     <script>
       (() => {
         const saved = localStorage.getItem("arcway-theme");
-        const followsSystem = !saved || saved === "system";
-        const dark = saved === "dark" || (followsSystem && matchMedia("(prefers-color-scheme: dark)").matches);
+        const dark = saved !== "light";
         document.documentElement.dataset.theme = dark ? "dark" : "light";
         const serverStyle = document.documentElement.dataset.serverTheme;
         document.documentElement.dataset.styleTheme = ["flat", "pixel", "anime"].includes(serverStyle) ? serverStyle : "flat";
       })();
     </script>
-    <script type="module" crossorigin src="/assets/index-CgcCukfw.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/ui-DddROn7I.js">
-    <link rel="stylesheet" crossorigin href="/assets/index-B5CEOIid.css">
+    <script type="module" crossorigin src="/assets/index-DXrww_kp.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/ui-vfMDX2xq.js">
+    <link rel="stylesheet" crossorigin href="/assets/index-Dh7jBPWD.css">
   </head>
   <body>
     <div id="root"></div>

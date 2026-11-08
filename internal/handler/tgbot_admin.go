@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"regexp"
 	"sort"
@@ -541,8 +542,7 @@ func (h *TGBotAPIHandler) bindAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if boundTG := h.repo.GetTelegramIDByUsername(ctx, adminUser); boundTG != 0 && boundTG != body.TelegramID {
-		writeJSONError(w, http.StatusConflict, "管理员账号已绑定其它 Telegram,请先在网页端解绑")
-		return
+		log.Printf("[TGBOT] 管理员账号重新绑定到新的 Telegram ID: admin=%s, old_tg=%d, new_tg=%d", adminUser, boundTG, body.TelegramID)
 	}
 	if err := h.repo.BindTelegram(ctx, adminUser, body.TelegramID, body.TelegramHandle); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "绑定失败: "+err.Error())

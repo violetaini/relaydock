@@ -44,3 +44,8 @@ go.work.sum
 *.swo
 
 # internal/web/dist is intentionally versioned: Go embeds it at compile time.
+
+bin/
+server_arm64
+server-linux-*
+relaydock-linux-*

@@ -301,6 +301,8 @@ func validateUserManagedStreamProfile(inbound map[string]interface{}, protocol, 
 		validProfile = network == "tcp" && (security == "tls" || security == "reality") || network == "grpc" && security == "tls" || network == "ws" && security == "none"
 	case "hysteria":
 		validProfile = network == "hysteria" && security == "tls"
+	case "chitanda":
+		validProfile = (network == "tcp" || network == "") && (security == "tls" || security == "none")
 	}
 	if !validProfile {
 		return fmt.Errorf("%w: unsupported protocol, transport, and security combination", storage.ErrManagedInvalidArgument)
@@ -346,8 +348,15 @@ func validateUserManagedStreamProfile(inbound map[string]interface{}, protocol, 
 			expectedALPN = []string{"h2"}
 		} else if network == "hysteria" {
 			expectedALPN = []string{"h3"}
+		} else if protocol == "chitanda" {
+			expectedALPN = nil
+			if !exactUserManagedStringArray(tls["alpn"], "h2", "http/1.1") &&
+				!exactUserManagedStringArray(tls["alpn"], "h3") &&
+				!exactUserManagedStringArray(tls["alpn"], "h2", "h3", "http/1.1") {
+				return fmt.Errorf("%w: invalid TLS ALPN for transport", storage.ErrManagedInvalidArgument)
+			}
 		}
-		if !exactUserManagedStringArray(tls["alpn"], expectedALPN...) {
+		if expectedALPN != nil && !exactUserManagedStringArray(tls["alpn"], expectedALPN...) {
 			return fmt.Errorf("%w: invalid TLS ALPN for transport", storage.ErrManagedInvalidArgument)
 		}
 	}
@@ -449,7 +458,7 @@ func validateUserManagedInboundShape(request map[string]interface{}) (map[string
 		return nil, nil, "", "", fmt.Errorf("%w: invalid inbound tag", storage.ErrManagedInvalidArgument)
 	}
 	switch protocol {
-	case "vless", "vmess", "trojan", "shadowsocks", "hysteria", "socks", "http":
+	case "vless", "vmess", "trojan", "shadowsocks", "hysteria", "socks", "http", "chitanda":
 	default:
 		return nil, nil, "", "", fmt.Errorf("%w: unsupported inbound protocol", storage.ErrManagedInvalidArgument)
 	}
@@ -518,6 +527,13 @@ func validateUserManagedInboundShape(request map[string]interface{}) (map[string
 	case "http":
 		if err = validateUserManagedObjectKeys(settings, "settings", "accounts", "allowTransparent"); err == nil {
 			credential, err = validateUserManagedCredentialPlaceholder(settings, "accounts", "user", "pass")
+		}
+	case "chitanda":
+		if err = validateUserManagedObjectKeys(settings, "settings", "psk", "path", "transport", "fallback", "server_id", "strict_sni", "replay_file"); err == nil {
+			psk := wireGuardStringValue(settings["psk"])
+			if len(psk) < 8 {
+				err = fmt.Errorf("%w: chitanda psk too short", storage.ErrManagedInvalidArgument)
+			}
 		}
 		if transparent, valid := settings["allowTransparent"].(bool); err == nil && (!valid || transparent) {
 			err = fmt.Errorf("%w: transparent HTTP proxy is not allowed", storage.ErrManagedInvalidArgument)

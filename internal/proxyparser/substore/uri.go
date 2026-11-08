@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -316,6 +317,8 @@ func (p *URIProducer) Produce(proxies []Proxy, outputType string, opts *ProduceO
 			uri, err = p.encodeNaive(proxy)
 		case "mieru":
 			uri, err = p.encodeMieru(proxy)
+		case "chitanda":
+			uri, err = p.encodeChitanda(proxy)
 		default:
 			// Skip unsupported proxy types instead of returning error
 			continue
@@ -1464,5 +1467,57 @@ func (p *URIProducer) encodeMieru(proxy Proxy) (string, error) {
 
 	uri := fmt.Sprintf("mieru://%s@%s/?%s", auth, serverPart, params.Encode())
 	uri += "#" + url.PathEscape(name)
+	return uri, nil
+}
+
+func (p *URIProducer) encodeChitanda(proxy Proxy) (string, error) {
+	name := GetString(proxy, "name")
+	server := GetString(proxy, "server")
+	port := GetInt(proxy, "port")
+	psk := GetString(proxy, "psk")
+	if psk == "" {
+		psk = GetString(proxy, "password")
+	}
+
+	if server == "" || port == 0 || psk == "" {
+		return "", fmt.Errorf("invalid chitanda proxy: missing server, port, or psk")
+	}
+
+	params := url.Values{}
+	transport := strings.ToLower(strings.TrimSpace(GetString(proxy, "transport")))
+	if transport == "" {
+		transport = "h2"
+	}
+	params.Set("transport", transport)
+
+	if path := GetString(proxy, "path"); path != "" {
+		params.Set("path", path)
+	}
+	if sni := GetString(proxy, "sni"); sni != "" {
+		params.Set("sni", sni)
+	}
+	if serverID := GetString(proxy, "server-id"); serverID != "" {
+		params.Set("server-id", serverID)
+	}
+	if poolSize := GetInt(proxy, "pool-size"); poolSize > 0 {
+		params.Set("pool-size", strconv.Itoa(poolSize))
+	}
+	if udpPoolSize := GetInt(proxy, "udp-pool-size"); udpPoolSize > 0 {
+		params.Set("udp-pool-size", strconv.Itoa(udpPoolSize))
+	}
+	if IsPresent(proxy, "udp") {
+		params.Set("udp", strconv.FormatBool(GetBool(proxy, "udp")))
+	}
+	if GetBool(proxy, "skip-cert-verify") {
+		params.Set("skip-cert-verify", "true")
+	}
+
+	query := params.Encode()
+	var uri string
+	if query != "" {
+		uri = fmt.Sprintf("chitanda://%s@%s:%d?%s#%s", url.QueryEscape(psk), server, port, query, uriEncodeComponent(name))
+	} else {
+		uri = fmt.Sprintf("chitanda://%s@%s:%d#%s", url.QueryEscape(psk), server, port, uriEncodeComponent(name))
+	}
 	return uri, nil
 }

@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"log"
 	"strings"
 	"time"
 
@@ -32,6 +33,10 @@ func (s *Service) authorizeUpdate(next bot.HandlerFunc) bot.HandlerFunc {
 			return
 		}
 
+		if update.Message != nil && update.Message.From != nil {
+			log.Printf("[TGBOT] 收到 Telegram 私聊消息 (ID=%d @%s): %q", tgID, update.Message.From.Username, update.Message.Text)
+		}
+
 		if s.cfg.IsAdmin(tgID) {
 			next(ctx, b, update)
 			return
@@ -39,6 +44,11 @@ func (s *Service) authorizeUpdate(next bot.HandlerFunc) bot.HandlerFunc {
 
 		if update.Message != nil {
 			if _, ok := startInviteCode(update.Message.Text); ok {
+				next(ctx, b, update)
+				return
+			}
+			cmd, args, isCmd := telegramCommand(update.Message.Text)
+			if isCmd && cmd == "start" && len(args) == 0 {
 				next(ctx, b, update)
 				return
 			}
@@ -50,6 +60,7 @@ func (s *Service) authorizeUpdate(next bot.HandlerFunc) bot.HandlerFunc {
 
 		info, err := s.client.UserByTG(ctx, tgID)
 		if err != nil || !info.Bound {
+			log.Printf("[TGBOT] 未绑定访客 (ID=%d) 发送非 /start 命令, 静默忽略防探测", tgID)
 			return
 		}
 		next(ctx, b, update)

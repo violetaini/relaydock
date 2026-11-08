@@ -406,3 +406,27 @@ func TestURIHysteria(t *testing.T) {
 	mustContain(t, uri, "alpn=h3")
 	mustContain(t, uri, "#hy%20node")
 }
+
+func TestURIChitanda(t *testing.T) {
+	proxy := Proxy{
+		"type":             "chitanda",
+		"name":             "Chitanda Tokyo",
+		"server":           "168.138.209.1",
+		"port":             11322,
+		"psk":              "my-secret-key-12345",
+		"transport":        "h2",
+		"path":             "/assets/sync.bin",
+		"sni":              "status.chitanda.org",
+		"udp":              true,
+		"skip-cert-verify": false,
+	}
+	uri := produceURI(t, proxy)
+	if !strings.HasPrefix(uri, "chitanda://") {
+		t.Fatalf("expected chitanda:// prefix, got: %s", uri)
+	}
+	mustContain(t, uri, "my-secret-key-12345@168.138.209.1:11322")
+	mustContain(t, uri, "transport=h2")
+	mustContain(t, uri, "path=%2Fassets%2Fsync.bin")
+	mustContain(t, uri, "sni=status.chitanda.org")
+	mustContain(t, uri, "#Chitanda%20Tokyo")
+}

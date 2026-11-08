@@ -298,7 +298,7 @@ function renderAnnouncements(list){
  return h;
 }
 function renderHome(d){
- if(d.bound===false)return renderAnnouncements(d.announcements)+renderRegister();
+ if(d.bound===false){if(d.is_admin)return renderAnnouncements(d.announcements)+'<div class="card"><div class="title">管理员工作台</div><div class="muted">当前 Telegram 已认证为管理员。您可点击下方「状态」、「邀请码」和「用户管理」进行运维。</div></div>'+renderRedeem();return renderAnnouncements(d.announcements)+renderRegister();}
  var h=renderAnnouncements(d.announcements),a=d.account||{};
  h+='<div class="card"><div class="row" style="margin:0"><span style="font-size:17px;font-weight:600">'+esc(a.username)+'</span><span class="muted">'+(a.role==="admin"?"管理员":"用户")+(a.is_active?"":" · 已停用")+'</span></div>';
  if(a.email)h+='<div class="muted" style="margin-top:3px">'+esc(a.email)+'</div>';
@@ -392,7 +392,7 @@ function render(d){
  document.getElementById("view-home").innerHTML=renderHome(d);
  document.getElementById("view-traffic").innerHTML=renderTraffic(d);
  document.getElementById("view-status").innerHTML=renderStatus(d);
- if(d.bound!==false)document.getElementById("nav").classList.remove("hide");
+ if(d.bound!==false||d.is_admin)document.getElementById("nav").classList.remove("hide");
  if(d.is_admin){document.getElementById("nav-invites").classList.remove("hide");document.getElementById("nav-users").classList.remove("hide");}
 }
 

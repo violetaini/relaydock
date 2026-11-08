@@ -475,6 +475,7 @@ func main() {
 	mux.Handle("/api/user/2fa/disable", auth.RequireToken(tokenStore, userRepo, handler.NewTwoFactorDisableHandler(authManager, repo)))
 	mux.Handle("/api/user/password", auth.RequireToken(tokenStore, userRepo, handler.NewPasswordHandler(authManager, tokenStore, repo, twoFactorStore)))
 	mux.Handle("/api/user/profile", auth.RequireToken(tokenStore, userRepo, handler.NewProfileHandler(repo)))
+	mux.Handle("/api/user/portal-summary", auth.RequireToken(tokenStore, userRepo, handler.NewPortalSummaryHandler(repo)))
 	mux.Handle("/api/user/config", auth.RequireToken(tokenStore, userRepo, handler.NewUserConfigHandler(repo)))
 	mux.Handle("/api/user/token", auth.RequireToken(tokenStore, userRepo, handler.NewUserTokenHandler(repo)))
 	// 代理集合(Clash proxy-provider)配置 — 用户自己 CRUD;handler 内做 username 隔离
@@ -494,7 +495,20 @@ func main() {
 	mux.Handle("/api/traffic/summary", auth.RequireToken(tokenStore, userRepo, trafficHandler))
 	mux.Handle("/api/traffic/summary/aggregated", auth.RequireToken(tokenStore, userRepo, trafficHandler))
 	mux.Handle("/api/subscriptions", auth.RequireToken(tokenStore, userRepo, handler.NewSubscriptionListHandler(repo)))
-	mux.Handle("/api/user/package-subscribe", auth.RequireToken(tokenStore, userRepo, packageSubscribeHandler))
+	packageSubWrapper := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if queryToken := strings.TrimSpace(r.URL.Query().Get("token")); queryToken != "" {
+			if un, err := repo.ValidateUserToken(r.Context(), queryToken); err == nil && un != "" {
+				user, uerr := repo.GetUser(r.Context(), un)
+				if uerr == nil && user.IsActive {
+					ctx := auth.ContextWithUsername(r.Context(), un)
+					packageSubscribeHandler.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
+			}
+		}
+		auth.RequireToken(tokenStore, userRepo, packageSubscribeHandler).ServeHTTP(w, r)
+	})
+	mux.Handle("/api/user/package-subscribe", packageSubWrapper)
 	mux.Handle("/api/dns/resolve", auth.RequireToken(tokenStore, userRepo, handler.NewDNSHandler()))
 	mux.Handle("/api/subscribe-files", auth.RequireToken(tokenStore, userRepo, handler.NewSubscribeFilesListHandler(repo)))
 	mux.Handle("/api/clash/subscribe", handler.NewSubscriptionEndpoint(tokenStore, repo, subscribeDir))
@@ -735,6 +749,7 @@ func main() {
 	// 用户节点管理（普通用户查看套餐节点、管理自己的出站）
 	userNodesHandler := handler.NewUserNodesHandler(repo, remoteManageHandler)
 	mux.Handle("/api/user/nodes", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(userNodesHandler.HandleListNodes)))
+	mux.Handle("/api/user/nodes/public", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(userNodesHandler.HandlePublicNodes)))
 	mux.Handle("/api/user/nodes/outbound", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(userNodesHandler.HandleOutbound)))
 	mux.Handle("/api/user/nodes/outbounds", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(userNodesHandler.HandleListOutbounds)))
 
@@ -759,6 +774,14 @@ func main() {
 	mux.Handle("/api/admin/migrate/distinct-node-servers", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.DistinctNodeServers)))
 	mux.Handle("/api/admin/migrate/patch-client-emails", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.PatchClientEmails)))
 	mux.Handle("/api/admin/migrate/takeover-external-xray", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(migrateHandler.TakeoverExternalXray)))
+
+	// 3x-ui 深度评估、预检审计与平滑导入接管
+	xuiMigrateHandler := handler.NewXUIMigrateHandler(repo, remoteManageHandler)
+	mux.Handle("/api/admin/migrate/xui/upload", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xuiMigrateHandler.Upload)))
+	mux.Handle("/api/admin/migrate/xui/inspect", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xuiMigrateHandler.Inspect)))
+	mux.Handle("/api/admin/migrate/xui/import", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xuiMigrateHandler.Import)))
+	mux.Handle("/api/admin/migrate/xui/detect", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xuiMigrateHandler.DetectRemote)))
+	mux.Handle("/api/admin/remote-servers/xui/detect", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xuiMigrateHandler.DetectRemote)))
 
 	// 初始化事件系统以进行入站同步
 	eventBus := event.GetBus()

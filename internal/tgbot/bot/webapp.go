@@ -222,6 +222,34 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !info.Bound {
+			if s.cfg.IsAdmin(tgID) {
+				adminResp := map[string]any{
+					"bound":          false,
+					"is_admin":       true,
+					"account":        map[string]any{"username": handle, "role": "admin", "is_active": true},
+					"history":        []any{},
+					"nodes":          []any{},
+					"subscriptions":  []any{},
+					"traffic_period": "month",
+				}
+				serverStatuses := []map[string]any{}
+				if servers, err := s.client.RemoteServers(ctx); err == nil {
+					for _, server := range servers {
+						status := "offline"
+						if strings.EqualFold(strings.TrimSpace(server.Status), "connected") {
+							status = "online"
+						}
+						serverStatuses = append(serverStatuses, map[string]any{
+							"id": server.ID, "name": server.Name, "status": status,
+							"xray_running": server.XrayRunning,
+						})
+					}
+				}
+				adminResp["node_status"] = serverStatuses
+				adminResp["status_kind"] = "server"
+				writeJSONResp(w, http.StatusOK, adminResp)
+				return
+			}
 			writeJSONResp(w, http.StatusOK, map[string]any{"bound": false})
 			return
 		}

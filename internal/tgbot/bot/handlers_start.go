@@ -40,22 +40,34 @@ func (s *Service) handleStart(ctx context.Context, b *bot.Bot, update *models.Up
 
 	// A 无 code
 	if len(args) == 0 {
-		if !knownUser {
-			return
-		}
 		if info != nil && info.Bound {
 			_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
 				ChatID: chatID,
-				Text: fmt.Sprintf("已绑定账号:%s\n\n常用:/me /sub /traffic /nodes /unbind /help",
+				Text: fmt.Sprintf("已绑定账号: %s\n\n常用: /me /sub /traffic /nodes /unbind /help",
 					info.Username),
 			})
 			return
 		}
-		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text: "欢迎使用 Arcway。\n" +
-				"本系统仅接受邀请码注册/绑定。请联系管理员要邀请码后用 /start <code>。",
-		})
+		if s.cfg.IsAdmin(tgID) {
+			_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
+				ChatID: chatID,
+				Text: fmt.Sprintf("您已作为管理员登录 RelayDock。\n\n您的 Telegram ID: %d\n常用管理命令: /admin_invite /admin_user /announce /help", tgID),
+			})
+			return
+		}
+		if b != nil {
+			_, _ = b.SendMessage(ctx, &bot.SendMessageParams{
+				ChatID:    chatID,
+				ParseMode: models.ParseModeHTML,
+				Text: fmt.Sprintf(
+					"👋 <b>欢迎使用 RelayDock</b>\n\n" +
+						"您的 Telegram ID: <code>%d</code> (点击可复制)\n\n" +
+						"• <b>如果您是管理员</b>：请在面板「系统设置 -> Telegram Bot」中将该 ID 添加到「管理员 Telegram ID」保存。\n" +
+						"• <b>如果您是普通用户</b>：请向管理员获取邀请码后，使用 <code>/start &lt;邀请码&gt;</code> 进行注册或绑定。",
+					tgID,
+				),
+			})
+		}
 		return
 	}
 

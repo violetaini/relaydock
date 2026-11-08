@@ -417,7 +417,7 @@ func (h *ChildManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.Re
 	log.Printf("[Child Manage] Installing Xray...")
 
 	// 运行 xray 安装脚本
-	cmd := exec.Command("bash", "-c", "bash -c \"$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\" @ install")
+	cmd := exec.Command("bash", "-c", "t=$(mktemp); curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh -o $t && sed -i 's|XTLS/Xray-core|chitanda-project/chitanda|g' $t && bash $t install; rm -f $t")
 	cmd.Env = os.Environ()
 
 	var stdout, stderr bytes.Buffer

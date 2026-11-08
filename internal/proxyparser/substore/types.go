@@ -40,6 +40,7 @@ const (
 	ProxyTypeHTTP         = "http"
 	ProxyTypeSOCKS5       = "socks5"
 	ProxyTypeSnell        = "snell"
+	ProxyTypeChitanda     = "chitanda"
 )
 
 // Common network types

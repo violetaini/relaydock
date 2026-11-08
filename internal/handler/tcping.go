@@ -256,6 +256,21 @@ func (h *tcpingHandler) probeResolved(ctx context.Context, resolved []resolvedTC
 			responses[index] = TCPingResponse{Error: item.resolveError, Probe: "mihomo_url_test"}
 			continue
 		}
+		protocol := canonicalProbeProtocol(item.node.Protocol)
+		if isDirectTCPProbeProtocol(protocol) {
+			timeout := normalizedTCPingTimeout(item.request.Timeout)
+			addr := net.JoinHostPort(item.request.Host, strconv.Itoa(item.request.Port))
+			start := time.Now()
+			conn, dialErr := net.DialTimeout("tcp", addr, timeout)
+			if dialErr != nil {
+				responses[index] = TCPingResponse{Error: dialErr.Error(), Probe: "tcp_ping"}
+			} else {
+				latency := float64(time.Since(start).Milliseconds())
+				_ = conn.Close()
+				responses[index] = TCPingResponse{Success: true, Latency: latency, Probe: "tcp_ping"}
+			}
+			continue
+		}
 		target, err := h.prepareMihomoLatencyTarget(ctx, item, wireGuardCache)
 		if err != nil {
 			responses[index] = TCPingResponse{Error: err.Error(), Probe: "mihomo_url_test"}
@@ -346,6 +361,10 @@ func (h *tcpingHandler) mihomoProbeConfigForNode(ctx context.Context, node stora
 	}
 	if canonicalProbeProtocolFamily(node.Protocol) != canonicalProbeProtocolFamily(configProtocol) {
 		return "", false, fmt.Errorf("节点 %d 的协议与 Mihomo 配置不一致", node.ID)
+	}
+	if canonicalProbeProtocol(configProtocol) == "chitanda" {
+		config = ensureChitandaProbeConfig(config)
+		return config, false, nil
 	}
 	if canonicalProbeProtocol(configProtocol) != "wireguard" {
 		return config, false, nil
@@ -1144,4 +1163,29 @@ func buildWireGuardMihomoProbeConfig(raw string, peer *storage.WireGuardProbePee
 		return "", errors.New("无法生成 WireGuard Mihomo 探测配置")
 	}
 	return string(encoded), nil
+}
+
+func isDirectTCPProbeProtocol(protocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "dokodemo-door", "dokodemo", "forward", "tcp":
+		return true
+	default:
+		return false
+	}
+}
+
+func ensureChitandaProbeConfig(config string) string {
+	var proxy map[string]interface{}
+	if err := json.Unmarshal([]byte(config), &proxy); err != nil || proxy == nil {
+		return config
+	}
+	proxy["skip-cert-verify"] = true
+	if path, ok := proxy["path"].(string); !ok || strings.TrimSpace(path) == "" {
+		proxy["path"] = "/api/v1/sync"
+	}
+	raw, err := json.Marshal(proxy)
+	if err != nil {
+		return config
+	}
+	return string(raw)
 }

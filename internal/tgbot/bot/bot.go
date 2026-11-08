@@ -4,8 +4,11 @@ package bot
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,8 +65,30 @@ func (s *Service) Start(parent context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	dialer := &net.Dialer{
+		Timeout:   15 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if strings.HasPrefix(network, "tcp") {
+				network = "tcp4"
+			}
+			return dialer.DialContext(ctx, network, addr)
+		},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	httpClient := &http.Client{
+		Transport: transport,
+	}
+
 	b, err := bot.New(
 		s.cfg.TGBotToken,
+		bot.WithHTTPClient(30*time.Second, httpClient),
 		bot.WithDefaultHandler(s.defaultHandler),
 		bot.WithMiddlewares(s.rateLimitUpdate, s.authorizeUpdate),
 		bot.WithAllowedUpdates(bot.AllowedUpdates{
@@ -96,12 +121,14 @@ func (s *Service) Start(parent context.Context) error {
 	if err := s.setMyCommands(setupCtx, b); err != nil {
 		setupCancel()
 		cancel()
-		return errors.New("Telegram Bot 命令菜单配置失败")
+		log.Printf("[arcway-tgbot] setMyCommands failed: %v", err)
+		return fmt.Errorf("Telegram Bot 命令菜单配置失败: %w", err)
 	}
 	if err := s.setMenuButton(setupCtx, b); err != nil {
 		setupCancel()
 		cancel()
-		return errors.New("Telegram Mini App 菜单配置失败")
+		log.Printf("[arcway-tgbot] setMenuButton failed: %v", err)
+		return fmt.Errorf("Telegram Mini App 菜单配置失败: %w", err)
 	}
 	setupCancel()
 

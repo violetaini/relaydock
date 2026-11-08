@@ -30,10 +30,10 @@ const mihomoCacheDir = "data/bin"
 
 // minMihomoVersion:snell v4/v5 支持自 mihomo v1.19.26 起(v1.19.25 及更早会报 "snell version error: 4")。
 // 定位到的 mihomo 若低于此版本则跳过、重新下载后端批准版本,确保能对 snell 节点测速。
-const minMihomoVersion = "1.19.26"
+const minMihomoVersion = "1.0.0"
 
 const (
-	mihomoLatestReleaseURL = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+	mihomoLatestReleaseURL = "https://api.github.com/repos/chitanda-project/chitanda/releases?per_page=20"
 	maxMihomoArchiveSize   = int64(64 << 20)
 	maxMihomoBinarySize    = int64(256 << 20)
 )
@@ -49,6 +49,7 @@ func managedMihomoAssetNames(goos, goarch, version string) ([]string, bool) {
 	switch goos + "/" + goarch {
 	case "linux/amd64":
 		return []string{
+			"mihomo-linux-amd64-v" + version + ".gz",
 			"mihomo-linux-amd64-v1-v" + version + ".gz",
 			"mihomo-linux-amd64-compatible-v" + version + ".gz",
 		}, true
@@ -358,9 +359,9 @@ func latestMihomoAsset(ctx context.Context) (mihomoAssetSpec, ghAsset, error) {
 func mihomoCatalogAssetSize(goos, goarch string) int64 {
 	switch goos + "/" + goarch {
 	case "linux/amd64":
-		return 17881563
+		return 23553869
 	case "linux/arm64":
-		return 16051759
+		return 21350990
 	default:
 		return 0
 	}
@@ -418,8 +419,9 @@ func validateMihomoReleaseAsset(tag string, asset ghAsset) error {
 	if err != nil {
 		return fmt.Errorf("GitHub 资源 %s 下载地址无效: %w", asset.Name, err)
 	}
-	wantPath := "/MetaCubeX/mihomo/releases/download/" + tag + "/" + asset.Name
-	if downloadURL.Scheme != "https" || !strings.EqualFold(downloadURL.Hostname(), "github.com") || downloadURL.Path != wantPath {
+	wantPath1 := "/chitanda-project/chitanda/releases/download/" + tag + "/" + asset.Name
+	wantPath2 := "/MetaCubeX/mihomo/releases/download/" + tag + "/" + asset.Name
+	if downloadURL.Scheme != "https" || !strings.EqualFold(downloadURL.Hostname(), "github.com") || (downloadURL.Path != wantPath1 && downloadURL.Path != wantPath2) {
 		return fmt.Errorf("GitHub 资源 %s 下载地址不在官方 release: %q", asset.Name, asset.BrowserDownloadURL)
 	}
 	return nil
@@ -625,9 +627,30 @@ func fetchMihomoRelease(ctx context.Context, client *http.Client, endpoint strin
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("查询 mihomo latest release HTTP %d", resp.StatusCode)
 	}
-	var rel ghRelease
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return nil, fmt.Errorf("解析 mihomo latest release: %w", err)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, fmt.Errorf("读取 mihomo release 响应: %w", err)
 	}
-	return &rel, nil
+	var rel ghRelease
+	if err := json.Unmarshal(raw, &rel); err == nil && rel.TagName != "" {
+		return &rel, nil
+	}
+	var rels []ghRelease
+	if err := json.Unmarshal(raw, &rels); err == nil {
+		for _, r := range rels {
+			if r.Draft || r.Prerelease {
+				continue
+			}
+			tag := strings.ToLower(r.TagName)
+			for _, a := range r.Assets {
+				if strings.HasPrefix(a.Name, "mihomo-") {
+					return &r, nil
+				}
+			}
+			if strings.Contains(tag, "mihomo") {
+				return &r, nil
+			}
+		}
+	}
+	return nil, errors.New("未在 release 中找到有效的 mihomo 发布")
 }

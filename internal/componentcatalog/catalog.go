@@ -13,7 +13,7 @@ import (
 
 const (
 	githubReleaseRoot = "https://github.com/violetaini/relaydock/releases/download"
-	mihomoVersion     = "1.19.29"
+	mihomoVersion     = "1.19.33"
 	OoklaVersion      = "1.2.0"
 )
 
@@ -25,7 +25,7 @@ type Asset struct {
 	SHA256  string
 }
 
-// Mihomo returns the exact MetaCubeX artifact approved by this backend build.
+// Mihomo returns the exact Chitanda artifact approved by this backend build.
 // The source URLs and archive hashes are copied from the upstream GitHub
 // release metadata when this catalog is updated.
 func Mihomo(goos, goarch string) (Asset, bool) {
@@ -33,16 +33,16 @@ func Mihomo(goos, goarch string) (Asset, bool) {
 	case "linux/amd64":
 		return Asset{
 			Version: mihomoVersion,
-			Name:    "mihomo-linux-amd64-compatible-v1.19.29.gz",
-			URL:     "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.29/mihomo-linux-amd64-compatible-v1.19.29.gz",
-			SHA256:  "5612e698e96c8b8ad15abc4c0a4f098eba9234354b4f248cb97f2528e215b094",
+			Name:    "mihomo-linux-amd64-v1.19.33.gz",
+			URL:     "https://github.com/chitanda-project/chitanda/releases/download/v1.19.33/mihomo-linux-amd64-v1.19.33.gz",
+			SHA256:  "e5907094b18f183188f015ea7ee15479e128d82f27f6d5cfc41f52a2d17aa879",
 		}, true
 	case "linux/arm64":
 		return Asset{
 			Version: mihomoVersion,
-			Name:    "mihomo-linux-arm64-v1.19.29.gz",
-			URL:     "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.29/mihomo-linux-arm64-v1.19.29.gz",
-			SHA256:  "9a868b5e4e0ad91d9d71e1b41b0cfce78aaba44360c30df74a723f8e3926a86c",
+			Name:    "mihomo-linux-arm64-v1.19.33.gz",
+			URL:     "https://github.com/chitanda-project/chitanda/releases/download/v1.19.33/mihomo-linux-arm64-v1.19.33.gz",
+			SHA256:  "5637ab861c10385975ab8a96802c42d9356a0e16c996dfc36a44e16a04965fc8",
 		}, true
 	default:
 		return Asset{}, false

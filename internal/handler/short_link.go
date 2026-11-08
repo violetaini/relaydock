@@ -84,6 +84,17 @@ func (h *shortLinkHandler) TryServe(w http.ResponseWriter, r *http.Request) bool
 	if err != nil || len(userCodes) == 0 {
 		return false
 	}
+
+	// 直接用户短码匹配：若 code 就是该用户的 user_short_code 且用户具有有效套餐
+	if un, uOk := userCodes[code]; uOk && un != "" {
+	if u, err := h.repo.GetUser(ctx, un); err == nil && u.PackageID > 0 && h.packageHandler != nil {
+		newCtx := auth.ContextWithUsername(ctx, un)
+		newRequest := r.Clone(newCtx)
+		h.packageHandler.ServeHTTP(w, newRequest)
+		return true
+	}
+	}
+
 	packageCodes, _ := h.repo.GetAllPackageShortCodes(ctx)
 
 	if len(fileCodes) == 0 && len(packageCodes) == 0 {

@@ -5359,7 +5359,7 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 	// dokodemo-door 是端口转发,本来就没 clients/users/accounts。这几个协议允许 client == nil 继续走下游 case 分支。
 	// 历史 bug:只放过 shadowsocks → 无认证 SOCKS5 入站扫描时这里报 "no client/account found",
 	// syncInboundsToNodes SkippedCount++ → 节点不进 DB → UI 节点列表看不到 + 无法删除。
-	noClientProtocols := map[string]bool{"shadowsocks": true, "socks": true, "http": true, "dokodemo-door": true}
+	noClientProtocols := map[string]bool{"shadowsocks": true, "socks": true, "http": true, "dokodemo-door": true, "chitanda": true}
 	if client == nil && !noClientProtocols[protocol] {
 		return nil, fmt.Errorf("no client/account found")
 	}
@@ -5545,6 +5545,54 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 				obfsOpts["host"] = obfsHost
 			}
 			proxy["obfs-opts"] = obfsOpts
+		}
+
+	case "chitanda":
+		proxy["type"] = "chitanda"
+		if psk, ok := settings["psk"].(string); ok {
+			proxy["psk"] = psk
+		}
+		transport := "h2"
+		if t, ok := settings["transport"].(string); ok && t != "" {
+			transport = t
+		}
+		proxy["transport"] = transport
+		proxy["udp"] = true
+
+		if transport == "stream" {
+			// RawStream: no path, no sni, no tls
+			delete(proxy, "sni")
+			delete(proxy, "servername")
+			if sid, ok := settings["server_id"].(string); ok && sid != "" {
+				proxy["server-id"] = sid
+			}
+		} else if transport == "h1" {
+			// H1: pure IP HTTP/1.1, has path, no sni, no tls
+			delete(proxy, "sni")
+			delete(proxy, "servername")
+			if path, ok := settings["path"].(string); ok && path != "" {
+				proxy["path"] = path
+			} else {
+				proxy["path"] = "/api/v1/sync"
+			}
+		} else {
+			// h2, h3, auto: requires TLS
+			if path, ok := settings["path"].(string); ok && path != "" {
+				proxy["path"] = path
+			} else {
+				proxy["path"] = "/api/v1/sync"
+			}
+			if err := h.addStreamSettings(proxy, streamSettings); err != nil {
+				return nil, err
+			}
+			if sni, ok := proxy["servername"].(string); ok && sni != "" {
+				proxy["sni"] = sni
+			}
+			if proxy["sni"] == nil || proxy["sni"] == "" {
+				if serverHost != "" && net.ParseIP(serverHost) == nil {
+					proxy["sni"] = serverHost
+				}
+			}
 		}
 
 	default:

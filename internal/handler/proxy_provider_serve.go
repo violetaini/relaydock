@@ -2,6 +2,7 @@ package handler
 
 import (
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -230,15 +231,10 @@ func getGeoIPCountryCode(ipOrHost string) string {
 	if ipOrHost == "" {
 		return ""
 	}
-	token := strings.TrimSpace(os.Getenv("ARCWAY_IPINFO_TOKEN"))
-	if token == "" {
-		return ""
-	}
 
 	// 如果是域名，先解析为 IP
 	ip := ipOrHost
 	if net.ParseIP(ipOrHost) == nil {
-		// 是域名，需要解析
 		ips, err := net.LookupIP(ipOrHost)
 		if err != nil || len(ips) == 0 {
 			logger.Info("[GeoIP] 域名解析失败", "domain", ipOrHost, "error", err)
@@ -249,44 +245,69 @@ func getGeoIPCountryCode(ipOrHost string) string {
 
 	// 检查缓存
 	if cached, ok := geoIPCache.Load(ip); ok {
-		return cached.(string)
+		if s, ok := cached.(string); ok {
+			return s
+		}
 	}
 
-	// 查询 API
-	resp, err := geoIPHTTPClient.Get(fmt.Sprintf("https://api.ipinfo.io/lite/%s?token=%s", url.PathEscape(ip), url.QueryEscape(token)))
-	if err != nil {
-		logger.Info("[GeoIP] IP查询失败", "ip", ip, "error", sanitizeSubscriptionRequestError(err))
-		// 缓存空结果避免重复查询
-		geoIPCache.Store(ip, "")
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		logger.Info("[GeoIP] 查询返回非成功状态", "ip", ip, "status", resp.StatusCode)
-		geoIPCache.Store(ip, "")
-		return ""
-	}
-
-	var result geoIPResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		logger.Info("[GeoIP] 响应解析失败", "ip", ip, "error", err)
-		geoIPCache.Store(ip, "")
-		return ""
+	token := strings.TrimSpace(os.Getenv("ARCWAY_IPINFO_TOKEN"))
+	if token != "" {
+		resp, err := geoIPHTTPClient.Get(fmt.Sprintf("https://api.ipinfo.io/lite/%s?token=%s", url.PathEscape(ip), url.QueryEscape(token)))
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var result geoIPResponse
+				if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && result.CountryCode != "" {
+					countryCode := strings.ToUpper(strings.TrimSpace(result.CountryCode))
+					geoIPCache.Store(ip, countryCode)
+					logger.Info("[GeoIP] IP地理位置查询成功 (ipinfo)", "ip", ip, "country", countryCode)
+					return countryCode
+				}
+			}
+		}
 	}
 
-	// 缓存结果
-	countryCode := strings.ToUpper(result.CountryCode)
-	geoIPCache.Store(ip, countryCode)
-	logger.Info("[GeoIP] IP地理位置查询成功", "ip", ip, "country", countryCode)
-	return countryCode
+	// 优先回退到 api.ip.sb
+	req, reqErr := http.NewRequestWithContext(context.Background(), "GET", fmt.Sprintf("https://api.ip.sb/geoip/%s", url.PathEscape(ip)), nil)
+	if reqErr == nil {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+		if sbResp, err := geoIPHTTPClient.Do(req); err == nil {
+			defer sbResp.Body.Close()
+			if sbResp.StatusCode == http.StatusOK {
+				var sbResult struct {
+					CountryCode string `json:"country_code"`
+				}
+				if json.NewDecoder(sbResp.Body).Decode(&sbResult) == nil && sbResult.CountryCode != "" {
+					countryCode := strings.ToUpper(strings.TrimSpace(sbResult.CountryCode))
+					geoIPCache.Store(ip, countryCode)
+					logger.Info("[GeoIP] IP地理位置查询成功 (api.ip.sb)", "ip", ip, "country", countryCode)
+					return countryCode
+				}
+			}
+		}
+	}
+
+	// 其次回退到 ip-api.com
+	if apiResp, err := geoIPHTTPClient.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode", url.PathEscape(ip))); err == nil {
+		defer apiResp.Body.Close()
+		if apiResp.StatusCode == http.StatusOK {
+			var apiResult struct {
+				Status      string `json:"status"`
+				CountryCode string `json:"countryCode"`
+			}
+			if json.NewDecoder(apiResp.Body).Decode(&apiResult) == nil && apiResult.Status == "success" && apiResult.CountryCode != "" {
+				countryCode := strings.ToUpper(strings.TrimSpace(apiResult.CountryCode))
+				geoIPCache.Store(ip, countryCode)
+				logger.Info("[GeoIP] IP地理位置查询成功 (ip-api)", "ip", ip, "country", countryCode)
+				return countryCode
+			}
+		}
+	}
+
+	geoIPCache.Store(ip, "")
+	return ""
 }
 
-// cachedOrQueueGeoIPCountryCode returns a cached country code immediately and
-// queues a bounded background lookup for a public literal address on a cache
-// miss. Server-management and public-probe list handlers must not wait on a
-// third-party GeoIP request. Cache hits are local-only; cache misses reject
-// private, link-local, carrier-grade NAT and documentation ranges so opening
-// a list cannot disclose an internal/test address to the GeoIP provider.
 func cachedOrQueueGeoIPCountryCode(ipAddress string) string {
 	ip := net.ParseIP(strings.TrimSpace(ipAddress))
 	if ip == nil {
@@ -294,15 +315,12 @@ func cachedOrQueueGeoIPCountryCode(ipAddress string) string {
 	}
 	key := ip.String()
 	if cached, ok := geoIPCache.Load(key); ok {
-		if countryCode, ok := cached.(string); ok {
+		if countryCode, ok := cached.(string); ok && countryCode != "" {
 			return publicCountryCode(countryCode)
 		}
 		return ""
 	}
 	if !isGeoIPLookupPublicIP(ip) {
-		return ""
-	}
-	if strings.TrimSpace(os.Getenv("ARCWAY_IPINFO_TOKEN")) == "" {
 		return ""
 	}
 	if _, loaded := geoIPLookupPending.LoadOrStore(key, struct{}{}); !loaded {

@@ -37,6 +37,21 @@ func NewProbePublicHandler(repo *storage.TrafficRepository, ws *RemoteWSHandler,
 	if len(stores) > 0 {
 		h.probeStore = stores[0]
 	}
+	if repo != nil {
+		go func() {
+			time.Sleep(1 * time.Second)
+			if servers, err := repo.ListRemoteServers(context.Background()); err == nil {
+				for _, s := range servers {
+					if s.IPAddress != "" {
+						_ = getGeoIPCountryCode(s.IPAddress)
+					}
+					if s.IPAddressV6 != "" {
+						_ = getGeoIPCountryCode(s.IPAddressV6)
+					}
+				}
+			}
+		}()
+	}
 	return h
 }
 

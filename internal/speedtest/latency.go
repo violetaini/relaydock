@@ -53,6 +53,7 @@ var supportedProtocolLatencyProxyTypes = map[string]string{
 	"snell":       "snell",
 	"ssh":         "ssh",
 	"mieru":       "mieru",
+	"chitanda":    "chitanda",
 }
 
 // ProtocolLatencyTarget is one complete Mihomo proxy object serialized as JSON.
