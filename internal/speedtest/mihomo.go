@@ -33,7 +33,8 @@ const mihomoCacheDir = "data/bin"
 const minMihomoVersion = "1.0.0"
 
 const (
-	mihomoLatestReleaseURL = "https://api.github.com/repos/MetaCubeX/mihomo/releases?per_page=30"
+	mihomoLatestReleaseURL = "https://api.github.com/repos/chitanda-project/chitanda/releases?per_page=30"
+	mihomoMirrorReleaseURL = "https://api.github.com/repos/violetaini/chitanda/releases?per_page=30"
 	maxMihomoArchiveSize   = int64(64 << 20)
 	maxMihomoBinarySize    = int64(256 << 20)
 )
@@ -262,34 +263,28 @@ func FetchMihomoReleaseVersions(ctx context.Context) ([]string, error) {
 	mihomoVersionsMu.Unlock()
 
 	client := &http.Client{Timeout: 15 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mihomoLatestReleaseURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("创建 releases 请求: %w", err)
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "relaydock-speedtest")
-	resp, err := client.Do(req)
-	if err != nil {
-		mihomoVersionsMu.Lock()
-		defer mihomoVersionsMu.Unlock()
-		if len(cachedMihomoVers) > 0 {
-			return cachedMihomoVers, nil
-		}
-		return []string{"v" + componentcatalog.MihomoVersion()}, nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		mihomoVersionsMu.Lock()
-		defer mihomoVersionsMu.Unlock()
-		if len(cachedMihomoVers) > 0 {
-			return cachedMihomoVers, nil
-		}
-		return []string{"v" + componentcatalog.MihomoVersion()}, nil
-	}
-
+	endpoints := []string{mihomoLatestReleaseURL, mihomoMirrorReleaseURL}
 	var rels []ghRelease
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&rels); err != nil {
-		return nil, fmt.Errorf("解析 releases: %w", err)
+	for _, ep := range endpoints {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "relaydock-speedtest")
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			continue
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&rels)
+		resp.Body.Close()
+		if decodeErr == nil && len(rels) > 0 {
+			break
+		}
 	}
 
 	var versions []string
@@ -351,15 +346,26 @@ func resolveMihomoVersionAsset(ctx context.Context, version string) (mihomoAsset
 
 	cleanVer := strings.TrimPrefix(version, "v")
 	tag := "v" + cleanVer
-	endpoint := fmt.Sprintf("https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/%s", tag)
+	endpoints := []string{
+		fmt.Sprintf("https://api.github.com/repos/chitanda-project/chitanda/releases/tags/%s", tag),
+		fmt.Sprintf("https://api.github.com/repos/violetaini/chitanda/releases/tags/%s", tag),
+		fmt.Sprintf("https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/%s", tag),
+	}
 	client := &http.Client{Timeout: 30 * time.Second}
-	rel, err := fetchMihomoRelease(ctx, client, endpoint)
-	if err != nil {
+	var rel *ghRelease
+	var lastErr error
+	for _, ep := range endpoints {
+		rel, lastErr = fetchMihomoRelease(ctx, client, ep)
+		if lastErr == nil && rel != nil {
+			break
+		}
+	}
+	if rel == nil {
 		catSpec, catAsset, catErr := latestMihomoAsset(ctx)
 		if catErr == nil && (catSpec.Version == cleanVer || catSpec.Tag == tag) {
 			return catSpec, catAsset, nil
 		}
-		return mihomoAssetSpec{}, ghAsset{}, fmt.Errorf("获取 Mihomo %s release 失败: %w", tag, err)
+		return mihomoAssetSpec{}, ghAsset{}, fmt.Errorf("获取 Mihomo %s release 失败: %w", tag, lastErr)
 	}
 	return resolveMihomoReleaseAsset(rel, runtime.GOOS, runtime.GOARCH)
 }
@@ -508,9 +514,9 @@ func latestMihomoAsset(ctx context.Context) (mihomoAssetSpec, ghAsset, error) {
 func mihomoCatalogAssetSize(goos, goarch string) int64 {
 	switch goos + "/" + goarch {
 	case "linux/amd64":
-		return 22893972
+		return 23553869
 	case "linux/arm64":
-		return 20824326
+		return 21350990
 	default:
 		return 0
 	}
@@ -569,8 +575,9 @@ func validateMihomoReleaseAsset(tag string, asset ghAsset) error {
 		return fmt.Errorf("GitHub 资源 %s 下载地址无效: %w", asset.Name, err)
 	}
 	wantPath1 := "/chitanda-project/chitanda/releases/download/" + tag + "/" + asset.Name
-	wantPath2 := "/MetaCubeX/mihomo/releases/download/" + tag + "/" + asset.Name
-	if downloadURL.Scheme != "https" || !strings.EqualFold(downloadURL.Hostname(), "github.com") || (downloadURL.Path != wantPath1 && downloadURL.Path != wantPath2) {
+	wantPath2 := "/violetaini/chitanda/releases/download/" + tag + "/" + asset.Name
+	wantPath3 := "/MetaCubeX/mihomo/releases/download/" + tag + "/" + asset.Name
+	if downloadURL.Scheme != "https" || !strings.EqualFold(downloadURL.Hostname(), "github.com") || (downloadURL.Path != wantPath1 && downloadURL.Path != wantPath2 && downloadURL.Path != wantPath3) {
 		return fmt.Errorf("GitHub 资源 %s 下载地址不在官方 release: %q", asset.Name, asset.BrowserDownloadURL)
 	}
 	return nil
@@ -757,7 +764,11 @@ type ghRelease struct {
 }
 
 func fetchLatestRelease(ctx context.Context) (*ghRelease, error) {
-	return fetchMihomoRelease(ctx, &http.Client{Timeout: 30 * time.Second}, mihomoLatestReleaseURL)
+	rel, err := fetchMihomoRelease(ctx, &http.Client{Timeout: 30 * time.Second}, mihomoLatestReleaseURL)
+	if err == nil && rel != nil {
+		return rel, nil
+	}
+	return fetchMihomoRelease(ctx, &http.Client{Timeout: 30 * time.Second}, mihomoMirrorReleaseURL)
 }
 
 func fetchMihomoRelease(ctx context.Context, client *http.Client, endpoint string) (*ghRelease, error) {

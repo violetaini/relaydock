@@ -30,23 +30,23 @@ type Asset struct {
 	SHA256  string
 }
 
-// Mihomo returns the exact Mihomo artifact approved by this backend build.
-// The source URLs and archive hashes point to upstream MetaCubeX/mihomo releases.
+// Mihomo returns the exact Chitanda artifact approved by this backend build.
+// The source URLs and archive hashes point to our chitanda-project/chitanda releases.
 func Mihomo(goos, goarch string) (Asset, bool) {
 	switch goos + "/" + goarch {
 	case "linux/amd64":
 		return Asset{
 			Version: mihomoVersion,
-			Name:    "mihomo-linux-amd64-compatible-v1.19.33.gz",
-			URL:     "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz",
-			SHA256:  "386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6",
+			Name:    "mihomo-linux-amd64-v1.19.33.gz",
+			URL:     "https://github.com/chitanda-project/chitanda/releases/download/v1.19.33/mihomo-linux-amd64-v1.19.33.gz",
+			SHA256:  "e5907094b18f183188f015ea7ee15479e128d82f27f6d5cfc41f52a2d17aa879",
 		}, true
 	case "linux/arm64":
 		return Asset{
 			Version: mihomoVersion,
 			Name:    "mihomo-linux-arm64-v1.19.33.gz",
-			URL:     "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-arm64-v1.19.33.gz",
-			SHA256:  "ba408b317080ee265c46cb923a50018c1b82cbd708551cdd46a1e3e307396187",
+			URL:     "https://github.com/chitanda-project/chitanda/releases/download/v1.19.33/mihomo-linux-arm64-v1.19.33.gz",
+			SHA256:  "5637ab861c10385975ab8a96802c42d9356a0e16c996dfc36a44e16a04965fc8",
 		}, true
 	default:
 		return Asset{}, false
