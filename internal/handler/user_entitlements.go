@@ -25,7 +25,7 @@ func (e UserServiceEntitlements) pages() []string {
 		pages = append(pages, "subscription")
 	}
 	if e.Nodes || e.Servers {
-		pages = append(pages, "nodes", "certificates")
+		pages = append(pages, "nodes")
 	}
 	if e.Forwarding {
 		pages = append(pages, "forwarding")

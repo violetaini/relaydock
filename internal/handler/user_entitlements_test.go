@@ -398,3 +398,32 @@ func TestUserPermissionsGlobalAPITokenDoesNotResolveSyntheticUser(t *testing.T) 
 		t.Fatalf("global API token permissions=%+v", body)
 	}
 }
+
+func TestDefaultUserPermissionsIncludesCertificates(t *testing.T) {
+	fixture := newEffectiveAuthorizationFixture(t)
+	request := httptest.NewRequest(http.MethodGet, "/api/user/permissions", nil)
+	request = request.WithContext(auth.ContextWithUsername(request.Context(), "alice"))
+	response := httptest.NewRecorder()
+
+	NewUserPermissionsHandler(fixture.repo).UserGet(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("permissions status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Pages []string `json:"pages"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode permissions: %v", err)
+	}
+	hasCert := false
+	for _, p := range body.Pages {
+		if p == "certificates" {
+			hasCert = true
+			break
+		}
+	}
+	if !hasCert {
+		t.Fatalf("default pages missing certificates: %v", body.Pages)
+	}
+}

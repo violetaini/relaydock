@@ -49,6 +49,17 @@ var validUserPages = map[string]bool{
 	"certificates":    true, // 证书管理
 }
 
+// defaultUserPages 普通用户默认开放的功能页面（未自定义配置全局权限时的默认策略）。
+var defaultUserPages = []string{
+	"subscription",
+	"generator",
+	"nodes",
+	"certificates",
+	"templates",
+	"subscribe-files",
+	"custom-rules",
+}
+
 func stableUserPageUnion(configured, effective []string) []string {
 	pages := make([]string, 0, len(configured)+len(effective))
 	seen := make(map[string]bool, cap(pages))
@@ -96,6 +107,8 @@ func loadUserPermConfig(ctx context.Context, repo *storage.TrafficRepository) Us
 				}
 			}
 		}
+	} else {
+		cfg.Pages = append([]string{}, defaultUserPages...)
 	}
 	atoi := func(key string) int {
 		if v, _ := repo.GetSystemSetting(ctx, key); v != "" {
