@@ -568,6 +568,10 @@ func TestCreateCertificateRejectsInvalidRequestBeforeBackgroundOperation(t *test
 
 func TestCreateCertificateReservesIssuanceOperation(t *testing.T) {
 	repo := newCertificateLifecycleRepo(t)
+	dp := &storage.DNSProvider{Name: "test-provider", ProviderType: "cloudflare", Credentials: `{"CF_DNS_API_TOKEN":"token"}`}
+	if err := repo.CreateDNSProvider(context.Background(), dp); err != nil {
+		t.Fatalf("CreateDNSProvider: %v", err)
+	}
 	now := time.Now().UTC()
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -582,7 +586,7 @@ func TestCreateCertificateReservesIssuanceOperation(t *testing.T) {
 	}
 	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/certificates", bytes.NewBufferString(`{
 		"domain":"guarded-issue.example.test","email":"admin@example.test",
-		"provider":"letsencrypt-staging","challenge_mode":"standalone"
+		"provider":"letsencrypt-staging","challenge_mode":"dns","dns_provider_id":` + itoa64(dp.ID) + `
 	}`))
 	createReq = createReq.WithContext(auth.ContextWithGlobalAPIToken(createReq.Context()))
 	createResp := httptest.NewRecorder()

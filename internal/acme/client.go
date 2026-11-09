@@ -20,7 +20,6 @@ import (
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
 	"github.com/go-acme/lego/v4/challenge/dns01"
-	"github.com/go-acme/lego/v4/challenge/http01"
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
 )
@@ -143,6 +142,8 @@ func (c *Client) ObtainCertificateV2(ctx context.Context, req CertRequest) (*Cer
 	if err != nil {
 		if req.DNSProvider == "cloudflare" {
 			err = dnscredentials.FriendlyCloudflareError(err)
+		} else if req.DNSProvider == "huaweicloud" || req.DNSProvider == "huawei" {
+			err = dnscredentials.FriendlyHuaweiCloudError(err)
 		}
 		return nil, fmt.Errorf("obtain certificate: %w", err)
 	}
@@ -186,6 +187,8 @@ func (c *Client) RenewCertificateV2(ctx context.Context, req CertRequest, certPE
 	if err != nil {
 		if req.DNSProvider == "cloudflare" {
 			err = dnscredentials.FriendlyCloudflareError(err)
+		} else if req.DNSProvider == "huaweicloud" || req.DNSProvider == "huawei" {
+			err = dnscredentials.FriendlyHuaweiCloudError(err)
 		}
 		return nil, fmt.Errorf("renew certificate: %w", err)
 	}
@@ -215,21 +218,16 @@ func (c *Client) buildLegoClient(req CertRequest) (*lego.Client, error) {
 		return nil, fmt.Errorf("create lego client: %w", err)
 	}
 
-	// 设置挑战提供者
+	// 设置挑战提供者 (仅支持 DNS-01 / DNS TXT 验证)
 	switch req.ChallengeMode {
 	case "dns":
 		if err := c.setupDNSChallenge(client, req); err != nil {
 			return nil, err
 		}
-	case "webroot":
-		if err := c.setupWebrootChallenge(client, req); err != nil {
-			return nil, err
-		}
-	default: // 独立的
-		p := http01.NewProviderServer("", c.httpPort)
-		if err := client.Challenge.SetHTTP01Provider(p); err != nil {
-			return nil, fmt.Errorf("set http01 provider: %w", err)
-		}
+	case "webroot", "standalone", "http":
+		return nil, errors.New("仅支持 DNS-01 (DNS TXT) 验证方式，系统已禁用 HTTP 验证和网站根目录验证")
+	default:
+		return nil, fmt.Errorf("不支持的验证方式: %s，系统仅支持 DNS-01 (DNS TXT) 验证", req.ChallengeMode)
 	}
 
 	// 注册用户（如果需要，使用 EAB）

@@ -12,6 +12,7 @@ import (
 	"github.com/go-acme/lego/v4/providers/dns/cloudflare"
 	"github.com/go-acme/lego/v4/providers/dns/dnspod"
 	"github.com/go-acme/lego/v4/providers/dns/godaddy"
+	"github.com/go-acme/lego/v4/providers/dns/huaweicloud"
 	"github.com/go-acme/lego/v4/providers/dns/namesilo"
 	"github.com/go-acme/lego/v4/providers/dns/tencentcloud"
 )
@@ -24,6 +25,8 @@ var DNSProviderEnvKeys = map[string][]string{
 	"dnspod":       {"DNSPOD_API_KEY"},
 	"namesilo":     {"NAMESILO_API_KEY"},
 	"godaddy":      {"GODADDY_API_KEY", "GODADDY_API_SECRET"},
+	"huaweicloud":  {"HUAWEICLOUD_ACCESS_KEY_ID", "HUAWEICLOUD_SECRET_ACCESS_KEY", "HUAWEICLOUD_REGION"},
+	"huawei":       {"HUAWEICLOUD_ACCESS_KEY_ID", "HUAWEICLOUD_SECRET_ACCESS_KEY", "HUAWEICLOUD_REGION"},
 }
 
 var dnsCredentialEnvMu sync.Mutex
@@ -44,6 +47,8 @@ func NewDNSProviderByName(name string) (challenge.Provider, error) {
 		return namesilo.NewDNSProvider()
 	case "godaddy":
 		return godaddy.NewDNSProvider()
+	case "huaweicloud", "huawei":
+		return huaweicloud.NewDNSProvider()
 	default:
 		return nil, fmt.Errorf("unsupported DNS provider: %s", name)
 	}
@@ -58,6 +63,11 @@ func SetDNSCredentialEnv(providerType string, credentials map[string]string) (cl
 	}
 	if providerType == "cloudflare" {
 		credentials, err = dnscredentials.NormalizeCloudflare(credentials)
+		if err != nil {
+			return nil, err
+		}
+	} else if providerType == "huaweicloud" || providerType == "huawei" {
+		credentials, err = dnscredentials.NormalizeHuaweiCloud(credentials)
 		if err != nil {
 			return nil, err
 		}

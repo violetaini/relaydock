@@ -459,14 +459,6 @@ func (h *CertificateHandler) UpdateCertificate(w http.ResponseWriter, r *http.Re
 			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "DNS-01 验证必须选择 DNS 提供商"})
 			return
 		}
-	case storage.CertChallengeWebroot:
-		if req.WebrootPath == "" {
-			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "网站根目录不能为空"})
-			return
-		}
-		req.DNSProviderID = 0
-	case storage.CertChallengeStandalone:
-		req.DNSProviderID = 0
 	case "manual":
 		if req.Provider != "manual" {
 			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "ACME 证书不能使用手动验证方式"})
@@ -475,8 +467,11 @@ func (h *CertificateHandler) UpdateCertificate(w http.ResponseWriter, r *http.Re
 		req.DNSProviderID = 0
 		req.WebrootPath = ""
 		req.AutoRenew = false
+	case storage.CertChallengeWebroot, storage.CertChallengeStandalone, "http":
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "系统仅支持 DNS TXT (DNS-01) 验证方式，不支持 HTTP 独立验证或网站根目录验证"})
+		return
 	default:
-		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "不支持的验证方式"})
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "不支持的验证方式，系统仅支持 DNS TXT (DNS-01) 验证"})
 		return
 	}
 	if req.Provider == "manual" && req.ChallengeMode != "manual" {
@@ -592,7 +587,7 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 		req.Provider = acme.CALetsEncrypt
 	}
 	if req.ChallengeMode == "" {
-		req.ChallengeMode = storage.CertChallengeStandalone
+		req.ChallengeMode = storage.CertChallengeDNS
 	}
 	if req.Provider != acme.CALetsEncrypt && req.Provider != acme.CALetsEncryptStaging {
 		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "不支持的证书颁发机构"})
@@ -609,16 +604,11 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "DNS-01 验证必须选择 DNS 提供商"})
 			return
 		}
-	case storage.CertChallengeWebroot:
-		if req.WebrootPath == "" {
-			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "网站根目录不能为空"})
-			return
-		}
-		req.DNSProviderID = 0
-	case storage.CertChallengeStandalone:
-		req.DNSProviderID = 0
+	case storage.CertChallengeWebroot, storage.CertChallengeStandalone, "http":
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "系统仅支持 DNS TXT (DNS-01) 验证方式，不支持 HTTP 独立验证或网站根目录验证"})
+		return
 	default:
-		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "不支持的验证方式"})
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "不支持的验证方式，系统仅支持 DNS TXT (DNS-01) 验证"})
 		return
 	}
 	if strings.HasPrefix(req.Domain, "*.") && req.ChallengeMode != storage.CertChallengeDNS {
@@ -1918,6 +1908,12 @@ func normalizeDNSProviderCredentials(providerType, raw string) (string, error) {
 	if providerType == "cloudflare" {
 		var err error
 		normalized, err = dnscredentials.NormalizeCloudflare(input)
+		if err != nil {
+			return "", err
+		}
+	} else if providerType == "huaweicloud" || providerType == "huawei" {
+		var err error
+		normalized, err = dnscredentials.NormalizeHuaweiCloud(input)
 		if err != nil {
 			return "", err
 		}

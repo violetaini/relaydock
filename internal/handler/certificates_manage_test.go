@@ -162,6 +162,10 @@ func TestUpdateCertificateRejectsIssuedDomainMetadataChange(t *testing.T) {
 		t.Fatalf("NewTrafficRepository: %v", err)
 	}
 	t.Cleanup(func() { _ = repo.Close() })
+	dp := &storage.DNSProvider{Name: "p", ProviderType: "cloudflare", Credentials: `{"CF_DNS_API_TOKEN":"token"}`}
+	if err := repo.CreateDNSProvider(context.Background(), dp); err != nil {
+		t.Fatalf("CreateDNSProvider: %v", err)
+	}
 	cert := &storage.Certificate{
 		Domain:        "issued.example.com",
 		Email:         "admin@example.com",
@@ -169,14 +173,15 @@ func TestUpdateCertificateRejectsIssuedDomainMetadataChange(t *testing.T) {
 		CertPEM:       "issued-certificate",
 		KeyPEM:        "issued-key",
 		Status:        storage.CertStatusValid,
-		ChallengeMode: storage.CertChallengeStandalone,
+		ChallengeMode: storage.CertChallengeDNS,
+		DNSProviderID: dp.ID,
 		DeployTarget:  "none",
 	}
 	if err := repo.CreateCertificate(context.Background(), cert); err != nil {
 		t.Fatalf("CreateCertificate: %v", err)
 	}
 
-	body := []byte(`{"domain":"other.example.com","email":"admin@example.com","provider":"letsencrypt","challenge_mode":"standalone","deploy_target":"none"}`)
+	body := []byte(fmt.Sprintf(`{"domain":"other.example.com","email":"admin@example.com","provider":"letsencrypt","challenge_mode":"dns","dns_provider_id":%d,"deploy_target":"none"}`, dp.ID))
 	request := httptest.NewRequest(http.MethodPut, "/api/admin/certificates/"+strconv.FormatInt(cert.ID, 10), bytes.NewReader(body))
 	request = request.WithContext(auth.ContextWithGlobalAPIToken(request.Context()))
 	response := httptest.NewRecorder()
@@ -190,6 +195,80 @@ func TestUpdateCertificateRejectsIssuedDomainMetadataChange(t *testing.T) {
 	}
 	if stored.Domain != cert.Domain {
 		t.Fatalf("issued certificate domain changed to %q", stored.Domain)
+	}
+}
+
+func TestCreateCertificateRejectsHTTPAndWebroot(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "reject-http.db"))
+	if err != nil {
+		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	handler := NewCertificateHandler(repo, nil)
+
+	for _, mode := range []string{"standalone", "webroot", "http"} {
+		body := []byte(fmt.Sprintf(`{"domain":"test-%s.example.com","email":"admin@example.com","provider":"letsencrypt","challenge_mode":%q}`, mode, mode))
+		request := httptest.NewRequest(http.MethodPost, "/api/admin/certificates", bytes.NewReader(body))
+		request = request.WithContext(auth.ContextWithGlobalAPIToken(request.Context()))
+		response := httptest.NewRecorder()
+		handler.CreateCertificate(response, request)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "仅支持 DNS TXT") {
+			t.Fatalf("mode %q: status=%d body=%s", mode, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestCreateDNSProviderHuaweiCloudSupport(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "hw-provider.db"))
+	if err != nil {
+		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	handler := NewCertificateHandler(repo, nil)
+
+	// 1. huaweicloud with AccessKeyId and SecretAccessKey (dnsmgr style)
+	body := []byte(`{"name":"Huawei Cloud Primary","provider_type":"huaweicloud","credentials":"{\"AccessKeyId\":\"hw-ak\",\"SecretAccessKey\":\"hw-sk\"}"}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/dns-providers", bytes.NewReader(body))
+	request = request.WithContext(auth.ContextWithGlobalAPIToken(request.Context()))
+	response := httptest.NewRecorder()
+	handler.CreateDNSProvider(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("CreateDNSProvider huaweicloud: status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	providers, err := repo.ListDNSProviders(context.Background())
+	if err != nil || len(providers) != 1 {
+		t.Fatalf("ListDNSProviders: err=%v, count=%d", err, len(providers))
+	}
+	p := providers[0]
+	if p.ProviderType != "huaweicloud" {
+		t.Fatalf("provider_type = %q, want huaweicloud", p.ProviderType)
+	}
+	var creds map[string]string
+	if err := json.Unmarshal([]byte(p.Credentials), &creds); err != nil {
+		t.Fatalf("unmarshal credentials: %v", err)
+	}
+	if creds["HUAWEICLOUD_ACCESS_KEY_ID"] != "hw-ak" || creds["HUAWEICLOUD_SECRET_ACCESS_KEY"] != "hw-sk" || creds["HUAWEICLOUD_REGION"] != "cn-north-4" {
+		t.Fatalf("unexpected normalized credentials: %#v", creds)
+	}
+
+	// 2. Reveal credentials endpoint for huaweicloud
+	reqReveal := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/admin/dns-providers/%d/credentials", p.ID), nil)
+	reqReveal = reqReveal.WithContext(auth.ContextWithGlobalAPIToken(reqReveal.Context()))
+	respReveal := httptest.NewRecorder()
+	handler.RevealDNSProviderCredentials(respReveal, reqReveal)
+	if respReveal.Code != http.StatusOK {
+		t.Fatalf("reveal status=%d body=%s", respReveal.Code, respReveal.Body.String())
+	}
+	var revealPayload struct {
+		Success     bool              `json:"success"`
+		Credentials map[string]string `json:"credentials"`
+	}
+	if err := json.Unmarshal(respReveal.Body.Bytes(), &revealPayload); err != nil {
+		t.Fatalf("unmarshal reveal: %v", err)
+	}
+	if revealPayload.Credentials["HUAWEICLOUD_ACCESS_KEY_ID"] != "hw-ak" {
+		t.Fatalf("revealed credentials mismatch: %#v", revealPayload.Credentials)
 	}
 }
 
