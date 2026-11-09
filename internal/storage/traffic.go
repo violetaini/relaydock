@@ -674,15 +674,14 @@ type UserSettings struct {
 
 // SystemConfig 代表所有用户共享的全局系统配置。
 type SystemConfig struct {
-	ProxyGroupsSourceURL    string // 代理组配置的远程 URL
-	ClientCompatibilityMode bool   // 自动过滤客户端不兼容的节点
-	EnableShortLink         bool   // 全局启用订阅短链接
-	SpeedCollectInterval    int    // 网速采集间隔（秒），默认 3
-	TrafficCollectInterval  int    // 流量采集间隔（秒），默认 60
-	TrafficCheckInterval    int    // 流量限额检查间隔（秒），默认 120
-	HeartbeatInterval       int    // 心跳间隔（秒），默认 30
-	AgentLogEnabled         bool   // 是否打印 agent 交互日志，默认关闭
-
+	ProxyGroupsSourceURL          string // 代理组配置的远程 URL
+	ClientCompatibilityMode       bool   // 自动过滤客户端不兼容的节点
+	EnableShortLink               bool   // 全局启用订阅短链接
+	SpeedCollectInterval          int    // 网速采集间隔（秒），默认 3
+	TrafficCollectInterval        int    // 流量采集间隔（秒），默认 60
+	TrafficCheckInterval          int    // 流量限额检查间隔（秒），默认 120
+	HeartbeatInterval             int    // 心跳间隔（秒），默认 30
+	AgentLogEnabled               bool   // 是否打印 agent 交互日志，默认关闭
 	NotifyEnabled                 bool
 	TelegramBotToken              string
 	TelegramChatID                string
@@ -2919,6 +2918,7 @@ END;
 	const certificatesSchema = `
 CREATE TABLE IF NOT EXISTS certificates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL DEFAULT '',
     domain TEXT NOT NULL,
     email TEXT NOT NULL,
     provider TEXT NOT NULL DEFAULT 'letsencrypt',
@@ -2930,7 +2930,7 @@ CREATE TABLE IF NOT EXISTS certificates (
     expiry_date TIMESTAMP,
     issue_date TIMESTAMP,
     auto_renew INTEGER NOT NULL DEFAULT 1,
-    challenge_mode TEXT NOT NULL DEFAULT 'standalone' CHECK (challenge_mode IN ('standalone', 'webroot', 'dns', 'manual')),
+    challenge_mode TEXT NOT NULL DEFAULT 'dns' CHECK (challenge_mode IN ('standalone', 'webroot', 'dns', 'manual')),
     webroot_path TEXT,
     remote_server_id INTEGER NOT NULL DEFAULT 0,
     message TEXT,
@@ -2941,7 +2941,7 @@ CREATE TABLE IF NOT EXISTS certificates (
     auto_deploy INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(domain, remote_server_id)
+    UNIQUE(username, domain, remote_server_id)
 );
 CREATE INDEX IF NOT EXISTS idx_certificates_domain ON certificates(domain);
 CREATE INDEX IF NOT EXISTS idx_certificates_status ON certificates(status);
@@ -2959,34 +2959,55 @@ CREATE INDEX IF NOT EXISTS idx_certificates_expiry_date ON certificates(expiry_d
 		{"deploy_cert_path", "TEXT"},
 		{"deploy_key_path", "TEXT"},
 		{"auto_deploy", "INTEGER NOT NULL DEFAULT 0"},
+		{"username", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		r.db.Exec(fmt.Sprintf("ALTER TABLE certificates ADD COLUMN %s %s", col.name, col.def))
 	}
 
-	// 迁移：如果 CHECK 约束已过时，则重建表（challenge_mode 中缺少 dns 或 manual）
+	// 迁移：如果 CHECK 约束或 UNIQUE 约束已过时，则重建表
 	var checkSQL string
 	row := r.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='certificates'`)
-	if row.Scan(&checkSQL) == nil && (!strings.Contains(checkSQL, "'dns'") || !strings.Contains(checkSQL, "'manual'")) {
+	if row.Scan(&checkSQL) == nil && (!strings.Contains(checkSQL, "'dns'") || !strings.Contains(checkSQL, "'manual'") || !strings.Contains(checkSQL, "username") || strings.Contains(checkSQL, "UNIQUE(domain, remote_server_id)")) {
 		r.db.Exec(`ALTER TABLE certificates RENAME TO _certificates_old`)
 		r.db.Exec(certificatesSchema)
-		r.db.Exec(`INSERT INTO certificates SELECT * FROM _certificates_old`)
+		r.db.Exec(`INSERT INTO certificates (id, username, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
+			status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path, remote_server_id,
+			message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy, created_at, updated_at)
+			SELECT id, COALESCE(username, ''), domain, email, provider, cert_path, key_path, cert_pem, key_pem,
+			status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path, remote_server_id,
+			message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy, created_at, updated_at
+			FROM _certificates_old`)
 		r.db.Exec(`DROP TABLE _certificates_old`)
 	}
+	r.db.Exec(`CREATE INDEX IF NOT EXISTS idx_certificates_username ON certificates(username)`)
 
 	// DNS 提供商表 - 存储可重复使用的 DNS API 凭据
 	const dnsProvidersSchema = `
 CREATE TABLE IF NOT EXISTS dns_providers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
+    username TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
     provider_type TEXT NOT NULL,
     credentials TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(username, name)
 );
 `
 	if _, err := r.db.Exec(dnsProvidersSchema); err != nil {
 		return fmt.Errorf("migrate dns_providers: %w", err)
 	}
+	r.db.Exec("ALTER TABLE dns_providers ADD COLUMN username TEXT NOT NULL DEFAULT ''")
+	var checkDNSProviderSQL string
+	row = r.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='dns_providers'`)
+	if row.Scan(&checkDNSProviderSQL) == nil && (strings.Contains(checkDNSProviderSQL, "name TEXT NOT NULL UNIQUE") || !strings.Contains(checkDNSProviderSQL, "username")) {
+		r.db.Exec(`ALTER TABLE dns_providers RENAME TO _dns_providers_old`)
+		r.db.Exec(dnsProvidersSchema)
+		r.db.Exec(`INSERT INTO dns_providers (id, username, name, provider_type, credentials, created_at, updated_at)
+			SELECT id, COALESCE(username, ''), name, provider_type, credentials, created_at, updated_at FROM _dns_providers_old`)
+		r.db.Exec(`DROP TABLE _dns_providers_old`)
+	}
+	r.db.Exec(`CREATE INDEX IF NOT EXISTS idx_dns_providers_username ON dns_providers(username)`)
 
 	const userInboundConfigsSchema = `
 CREATE TABLE IF NOT EXISTS user_inbound_configs (
@@ -15210,6 +15231,7 @@ const (
 // 证书表示由 ACME 管理的 SSL/TLS 证书
 type Certificate struct {
 	ID             int64
+	Username       string
 	Domain         string
 	Email          string
 	Provider       string
@@ -15237,6 +15259,7 @@ type Certificate struct {
 // DNSProvider 代表可重用的 DNS API 凭证集
 type DNSProvider struct {
 	ID           int64
+	Username     string
 	Name         string
 	ProviderType string
 	Credentials  string // 详见上下文
@@ -15244,9 +15267,14 @@ type DNSProvider struct {
 	UpdatedAt    time.Time
 }
 
+const certificateSelectColumns = `id, username, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
+	status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
+	remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy,
+	created_at, updated_at`
+
 func scanCertificate(scanner rowScanner) (Certificate, error) {
 	var cert Certificate
-	var certPath, keyPath, certPEM, keyPEM, webrootPath, message sql.NullString
+	var username, certPath, keyPath, certPEM, keyPEM, webrootPath, message sql.NullString
 	var deployTarget, deployCertPath, deployKeyPath sql.NullString
 	var expiryDate, issueDate sql.NullTime
 	var autoRenew int
@@ -15254,6 +15282,7 @@ func scanCertificate(scanner rowScanner) (Certificate, error) {
 
 	if err := scanner.Scan(
 		&cert.ID,
+		&username,
 		&cert.Domain,
 		&cert.Email,
 		&cert.Provider,
@@ -15279,6 +15308,7 @@ func scanCertificate(scanner rowScanner) (Certificate, error) {
 	); err != nil {
 		return Certificate{}, err
 	}
+	cert.Username = username.String
 
 	cert.CertPath = certPath.String
 	cert.KeyPath = keyPath.String
@@ -15301,19 +15331,25 @@ func scanCertificate(scanner rowScanner) (Certificate, error) {
 	return cert, nil
 }
 
-// 返回按创建时间排序的所有证书。
-func (r *TrafficRepository) ListCertificates(ctx context.Context) ([]Certificate, error) {
+// 返回按创建时间排序的所有证书。可选传入用户名进行隔离过滤；缺省或为 admin 时返回管理员/系统证书。
+func (r *TrafficRepository) ListCertificates(ctx context.Context, username ...string) ([]Certificate, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
 
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
-		       status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
-		       remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy,
-		       created_at, updated_at
-		FROM certificates ORDER BY id DESC
-	`)
+	user := ""
+	if len(username) > 0 {
+		user = strings.TrimSpace(username[0])
+	}
+	var query string
+	var args []interface{}
+	if user == "" || user == "admin" {
+		query = fmt.Sprintf("SELECT %s FROM certificates WHERE username = '' OR username = 'admin' ORDER BY id DESC", certificateSelectColumns)
+	} else {
+		query = fmt.Sprintf("SELECT %s FROM certificates WHERE username = ? ORDER BY id DESC", certificateSelectColumns)
+		args = append(args, user)
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list certificates: %w", err)
 	}
@@ -15335,19 +15371,26 @@ func (r *TrafficRepository) ListCertificates(ctx context.Context) ([]Certificate
 	return certs, nil
 }
 
-// 返回特定服务器的证书。
-func (r *TrafficRepository) ListCertificatesByServer(ctx context.Context, serverID int64) ([]Certificate, error) {
+// 返回特定服务器的证书。可选传入用户名进行隔离过滤。
+func (r *TrafficRepository) ListCertificatesByServer(ctx context.Context, serverID int64, username ...string) ([]Certificate, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
 
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
-		       status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
-		       remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy,
-		       created_at, updated_at
-		FROM certificates WHERE remote_server_id = ? ORDER BY id DESC
-	`, serverID)
+	user := ""
+	if len(username) > 0 {
+		user = strings.TrimSpace(username[0])
+	}
+	var query string
+	var args []interface{}
+	if user == "" || user == "admin" {
+		query = fmt.Sprintf("SELECT %s FROM certificates WHERE remote_server_id = ? AND (username = '' OR username = 'admin') ORDER BY id DESC", certificateSelectColumns)
+		args = append(args, serverID)
+	} else {
+		query = fmt.Sprintf("SELECT %s FROM certificates WHERE remote_server_id = ? AND username = ? ORDER BY id DESC", certificateSelectColumns)
+		args = append(args, serverID, user)
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list certificates by server: %w", err)
 	}
@@ -15375,13 +15418,8 @@ func (r *TrafficRepository) GetCertificate(ctx context.Context, id int64) (*Cert
 		return nil, errors.New("traffic repository not initialized")
 	}
 
-	row := r.db.QueryRowContext(ctx, `
-		SELECT id, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
-		       status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
-		       remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy,
-		       created_at, updated_at
-		FROM certificates WHERE id = ?
-	`, id)
+	query := fmt.Sprintf("SELECT %s FROM certificates WHERE id = ?", certificateSelectColumns)
+	row := r.db.QueryRowContext(ctx, query, id)
 
 	cert, err := scanCertificate(row)
 	if err != nil {
@@ -15394,19 +15432,26 @@ func (r *TrafficRepository) GetCertificate(ctx context.Context, id int64) (*Cert
 	return &cert, nil
 }
 
-// 按域和服务器 ID 返回证书。
-func (r *TrafficRepository) GetCertificateByDomain(ctx context.Context, domain string, serverID int64) (*Certificate, error) {
+// 按域和服务器 ID 返回证书。可选传入用户名进行隔离过滤。
+func (r *TrafficRepository) GetCertificateByDomain(ctx context.Context, domain string, serverID int64, username ...string) (*Certificate, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
 
-	row := r.db.QueryRowContext(ctx, `
-		SELECT id, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
-		       status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
-		       remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy,
-		       created_at, updated_at
-		FROM certificates WHERE domain = ? AND remote_server_id = ?
-	`, domain, serverID)
+	user := ""
+	if len(username) > 0 {
+		user = strings.TrimSpace(username[0])
+	}
+	var query string
+	var args []interface{}
+	if user == "" || user == "admin" {
+		query = fmt.Sprintf("SELECT %s FROM certificates WHERE domain = ? AND remote_server_id = ? AND (username = '' OR username = 'admin')", certificateSelectColumns)
+		args = append(args, domain, serverID)
+	} else {
+		query = fmt.Sprintf("SELECT %s FROM certificates WHERE domain = ? AND remote_server_id = ? AND username = ?", certificateSelectColumns)
+		args = append(args, domain, serverID, user)
+	}
+	row := r.db.QueryRowContext(ctx, query, args...)
 
 	cert, err := scanCertificate(row)
 	if err != nil {
@@ -15425,13 +15470,17 @@ func (r *TrafficRepository) GetCertificateByDomain(ctx context.Context, domain s
 //
 // 返回找到的第一张(优先精确,其次通配符),没有则 ErrCertificateNotFound。
 // 证书签发时已经选好 dns_provider_id,这里只需把它读出来给 DDNS 用。
-func (r *TrafficRepository) FindCertificateForDomain(ctx context.Context, fqdn string) (*Certificate, error) {
+func (r *TrafficRepository) FindCertificateForDomain(ctx context.Context, fqdn string, username ...string) (*Certificate, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
 	fqdn = strings.TrimSpace(strings.ToLower(fqdn))
 	if fqdn == "" {
 		return nil, ErrCertificateNotFound
+	}
+	user := ""
+	if len(username) > 0 {
+		user = strings.TrimSpace(username[0])
 	}
 
 	// 候选 domain:精确 + 各层级通配符(host.a.b.com → *.a.b.com / *.b.com)
@@ -15448,14 +15497,16 @@ func (r *TrafficRepository) FindCertificateForDomain(ctx context.Context, fqdn s
 		args[i] = c
 	}
 
-	query := `SELECT id, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
-		       status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
-		       remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy,
-		       created_at, updated_at
+	userClause := "AND (username = '' OR username = 'admin')"
+	if user != "" && user != "admin" {
+		userClause = "AND username = ?"
+		args = append(args, user)
+	}
+	query := fmt.Sprintf(`SELECT %s
 		FROM certificates
-		WHERE status = 'valid' AND domain IN (` + placeholders + `)
+		WHERE status = 'valid' AND domain IN (`+placeholders+`) `+userClause+`
 		ORDER BY CASE WHEN domain = ? THEN 0 ELSE 1 END, id DESC
-		LIMIT 1`
+		LIMIT 1`, certificateSelectColumns)
 	args = append(args, fqdn) // 第一个 ORDER BY 的精确匹配参数
 
 	row := r.db.QueryRowContext(ctx, query, args...)
@@ -15562,7 +15613,7 @@ func (r *TrafficRepository) CreateCertificate(ctx context.Context, cert *Certifi
 		cert.Status = CertStatusPending
 	}
 	if cert.ChallengeMode == "" {
-		cert.ChallengeMode = CertChallengeStandalone
+		cert.ChallengeMode = CertChallengeDNS
 	}
 
 	autoRenew := 0
@@ -15580,11 +15631,12 @@ func (r *TrafficRepository) CreateCertificate(ctx context.Context, cert *Certifi
 	}
 
 	result, err := r.db.ExecContext(ctx, `
-		INSERT INTO certificates (domain, email, provider, cert_path, key_path, cert_pem, key_pem,
+		INSERT INTO certificates (username, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
 		                          status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
 		                          remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
+		cert.Username,
 		cert.Domain,
 		cert.Email,
 		cert.Provider,
@@ -15643,6 +15695,7 @@ func (r *TrafficRepository) UpdateCertificate(ctx context.Context, cert *Certifi
 
 	result, err := r.db.ExecContext(ctx, `
 		UPDATE certificates SET
+		    username = ?,
 		    domain = ?,
 		    email = ?,
 		    provider = ?,
@@ -15666,6 +15719,7 @@ func (r *TrafficRepository) UpdateCertificate(ctx context.Context, cert *Certifi
 		    updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
 	`,
+		cert.Username,
 		cert.Domain,
 		cert.Email,
 		cert.Provider,
@@ -15703,9 +15757,8 @@ func (r *TrafficRepository) UpdateCertificate(ctx context.Context, cert *Certifi
 	return nil
 }
 
-// UpdateCertificateSettings updates administrator-controlled certificate
-// metadata without writing issued material, status, dates, or messages. Those
-// fields may change concurrently while an ACME operation is in flight.
+// UpdateCertificateSettings updates administrator/user-controlled certificate
+// metadata without writing issued material, status, dates, or messages.
 func (r *TrafficRepository) UpdateCertificateSettings(ctx context.Context, cert *Certificate) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
@@ -15750,8 +15803,6 @@ func (r *TrafficRepository) UpdateCertificateSettings(ctx context.Context, cert 
 }
 
 // UpdateCertificateDeploymentSettings persists a successful manual deployment
-// without replaying a stale certificate snapshot over concurrently renewed
-// material or automation settings.
 func (r *TrafficRepository) UpdateCertificateDeploymentSettings(ctx context.Context, id int64, target, certPath, keyPath string) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
@@ -15846,25 +15897,31 @@ func (r *TrafficRepository) UpdateCertificateIssued(ctx context.Context, id int6
 	return nil
 }
 
-// UpdateCertificateIssuedWithDefaultDeployPaths is used by manual uploads of
-// an existing certificate. It replaces issued material and initializes missing
-// deployment paths in one statement, so no stale full-record update can restore
-// the old PEM after a successful upload.
+// UpdateCertificateIssuedWithDefaultDeployPaths is used by manual uploads of an existing certificate.
 func (r *TrafficRepository) UpdateCertificateIssuedWithDefaultDeployPaths(ctx context.Context, id int64, certPath, keyPath, certPEM, keyPEM string, issueDate, expiryDate time.Time, deployCertPath, deployKeyPath string) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
 	result, err := r.db.ExecContext(ctx, `
 		UPDATE certificates SET
-		    cert_path = ?, key_path = ?, cert_pem = ?, key_pem = ?, status = ?,
-		    issue_date = ?, expiry_date = ?, message = NULL,
-		    deploy_cert_path = CASE WHEN COALESCE(TRIM(deploy_cert_path), '') = '' THEN ? ELSE deploy_cert_path END,
-		    deploy_key_path = CASE WHEN COALESCE(TRIM(deploy_key_path), '') = '' THEN ? ELSE deploy_key_path END,
+		    cert_path = ?,
+		    key_path = ?,
+		    cert_pem = ?,
+		    key_pem = ?,
+		    status = ?,
+		    issue_date = ?,
+		    expiry_date = ?,
+		    message = NULL,
+		    deploy_cert_path = CASE WHEN deploy_cert_path IS NULL OR deploy_cert_path = '' THEN ? ELSE deploy_cert_path END,
+		    deploy_key_path = CASE WHEN deploy_key_path IS NULL OR deploy_key_path = '' THEN ? ELSE deploy_key_path END,
 		    updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
-	`, certPath, keyPath, certPEM, keyPEM, CertStatusValid, issueDate, expiryDate, deployCertPath, deployKeyPath, id)
+	`, certPath, keyPath, certPEM, keyPEM, CertStatusValid, issueDate, expiryDate,
+		sql.NullString{String: deployCertPath, Valid: deployCertPath != ""},
+		sql.NullString{String: deployKeyPath, Valid: deployKeyPath != ""},
+		id)
 	if err != nil {
-		return fmt.Errorf("update uploaded certificate issued material: %w", err)
+		return fmt.Errorf("update certificate issued with default deploy paths: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -15876,7 +15933,7 @@ func (r *TrafficRepository) UpdateCertificateIssuedWithDefaultDeployPaths(ctx co
 	return nil
 }
 
-// 设置证书的 auto_renew 标志。
+// 更新证书的 auto_renew 标志。
 func (r *TrafficRepository) SetCertificateAutoRenew(ctx context.Context, id int64, autoRenew bool) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
@@ -15940,16 +15997,12 @@ func (r *TrafficRepository) ListAutoDeployCertificates(ctx context.Context) ([]C
 		return nil, errors.New("traffic repository not initialized")
 	}
 
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
-		       status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
-		       remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy,
-		       created_at, updated_at
+	query := fmt.Sprintf(`SELECT %s
 		FROM certificates
 		WHERE auto_deploy = 1 AND status = 'valid' AND cert_pem != '' AND key_pem != ''
 		      AND deploy_cert_path != '' AND deploy_key_path != ''
-		ORDER BY id
-	`)
+		ORDER BY id`, certificateSelectColumns)
+	rows, err := r.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("list auto_deploy certificates: %w", err)
 	}
@@ -15998,18 +16051,14 @@ func (r *TrafficRepository) ListExpiringCertificates(ctx context.Context, days i
 		days = 30
 	}
 
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
-		       status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
-		       remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy,
-		       created_at, updated_at
+	query := fmt.Sprintf(`SELECT %s
 		FROM certificates
 		WHERE auto_renew = 1
 		  AND status = 'valid'
 		  AND expiry_date IS NOT NULL
 		  AND expiry_date <= datetime('now', '+' || ? || ' days')
-		ORDER BY expiry_date ASC
-	`, days)
+		ORDER BY expiry_date ASC`, certificateSelectColumns)
+	rows, err := r.db.QueryContext(ctx, query, days)
 	if err != nil {
 		return nil, fmt.Errorf("list expiring certificates: %w", err)
 	}
@@ -16031,21 +16080,25 @@ func (r *TrafficRepository) ListExpiringCertificates(ctx context.Context, days i
 	return certs, nil
 }
 
-// 返回所有有效证书（用于入站向导选择）。
-func (r *TrafficRepository) ListValidCertificates(ctx context.Context) ([]Certificate, error) {
+// 返回所有有效证书（用于入站向导选择）。可选传入用户名进行隔离过滤。
+func (r *TrafficRepository) ListValidCertificates(ctx context.Context, username ...string) ([]Certificate, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
 
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
-		       status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
-		       remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy,
-		       created_at, updated_at
-		FROM certificates
-		WHERE status = 'valid'
-		ORDER BY domain ASC
-	`)
+	user := ""
+	if len(username) > 0 {
+		user = strings.TrimSpace(username[0])
+	}
+	var query string
+	var args []interface{}
+	if user == "" || user == "admin" {
+		query = fmt.Sprintf("SELECT %s FROM certificates WHERE status = 'valid' AND (username = '' OR username = 'admin') ORDER BY domain ASC", certificateSelectColumns)
+	} else {
+		query = fmt.Sprintf("SELECT %s FROM certificates WHERE status = 'valid' AND username = ? ORDER BY domain ASC", certificateSelectColumns)
+		args = append(args, user)
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list valid certificates: %w", err)
 	}
@@ -16069,12 +16122,24 @@ func (r *TrafficRepository) ListValidCertificates(ctx context.Context) ([]Certif
 
 // --- DNS 提供商 CRUD ---
 
-// 返回所有 DNS 提供商。
-func (r *TrafficRepository) ListDNSProviders(ctx context.Context) ([]DNSProvider, error) {
+// 返回 DNS 提供商列表。可选传入用户名进行隔离过滤；缺省或为 admin 时返回管理员/系统凭据。
+func (r *TrafficRepository) ListDNSProviders(ctx context.Context, username ...string) ([]DNSProvider, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT id, name, provider_type, credentials, created_at, updated_at FROM dns_providers ORDER BY id ASC`)
+	user := ""
+	if len(username) > 0 {
+		user = strings.TrimSpace(username[0])
+	}
+	var query string
+	var args []interface{}
+	if user == "" || user == "admin" {
+		query = "SELECT id, username, name, provider_type, credentials, created_at, updated_at FROM dns_providers WHERE username = '' OR username = 'admin' ORDER BY id ASC"
+	} else {
+		query = "SELECT id, username, name, provider_type, credentials, created_at, updated_at FROM dns_providers WHERE username = ? ORDER BY id ASC"
+		args = append(args, user)
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list dns_providers: %w", err)
 	}
@@ -16083,7 +16148,7 @@ func (r *TrafficRepository) ListDNSProviders(ctx context.Context) ([]DNSProvider
 	var providers []DNSProvider
 	for rows.Next() {
 		var p DNSProvider
-		if err := rows.Scan(&p.ID, &p.Name, &p.ProviderType, &p.Credentials, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Username, &p.Name, &p.ProviderType, &p.Credentials, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan dns_provider: %w", err)
 		}
 		providers = append(providers, p)
@@ -16097,8 +16162,8 @@ func (r *TrafficRepository) GetDNSProvider(ctx context.Context, id int64) (*DNSP
 		return nil, errors.New("traffic repository not initialized")
 	}
 	var p DNSProvider
-	err := r.db.QueryRowContext(ctx, `SELECT id, name, provider_type, credentials, created_at, updated_at FROM dns_providers WHERE id = ?`, id).
-		Scan(&p.ID, &p.Name, &p.ProviderType, &p.Credentials, &p.CreatedAt, &p.UpdatedAt)
+	err := r.db.QueryRowContext(ctx, `SELECT id, username, name, provider_type, credentials, created_at, updated_at FROM dns_providers WHERE id = ?`, id).
+		Scan(&p.ID, &p.Username, &p.Name, &p.ProviderType, &p.Credentials, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("get dns_provider: %w", err)
 	}
@@ -16110,8 +16175,8 @@ func (r *TrafficRepository) CreateDNSProvider(ctx context.Context, p *DNSProvide
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
-	result, err := r.db.ExecContext(ctx, `INSERT INTO dns_providers (name, provider_type, credentials) VALUES (?, ?, ?)`,
-		p.Name, p.ProviderType, p.Credentials)
+	result, err := r.db.ExecContext(ctx, `INSERT INTO dns_providers (username, name, provider_type, credentials) VALUES (?, ?, ?, ?)`,
+		p.Username, p.Name, p.ProviderType, p.Credentials)
 	if err != nil {
 		return fmt.Errorf("create dns_provider: %w", err)
 	}
@@ -16125,8 +16190,8 @@ func (r *TrafficRepository) UpdateDNSProvider(ctx context.Context, p *DNSProvide
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
-	result, err := r.db.ExecContext(ctx, `UPDATE dns_providers SET name = ?, provider_type = ?, credentials = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		p.Name, p.ProviderType, p.Credentials, p.ID)
+	result, err := r.db.ExecContext(ctx, `UPDATE dns_providers SET username = ?, name = ?, provider_type = ?, credentials = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		p.Username, p.Name, p.ProviderType, p.Credentials, p.ID)
 	if err != nil {
 		return fmt.Errorf("update dns_provider: %w", err)
 	}

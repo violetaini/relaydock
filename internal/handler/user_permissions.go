@@ -46,6 +46,7 @@ var validUserPages = map[string]bool{
 	"subscribe-files": true, // 订阅管理
 	"custom-rules":    true, // 覆写管理
 	"nodes":           true, // 节点管理(普通用户:只读自己导入的+套餐节点、可导入、用于出站)
+	"certificates":    true, // 证书管理
 }
 
 func stableUserPageUnion(configured, effective []string) []string {

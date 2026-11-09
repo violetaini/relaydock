@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
@@ -113,6 +114,8 @@ func managedNumericInt(value interface{}) (int, bool) {
 		return int(v), v >= 0 && v <= math.MaxInt && math.Trunc(v) == v
 	case int:
 		return v, v >= 0
+	case int64:
+		return int(v), v >= 0 && v <= math.MaxInt
 	case json.Number:
 		n, err := strconv.Atoi(v.String())
 		return n, err == nil && n >= 0
@@ -607,7 +610,7 @@ func (h *ManagedNodesHandler) userManagedCreationContext(ctx context.Context, us
 		allowedServers[server.ID] = struct{}{}
 	}
 	certificates := make([]userManagedCreationCertificate, 0)
-	if certs, certErr := h.repo.ListValidCertificates(ctx); certErr == nil {
+	if certs, certErr := h.repo.ListValidCertificates(ctx, username); certErr == nil {
 		for i := range certs {
 			cert := &certs[i]
 			if cert.RemoteServerID > 0 {
@@ -712,10 +715,14 @@ func (h *ManagedNodesHandler) validateUserManagedCertificate(ctx context.Context
 		return fmt.Errorf("%w: a managed TLS certificate is required", storage.ErrManagedInvalidArgument)
 	}
 	certificate, err := h.repo.GetCertificate(ctx, int64(certificateID))
-	if err != nil || certificate == nil || certificate.Status != storage.CertStatusValid ||
+	username := auth.UsernameFromContext(ctx)
+	if auth.IsGlobalAPIToken(ctx) && username == "" {
+		username = "admin"
+	}
+	if err != nil || certificate == nil || !userMatches(username, certificate.Username) || certificate.Status != storage.CertStatusValid ||
 		certificate.RemoteServerID != 0 && certificate.RemoteServerID != serverID ||
 		certificate.ExpiryDate != nil && !certificate.ExpiryDate.After(time.Now().UTC()) {
-		return fmt.Errorf("%w: certificate is unavailable for this server", storage.ErrManagedInvalidArgument)
+		return fmt.Errorf("%w: certificate is unavailable for this user/server", storage.ErrManagedInvalidArgument)
 	}
 	return nil
 }

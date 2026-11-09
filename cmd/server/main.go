@@ -1233,24 +1233,24 @@ func main() {
 	remoteManageHandler.SetStealSelfDeployer(remoteManageHandler.DeployStealSelfConfig)
 	remoteWSHandler.SetScanResultHandler(remoteManageHandler.HandleScanResult)
 	remoteWSHandler.SetStealSelfDeployer(remoteManageHandler.DeployStealSelfConfig)
-	mux.Handle("/api/admin/certificates", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.ListCertificates)))
-	mux.Handle("/api/admin/certificates/valid", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.ListValidCertificates)))
-	mux.Handle("/api/admin/certificates/create", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.CreateCertificate)))
-	mux.Handle("/api/admin/certificates/renew", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.RenewCertificate)))
-	mux.Handle("/api/admin/certificates/auto-renew", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.SetAutoRenew)))
-	mux.Handle("/api/admin/certificates/auto-deploy", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.SetAutoDeploy)))
-	mux.Handle("/api/admin/certificates/deploy", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.DeployCertificate)))
-	mux.Handle("/api/admin/certificates/upload", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.UploadCertificate)))
-	mux.Handle("/api/admin/certificates/delete", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.DeleteCertificate)))
-	mux.Handle("/api/admin/certificates/", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.GetCertificate)))
+	mux.Handle("/api/admin/certificates", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.ListCertificates)))
+	mux.Handle("/api/admin/certificates/valid", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.ListValidCertificates)))
+	mux.Handle("/api/admin/certificates/create", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.CreateCertificate)))
+	mux.Handle("/api/admin/certificates/renew", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.RenewCertificate)))
+	mux.Handle("/api/admin/certificates/auto-renew", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.SetAutoRenew)))
+	mux.Handle("/api/admin/certificates/auto-deploy", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.SetAutoDeploy)))
+	mux.Handle("/api/admin/certificates/deploy", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.DeployCertificate)))
+	mux.Handle("/api/admin/certificates/upload", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.UploadCertificate)))
+	mux.Handle("/api/admin/certificates/delete", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.DeleteCertificate)))
+	mux.Handle("/api/admin/certificates/", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.GetCertificate)))
 	mux.Handle("/api/admin/master-cert-status", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.GetMasterCertStatus)))
 	mux.Handle("/api/admin/deploy-master-cert", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.DeployMasterCert)))
 	mux.Handle("/api/admin/enable-https", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.EnableHTTPS)))
 
-	// DNS 提供商管理 API（仅限管理员）
-	mux.Handle("/api/admin/dns-providers", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.ListDNSProviders)))
-	mux.Handle("/api/admin/dns-providers/create", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.CreateDNSProvider)))
-	mux.Handle("/api/admin/dns-providers/", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// DNS 提供商管理 API（支持多租户隔离）
+	mux.Handle("/api/admin/dns-providers", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.ListDNSProviders)))
+	mux.Handle("/api/admin/dns-providers/create", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.CreateDNSProvider)))
+	mux.Handle("/api/admin/dns-providers/", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			certHandler.RevealDNSProviderCredentials(w, r)

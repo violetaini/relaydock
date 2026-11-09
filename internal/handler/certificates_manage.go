@@ -287,6 +287,40 @@ func certificateToResponse(cert *storage.Certificate) CertificateResponse {
 	return resp
 }
 
+// userMatches 判断资源所属用户是否与当前登录用户匹配（管理员或系统归属视为匹配管理员，普通用户仅匹配自身）。
+func userMatches(currentUser, resourceUser string) bool {
+	if currentUser == "admin" || currentUser == "" {
+		return resourceUser == "" || resourceUser == "admin"
+	}
+	return resourceUser == currentUser
+}
+
+// authenticateUser 鉴权当前用户，校验用户登录态及证书管理权限。
+func (h *CertificateHandler) authenticateUser(w http.ResponseWriter, r *http.Request) (string, bool) {
+	username := auth.UsernameFromContext(r.Context())
+	if auth.IsGlobalAPIToken(r.Context()) {
+		return "admin", true
+	}
+	if username == "" {
+		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+		return "", false
+	}
+	if userIsAdmin(r.Context(), h.repo, username) {
+		return username, true
+	}
+	// 普通用户：检查页面权限与服务配额
+	cfg := loadUserPermConfig(r.Context(), h.repo)
+	entitlements, _ := ResolveUserServiceEntitlements(r.Context(), h.repo, username, time.Now().UTC())
+	pages := stableUserPageUnion(cfg.Pages, entitlements.pages())
+	for _, p := range pages {
+		if p == "certificates" {
+			return username, true
+		}
+	}
+	respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "当前账户无权访问证书管理"})
+	return "", false
+}
+
 // 检查当前用户是否是管理员
 func (h *CertificateHandler) requireAdmin(r *http.Request) bool {
 	username := auth.UsernameFromContext(r.Context())
@@ -305,8 +339,8 @@ func (h *CertificateHandler) requireAdmin(r *http.Request) bool {
 
 // 处理 GET /api/admin/certificates
 func (h *CertificateHandler) ListCertificates(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -324,9 +358,9 @@ func (h *CertificateHandler) ListCertificates(w http.ResponseWriter, r *http.Req
 			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "无效的服务器ID"})
 			return
 		}
-		certs, err = h.repo.ListCertificatesByServer(ctx, serverID)
+		certs, err = h.repo.ListCertificatesByServer(ctx, serverID, username)
 	} else {
-		certs, err = h.repo.ListCertificates(ctx)
+		certs, err = h.repo.ListCertificates(ctx, username)
 	}
 
 	if err != nil {
@@ -368,8 +402,8 @@ func (h *CertificateHandler) GetCertificate(w http.ResponseWriter, r *http.Reque
 		respondJSON(w, http.StatusMethodNotAllowed, map[string]any{"success": false, "message": "不支持的请求方法"})
 		return
 	}
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -385,8 +419,8 @@ func (h *CertificateHandler) GetCertificate(w http.ResponseWriter, r *http.Reque
 	defer cancel()
 
 	cert, err := h.repo.GetCertificate(ctx, id)
-	if err != nil {
-		if err == storage.ErrCertificateNotFound {
+	if err != nil || !userMatches(username, cert.Username) {
+		if err == storage.ErrCertificateNotFound || (cert != nil && !userMatches(username, cert.Username)) {
 			respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
 			return
 		}
@@ -414,8 +448,8 @@ func (h *CertificateHandler) GetCertificate(w http.ResponseWriter, r *http.Reque
 // UpdateCertificate edits certificate automation metadata. It does not issue a
 // certificate; the new provider and challenge settings apply on the next renewal.
 func (h *CertificateHandler) UpdateCertificate(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -501,7 +535,7 @@ func (h *CertificateHandler) UpdateCertificate(w http.ResponseWriter, r *http.Re
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	cert, err := h.repo.GetCertificate(ctx, id)
-	if err != nil {
+	if err != nil || !userMatches(username, cert.Username) {
 		respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
 		return
 	}
@@ -516,8 +550,9 @@ func (h *CertificateHandler) UpdateCertificate(w http.ResponseWriter, r *http.Re
 		}
 	}
 	if req.ChallengeMode == storage.CertChallengeDNS {
-		if _, err := h.repo.GetDNSProvider(ctx, req.DNSProviderID); err != nil {
-			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "所选 DNS 提供商不存在，请重新选择"})
+		p, err := h.repo.GetDNSProvider(ctx, req.DNSProviderID)
+		if err != nil || !userMatches(username, p.Username) {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "所选 DNS 提供商不存在或无权使用"})
 			return
 		}
 	}
@@ -554,8 +589,8 @@ func (h *CertificateHandler) UpdateCertificate(w http.ResponseWriter, r *http.Re
 
 // 处理 POST /api/admin/certificates
 func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -602,6 +637,11 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 	case storage.CertChallengeDNS:
 		if req.DNSProviderID <= 0 {
 			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "DNS-01 验证必须选择 DNS 提供商"})
+			return
+		}
+		dnsProv, pErr := h.repo.GetDNSProvider(r.Context(), req.DNSProviderID)
+		if pErr != nil || !userMatches(username, dnsProv.Username) {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "所选 DNS 提供商不存在或无权使用"})
 			return
 		}
 	case storage.CertChallengeWebroot, storage.CertChallengeStandalone, "http":
@@ -655,6 +695,7 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 
 	// 先创建证书记录
 	cert := &storage.Certificate{
+		Username:       username,
 		Domain:         req.Domain,
 		Email:          req.Email,
 		Provider:       req.Provider,
@@ -843,8 +884,8 @@ func (h *CertificateHandler) requestRemoteCertificate(cert *storage.Certificate)
 
 // 处理 POST /api/admin/certificates/renew
 func (h *CertificateHandler) RenewCertificate(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -861,6 +902,10 @@ func (h *CertificateHandler) RenewCertificate(w http.ResponseWriter, r *http.Req
 	defer cancel()
 
 	cert, err := h.repo.GetCertificate(ctx, id)
+	if err != nil || !userMatches(username, cert.Username) {
+		respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
+		return
+	}
 	if err != nil {
 		if err == storage.ErrCertificateNotFound {
 			respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
@@ -969,8 +1014,8 @@ func (h *CertificateHandler) markCertificateOperationFailed(cert *storage.Certif
 
 // 处理 PATCH /api/admin/certificates/auto-renew
 func (h *CertificateHandler) SetAutoRenew(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -986,6 +1031,10 @@ func (h *CertificateHandler) SetAutoRenew(w http.ResponseWriter, r *http.Request
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	cert, err := h.repo.GetCertificate(ctx, req.ID)
+	if err != nil || !userMatches(username, cert.Username) {
+		respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
+		return
+	}
 	if err != nil {
 		if err == storage.ErrCertificateNotFound {
 			respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
@@ -1015,8 +1064,8 @@ func (h *CertificateHandler) SetAutoRenew(w http.ResponseWriter, r *http.Request
 
 // 处理 PATCH /api/admin/certificates/auto-deploy
 func (h *CertificateHandler) SetAutoDeploy(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -1032,6 +1081,10 @@ func (h *CertificateHandler) SetAutoDeploy(w http.ResponseWriter, r *http.Reques
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	cert, err := h.repo.GetCertificate(ctx, req.ID)
+	if err != nil || !userMatches(username, cert.Username) {
+		respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
+		return
+	}
 	if err != nil {
 		if err == storage.ErrCertificateNotFound {
 			respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
@@ -1061,8 +1114,8 @@ func (h *CertificateHandler) SetAutoDeploy(w http.ResponseWriter, r *http.Reques
 
 // 处理 DELETE /api/admin/certificates/delete
 func (h *CertificateHandler) DeleteCertificate(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -1076,6 +1129,11 @@ func (h *CertificateHandler) DeleteCertificate(w http.ResponseWriter, r *http.Re
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	cert, err := h.repo.GetCertificate(ctx, req.ID)
+	if err != nil || !userMatches(username, cert.Username) {
+		respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "证书不存在"})
+		return
+	}
 
 	if err := h.repo.DeleteCertificate(ctx, req.ID); err != nil {
 		if err == storage.ErrCertificateNotFound {
@@ -1091,15 +1149,15 @@ func (h *CertificateHandler) DeleteCertificate(w http.ResponseWriter, r *http.Re
 
 // 处理 GET /api/admin/certificates/valid
 func (h *CertificateHandler) ListValidCertificates(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	certs, err := h.repo.ListValidCertificates(ctx)
+	certs, err := h.repo.ListValidCertificates(ctx, username)
 	if err != nil {
 		log.Printf("[Certificate] ListValidCertificates error: %v", err)
 		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "获取证书列表失败"})
@@ -1498,8 +1556,12 @@ func validateCertificateDeployACK(body []byte) error {
 
 // 处理 POST /api/admin/certificates/deploy — 手动部署证书。
 func (h *CertificateHandler) DeployCertificate(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
+		return
+	}
+	if !userIsAdmin(r.Context(), h.repo, username) {
+		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "普通用户证书仅供节点 TLS 使用，不支持部署到系统服务路径"})
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -1695,15 +1757,15 @@ func publicDNSProvider(provider storage.DNSProvider) dnsProviderResponse {
 
 // 处理 GET /api/admin/dns-providers
 func (h *CertificateHandler) ListDNSProviders(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	providers, err := h.repo.ListDNSProviders(ctx)
+	providers, err := h.repo.ListDNSProviders(ctx, username)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "获取DNS提供商列表失败"})
 		return
@@ -1730,8 +1792,8 @@ func (h *CertificateHandler) RevealDNSProviderCredentials(w http.ResponseWriter,
 		respondJSON(w, http.StatusMethodNotAllowed, map[string]any{"success": false, "message": "不支持的请求方法"})
 		return
 	}
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -1751,7 +1813,7 @@ func (h *CertificateHandler) RevealDNSProviderCredentials(w http.ResponseWriter,
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	provider, err := h.repo.GetDNSProvider(ctx, id)
-	if err != nil {
+	if err != nil || !userMatches(username, provider.Username) {
 		respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "DNS 提供商不存在"})
 		return
 	}
@@ -1768,8 +1830,8 @@ func (h *CertificateHandler) RevealDNSProviderCredentials(w http.ResponseWriter,
 
 // 处理 POST /api/admin/dns-providers
 func (h *CertificateHandler) CreateDNSProvider(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -1796,6 +1858,7 @@ func (h *CertificateHandler) CreateDNSProvider(w http.ResponseWriter, r *http.Re
 	defer cancel()
 
 	p := &storage.DNSProvider{
+		Username:     username,
 		Name:         req.Name,
 		ProviderType: req.ProviderType,
 		Credentials:  req.Credentials,
@@ -1811,8 +1874,8 @@ func (h *CertificateHandler) CreateDNSProvider(w http.ResponseWriter, r *http.Re
 
 // 处理 PUT /api/admin/dns-providers/{id}
 func (h *CertificateHandler) UpdateDNSProvider(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -1832,7 +1895,7 @@ func (h *CertificateHandler) UpdateDNSProvider(w http.ResponseWriter, r *http.Re
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	existing, err := h.repo.GetDNSProvider(ctx, id)
-	if err != nil {
+	if err != nil || !userMatches(username, existing.Username) {
 		respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "DNS 提供商不存在"})
 		return
 	}
@@ -1851,6 +1914,7 @@ func (h *CertificateHandler) UpdateDNSProvider(w http.ResponseWriter, r *http.Re
 
 	p := &storage.DNSProvider{
 		ID:           id,
+		Username:     existing.Username,
 		Name:         req.Name,
 		ProviderType: req.ProviderType,
 		Credentials:  credentials,
@@ -1936,8 +2000,8 @@ func normalizeDNSProviderCredentials(providerType, raw string) (string, error) {
 
 // 处理 DELETE /api/admin/dns-providers/{id}
 func (h *CertificateHandler) DeleteDNSProvider(w http.ResponseWriter, r *http.Request) {
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -1950,6 +2014,11 @@ func (h *CertificateHandler) DeleteDNSProvider(w http.ResponseWriter, r *http.Re
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	existing, err := h.repo.GetDNSProvider(ctx, id)
+	if err != nil || !userMatches(username, existing.Username) {
+		respondJSON(w, http.StatusNotFound, map[string]any{"success": false, "message": "DNS 提供商不存在"})
+		return
+	}
 
 	if err := h.repo.DeleteDNSProvider(ctx, id); err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("删除DNS提供商失败: %v", err)})
@@ -1971,8 +2040,8 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 		respondJSON(w, http.StatusMethodNotAllowed, map[string]any{"success": false, "message": "Method not allowed"})
 		return
 	}
-	if !h.requireAdmin(r) {
-		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "权限不足"})
+	username, ok := h.authenticateUser(w, r)
+	if !ok {
 		return
 	}
 
@@ -2044,8 +2113,9 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 	}
 
 	cert := &storage.Certificate{
+		Username:       username,
 		Domain:         req.Domain,
-		Email:          auth.UsernameFromContext(r.Context()) + "@upload",
+		Email:          username + "@upload",
 		Provider:       "manual",
 		Status:         storage.CertStatusPending,
 		AutoRenew:      false,

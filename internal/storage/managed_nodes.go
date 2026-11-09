@@ -470,28 +470,31 @@ func managedInitialized(r *TrafficRepository) error {
 }
 
 var managedGrantProtocolAliases = map[string]string{
-	"vless":       "vless",
-	"vmess":       "vmess",
-	"trojan":      "trojan",
-	"shadowsocks": "shadowsocks",
-	"ss":          "shadowsocks",
-	"hysteria":    "hysteria",
-	"hysteria2":   "hysteria",
-	"hy2":         "hysteria",
-	"socks":       "socks",
-	"socks5":      "socks",
-	"http":        "http",
-	"wireguard":   "wireguard",
-	"anytls":      "anytls",
-	"snell":       "snell",
-	"chitanda":    "chitanda",
+	"vless":         "vless",
+	"vmess":         "vmess",
+	"trojan":        "trojan",
+	"shadowsocks":   "shadowsocks",
+	"ss":            "shadowsocks",
+	"hysteria":      "hysteria",
+	"hysteria2":     "hysteria",
+	"hy2":           "hysteria",
+	"socks":         "socks",
+	"socks5":        "socks",
+	"http":          "http",
+	"wireguard":     "wireguard",
+	"anytls":        "anytls",
+	"snell":         "snell",
+	"chitanda":      "chitanda",
+	"dokodemo-door": "dokodemo-door",
+	"dokodemo":      "dokodemo-door",
+	"tunnel":        "tunnel",
 }
 
 var managedGrantProtocolProfileFamilies = map[string]string{
 	"vless-reality": "vless", "vless-tcp-tls": "vless", "vless-grpc-tls": "vless", "vless-wss": "vless", "vless-ws": "vless",
 	"vmess-tcp-none": "vmess", "vmess-tcp-tls": "vmess", "vmess-grpc-tls": "vmess", "vmess-wss": "vmess", "vmess-ws": "vmess",
 	"trojan-tcp-tls": "trojan", "trojan-reality": "trojan", "trojan-grpc-tls": "trojan", "trojan-wss": "trojan",
-	"shadowsocks-classic": "shadowsocks", "shadowsocks-2022": "shadowsocks", "hysteria2": "hysteria", "socks5": "socks", "http": "http", "anytls": "anytls", "snell": "snell", "chitanda": "chitanda", "chitanda-stream": "chitanda", "chitanda-h2": "chitanda", "chitanda-h3": "chitanda", "chitanda-auto": "chitanda", "chitanda-h1": "chitanda",
+	"shadowsocks-classic": "shadowsocks", "shadowsocks-2022": "shadowsocks", "hysteria2": "hysteria", "socks5": "socks", "http": "http", "anytls": "anytls", "snell": "snell", "chitanda": "chitanda", "chitanda-stream": "chitanda", "chitanda-h2": "chitanda", "chitanda-h3": "chitanda", "chitanda-auto": "chitanda", "chitanda-h1": "chitanda", "dokodemo-door": "dokodemo-door", "dokodemo": "dokodemo-door", "tunnel": "tunnel",
 }
 
 func canonicalManagedGrantProtocol(protocol string) (string, bool) {
