@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"runtime"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -91,6 +92,9 @@ func stageCertFile(path string, data []byte, mode fs.FileMode) (string, error) {
 }
 
 func syncCertDir(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err

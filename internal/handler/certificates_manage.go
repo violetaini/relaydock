@@ -253,12 +253,32 @@ type CertificateDeployResponse struct {
 	Deployments    []CertificateDeployResult `json:"deployments"`
 }
 
+func (h *CertificateHandler) backfillCertificateIssuerIfMissing(ctx context.Context, cert *storage.Certificate) {
+	if cert == nil || cert.ID <= 0 || cert.CertPEM == "" {
+		return
+	}
+	if cert.Provider == "" || strings.EqualFold(cert.Provider, "manual") {
+		if issuer := acme.ExtractCertificateIssuerFromPEM([]byte(cert.CertPEM)); issuer != "" && issuer != cert.Provider {
+			cert.Provider = issuer
+			if h.repo != nil {
+				_ = h.repo.UpdateCertificateProvider(ctx, cert.ID, issuer)
+			}
+		}
+	}
+}
+
 func certificateToResponse(cert *storage.Certificate) CertificateResponse {
+	provider := cert.Provider
+	if (provider == "" || strings.EqualFold(provider, "manual")) && cert.CertPEM != "" {
+		if issuer := acme.ExtractCertificateIssuerFromPEM([]byte(cert.CertPEM)); issuer != "" {
+			provider = issuer
+		}
+	}
 	resp := CertificateResponse{
 		ID:             cert.ID,
 		Domain:         cert.Domain,
 		Email:          cert.Email,
-		Provider:       cert.Provider,
+		Provider:       provider,
 		CertPath:       cert.CertPath,
 		KeyPath:        cert.KeyPath,
 		Status:         cert.Status,
@@ -378,7 +398,8 @@ func (h *CertificateHandler) ListCertificates(w http.ResponseWriter, r *http.Req
 
 	responses := make([]CertificateResponse, len(certs))
 	for i, cert := range certs {
-		responses[i] = certificateToResponse(&cert)
+		h.backfillCertificateIssuerIfMissing(ctx, &certs[i])
+		responses[i] = certificateToResponse(&certs[i])
 		if cert.RemoteServerID > 0 {
 			responses[i].RemoteServerName = serverNames[cert.RemoteServerID]
 		} else {
@@ -429,6 +450,7 @@ func (h *CertificateHandler) GetCertificate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	h.backfillCertificateIssuerIfMissing(ctx, cert)
 	resp := certificateToResponse(cert)
 	if cert.RemoteServerID > 0 {
 		server, _ := h.repo.GetRemoteServer(ctx, cert.RemoteServerID)
@@ -579,6 +601,7 @@ func (h *CertificateHandler) UpdateCertificate(w http.ResponseWriter, r *http.Re
 	if refreshed, refreshErr := h.repo.GetCertificate(ctx, cert.ID); refreshErr == nil {
 		cert = refreshed
 	}
+	h.backfillCertificateIssuerIfMissing(ctx, cert)
 	resp := certificateToResponse(cert)
 	respondJSON(w, http.StatusOK, SingleCertificateResponse{
 		Success:     true,
@@ -1173,7 +1196,8 @@ func (h *CertificateHandler) ListValidCertificates(w http.ResponseWriter, r *htt
 
 	responses := make([]CertificateResponse, len(certs))
 	for i, cert := range certs {
-		responses[i] = certificateToResponse(&cert)
+		h.backfillCertificateIssuerIfMissing(ctx, &certs[i])
+		responses[i] = certificateToResponse(&certs[i])
 		if cert.RemoteServerID > 0 {
 			responses[i].RemoteServerName = serverNames[cert.RemoteServerID]
 		} else {
@@ -2092,6 +2116,13 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 
 	deployCertPath, deployKeyPath := certDeployPaths(req.Domain, "/usr/local/nginx/cert")
 
+	provider := "manual"
+	if result.Issuer != "" {
+		provider = result.Issuer
+	} else if issuer := acme.ExtractCertificateIssuerFromPEM(certBytes); issuer != "" {
+		provider = issuer
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
@@ -2100,6 +2131,9 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 		if err := h.repo.UpdateCertificateIssuedWithDefaultDeployPaths(ctx, existing.ID, result.CertPath, result.KeyPath, result.CertPEM, result.KeyPEM, result.IssueDate, result.ExpiryDate, deployCertPath, deployKeyPath); err != nil {
 			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("更新证书失败: %v", err)})
 			return
+		}
+		if provider != "manual" {
+			_ = h.repo.UpdateCertificateProvider(ctx, existing.ID, provider)
 		}
 		refreshed, refreshErr := h.repo.GetCertificate(ctx, existing.ID)
 		if refreshErr != nil {
@@ -2116,7 +2150,7 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 		Username:       username,
 		Domain:         req.Domain,
 		Email:          username + "@upload",
-		Provider:       "manual",
+		Provider:       provider,
 		Status:         storage.CertStatusPending,
 		AutoRenew:      false,
 		ChallengeMode:  "manual",

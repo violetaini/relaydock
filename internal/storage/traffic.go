@@ -15933,6 +15933,15 @@ func (r *TrafficRepository) UpdateCertificateIssuedWithDefaultDeployPaths(ctx co
 	return nil
 }
 
+// UpdateCertificateProvider updates the CA/provider name for a certificate record.
+func (r *TrafficRepository) UpdateCertificateProvider(ctx context.Context, id int64, provider string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	_, err := r.db.ExecContext(ctx, `UPDATE certificates SET provider = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, provider, id)
+	return err
+}
+
 // 更新证书的 auto_renew 标志。
 func (r *TrafficRepository) SetCertificateAutoRenew(ctx context.Context, id int64, autoRenew bool) error {
 	if r == nil || r.db == nil {

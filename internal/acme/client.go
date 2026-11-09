@@ -33,6 +33,7 @@ type CertResult struct {
 	KeyPEM     string
 	IssueDate  time.Time
 	ExpiryDate time.Time
+	Issuer     string
 }
 
 // CertRequest 包含证书请求的所有参数。
@@ -303,7 +304,7 @@ func (c *Client) ProcessCertResult(domain string, certPEMBytes, keyPEMBytes []by
 	if _, err := tls.X509KeyPair(certPEMBytes, keyPEMBytes); err != nil {
 		return nil, fmt.Errorf("validate certificate and private key: %w", err)
 	}
-	expiryDate, issueDate, err := parseCertificateDates(certPEMBytes)
+	expiryDate, issueDate, issuer, err := parseCertificateMeta(certPEMBytes)
 	if err != nil {
 		return nil, fmt.Errorf("parse certificate: %w", err)
 	}
@@ -321,6 +322,7 @@ func (c *Client) ProcessCertResult(domain string, certPEMBytes, keyPEMBytes []by
 		KeyPEM:     string(keyPEMBytes),
 		IssueDate:  issueDate,
 		ExpiryDate: expiryDate,
+		Issuer:     issuer,
 	}, nil
 }
 
@@ -349,17 +351,73 @@ func (c *Client) saveCertificate(domain string, certPEM, keyPEM []byte) (string,
 }
 
 func parseCertificateDates(certPEM []byte) (expiryDate, issueDate time.Time, err error) {
+	expiryDate, issueDate, _, err = parseCertificateMeta(certPEM)
+	return expiryDate, issueDate, err
+}
+
+func parseCertificateMeta(certPEM []byte) (expiryDate, issueDate time.Time, issuer string, err error) {
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
-		return time.Time{}, time.Time{}, errors.New("failed to decode PEM block")
+		return time.Time{}, time.Time{}, "", errors.New("failed to decode PEM block")
 	}
 
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("parse certificate: %w", err)
+		return time.Time{}, time.Time{}, "", fmt.Errorf("parse certificate: %w", err)
 	}
 
-	return cert.NotAfter, cert.NotBefore, nil
+	return cert.NotAfter, cert.NotBefore, ExtractCertificateCA(cert), nil
+}
+
+// ExtractCertificateCA parses an x509.Certificate to determine the human-readable issuing CA.
+func ExtractCertificateCA(cert *x509.Certificate) string {
+	if cert == nil {
+		return ""
+	}
+	org := ""
+	if len(cert.Issuer.Organization) > 0 {
+		org = strings.TrimSpace(cert.Issuer.Organization[0])
+	}
+	cn := strings.TrimSpace(cert.Issuer.CommonName)
+	full := org + " " + cn
+
+	switch {
+	case strings.Contains(full, "Let's Encrypt"):
+		return "Let's Encrypt"
+	case strings.Contains(full, "Google Trust Services") || strings.Contains(cn, "GTS "):
+		return "Google Trust Services"
+	case strings.Contains(full, "ZeroSSL"):
+		return "ZeroSSL"
+	case strings.Contains(full, "DigiCert"):
+		return "DigiCert"
+	case strings.Contains(full, "Cloudflare"):
+		return "Cloudflare"
+	case strings.Contains(full, "Sectigo"):
+		return "Sectigo"
+	case strings.Contains(full, "TrustAsia"):
+		return "TrustAsia"
+	case strings.Contains(full, "Buypass"):
+		return "Buypass"
+	case org != "":
+		return org
+	case cn != "":
+		return cn
+	default:
+		return ""
+	}
+}
+
+// ExtractCertificateIssuerFromPEM decodes the first PEM certificate and extracts the issuing CA name.
+func ExtractCertificateIssuerFromPEM(certPEM []byte) string {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return ""
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return ""
+	}
+	return ExtractCertificateCA(cert)
 }
 
 // 返回证书存储目录。
