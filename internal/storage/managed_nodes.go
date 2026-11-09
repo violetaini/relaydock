@@ -491,7 +491,7 @@ var managedGrantProtocolProfileFamilies = map[string]string{
 	"vless-reality": "vless", "vless-tcp-tls": "vless", "vless-grpc-tls": "vless", "vless-wss": "vless", "vless-ws": "vless",
 	"vmess-tcp-none": "vmess", "vmess-tcp-tls": "vmess", "vmess-grpc-tls": "vmess", "vmess-wss": "vmess", "vmess-ws": "vmess",
 	"trojan-tcp-tls": "trojan", "trojan-reality": "trojan", "trojan-grpc-tls": "trojan", "trojan-wss": "trojan",
-	"shadowsocks-classic": "shadowsocks", "shadowsocks-2022": "shadowsocks", "hysteria2": "hysteria", "socks5": "socks", "http": "http", "anytls": "anytls", "snell": "snell", "chitanda": "chitanda", "chitanda-h2": "chitanda",
+	"shadowsocks-classic": "shadowsocks", "shadowsocks-2022": "shadowsocks", "hysteria2": "hysteria", "socks5": "socks", "http": "http", "anytls": "anytls", "snell": "snell", "chitanda": "chitanda", "chitanda-stream": "chitanda", "chitanda-h2": "chitanda", "chitanda-h3": "chitanda", "chitanda-auto": "chitanda", "chitanda-h1": "chitanda",
 }
 
 func canonicalManagedGrantProtocol(protocol string) (string, bool) {
@@ -704,6 +704,28 @@ func SelfServiceNodeProtocolProfile(protocolName, clashConfig string) (string, b
 		case network == "ws" && tls && !reality:
 			return "trojan-wss", true
 		}
+	case "chitanda":
+		transport := ""
+		if t, ok := config["transport"].(string); ok {
+			transport = strings.ToLower(strings.TrimSpace(t))
+		}
+		switch transport {
+		case "stream":
+			return "chitanda-stream", true
+		case "h2":
+			return "chitanda-h2", true
+		case "h3":
+			return "chitanda-h3", true
+		case "auto":
+			return "chitanda-auto", true
+		case "h1":
+			return "chitanda-h1", true
+		default:
+			if tls {
+				return "chitanda-h2", true
+			}
+			return "chitanda-stream", true
+		}
 	}
 	return "", false
 }
@@ -722,7 +744,7 @@ func (g UserServerGrant) AllowsNodeProtocol(protocol, clashConfig string) bool {
 		return false
 	}
 	for _, allowed := range g.AllowedProtocolProfiles {
-		if allowed == profile {
+		if allowed == profile || (protocol == "chitanda" && (allowed == "chitanda" || allowed == "chitanda-h2" && profile == "chitanda-stream")) {
 			return true
 		}
 	}
