@@ -1238,8 +1238,6 @@ func main() {
 	mux.Handle("/api/admin/certificates/create", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.CreateCertificate)))
 	mux.Handle("/api/admin/certificates/renew", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.RenewCertificate)))
 	mux.Handle("/api/admin/certificates/auto-renew", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.SetAutoRenew)))
-	mux.Handle("/api/admin/certificates/auto-deploy", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.SetAutoDeploy)))
-	mux.Handle("/api/admin/certificates/deploy", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.DeployCertificate)))
 	mux.Handle("/api/admin/certificates/upload", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.UploadCertificate)))
 	mux.Handle("/api/admin/certificates/delete", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.DeleteCertificate)))
 	mux.Handle("/api/admin/certificates/", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(certHandler.GetCertificate)))
