@@ -10,7 +10,7 @@ import (
 func TestMihomoCatalogContainsVerifiedLinuxTargets(t *testing.T) {
 	for _, platform := range [][2]string{{"linux", "amd64"}, {"linux", "arm64"}} {
 		asset, ok := Mihomo(platform[0], platform[1])
-		if !ok || asset.Version == "" || asset.Name == "" || !strings.HasPrefix(asset.URL, "https://github.com/chitanda-project/chitanda/releases/download/") || len(asset.SHA256) != 64 {
+		if !ok || asset.Version == "" || asset.Name == "" || (!strings.HasPrefix(asset.URL, "https://github.com/MetaCubeX/mihomo/releases/download/") && !strings.HasPrefix(asset.URL, "https://github.com/chitanda-project/chitanda/releases/download/")) || len(asset.SHA256) != 64 {
 			t.Fatalf("Mihomo(%q, %q) = %#v, %v", platform[0], platform[1], asset, ok)
 		}
 	}

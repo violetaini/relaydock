@@ -33,7 +33,7 @@ const mihomoCacheDir = "data/bin"
 const minMihomoVersion = "1.0.0"
 
 const (
-	mihomoLatestReleaseURL = "https://api.github.com/repos/chitanda-project/chitanda/releases?per_page=20"
+	mihomoLatestReleaseURL = "https://api.github.com/repos/MetaCubeX/mihomo/releases?per_page=30"
 	maxMihomoArchiveSize   = int64(64 << 20)
 	maxMihomoBinarySize    = int64(256 << 20)
 )
@@ -243,13 +243,162 @@ func EnsureMihomo(ctx context.Context) (string, error) {
 	return local, nil
 }
 
-// InstallManagedMihomo 安装或更新 Arcway 管理的核心到当前后端批准的
-// MetaCubeX/mihomo 版本。外部 MIHOMO_BIN/PATH 核心永远不会被覆盖；
-// 高于目标版本的受管核心也不会降级。
+var (
+	mihomoVersionsMu   sync.Mutex
+	cachedMihomoVers   []string
+	cachedMihomoExpiry time.Time
+)
+
+// FetchMihomoReleaseVersions 返回 MetaCubeX/mihomo 的稳定发布版本列表。
+// 结果在内存中缓存 10 分钟以避免频繁请求 GitHub API。
+func FetchMihomoReleaseVersions(ctx context.Context) ([]string, error) {
+	mihomoVersionsMu.Lock()
+	if time.Now().Before(cachedMihomoExpiry) && len(cachedMihomoVers) > 0 {
+		vers := make([]string, len(cachedMihomoVers))
+		copy(vers, cachedMihomoVers)
+		mihomoVersionsMu.Unlock()
+		return vers, nil
+	}
+	mihomoVersionsMu.Unlock()
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, mihomoLatestReleaseURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建 releases 请求: %w", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "relaydock-speedtest")
+	resp, err := client.Do(req)
+	if err != nil {
+		mihomoVersionsMu.Lock()
+		defer mihomoVersionsMu.Unlock()
+		if len(cachedMihomoVers) > 0 {
+			return cachedMihomoVers, nil
+		}
+		return []string{"v" + componentcatalog.MihomoVersion()}, nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		mihomoVersionsMu.Lock()
+		defer mihomoVersionsMu.Unlock()
+		if len(cachedMihomoVers) > 0 {
+			return cachedMihomoVers, nil
+		}
+		return []string{"v" + componentcatalog.MihomoVersion()}, nil
+	}
+
+	var rels []ghRelease
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&rels); err != nil {
+		return nil, fmt.Errorf("解析 releases: %w", err)
+	}
+
+	var versions []string
+	seen := make(map[string]bool)
+	for _, r := range rels {
+		if r.Draft || r.Prerelease {
+			continue
+		}
+		if !mihomoReleaseTagRe.MatchString(r.TagName) {
+			continue
+		}
+		vClean := strings.TrimPrefix(r.TagName, "v")
+		names, supported := managedMihomoAssetNames(runtime.GOOS, runtime.GOARCH, vClean)
+		if !supported {
+			continue
+		}
+		hasAsset := false
+		for _, name := range names {
+			for _, a := range r.Assets {
+				if a.Name == name {
+					hasAsset = true
+					break
+				}
+			}
+			if hasAsset {
+				break
+			}
+		}
+		if hasAsset && !seen[r.TagName] {
+			seen[r.TagName] = true
+			versions = append(versions, r.TagName)
+		}
+	}
+
+	if len(versions) == 0 {
+		versions = append(versions, "v"+componentcatalog.MihomoVersion())
+	}
+
+	mihomoVersionsMu.Lock()
+	cachedMihomoVers = versions
+	cachedMihomoExpiry = time.Now().Add(10 * time.Minute)
+	mihomoVersionsMu.Unlock()
+
+	return versions, nil
+}
+
+func resolveMihomoVersionAsset(ctx context.Context, version string) (mihomoAssetSpec, ghAsset, error) {
+	version = strings.TrimSpace(version)
+	if version == "" || strings.EqualFold(version, "latest") {
+		rel, err := fetchLatestRelease(ctx)
+		if err == nil {
+			spec, asset, rErr := resolveMihomoReleaseAsset(rel, runtime.GOOS, runtime.GOARCH)
+			if rErr == nil {
+				return spec, asset, nil
+			}
+		}
+		return latestMihomoAsset(ctx)
+	}
+
+	cleanVer := strings.TrimPrefix(version, "v")
+	tag := "v" + cleanVer
+	endpoint := fmt.Sprintf("https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/%s", tag)
+	client := &http.Client{Timeout: 30 * time.Second}
+	rel, err := fetchMihomoRelease(ctx, client, endpoint)
+	if err != nil {
+		catSpec, catAsset, catErr := latestMihomoAsset(ctx)
+		if catErr == nil && (catSpec.Version == cleanVer || catSpec.Tag == tag) {
+			return catSpec, catAsset, nil
+		}
+		return mihomoAssetSpec{}, ghAsset{}, fmt.Errorf("获取 Mihomo %s release 失败: %w", tag, err)
+	}
+	return resolveMihomoReleaseAsset(rel, runtime.GOOS, runtime.GOARCH)
+}
+
+// InstallManagedMihomo 安装或更新 Arcway 管理的核心到最新或目录版本。
 func InstallManagedMihomo(ctx context.Context) (MihomoCoreStatus, error) {
-	return installManagedMihomo(ctx, latestMihomoAsset, func(ctx context.Context, asset ghAsset, spec mihomoAssetSpec, dst string) error {
-		return downloadMihomoAsset(ctx, &http.Client{Timeout: 5 * time.Minute}, asset, spec, dst)
-	})
+	return InstallManagedMihomoVersion(ctx, "")
+}
+
+// InstallManagedMihomoVersion 安装或切换 Arcway 管理的核心到指定版本（或最新版本）。
+// 类似 3x-ui 的 Xray 版本切换功能，支持切换到任意稳定版本或最新版本。
+func InstallManagedMihomoVersion(ctx context.Context, version string) (MihomoCoreStatus, error) {
+	mihomoMu.Lock()
+	defer mihomoMu.Unlock()
+
+	status := inspectMihomoLocked()
+	if status.Source == "env" || status.Source == "path" {
+		return status, ErrMihomoExternallyManaged
+	}
+	if !status.Manageable {
+		return status, fmt.Errorf("mihomo 不支持在 %s/%s 自动安装，请通过 MIHOMO_BIN 提供可信二进制", runtime.GOOS, runtime.GOARCH)
+	}
+
+	spec, asset, err := resolveMihomoVersionAsset(ctx, version)
+	if err != nil {
+		status.LatestError = err.Error()
+		return status, fmt.Errorf("读取 Mihomo 版本失败: %w", err)
+	}
+	status = applyMihomoLatest(status, spec.Version)
+
+	local := filepath.Join(mihomoCacheDir, mihomoBinName())
+	if err := downloadMihomoAsset(ctx, &http.Client{Timeout: 5 * time.Minute}, asset, spec, local); err != nil {
+		return status, fmt.Errorf("安装 Mihomo 失败: %w", err)
+	}
+	installed := applyMihomoLatest(inspectMihomoLocked(), spec.Version)
+	if !installed.Ready || installed.Source != "managed" {
+		return installed, errors.New("Mihomo 已下载但未能通过版本校验")
+	}
+	return installed, nil
 }
 
 // AutoUpdateManagedMihomo only updates an already Arcway-managed copy. It does
@@ -359,9 +508,9 @@ func latestMihomoAsset(ctx context.Context) (mihomoAssetSpec, ghAsset, error) {
 func mihomoCatalogAssetSize(goos, goarch string) int64 {
 	switch goos + "/" + goarch {
 	case "linux/amd64":
-		return 23553869
+		return 22893972
 	case "linux/arm64":
-		return 21350990
+		return 20824326
 	default:
 		return 0
 	}

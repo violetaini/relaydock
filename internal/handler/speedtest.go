@@ -24,6 +24,8 @@ type SpeedTestHandler struct {
 	testerWS          *SpeedTesterWSHandler // 家用测速端(Phase 2);nil 时只支持本机测速
 	mihomoStatus      func(context.Context) speedtest.MihomoCoreStatus
 	mihomoInstall     func(context.Context) (speedtest.MihomoCoreStatus, error)
+	mihomoInstallVer  func(context.Context, string) (speedtest.MihomoCoreStatus, error)
+	mihomoVersions    func(context.Context) ([]string, error)
 }
 
 func NewSpeedTestHandler(repo *storage.TrafficRepository, manager *capabilities.Manager) *SpeedTestHandler {
@@ -32,6 +34,8 @@ func NewSpeedTestHandler(repo *storage.TrafficRepository, manager *capabilities.
 		capabilityManager: manager,
 		mihomoStatus:      speedtest.GetMihomoCoreStatus,
 		mihomoInstall:     speedtest.InstallManagedMihomo,
+		mihomoInstallVer:  speedtest.InstallManagedMihomoVersion,
+		mihomoVersions:    speedtest.FetchMihomoReleaseVersions,
 	}
 }
 
@@ -63,6 +67,8 @@ func (h *SpeedTestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"path":    status.Path,
 			"status":  status,
 		})
+	case r.URL.Path == "/api/admin/speedtest/mihomo/versions" && r.Method == http.MethodGet:
+		h.handleMihomoVersions(w, r)
 	case r.URL.Path == "/api/admin/speedtest/mihomo/install" && r.Method == http.MethodPost:
 		h.handleMihomoInstall(w, r)
 	case r.URL.Path == "/api/admin/speedtest/testers" && r.Method == http.MethodGet:
@@ -81,7 +87,24 @@ func (h *SpeedTestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *SpeedTestHandler) handleMihomoInstall(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
-	status, err := h.mihomoInstall(ctx)
+
+	var req struct {
+		Version string `json:"version,omitempty"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	var status speedtest.MihomoCoreStatus
+	var err error
+	if h.mihomoInstallVer != nil && req.Version != "" {
+		status, err = h.mihomoInstallVer(ctx, req.Version)
+	} else if h.mihomoInstall != nil {
+		status, err = h.mihomoInstall(ctx)
+	} else if h.mihomoInstallVer != nil {
+		status, err = h.mihomoInstallVer(ctx, "")
+	}
+
 	if err != nil {
 		code := http.StatusInternalServerError
 		if errors.Is(err, speedtest.ErrMihomoExternallyManaged) {
@@ -91,6 +114,29 @@ func (h *SpeedTestHandler) handleMihomoInstall(w http.ResponseWriter, r *http.Re
 		return
 	}
 	respondJSON(w, http.StatusOK, map[string]any{"success": true, "status": status})
+}
+
+func (h *SpeedTestHandler) handleMihomoVersions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	status := h.mihomoStatus(ctx)
+	var versions []string
+	if h.mihomoVersions != nil {
+		vers, err := h.mihomoVersions(ctx)
+		if err == nil {
+			versions = vers
+		}
+	}
+	if len(versions) == 0 {
+		versions = []string{"v" + status.TargetVersion}
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"success":         true,
+		"current_version": status.CurrentVersion,
+		"target_version":  status.TargetVersion,
+		"latest_version":  status.LatestVersion,
+		"manageable":      status.Manageable,
+		"versions":        versions,
+	})
 }
 
 func (h *SpeedTestHandler) handleRun(w http.ResponseWriter, r *http.Request) {

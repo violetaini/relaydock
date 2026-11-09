@@ -72,3 +72,55 @@ func TestSpeedTestMihomoInstallAndExternalConflict(t *testing.T) {
 		t.Fatalf("external conflict status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestSpeedTestMihomoVersionsAndCustomVersionInstall(t *testing.T) {
+	h := NewSpeedTestHandler(nil, capabilities.NewManager())
+	h.mihomoStatus = func(context.Context) speedtest.MihomoCoreStatus {
+		return speedtest.MihomoCoreStatus{
+			Ready: true, Path: "data/bin/mihomo", Source: "managed",
+			CurrentVersion: "1.19.33", TargetVersion: "1.19.33", LatestVersion: "1.19.33", Manageable: true,
+		}
+	}
+	h.mihomoVersions = func(context.Context) ([]string, error) {
+		return []string{"v1.19.33", "v1.19.32", "v1.19.31"}, nil
+	}
+
+	// Test GET /api/admin/speedtest/mihomo/versions
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/admin/speedtest/mihomo/versions", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("versions code = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var versResp struct {
+		Success        bool     `json:"success"`
+		CurrentVersion string   `json:"current_version"`
+		Versions       []string `json:"versions"`
+		Manageable     bool     `json:"manageable"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &versResp); err != nil {
+		t.Fatal(err)
+	}
+	if !versResp.Success || !versResp.Manageable || len(versResp.Versions) != 3 || versResp.Versions[0] != "v1.19.33" {
+		t.Fatalf("unexpected versions response: %#v", versResp)
+	}
+
+	// Test POST /api/admin/speedtest/mihomo/install with specific version
+	requestedVersion := ""
+	h.mihomoInstallVer = func(ctx context.Context, v string) (speedtest.MihomoCoreStatus, error) {
+		requestedVersion = v
+		return speedtest.MihomoCoreStatus{
+			Ready: true, Path: "data/bin/mihomo", Source: "managed",
+			CurrentVersion: v, TargetVersion: v, LatestVersion: "1.19.33", Manageable: true,
+		}, nil
+	}
+
+	recorder = httptest.NewRecorder()
+	reqBody := strings.NewReader(`{"version":"v1.19.32"}`)
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/admin/speedtest/mihomo/install", reqBody))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("install with version code = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if requestedVersion != "v1.19.32" {
+		t.Fatalf("requestedVersion = %q, want v1.19.32", requestedVersion)
+	}
+}
