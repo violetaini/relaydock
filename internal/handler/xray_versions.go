@@ -16,6 +16,7 @@ import (
 
 const (
 	xrayCoreReleasesURL       = "https://api.github.com/repos/chitanda-project/chitanda/releases?per_page=30"
+	xrayCoreMirrorReleasesURL = "https://api.github.com/repos/violetaini/chitanda/releases?per_page=30"
 	xrayCoreVersionsCacheTTL  = 15 * time.Minute
 	xrayCoreVersionsTimeout   = 10 * time.Second
 	xrayCoreVersionsMaxBody   = 8 << 20
@@ -103,32 +104,45 @@ func (h *RemoteManageHandler) fetchXrayCoreVersions(ctx context.Context) ([]Xray
 func (h *RemoteManageHandler) fetchOfficialXrayCoreVersions(parent context.Context) ([]XrayCoreVersion, string) {
 	ctx, cancel := context.WithTimeout(parent, xrayCoreVersionsTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, xrayCoreReleasesURL, nil)
-	if err != nil {
-		return nil, err.Error()
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
 	client := h.httpClient
 	if client == nil {
 		client = http.DefaultClient
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err.Error()
+
+	endpoints := []string{xrayCoreReleasesURL, xrayCoreMirrorReleasesURL}
+	var raw []byte
+	var lastStatus string
+	for _, ep := range endpoints {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep, nil)
+		if err != nil {
+			lastStatus = err.Error()
+			continue
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastStatus = err.Error()
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastStatus = "github status " + strconv.Itoa(resp.StatusCode)
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, xrayCoreVersionsMaxBody+1))
+		resp.Body.Close()
+		if err == nil && len(data) <= xrayCoreVersionsMaxBody {
+			raw = data
+			break
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, "github status " + strconv.Itoa(resp.StatusCode)
+	if len(raw) == 0 {
+		return nil, lastStatus
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, xrayCoreVersionsMaxBody+1))
-	if err != nil {
-		return nil, err.Error()
-	}
-	if len(raw) > xrayCoreVersionsMaxBody {
-		return nil, "github response exceeds size limit"
-	}
+
 	var releases []githubXrayCoreRelease
 	if err := json.Unmarshal(raw, &releases); err != nil {
 		return nil, "parse github releases: " + err.Error()
@@ -141,16 +155,21 @@ func (h *RemoteManageHandler) fetchOfficialXrayCoreVersions(parent context.Conte
 		if release.Draft || !xrayCoreVersionPattern.MatchString(version) {
 			continue
 		}
+		isMihomo := false
 		isXray := strings.Contains(strings.ToLower(release.Name), "xray")
-		if !isXray {
-			for _, a := range release.Assets {
-				if strings.HasPrefix(a.Name, "Xray-") {
-					isXray = true
-					break
-				}
+		for _, a := range release.Assets {
+			if strings.HasPrefix(a.Name, "mihomo-") {
+				isMihomo = true
+				break
+			}
+			if strings.HasPrefix(a.Name, "Xray-") {
+				isXray = true
 			}
 		}
-		if !isXray {
+		if isMihomo {
+			continue
+		}
+		if len(release.Assets) > 0 && !isXray {
 			continue
 		}
 		if _, duplicate := seen[version]; duplicate {
