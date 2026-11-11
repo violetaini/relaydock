@@ -780,3 +780,189 @@ func TestSyncWSSNginxRendersProxyCamouflageWithAntiCFHijackHeaders(t *testing.T)
 		}
 	}
 }
+
+func TestHandleInboundsWSSSupportsInlineDomainAndWildcardCertificateWhenServerDomainEmpty(t *testing.T) {
+	var inboundsPayload map[string]interface{}
+	var deployedCert WSCertDeployPayload
+	var capturedDomainConf string
+	var createdInbound map[string]interface{}
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/child/inbounds":
+			inbounds := []map[string]interface{}{}
+			if createdInbound != nil {
+				inbounds = append(inbounds, createdInbound)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":              true,
+				"inbounds":             inbounds,
+				"mutation_fence_known": true,
+				"mutation_owners":      map[string]interface{}{},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/child/xray/config":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "config": "{}"})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
+			_ = json.NewDecoder(r.Body).Decode(&inboundsPayload)
+			mutationID, _ := inboundsPayload["mutation_id"].(string)
+			if inbound, ok := inboundsPayload["inbound"].(map[string]interface{}); ok {
+				createdInbound = inbound
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "mutation_id": mutationID})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/child/cert/deploy":
+			_ = json.NewDecoder(r.Body).Decode(&deployedCert)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/child/nginx/setup-ssl":
+			var body map[string]interface{}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			capturedDomainConf, _ = body["domain_config"].(string)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer agent.Close()
+
+	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
+	if err := repo.UpdateRemoteServerDomain(context.Background(), server.ID, ""); err != nil {
+		t.Fatalf("clear server domain: %v", err)
+	}
+	wildcardPEM, wildcardKey, wildcardExp := createTestCertificatePEM(t, "*.example.test")
+	wildcardCert := &storage.Certificate{
+		Domain:         "*.example.test",
+		Email:          "admin@example.test",
+		Status:         storage.CertStatusValid,
+		RemoteServerID: server.ID,
+		CertPEM:        wildcardPEM,
+		KeyPEM:         wildcardKey,
+		ExpiryDate:     &wildcardExp,
+	}
+	createWSSCertificateForTest(t, repo, wildcardCert)
+
+	handler := NewRemoteManageHandler(repo, nil)
+	attachRemoteCertificateHandler(t, repo, handler)
+
+	payload := map[string]interface{}{
+		"action":      "add",
+		"wss_domain":  "hk.example.test",
+		"wss_cert_id": wildcardCert.ID,
+		"inbound": map[string]interface{}{
+			"tag":      "vless-wss-inline",
+			"protocol": "vless",
+			"listen":   "127.0.0.1",
+			"port":     443,
+			"settings": map[string]interface{}{
+				"clients":    []map[string]interface{}{{"id": "11111111-1111-4111-8111-111111111111", "email": "admin"}},
+				"decryption": "none",
+			},
+			"streamSettings": map[string]interface{}{
+				"network":  "ws",
+				"security": "none",
+				"wsSettings": map[string]interface{}{
+					"path": "/ws/inline",
+					"host": "hk.example.test",
+				},
+			},
+		},
+	}
+	raw, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/api/remote/inbounds?server_id="+leaseTestID(server.ID), bytes.NewReader(raw))
+	req = req.WithContext(auth.ContextWithUsername(req.Context(), "admin"))
+	rec := httptest.NewRecorder()
+	handler.HandleInbounds(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	if _, exists := inboundsPayload["wss_domain"]; exists {
+		t.Fatalf("agent payload leaked wss_domain: %#v", inboundsPayload)
+	}
+	if _, exists := inboundsPayload["wss_cert_id"]; exists {
+		t.Fatalf("agent payload leaked wss_cert_id: %#v", inboundsPayload)
+	}
+	forwardedInbound, _ := inboundsPayload["inbound"].(map[string]interface{})
+	if _, exists := forwardedInbound["cert_id"]; exists {
+		t.Fatalf("agent inbound leaked cert_id: %#v", forwardedInbound)
+	}
+	updatedServer, err := repo.GetRemoteServer(context.Background(), server.ID)
+	if err != nil {
+		t.Fatalf("GetRemoteServer: %v", err)
+	}
+	if updatedServer.Domain != "hk.example.test" {
+		t.Fatalf("updated server.Domain = %q, want hk.example.test", updatedServer.Domain)
+	}
+	if deployedCert.CertPath != "/usr/local/nginx/cert/_.example.test.pem" {
+		t.Fatalf("deployed CertPath = %q, want /usr/local/nginx/cert/_.example.test.pem", deployedCert.CertPath)
+	}
+	if !strings.Contains(capturedDomainConf, "hk.example.test") {
+		t.Fatalf("expected nginx config for hk.example.test, got:\n%s", capturedDomainConf)
+	}
+}
+
+func TestHandleInboundsWSSRejectsMismatchedExplicitCertificateBeforeMutation(t *testing.T) {
+	var agentRequests atomic.Int64
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		agentRequests.Add(1)
+		http.Error(w, "unexpected agent request", http.StatusInternalServerError)
+	}))
+	defer agent.Close()
+
+	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
+	if err := repo.UpdateRemoteServerDomain(context.Background(), server.ID, ""); err != nil {
+		t.Fatalf("clear server domain: %v", err)
+	}
+	otherPEM, otherKey, otherExp := createTestCertificatePEM(t, "other.example.test")
+	otherCert := &storage.Certificate{
+		Domain:         "other.example.test",
+		Email:          "admin@example.test",
+		Status:         storage.CertStatusValid,
+		RemoteServerID: server.ID,
+		CertPEM:        otherPEM,
+		KeyPEM:         otherKey,
+		ExpiryDate:     &otherExp,
+	}
+	createWSSCertificateForTest(t, repo, otherCert)
+
+	handler := NewRemoteManageHandler(repo, nil)
+	attachRemoteCertificateHandler(t, repo, handler)
+
+	payload := map[string]interface{}{
+		"action":      "add",
+		"wss_domain":  "hk.example.test",
+		"wss_cert_id": otherCert.ID,
+		"inbound": map[string]interface{}{
+			"tag":      "vless-wss-bad-cert",
+			"protocol": "vless",
+			"listen":   "127.0.0.1",
+			"port":     443,
+			"settings": map[string]interface{}{"clients": []interface{}{}},
+			"streamSettings": map[string]interface{}{
+				"network":  "ws",
+				"security": "none",
+				"wsSettings": map[string]interface{}{
+					"path": "/ws/bad",
+					"host": "hk.example.test",
+				},
+			},
+		},
+	}
+	raw, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/api/remote/inbounds?server_id="+leaseTestID(server.ID), bytes.NewReader(raw))
+	req = req.WithContext(auth.ContextWithUsername(req.Context(), "admin"))
+	rec := httptest.NewRecorder()
+	handler.HandleInbounds(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409", rec.Code, rec.Body.String())
+	}
+	if got := agentRequests.Load(); got != 0 {
+		t.Fatalf("agentRequests = %d, want 0 before failing preflight", got)
+	}
+	unchangedServer, err := repo.GetRemoteServer(context.Background(), server.ID)
+	if err != nil {
+		t.Fatalf("GetRemoteServer: %v", err)
+	}
+	if unchangedServer.Domain != "" {
+		t.Fatalf("server.Domain mutated to %q on failed preflight, want empty", unchangedServer.Domain)
+	}
+}

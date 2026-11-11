@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	texttemplate "text/template"
 
 	"github.com/violetaini/relaydock/internal/storage"
@@ -212,26 +213,119 @@ type wssCertificateContext struct {
 	certName    string
 }
 
+// extractWSSRequestDomainAndCert extracts out-of-band WSS domain and certificate ID fields
+// from a create-inbound payload and removes them so the downstream Agent/Xray receives clean JSON.
+func extractWSSRequestDomainAndCert(inboundReq map[string]interface{}) (explicitDomain string, fallbackHost string, certID int64) {
+	if inboundReq == nil {
+		return "", "", 0
+	}
+	if rawDomain, ok := inboundReq["wss_domain"].(string); ok {
+		explicitDomain = strings.ToLower(strings.TrimSpace(rawDomain))
+	}
+	delete(inboundReq, "wss_domain")
+
+	if rawCertID, ok := managedNumericInt(inboundReq["wss_cert_id"]); ok && rawCertID > 0 {
+		certID = int64(rawCertID)
+	} else if rawCertID, ok := managedNumericInt(inboundReq["cert_id"]); ok && rawCertID > 0 {
+		certID = int64(rawCertID)
+	}
+	delete(inboundReq, "wss_cert_id")
+	delete(inboundReq, "cert_id")
+
+	inbound, _ := inboundReq["inbound"].(map[string]interface{})
+	if inbound == nil {
+		return explicitDomain, "", certID
+	}
+	if certID <= 0 {
+		if rawCertID, ok := managedNumericInt(inbound["cert_id"]); ok && rawCertID > 0 {
+			certID = int64(rawCertID)
+		}
+	}
+	delete(inbound, "cert_id")
+
+	ss, _ := inbound["streamSettings"].(map[string]interface{})
+	ws, _ := ss["wsSettings"].(map[string]interface{})
+	if ws != nil {
+		if host, _ := ws["host"].(string); strings.TrimSpace(host) != "" {
+			fallbackHost = strings.ToLower(strings.TrimSpace(host))
+		} else if headers, _ := ws["headers"].(map[string]interface{}); headers != nil {
+			if host, _ := headers["Host"].(string); strings.TrimSpace(host) != "" {
+				fallbackHost = strings.ToLower(strings.TrimSpace(host))
+			}
+		}
+	}
+	return explicitDomain, fallbackHost, certID
+}
+
+// setWSSInboundHost ensures wsSettings.host records the resolved node domain so client configs match Nginx.
+func setWSSInboundHost(inboundReq map[string]interface{}, domain string) {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if inboundReq == nil || domain == "" {
+		return
+	}
+	inbound, _ := inboundReq["inbound"].(map[string]interface{})
+	ss, _ := inbound["streamSettings"].(map[string]interface{})
+	ws, _ := ss["wsSettings"].(map[string]interface{})
+	if ws != nil {
+		ws["host"] = domain
+	}
+}
+
 func (h *RemoteManageHandler) resolveWSSCertificateContext(ctx context.Context, serverID int64) (*wssCertificateContext, error) {
+	return h.resolveWSSCertificateContextWithOptions(ctx, serverID, "", 0)
+}
+
+func (h *RemoteManageHandler) resolveWSSCertificateContextWithOptions(ctx context.Context, serverID int64, domainOverride string, certIDOverride int64) (*wssCertificateContext, error) {
 	server, err := h.repo.GetRemoteServer(ctx, serverID)
 	if err != nil {
 		return nil, fmt.Errorf("server not found: %v", err)
 	}
-	domain := strings.ToLower(strings.TrimSpace(server.Domain))
+	domain := strings.ToLower(strings.TrimSpace(domainOverride))
+	if domain == "" {
+		domain = strings.ToLower(strings.TrimSpace(server.Domain))
+	}
 	if domain == "" {
 		return nil, fmt.Errorf("server %d 未配置域名，无法同步 WSS nginx", serverID)
+	}
+	if !validManagedDNSName(domain) {
+		return nil, fmt.Errorf("WSS 节点域名 %q 格式无效", domain)
 	}
 	if h.certHandler == nil {
 		return nil, fmt.Errorf("证书功能未初始化，无法同步 WSS nginx")
 	}
 	rootDomain := extractRootDomain(domain)
-	certificate, err := h.findCertificateForRemoteDomain(ctx, domain, serverID)
-	if err != nil {
-		return nil, fmt.Errorf("server %d domain=%s 根域=%s 无可部署证书，无法同步 WSS nginx: %v", serverID, domain, rootDomain, err)
+	var certificate *storage.Certificate
+	if certIDOverride > 0 {
+		cert, certErr := h.repo.GetCertificate(ctx, certIDOverride)
+		if certErr != nil || cert == nil {
+			return nil, fmt.Errorf("所选证书不存在(id=%d)", certIDOverride)
+		}
+		if cert.Status != storage.CertStatusValid {
+			return nil, fmt.Errorf("所选证书状态不是 valid")
+		}
+		if cert.RemoteServerID != 0 && cert.RemoteServerID != serverID {
+			return nil, fmt.Errorf("所选证书属于另一台服务器，不能跨节点下发")
+		}
+		now := time.Now()
+		if cert.ExpiryDate != nil && !cert.ExpiryDate.After(now) {
+			return nil, fmt.Errorf("所选证书已过期")
+		}
+		if !certificateCoversHostname(cert.CertPEM, cert.KeyPEM, domain, now) {
+			return nil, fmt.Errorf("所选证书不覆盖 WSS 域名 %q，或证书与私钥不匹配", domain)
+		}
+		certificate = cert
+	} else {
+		certificate, err = h.findCertificateForRemoteDomain(ctx, domain, serverID)
+		if err != nil {
+			return nil, fmt.Errorf("server %d domain=%s 根域=%s 无可部署证书，无法同步 WSS nginx: %v", serverID, domain, rootDomain, err)
+		}
 	}
 	return &wssCertificateContext{
-		server: server, domain: domain, rootDomain: rootDomain,
-		certificate: certificate, certName: certDeployFilename(certificate.Domain),
+		server:      server,
+		domain:      domain,
+		rootDomain:  rootDomain,
+		certificate: certificate,
+		certName:    certDeployFilename(certificate.Domain),
 	}, nil
 }
 
@@ -246,7 +340,13 @@ func (h *RemoteManageHandler) resolveWSSCertificateContext(ctx context.Context, 
 //
 // 大写导出:nodes.go 的 deleteRemoteInbound 也要调,删节点路径不走 HandleInbounds remove。
 func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) error {
-	certificateContext, err := h.resolveWSSCertificateContext(ctx, serverID)
+	return h.SyncWSSNginxWithCertificate(ctx, serverID, 0)
+}
+
+// SyncWSSNginxWithCertificate syncs the Nginx WSS config using a caller-selected certificate ID when provided,
+// or automatically selects the best covering single-domain / wildcard certificate otherwise.
+func (h *RemoteManageHandler) SyncWSSNginxWithCertificate(ctx context.Context, serverID int64, certID int64) error {
+	certificateContext, err := h.resolveWSSCertificateContextWithOptions(ctx, serverID, "", certID)
 	if err != nil {
 		return err
 	}

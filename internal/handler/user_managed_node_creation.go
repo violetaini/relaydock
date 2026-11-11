@@ -691,6 +691,7 @@ func validateUserManagedCreateKeys(request map[string]interface{}) error {
 	allowed := map[string]bool{
 		"action": true, "node_name": true, "inbound": true,
 		"client_options": true, "ip_version": true,
+		"wss_domain": true, "wss_cert_id": true,
 	}
 	for key := range request {
 		if !allowed[key] {

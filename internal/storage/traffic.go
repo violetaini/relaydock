@@ -13980,6 +13980,26 @@ func (r *TrafficRepository) UpdateRemoteServerSiteConfig(ctx context.Context, id
 	return nil
 }
 
+// UpdateRemoteServerDomain updates only the remote server domain (e.g. when WSS creation sets/updates the node domain).
+func (r *TrafficRepository) UpdateRemoteServerDomain(ctx context.Context, id int64, domain string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if id <= 0 {
+		return errors.New("remote server id is required")
+	}
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	result, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET domain = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, domain, id)
+	if err != nil {
+		return fmt.Errorf("update domain: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return ErrRemoteServerNotFound
+	}
+	return nil
+}
+
 func (r *TrafficRepository) DeleteNodesByOriginalServer(ctx context.Context, serverName string) (int64, error) {
 	if r == nil || r.db == nil {
 		return 0, errors.New("traffic repository not initialized")

@@ -2663,8 +2663,9 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 
 	// 添加 tls 入站若选了主控托管证书(cert_id),先同步下发证书到 agent 并把路径注入到入站配置,
 	// 避免「agent 上没有该证书 → xray 加载失败 → 502」。失败明确报错(已透传,不被 CF 吞)。
+	var wssCertID int64
 	if r.Method == http.MethodPost && inboundReq != nil {
-		if action, _ := inboundReq["action"].(string); action == "" || strings.ToLower(action) == "add" {
+		if action, _ := inboundReq["action"].(string); (action == "" || strings.ToLower(action) == "add") && !isWSSInboundReq(inboundReq) {
 			if newBody, certErr := h.resolveInboundCert(operationCtx, id, inboundReq); certErr != nil {
 				remoteWriteError(w, http.StatusBadGateway, "证书处理失败: "+certErr.Error())
 				return
@@ -2685,8 +2686,9 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 			wssSiteValueRaw, hasWSSSiteValue := inboundReq["wss_site_value"].(string)
 			delete(inboundReq, "wss_site_type")
 			delete(inboundReq, "wss_site_value")
+			var wssSiteType, wssSiteValue string
 			if hasWSSSiteType || hasWSSSiteValue {
-				wssSiteType := strings.TrimSpace(wssSiteTypeRaw)
+				wssSiteType = strings.TrimSpace(wssSiteTypeRaw)
 				if wssSiteType == "" {
 					wssSiteType = "static"
 				}
@@ -2694,19 +2696,40 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 					remoteWriteError(w, http.StatusBadRequest, "WSS 伪装站点类型必须为 static 或 proxy")
 					return
 				}
-				wssSiteValue := strings.TrimSpace(wssSiteValueRaw)
+				wssSiteValue = strings.TrimSpace(wssSiteValueRaw)
 				if err := validateSiteValue(wssSiteType, wssSiteValue); err != nil {
 					remoteWriteError(w, http.StatusBadRequest, err.Error())
 					return
 				}
+			}
+			explicitWSSDomain, fallbackWSSHost, extractedWSSCertID := extractWSSRequestDomainAndCert(inboundReq)
+			wssCertID = extractedWSSCertID
+			domainCandidate := explicitWSSDomain
+			if domainCandidate == "" && fallbackWSSHost != "" {
+				if server, serverErr := h.repo.GetRemoteServer(operationCtx, id); serverErr == nil && server != nil && strings.TrimSpace(server.Domain) == "" {
+					domainCandidate = fallbackWSSHost
+				}
+			}
+			certCtx, prerequisiteErr := h.resolveWSSCertificateContextWithOptions(operationCtx, id, domainCandidate, wssCertID)
+			if prerequisiteErr != nil {
+				remoteWriteError(w, http.StatusConflict, "WSS 前置检查失败: "+prerequisiteErr.Error())
+				return
+			}
+			if hasWSSSiteType || hasWSSSiteValue {
 				if err := h.repo.UpdateRemoteServerSiteConfig(operationCtx, id, wssSiteType, wssSiteValue); err != nil {
 					remoteWriteError(w, http.StatusInternalServerError, "保存 WSS 伪装站点设置失败: "+err.Error())
 					return
 				}
 			}
-			if _, prerequisiteErr := h.resolveWSSCertificateContext(operationCtx, id); prerequisiteErr != nil {
-				remoteWriteError(w, http.StatusConflict, "WSS 前置检查失败: "+prerequisiteErr.Error())
-				return
+			if certCtx.domain != "" && !strings.EqualFold(strings.TrimSpace(certCtx.server.Domain), certCtx.domain) {
+				if err := h.repo.UpdateRemoteServerDomain(operationCtx, id, certCtx.domain); err != nil {
+					remoteWriteError(w, http.StatusInternalServerError, "保存 WSS 节点域名失败: "+err.Error())
+					return
+				}
+			}
+			setWSSInboundHost(inboundReq, certCtx.domain)
+			if cleanedBody, marshalErr := json.Marshal(inboundReq); marshalErr == nil {
+				body = cleanedBody
 			}
 			lock := wssServerLock(id)
 			lock.Lock()
@@ -2964,7 +2987,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 				}
 				// 受管 WS 入站添加成功 → 在同一租约内聚合渲染并等待 Agent ACK。
 				if managedWSSAdd {
-					if err := h.SyncWSSNginx(operationCtx, id); err != nil {
+					if err := h.SyncWSSNginxWithCertificate(operationCtx, id, wssCertID); err != nil {
 						postSyncErrors = append(postSyncErrors, "WSS nginx 同步失败: "+err.Error())
 					} else if pendingWSSEvent != nil {
 						if publishErr := h.publishManagedInboundEvent(*pendingWSSEvent); publishErr != nil {
