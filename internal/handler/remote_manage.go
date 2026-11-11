@@ -2681,6 +2681,29 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	// per-server 锁:防止并发添加抢到同一端口。
 	if r.Method == http.MethodPost && inboundReq != nil {
 		if action, _ := inboundReq["action"].(string); (action == "" || strings.ToLower(action) == "add") && isWSSInboundReq(inboundReq) {
+			wssSiteTypeRaw, hasWSSSiteType := inboundReq["wss_site_type"].(string)
+			wssSiteValueRaw, hasWSSSiteValue := inboundReq["wss_site_value"].(string)
+			delete(inboundReq, "wss_site_type")
+			delete(inboundReq, "wss_site_value")
+			if hasWSSSiteType || hasWSSSiteValue {
+				wssSiteType := strings.TrimSpace(wssSiteTypeRaw)
+				if wssSiteType == "" {
+					wssSiteType = "static"
+				}
+				if wssSiteType != "static" && wssSiteType != "proxy" {
+					remoteWriteError(w, http.StatusBadRequest, "WSS 伪装站点类型必须为 static 或 proxy")
+					return
+				}
+				wssSiteValue := strings.TrimSpace(wssSiteValueRaw)
+				if err := validateSiteValue(wssSiteType, wssSiteValue); err != nil {
+					remoteWriteError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				if err := h.repo.UpdateRemoteServerSiteConfig(operationCtx, id, wssSiteType, wssSiteValue); err != nil {
+					remoteWriteError(w, http.StatusInternalServerError, "保存 WSS 伪装站点设置失败: "+err.Error())
+					return
+				}
+			}
 			if _, prerequisiteErr := h.resolveWSSCertificateContext(operationCtx, id); prerequisiteErr != nil {
 				remoteWriteError(w, http.StatusConflict, "WSS 前置检查失败: "+prerequisiteErr.Error())
 				return

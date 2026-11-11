@@ -13957,6 +13957,29 @@ func (r *TrafficRepository) UpdateRemoteServerNginxMode(ctx context.Context, id 
 	return nil
 }
 
+func (r *TrafficRepository) UpdateRemoteServerSiteConfig(ctx context.Context, id int64, siteType, siteValue string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	siteType = strings.TrimSpace(siteType)
+	if siteType == "" {
+		siteType = "static"
+	}
+	if siteType != "static" && siteType != "proxy" {
+		return errors.New("invalid site_type")
+	}
+	siteValue = strings.TrimSpace(siteValue)
+	result, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET site_type = ?, site_value = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, siteType, siteValue, id)
+	if err != nil {
+		return fmt.Errorf("update site_config: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return ErrRemoteServerNotFound
+	}
+	return nil
+}
+
 func (r *TrafficRepository) DeleteNodesByOriginalServer(ctx context.Context, serverName string) (int64, error) {
 	if r == nil || r.db == nil {
 		return 0, errors.New("traffic repository not initialized")

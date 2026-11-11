@@ -297,7 +297,7 @@ func validateUserManagedStreamProfile(inbound map[string]interface{}, protocol, 
 	validProfile := false
 	switch protocol {
 	case "vless":
-		validProfile = network == "tcp" && (security == "tls" || security == "reality") || network == "grpc" && security == "tls" || network == "ws" && security == "none"
+		validProfile = network == "tcp" && (security == "none" || security == "tls" || security == "reality") || network == "grpc" && security == "tls" || network == "ws" && security == "none"
 	case "vmess":
 		validProfile = network == "tcp" && (security == "none" || security == "tls") || network == "grpc" && security == "tls" || network == "ws" && security == "none"
 	case "trojan":

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -299,11 +300,32 @@ func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) 
 		if err != nil {
 			return fmt.Errorf("解析 wss 模板失败: %v", err)
 		}
+		siteType := strings.TrimSpace(server.SiteType)
+		siteValue := strings.TrimSpace(server.SiteValue)
+		proxyPassServer := ""
+		staticRootPath := ""
+		if siteType == "proxy" && siteValue != "" {
+			proxyPassServer = normalizeProxyPassServer(siteValue)
+		} else if siteType == "proxy" && siteValue == "" {
+			siteType = ""
+		} else if siteValue != "" {
+			staticRootPath = siteValue
+		}
 		data := struct {
-			Domain   string
-			CertName string
-			Inbounds []wssInboundInfo
-		}{Domain: domain, CertName: certName, Inbounds: infos}
+			Domain          string
+			CertName        string
+			Inbounds        []wssInboundInfo
+			SiteType        string
+			ProxyPassServer string
+			StaticRootPath  string
+		}{
+			Domain:          domain,
+			CertName:        certName,
+			Inbounds:        infos,
+			SiteType:        siteType,
+			ProxyPassServer: proxyPassServer,
+			StaticRootPath:  staticRootPath,
+		}
 		var buf bytes.Buffer
 		if err := tpl.Execute(&buf, data); err != nil {
 			return fmt.Errorf("渲染 wss 模板失败: %v", err)
@@ -465,6 +487,20 @@ func injectWSLocations(conf string, wssInbounds []wssInboundInfo) string {
 	return conf[:idx] + wsLoc + conf[idx:]
 }
 
+func normalizeProxyPassServer(siteValue string) string {
+	v := strings.TrimSpace(siteValue)
+	if v == "" {
+		return ""
+	}
+	if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+		return v
+	}
+	if strings.HasPrefix(v, "localhost") || strings.HasPrefix(v, "127.") || strings.Contains(v, ":") || net.ParseIP(v) != nil {
+		return "http://" + v
+	}
+	return "https://" + v
+}
+
 // renderStealSelfDomainConf 渲染偷自己 server 的 servers/{domain}.conf:
 // 伪装站 location /(按 site_type static/proxy, listen 127.0.0.1:8001)+ 该域名所有 ws location。
 // 统一入口 —— 供 SyncWSSNginx / deployTunnelConfig / deployFallbackConfig / HandleSetupSSL / HandleAddWebsite 复用,
@@ -483,6 +519,10 @@ func renderStealSelfDomainConf(stealMode, siteType, siteValue, domain, certName 
 		staticRoot = "/usr/local/nginx/html"
 	}
 	conf = strings.ReplaceAll(conf, "{static_root_path}", staticRoot)
-	conf = strings.ReplaceAll(conf, "{proxy_pass_server}", siteValue)
+	proxyTarget := siteValue
+	if siteType == "proxy" && strings.TrimSpace(siteValue) != "" {
+		proxyTarget = normalizeProxyPassServer(siteValue)
+	}
+	conf = strings.ReplaceAll(conf, "{proxy_pass_server}", proxyTarget)
 	return injectWSLocations(conf, wssInbounds), nil
 }

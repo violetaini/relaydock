@@ -214,6 +214,8 @@ type RemoteServerUpdateRequest struct {
 	PullToken        string `json:"pull_token"`
 	XrayMode         string `json:"xray_mode"`
 	NginxMode        string `json:"nginx_mode"`
+	SiteType         string `json:"site_type"`
+	SiteValue        string `json:"site_value"`
 	TrafficStatsMode string `json:"traffic_stats_mode"` // both | upload | download
 	TrafficSource    string `json:"traffic_source"`     // xray | system
 	IPv6Enabled      *bool  `json:"ipv6_enabled"`       // 指针:nil=不改;false=关闭(服务管理不显示 v6、加节点不可选 v6)
@@ -458,9 +460,103 @@ func remoteServerTokenNeedsInstallRenewal(server *storage.RemoteServer, now time
 }
 
 // 使用生成的令牌创建一个新的远程服务器
-// validateSiteValue 校验偷自己/fallback 站点的反代地址。site_type=proxy 时,site_value 必须是
+var cloudflareCIDRs = func() []*net.IPNet {
+	cidrs := []string{
+		"173.245.48.0/20",
+		"103.21.244.0/22",
+		"103.22.200.0/22",
+		"103.31.4.0/22",
+		"141.101.64.0/18",
+		"108.162.192.0/18",
+		"190.93.240.0/20",
+		"188.114.96.0/20",
+		"197.234.240.0/22",
+		"198.41.128.0/17",
+		"162.158.0.0/15",
+		"104.16.0.0/13",
+		"104.24.0.0/14",
+		"172.64.0.0/13",
+		"131.0.72.0/22",
+		"1.1.1.1/32",
+		"1.0.0.1/32",
+		"2400:cb00::/32",
+		"2606:4700::/32",
+		"2803:f800::/32",
+		"2405:b500::/32",
+		"2405:8100::/32",
+		"2a06:98c0::/29",
+		"2c0f:f248::/32",
+	}
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, raw := range cidrs {
+		if _, ipNet, err := net.ParseCIDR(raw); err == nil {
+			nets = append(nets, ipNet)
+		}
+	}
+	return nets
+}()
+
+func isCloudflareIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	for _, ipNet := range cloudflareCIDRs {
+		if ipNet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCloudflareDomain(host string) bool {
+	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if h == "" {
+		return false
+	}
+	suffixes := []string{
+		"cloudflare.com",
+		"cloudflare.net",
+		"cloudflare-dns.com",
+		"workers.dev",
+		"pages.dev",
+		"trycloudflare.com",
+		"cfargotunnel.com",
+	}
+	for _, suffix := range suffixes {
+		if h == suffix || strings.HasSuffix(h, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func skipLiveDNSCheckForHost(host string) bool {
+	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if h == "" || h == "localhost" || !strings.Contains(h, ".") {
+		return true
+	}
+	reserved := []string{
+		".test",
+		".example",
+		".invalid",
+		".local",
+		".localhost",
+		".internal",
+		"example.com",
+		"example.org",
+		"example.net",
+	}
+	for _, suffix := range reserved {
+		if h == strings.TrimPrefix(suffix, ".") || strings.HasSuffix(h, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateSiteValue 校验偷自己/fallback/WSS 站点的反代地址。site_type=proxy 时,site_value 必须是
 // 合法的反代目标(host:port 或带 scheme 的 URL);host 形如"纯数字+点"却不是合法 IPv4 时判为 typo
-// (如 127.0.01 少一个 0)。static(本地静态路径)与空值跳过校验。
+// (如 127.0.01 少一个 0)。同时拦截 Cloudflare 域名与 Cloudflare CDN IP,防止服务器被扫成免费 CF 优选节点。
 func validateSiteValue(siteType, siteValue string) error {
 	v := strings.TrimSpace(siteValue)
 	if v == "" || siteType != "proxy" {
@@ -472,9 +568,32 @@ func validateSiteValue(siteType, siteValue string) error {
 			return fmt.Errorf("反代地址格式无效: %s", v)
 		}
 	}
-	host := u.Hostname()
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" {
+		return fmt.Errorf("反代地址格式无效: %s", v)
+	}
 	if isDottedNumeric(host) && net.ParseIP(host) == nil {
 		return fmt.Errorf("反代地址 IP 无效: %s(如 127.0.01 应为 127.0.0.1)", host)
+	}
+	if isCloudflareDomain(host) {
+		return fmt.Errorf("禁止反代 Cloudflare 域名 (%s)：反代 CF CDN 站点会导致服务器被全网扫描并滥用为免费优选节点", host)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if isCloudflareIP(ip) {
+			return fmt.Errorf("禁止反代 Cloudflare CDN IP (%s)：反代 CF 节点会导致服务器被滥用为免费优选节点", ip.String())
+		}
+		return nil
+	}
+	if !skipLiveDNSCheckForHost(host) {
+		lookupCtx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+		defer cancel()
+		if addrs, lookupErr := net.DefaultResolver.LookupIPAddr(lookupCtx, host); lookupErr == nil {
+			for _, addr := range addrs {
+				if isCloudflareIP(addr.IP) {
+					return fmt.Errorf("禁止反代启用了 Cloudflare CDN 的站点 (%s 解析到 CF IP %s)：反代 CF 站点会导致服务器被全网扫描并滥用为免费优选节点", host, addr.IP.String())
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -1842,6 +1961,29 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "Nginx 模式必须为 managed 或 reuse_existing"})
 		return
 	}
+	siteConfigProvided := strings.TrimSpace(req.SiteType) != "" || strings.TrimSpace(req.SiteValue) != ""
+	newSiteType := strings.TrimSpace(req.SiteType)
+	if newSiteType == "" {
+		newSiteType = strings.TrimSpace(oldServer.SiteType)
+		if newSiteType == "" {
+			newSiteType = "static"
+		}
+	}
+	if newSiteType != "static" && newSiteType != "proxy" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusBadRequest)
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "站点类型必须为 static 或 proxy"})
+		return
+	}
+	newSiteValue := strings.TrimSpace(req.SiteValue)
+	if siteConfigProvided {
+		if err := validateSiteValue(newSiteType, newSiteValue); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusBadRequest)
+			json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: err.Error()})
+			return
+		}
+	}
 	oldEffectiveNodeHost, newEffectiveNodeHost := normalizeRemoteServerAddressUpdate(oldServer, &req)
 	identityOrEndpointChanged := strings.TrimSpace(req.Name) != oldServer.Name ||
 		(newEffectiveNodeHost != "" && newEffectiveNodeHost != oldEffectiveNodeHost)
@@ -2031,6 +2173,27 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		w.WriteHeader(stdhttp.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("更新 DDNS 配置失败: %s", err.Error())})
 		return
+	}
+
+	if siteConfigProvided {
+		if err := h.repo.UpdateRemoteServerSiteConfig(ctx, req.ID, newSiteType, newSiteValue); err != nil {
+			log.Printf("[Remote Server] Failed to update site config for server %d: %v", req.ID, err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("更新伪装站点配置失败: %s", err.Error())})
+			return
+		}
+		if (newSiteType != oldServer.SiteType || newSiteValue != oldServer.SiteValue) && h.remoteManager != nil {
+			effectiveDomain := strings.TrimSpace(req.Domain)
+			if effectiveDomain == "" {
+				effectiveDomain = strings.TrimSpace(oldServer.Domain)
+			}
+			if effectiveDomain != "" {
+				if syncErr := h.remoteManager.SyncWSSNginx(ctx, req.ID); syncErr != nil {
+					log.Printf("[Remote Server] SyncWSSNginx after site config update on server %d failed (non-fatal): %v", req.ID, syncErr)
+				}
+			}
+		}
 	}
 
 	// 更新已用流量偏移量。优先级:

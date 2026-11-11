@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -645,5 +646,137 @@ func TestInboundToClashProxyRejectsIncompleteReality(t *testing.T) {
 				t.Fatal("expected incomplete Reality config to fail")
 			}
 		})
+	}
+}
+
+func TestInboundToClashProxySupportsPlainVlessTCP(t *testing.T) {
+	inbound := map[string]interface{}{
+		"tag":      "vless-tcp-plain",
+		"protocol": "vless",
+		"listen":   "0.0.0.0",
+		"port":     float64(20080),
+		"settings": map[string]interface{}{
+			"clients":    []interface{}{map[string]interface{}{"id": "63d4765a-4e7e-4a60-a47f-9780b98e7e9b", "email": "admin"}},
+			"decryption": "none",
+		},
+		"streamSettings": map[string]interface{}{
+			"network":  "tcp",
+			"security": "none",
+		},
+	}
+	proxy, err := (&RemoteManageHandler{}).inboundToClashProxy(inbound, "203.0.113.10", "edge", 0)
+	if err != nil {
+		t.Fatalf("inboundToClashProxy: %v", err)
+	}
+	if got := proxy["type"]; got != "vless" {
+		t.Fatalf("type = %v, want vless", got)
+	}
+	if got := proxy["udp"]; got != true {
+		t.Fatalf("udp = %v, want true", got)
+	}
+	if _, exists := proxy["network"]; exists {
+		t.Fatalf("plain VLESS TCP unexpectedly set network: %#v", proxy)
+	}
+	if _, exists := proxy["tls"]; exists {
+		t.Fatalf("plain VLESS TCP unexpectedly enabled tls: %#v", proxy)
+	}
+	if err := validateUserManagedStreamProfile(inbound, "vless", "0.0.0.0", map[string]interface{}{"id": "63d4765a-4e7e-4a60-a47f-9780b98e7e9b"}); err != nil {
+		t.Fatalf("validateUserManagedStreamProfile rejected plain VLESS TCP: %v", err)
+	}
+}
+
+func TestValidateSiteValueRejectsCloudflareAndAllowsOrigin(t *testing.T) {
+	blocked := []string{
+		"https://workers.dev",
+		"https://sub.pages.dev",
+		"https://www.cloudflare.com",
+		"https://demo.trycloudflare.com",
+		"http://104.16.12.34",
+		"https://172.67.10.20:443",
+		"http://1.1.1.1",
+		"http://[2606:4700::6810:1]",
+	}
+	for _, target := range blocked {
+		if err := validateSiteValue("proxy", target); err == nil {
+			t.Fatalf("expected validateSiteValue to reject Cloudflare target %q", target)
+		}
+	}
+
+	allowed := []string{
+		"https://origin.example.com",
+		"www.lovelive-anime.jp.test",
+		"http://127.0.0.1:8080",
+		"http://93.184.216.34:80",
+	}
+	for _, target := range allowed {
+		if err := validateSiteValue("proxy", target); err != nil {
+			t.Fatalf("expected validateSiteValue to allow %q, got error: %v", target, err)
+		}
+	}
+}
+
+func TestSyncWSSNginxRendersProxyCamouflageWithAntiCFHijackHeaders(t *testing.T) {
+	var capturedDomainConf string
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/child/inbounds":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"inbounds": []map[string]interface{}{
+					{
+						"tag":      "vless-wss-in",
+						"protocol": "vless",
+						"listen":   "127.0.0.1",
+						"port":     11005,
+						"streamSettings": map[string]interface{}{
+							"network":  "ws",
+							"security": "none",
+							"wsSettings": map[string]interface{}{
+								"path": "/ws/testpath",
+							},
+						},
+					},
+				},
+			})
+		case "/api/child/cert/deploy":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+		case "/api/child/nginx/setup-ssl":
+			var body map[string]interface{}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			capturedDomainConf, _ = body["domain_config"].(string)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer agent.Close()
+
+	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
+	createRemoteDomainCertificate(t, repo, server.ID, "edge.example.test")
+	if err := repo.UpdateRemoteServerStealMode(context.Background(), server.ID, "default"); err != nil {
+		t.Fatalf("UpdateRemoteServerStealMode: %v", err)
+	}
+	if err := repo.UpdateRemoteServerSiteConfig(context.Background(), server.ID, "proxy", "origin.example.com"); err != nil {
+		t.Fatalf("UpdateRemoteServerSiteConfig: %v", err)
+	}
+
+	handler := NewRemoteManageHandler(repo, nil)
+	attachRemoteCertificateHandler(t, repo, handler)
+	if err := handler.SyncWSSNginx(context.Background(), server.ID); err != nil {
+		t.Fatalf("SyncWSSNginx: %v", err)
+	}
+	for _, want := range []string{
+		`location = /ws/testpath`,
+		`proxy_pass              https://origin.example.com;`,
+		`if ($host != "edge.example.test") { return 444; }`,
+		`if ($http_upgrade != "") { return 404; }`,
+		`proxy_ssl_server_name   on;`,
+		`proxy_ssl_name          $proxy_host;`,
+		`proxy_set_header Host               $proxy_host;`,
+	} {
+		if !strings.Contains(capturedDomainConf, want) {
+			t.Fatalf("expected domain_config to contain %q, got:\n%s", want, capturedDomainConf)
+		}
 	}
 }

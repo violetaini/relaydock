@@ -491,7 +491,7 @@ var managedGrantProtocolAliases = map[string]string{
 }
 
 var managedGrantProtocolProfileFamilies = map[string]string{
-	"vless-reality": "vless", "vless-tcp-tls": "vless", "vless-grpc-tls": "vless", "vless-wss": "vless", "vless-ws": "vless",
+	"vless-tcp-none": "vless", "vless-reality": "vless", "vless-tcp-tls": "vless", "vless-grpc-tls": "vless", "vless-wss": "vless", "vless-ws": "vless",
 	"vmess-tcp-none": "vmess", "vmess-tcp-tls": "vmess", "vmess-grpc-tls": "vmess", "vmess-wss": "vmess", "vmess-ws": "vmess",
 	"trojan-tcp-tls": "trojan", "trojan-reality": "trojan", "trojan-grpc-tls": "trojan", "trojan-wss": "trojan",
 	"shadowsocks-classic": "shadowsocks", "shadowsocks-2022": "shadowsocks", "hysteria2": "hysteria", "socks5": "socks", "http": "http", "anytls": "anytls", "snell": "snell", "chitanda": "chitanda", "chitanda-stream": "chitanda", "chitanda-h2": "chitanda", "chitanda-h3": "chitanda", "chitanda-auto": "chitanda", "chitanda-h1": "chitanda", "dokodemo-door": "dokodemo-door", "dokodemo": "dokodemo-door", "tunnel": "tunnel",
@@ -672,6 +672,8 @@ func SelfServiceNodeProtocolProfile(protocolName, clashConfig string) (string, b
 	switch protocol {
 	case "vless":
 		switch {
+		case network == "tcp" && !tls && !reality:
+			return "vless-tcp-none", true
 		case network == "tcp" && reality:
 			return "vless-reality", true
 		case network == "tcp" && tls && !reality:
