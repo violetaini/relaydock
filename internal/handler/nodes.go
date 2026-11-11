@@ -20,6 +20,7 @@ import (
 	"github.com/violetaini/relaydock/internal/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/safefetch"
 	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/util"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1374,9 +1375,9 @@ func (h *nodesHandler) handleUpdateConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// 验证 JSON 格式
-	var clashConfigMap map[string]interface{}
-	if err := json.Unmarshal([]byte(req.ClashConfig), &clashConfigMap); err != nil {
+	// 支持标准 Clash YAML（proxies: - ... / - name: ... / 单对象映射）与 JSON 格式
+	clashConfigMap, normalizedConfigJSON, err := parseClashNodeConfigPayload(req.ClashConfig)
+	if err != nil {
 		writeBadRequest(w, "Clash 配置格式不正确: "+err.Error())
 		return
 	}
@@ -1384,7 +1385,7 @@ func (h *nodesHandler) handleUpdateConfig(w http.ResponseWriter, r *http.Request
 	// 验证必填字段
 	requiredFields := []string{"name", "type", "server", "port"}
 	for _, field := range requiredFields {
-		if _, ok := clashConfigMap[field]; !ok {
+		if val, ok := clashConfigMap[field]; !ok || val == nil || fmt.Sprint(val) == "" {
 			writeBadRequest(w, fmt.Sprintf("配置缺少必需字段: %s", field))
 			return
 		}
@@ -1405,7 +1406,7 @@ func (h *nodesHandler) handleUpdateConfig(w http.ResponseWriter, r *http.Request
 
 	// The raw editor receives marker-free JSON. Preserve the server-owned
 	// capability only for a same-cipher edit of the same managed physical node.
-	preparedClash, preparedParsed := prepareManagedNodeConfigUpdate(node, req.ClashConfig, req.ClashConfig)
+	preparedClash, preparedParsed := prepareManagedNodeConfigUpdate(node, normalizedConfigJSON, normalizedConfigJSON)
 	node.ClashConfig = preparedClash
 	node.ParsedConfig = preparedParsed
 
@@ -1435,6 +1436,77 @@ func (h *nodesHandler) handleUpdateConfig(w http.ResponseWriter, r *http.Request
 	respondJSON(w, http.StatusOK, map[string]any{
 		"node": convertNode(updated),
 	})
+}
+
+func parseClashNodeConfigPayload(raw string) (map[string]any, string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, "", errors.New("配置内容不能为空")
+	}
+
+	var candidate map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &candidate); err != nil || candidate == nil {
+		var yamlRoot any
+		if yamlErr := yaml.Unmarshal([]byte(trimmed), &yamlRoot); yamlErr != nil {
+			return nil, "", yamlErr
+		}
+		switch root := yamlRoot.(type) {
+		case map[string]any:
+			if proxiesVal, hasProxies := root["proxies"]; hasProxies {
+				proxiesList, ok := proxiesVal.([]any)
+				if !ok || len(proxiesList) == 0 {
+					return nil, "", errors.New("proxies 列表不能为空")
+				}
+				firstProxy, ok := proxiesList[0].(map[string]any)
+				if !ok {
+					return nil, "", errors.New("proxies 列表中第一个元素必须是节点映射")
+				}
+				candidate = firstProxy
+			} else {
+				candidate = root
+			}
+		case []any:
+			if len(root) == 0 {
+				return nil, "", errors.New("节点列表不能为空")
+			}
+			firstProxy, ok := root[0].(map[string]any)
+			if !ok {
+				return nil, "", errors.New("列表中第一个元素必须是节点映射")
+			}
+			candidate = firstProxy
+		default:
+			return nil, "", errors.New("必须提供有效的 Clash 节点对象或 proxies 列表")
+		}
+	}
+
+	stringFields := []string{
+		"name", "type", "server", "uuid", "cipher", "password", "psk",
+		"flow", "servername", "sni", "client-fingerprint", "fingerprint",
+		"network", "plugin",
+	}
+	for _, field := range stringFields {
+		if val, exists := candidate[field]; exists && val != nil {
+			if _, isStr := val.(string); !isStr {
+				candidate[field] = fmt.Sprint(val)
+			}
+		}
+	}
+	if realityOpts, ok := candidate["reality-opts"].(map[string]any); ok {
+		for _, k := range []string{"public-key", "short-id"} {
+			if val, exists := realityOpts[k]; exists && val != nil {
+				if _, isStr := val.(string); !isStr {
+					realityOpts[k] = fmt.Sprint(val)
+				}
+			}
+		}
+	}
+
+	candidate = util.SanitizeClashProxyMap(candidate)
+	normalizedBytes, err := json.Marshal(candidate)
+	if err != nil {
+		return nil, "", err
+	}
+	return candidate, string(normalizedBytes), nil
 }
 
 func (h *nodesHandler) handleDelete(w http.ResponseWriter, r *http.Request, idSegment string) {

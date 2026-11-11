@@ -536,6 +536,8 @@ func (p *URIProducer) encodeVLESS(proxy Proxy) (string, error) {
 	network := GetString(proxy, "network")
 	vlessType := network
 	switch network {
+	case "":
+		vlessType = "tcp"
 	case "splithttp":
 		vlessType = "xhttp"
 	case "ws":

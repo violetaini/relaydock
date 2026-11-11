@@ -13,6 +13,7 @@ import (
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/util"
 
 	"gopkg.in/yaml.v3"
 )
@@ -337,6 +338,9 @@ func injectProxiesIntoTemplate(templateContent string, proxies []map[string]any)
 
 // mapToYAMLNode converts a map to a YAML mapping node
 func mapToYAMLNode(m map[string]any) *yaml.Node {
+	if _, hasType := m["type"]; hasType {
+		m = util.SanitizeClashProxyMap(m)
+	}
 	node := &yaml.Node{
 		Kind: yaml.MappingNode,
 		Tag:  "!!map",

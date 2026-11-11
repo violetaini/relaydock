@@ -5629,8 +5629,8 @@ func (h *RemoteManageHandler) addStreamSettings(proxy map[string]interface{}, st
 	network, _ := streamSettings["network"].(string)
 	security, _ := streamSettings["security"].(string)
 
-	// 设置网络类型（始终包含，即使对于 tcp）
-	if network != "" {
+	// 设置网络类型（仅非默认 tcp 传输需要显式写出 network 字段）
+	if network != "" && !strings.EqualFold(network, "tcp") {
 		proxy["network"] = network
 	}
 

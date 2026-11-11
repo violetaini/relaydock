@@ -452,6 +452,9 @@ func (p *SurfboardProducer) wireguard(proxy Proxy) (string, error) {
 // handleTransport handles transport layer configuration
 func (p *SurfboardProducer) handleTransport(result *Result, proxy Proxy) error {
 	if !IsPresent(proxy, "network") {
+		if IsPresent(proxy, "reality-opts") {
+			return fmt.Errorf("network tcp with reality is unsupported")
+		}
 		return nil
 	}
 

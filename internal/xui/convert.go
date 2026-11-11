@@ -112,7 +112,9 @@ func ConvertXUIInboundToNodeCandidate(ib *XUIInbound, client *XUIClient, serverH
 				proxy["flow"] = effectiveClient.Flow
 			}
 		}
-		proxy["network"] = network
+		if network != "" && !strings.EqualFold(network, "tcp") {
+			proxy["network"] = network
+		}
 		if security == "reality" {
 			proxy["tls"] = true
 			proxy["skip-cert-verify"] = false
@@ -139,7 +141,9 @@ func ConvertXUIInboundToNodeCandidate(ib *XUIInbound, client *XUIClient, serverH
 		}
 		proxy["alterId"] = 0
 		proxy["cipher"] = "auto"
-		proxy["network"] = network
+		if network != "" && !strings.EqualFold(network, "tcp") {
+			proxy["network"] = network
+		}
 		if security == "tls" {
 			proxy["tls"] = true
 			if sni != "" {
@@ -158,7 +162,9 @@ func ConvertXUIInboundToNodeCandidate(ib *XUIInbound, client *XUIClient, serverH
 			}
 			proxy["password"] = pwd
 		}
-		proxy["network"] = network
+		if network != "" && !strings.EqualFold(network, "tcp") {
+			proxy["network"] = network
+		}
 		proxy["tls"] = true
 		if sni != "" {
 			proxy["sni"] = sni

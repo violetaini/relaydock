@@ -2,7 +2,9 @@ package util
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -10,9 +12,36 @@ import (
 // ProxyPriorityFields 定义应首先出现在代理配置中的字段
 var ProxyPriorityFields = []string{"name", "type", "server", "port"}
 
+// SanitizeClashProxyMap 清理 Clash 节点映射中的非标准或内部字段
+func SanitizeClashProxyMap(proxy map[string]any) map[string]any {
+	if proxy == nil {
+		return nil
+	}
+	cleaned := make(map[string]any, len(proxy))
+	proxyType, _ := proxy["type"].(string)
+	proxyType = strings.ToLower(strings.TrimSpace(proxyType))
+
+	for k, v := range proxy {
+		if k == "x-arcway-managed-users" {
+			continue
+		}
+		if k == "network" {
+			if netStr, ok := v.(string); ok && strings.EqualFold(strings.TrimSpace(netStr), "tcp") {
+				switch proxyType {
+				case "", "vmess", "vless", "trojan", "ss", "ssr", "anytls", "snell":
+					continue
+				}
+			}
+		}
+		cleaned[k] = v
+	}
+	return cleaned
+}
+
 // ReorderProxyFieldsToNode 重新排序代理配置以将关键字段放在第一位
 // 返回 yaml.Node 以保留字段顺序
 func ReorderProxyFieldsToNode(proxy map[string]any) *yaml.Node {
+	proxy = SanitizeClashProxyMap(proxy)
 	node := &yaml.Node{
 		Kind: yaml.MappingNode,
 	}
@@ -27,14 +56,20 @@ func ReorderProxyFieldsToNode(proxy map[string]any) *yaml.Node {
 		}
 	}
 
-	// 然后添加剩余的键（按照地图迭代的原始顺序）
-	for key, val := range proxy {
+	// 然后按字母顺序添加剩余的键以保证输出稳定
+	remainingKeys := make([]string, 0, len(proxy))
+	for key := range proxy {
 		if !isPriorityField(key) {
-			keyNode := &yaml.Node{Kind: yaml.ScalarNode, Value: key}
-			valNode := &yaml.Node{}
-			valNode.Encode(val)
-			node.Content = append(node.Content, keyNode, valNode)
+			remainingKeys = append(remainingKeys, key)
 		}
+	}
+	sort.Strings(remainingKeys)
+	for _, key := range remainingKeys {
+		val := proxy[key]
+		keyNode := &yaml.Node{Kind: yaml.ScalarNode, Value: key}
+		valNode := &yaml.Node{}
+		valNode.Encode(val)
+		node.Content = append(node.Content, keyNode, valNode)
 	}
 
 	return node

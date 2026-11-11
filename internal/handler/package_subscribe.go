@@ -16,6 +16,7 @@ import (
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/proxyparser/substore"
 	"github.com/violetaini/relaydock/internal/storage"
+	"github.com/violetaini/relaydock/internal/util"
 
 	"gopkg.in/yaml.v3"
 )
@@ -340,14 +341,17 @@ func (h *PackageSubscribeHandler) serveAllNodes(w http.ResponseWriter, r *http.R
 	}
 	var proxies []map[string]any
 	for _, node := range allNodes {
-		if !node.Enabled || node.ClashConfig == "" {
+		if !node.Enabled || node.ClashConfig == "" || isNonClashForwardingProtocol(node.Protocol) {
 			continue
 		}
 		var proxyConfig map[string]any
 		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
 			continue
 		}
-		delete(proxyConfig, storage.ManagedShadowsocksMultiUserMarker)
+		if proxyType, _ := proxyConfig["type"].(string); isNonClashForwardingProtocol(proxyType) {
+			continue
+		}
+		proxyConfig = util.SanitizeClashProxyMap(proxyConfig)
 		proxies = append(proxies, proxyConfig)
 	}
 	if len(proxies) == 0 {
@@ -523,8 +527,17 @@ func subscriptionCredentialJSON(ctx context.Context, repo *storage.TrafficReposi
 	return string(encoded), true
 }
 
+func isNonClashForwardingProtocol(protocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "dokodemo-door", "tunnel":
+		return true
+	default:
+		return false
+	}
+}
+
 func packageSubscriptionNodeEligible(ctx context.Context, repo *storage.TrafficRepository, node storage.Node) bool {
-	if !node.Enabled {
+	if !node.Enabled || isNonClashForwardingProtocol(node.Protocol) {
 		return false
 	}
 	if canonicalManagedProtocol(node.Protocol) != "wireguard" {

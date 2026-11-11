@@ -122,7 +122,7 @@ func (p *ClashMetaProducer) Produce(proxies []Proxy, outputType string, opts *Pr
 				if network != "" && network != "tcp" {
 					continue
 				}
-				if network == "tcp" && IsPresent(proxy, "reality-opts") {
+				if (network == "" || network == "tcp") && IsPresent(proxy, "reality-opts") {
 					continue
 				}
 			}
