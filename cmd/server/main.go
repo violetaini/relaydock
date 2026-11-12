@@ -658,6 +658,7 @@ func main() {
 	mux.Handle("/api/user/managed-nodes/{id}/retry", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeRetry)))
 	mux.Handle("/api/user/managed-node-creation", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeCreation)))
 	mux.Handle("/api/user/managed-node-creation/{id}", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeCreationItem)))
+	mux.Handle("/api/user/managed-node-creation/port-check", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeCreationPortCheck)))
 	mux.Handle("/api/user/managed-node-creation/reality-domains", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeCreationRealityDomains)))
 	mux.Handle("/api/user/managed-node-creation/x25519", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeCreationX25519)))
 
@@ -666,6 +667,7 @@ func main() {
 	// managed-node access. Remote mutations go through the signed expiry guard.
 	forwardingHandler := handler.NewForwardingHandler(repo, handler.NewForwardingGuardDeployer(managedNodesHandler))
 	forwardingHandler.SetLimiterPusher(limiterPusher)
+	forwardingHandler.SetRemoteManage(remoteManageHandler)
 	forwardingReconcileCtx, stopForwardingReconciler := context.WithCancel(context.Background())
 	forwardingHandler.StartReconciler(forwardingReconcileCtx)
 	mux.Handle("/api/admin/tunnel-templates", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminTunnelTemplates)))
@@ -680,6 +682,7 @@ func main() {
 	mux.Handle("/api/admin/forwards/{id}/{action}", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminForward)))
 	mux.Handle("/api/user/tunnel-grants", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleUserTunnelGrants)))
 	mux.Handle("/api/user/forwards", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleUserForwards)))
+	mux.Handle("/api/user/forwards/port-check", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleUserForwardPortCheck)))
 	mux.Handle("/api/user/forwards/preflight", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleUserForwardPreflight)))
 	mux.Handle("/api/user/forwards/{id}", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleUserForward)))
 	mux.Handle("/api/user/forwards/{id}/{action}", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleUserForward)))
@@ -821,6 +824,7 @@ func main() {
 	mux.Handle("/api/admin/remote/system/info", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleSystemInfo)))
 	// 远程服务器Xray入站/出站/路由管理
 	mux.Handle("/api/admin/remote/inbounds", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleInbounds)))
+	mux.Handle("/api/admin/remote/port-check", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleRemotePortCheck)))
 	mux.Handle("/api/admin/managed-nodes/create", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleCreateManagedNode)))
 	mux.Handle("/api/admin/managed-inbound-resources", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleManagedInboundResources)))
 	mux.Handle("/api/admin/managed-inbound-resources/", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleManagedInboundResources)))

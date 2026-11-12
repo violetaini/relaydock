@@ -1714,6 +1714,51 @@ func reserveForwardPortTx(ctx context.Context, tx *sql.Tx, serverID int64, netwo
 	return allocationIDs, nil
 }
 
+// FindOccupiedForwardPortAllocation checks whether port is already reserved
+// on serverID by any overlapping network in server_port_allocations.
+func (r *TrafficRepository) FindOccupiedForwardPortAllocation(ctx context.Context, serverID int64, networks []string, port int) (string, string, bool, error) {
+	if r == nil || r.db == nil || serverID <= 0 || port <= 0 {
+		return "", "", false, nil
+	}
+	checkNets := map[string]struct{}{ForwardNetworkTCPUDP: {}}
+	for _, n := range networks {
+		switch strings.ToLower(strings.TrimSpace(n)) {
+		case ForwardNetworkTCP:
+			checkNets[ForwardNetworkTCP] = struct{}{}
+		case ForwardNetworkUDP:
+			checkNets[ForwardNetworkUDP] = struct{}{}
+		case ForwardNetworkTCPUDP:
+			checkNets[ForwardNetworkTCP] = struct{}{}
+			checkNets[ForwardNetworkUDP] = struct{}{}
+		}
+	}
+	ordered := make([]string, 0, len(checkNets))
+	for k := range checkNets {
+		ordered = append(ordered, k)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ordered)), ",")
+	args := make([]any, 0, len(ordered)+2)
+	args = append(args, serverID)
+	for _, netName := range ordered {
+		args = append(args, netName)
+	}
+	args = append(args, port)
+
+	var ownerType, network string
+	err := r.db.QueryRowContext(
+		ctx,
+		`SELECT owner_type, network FROM server_port_allocations WHERE server_id = ? AND network IN (`+placeholders+`) AND port = ? LIMIT 1`,
+		args...,
+	).Scan(&ownerType, &network)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return ownerType, network, true, nil
+}
+
 // ReallocateUserForwardPorts replaces every per-hop identity and port in one
 // transaction. It is only used after Guard reports port_in_use/port_reserved;
 // replacing the resource ID avoids mutating an immutable Guard definition.

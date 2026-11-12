@@ -25,6 +25,7 @@ import (
 type ForwardingHandler struct {
 	repo            *storage.TrafficRepository
 	deployer        ForwardTunnelDeployer
+	remoteManage    *RemoteManageHandler
 	limiterPusher   *LimiterConfigPusher
 	reconcileMu     sync.Mutex
 	reconcileCancel context.CancelFunc
@@ -37,6 +38,10 @@ func NewForwardingHandler(repo *storage.TrafficRepository, deployer ForwardTunne
 
 func (h *ForwardingHandler) SetLimiterPusher(pusher *LimiterConfigPusher) {
 	h.limiterPusher = pusher
+}
+
+func (h *ForwardingHandler) SetRemoteManage(remoteManage *RemoteManageHandler) {
+	h.remoteManage = remoteManage
 }
 
 // ForwardTunnelSpec is the controller-to-Agent contract. The expiry-guard
@@ -922,6 +927,15 @@ func (h *ForwardingHandler) HandleUserForwardPreflight(w http.ResponseWriter, r 
 	if err := validateRequestedForwardPort(req.RequestedEntryPort, tunnel); err != nil {
 		writeForwardingError(w, err)
 		return
+	}
+	if req.RequestedEntryPort > 0 {
+		if checkRes, checkErr := h.checkForwardPortAcrossHops(r.Context(), tunnel, req.RequestedEntryPort); checkErr != nil {
+			writeForwardingError(w, fmt.Errorf("%w: %v", storage.ErrForwardingInvalid, checkErr))
+			return
+		} else if !checkRes.Available {
+			writeForwardingError(w, fmt.Errorf("%w: %s", storage.ErrForwardingConflict, checkRes.Reason))
+			return
+		}
 	}
 	node, host, port, _, err := h.resolveManagedForwardTarget(r.Context(), username, req.Target.NodeID)
 	if err != nil {
