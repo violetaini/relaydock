@@ -919,7 +919,7 @@ type RemoteServer struct {
 	NginxMode             string     `json:"nginx_mode"`                    // "managed"(Arcway 管理) | "reuse_existing"(复用系统 Nginx)
 	SiteType              string     `json:"site_type,omitempty"`           // "static" | "proxy"
 	SiteValue             string     `json:"site_value,omitempty"`          // 静态路径或反向代理地址
-	XrayMode              string     `json:"xray_mode"`                     // "external" (默认) 或 "embedded"
+	XrayMode              string     `json:"xray_mode"`                     // "embedded" (默认全托管) 或 "external"(接管现有环境)
 	TimeOffsetSeconds     *int64     `json:"time_offset_seconds,omitempty"` // agent 与主控的时钟偏差（秒）
 	TrafficUsedOffset     int64      `json:"traffic_used_offset"`
 	// 流量统计规则: "both"(默认,上行+下行) / "upload"(仅上行) / "download"(仅下行)
@@ -11643,9 +11643,9 @@ func RemoteServerInstallationPolicyFingerprint(server *RemoteServer) (string, er
 			return "", errors.New("invalid remote server takeover mode")
 		}
 	}
-	xrayMode := "external"
-	if server.XrayMode == "embedded" {
-		xrayMode = "embedded"
+	xrayMode := "embedded"
+	if server.XrayMode == "external" {
+		xrayMode = "external"
 	}
 	nginxMode := strings.TrimSpace(server.NginxMode)
 	if nginxMode == "" {
@@ -12973,9 +12973,9 @@ func (r *TrafficRepository) CreateRemoteServer(ctx context.Context, server *Remo
 	if nginxMode != "reuse_existing" {
 		nginxMode = "managed"
 	}
-	xrayMode := server.XrayMode
-	if xrayMode == "" {
-		xrayMode = "external"
+	xrayMode := strings.TrimSpace(server.XrayMode)
+	if xrayMode != "external" {
+		xrayMode = "embedded"
 	}
 	statsMode := strings.TrimSpace(server.TrafficStatsMode)
 	if statsMode != "upload" && statsMode != "download" {

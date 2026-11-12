@@ -614,9 +614,9 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 	if stealSelf && (server.StealMode == "tunnel" || server.StealMode == "fallback") {
 		stealMode = server.StealMode
 	}
-	xrayMode := server.XrayMode
-	if xrayMode != "embedded" {
-		xrayMode = "external"
+	xrayMode := strings.TrimSpace(server.XrayMode)
+	if xrayMode != "external" {
+		xrayMode = "embedded"
 	}
 	nginxMode := strings.TrimSpace(server.NginxMode)
 	if nginxMode != "reuse_existing" {

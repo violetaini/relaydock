@@ -121,7 +121,7 @@ type RemoteServerCreateRequest struct {
 	NginxMode         string `json:"nginx_mode"`          // "managed" | "reuse_existing"
 	SiteType          string `json:"site_type"`           // "static" | "proxy"
 	SiteValue         string `json:"site_value"`          // 静态路径或反向代理地址
-	XrayMode          string `json:"xray_mode"`           // "external" 或 "embedded"，默认 "external"
+	XrayMode          string `json:"xray_mode"`           // "embedded"(默认全托管) 或 "external"(接管现有环境)
 	TrafficStatsMode  string `json:"traffic_stats_mode"`  // "both"(默认) | "upload" | "download" — 节点流量统计方向
 	TrafficSource     string `json:"traffic_source"`      // "xray"(默认,聚合 node_traffic) | "system"(用 agent 上报系统级网卡累计)
 	IPv6Enabled       *bool  `json:"ipv6_enabled"`        // 指针:nil=默认启用;false=创建时即关闭 v6
@@ -886,9 +886,9 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		}
 	}
 
-	xrayMode := req.XrayMode
-	if xrayMode != "embedded" {
-		xrayMode = "external"
+	xrayMode := strings.TrimSpace(req.XrayMode)
+	if xrayMode != "external" {
+		xrayMode = "embedded"
 	}
 	if xrayMode == "embedded" && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureEmbeddedXray) {
 		w.Header().Set("Content-Type", "application/json")
