@@ -2365,6 +2365,7 @@ type nodeDTO struct {
 	ClashConfig         string `json:"clash_config"`
 	ManagedMultiUser    bool   `json:"managed_multi_user"`
 	DirectGrantEligible bool   `json:"direct_grant_eligible"`
+	PackageEligible     bool   `json:"package_eligible"`
 	CredentialState     string `json:"credential_state,omitempty"`
 	Enabled             bool   `json:"enabled"`
 	// Tag 是用户自定义分类标签(VIP / Asia / 测试),前端节点页用它做过滤、分组显示、批量更新。
@@ -2487,6 +2488,7 @@ func convertNode(node storage.Node) nodeDTO {
 	clashConfig, _, _, _ := sanitizeManagedShadowsocksConfig(node.ClashConfig)
 	parsedConfig, _, _, _ := sanitizeManagedShadowsocksConfig(node.ParsedConfig)
 	managedMultiUser := hasTrustedManagedShadowsocksCapability(node)
+	packageEligible, _ := isPackageNodeMultiUserEligible(node)
 	return nodeDTO{
 		ID:                node.ID,
 		RawURL:            node.RawURL,
@@ -2495,6 +2497,7 @@ func convertNode(node storage.Node) nodeDTO {
 		ParsedConfig:      parsedConfig,
 		ClashConfig:       clashConfig,
 		ManagedMultiUser:  managedMultiUser,
+		PackageEligible:   packageEligible,
 		Enabled:           node.Enabled,
 		Tag:               node.Tag,
 		Tags:              node.Tags,

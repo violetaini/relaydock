@@ -979,7 +979,7 @@ func SelfServiceNodeProtocolEligible(protocolName, clashConfig string) bool {
 	}
 }
 
-func managedShadowsocksProtocolProfile(config map[string]interface{}) (string, bool) {
+func ManagedShadowsocksProtocolProfile(config map[string]interface{}) (string, bool) {
 	cipher, _ := config["cipher"].(string)
 	if strings.TrimSpace(cipher) == "" {
 		cipher, _ = config["method"].(string)
@@ -992,6 +992,10 @@ func managedShadowsocksProtocolProfile(config map[string]interface{}) (string, b
 	default:
 		return "", false
 	}
+}
+
+func managedShadowsocksProtocolProfile(config map[string]interface{}) (string, bool) {
+	return ManagedShadowsocksProtocolProfile(config)
 }
 
 // SelfServiceCredentialProtocolMatches verifies that a stored credential was

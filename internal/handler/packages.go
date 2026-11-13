@@ -194,6 +194,72 @@ func validatePackageTemplateFilename(name string) error {
 	return nil
 }
 
+// isPackageNodeMultiUserEligible checks whether a node can multiplex ports with multi-user isolation.
+// Nodes that cannot multiplex ports (such as AnyDoor tunnel forwards, or Shadowsocks with
+// single-password ChaCha20 or unmanaged single-user passwords) cannot isolate user traffic
+// or enforce per-user limits, and must not be included in packages.
+func isPackageNodeMultiUserEligible(node storage.Node) (bool, string) {
+	tag := strings.ToLower(strings.TrimSpace(node.InboundTag))
+	proto := strings.ToLower(strings.TrimSpace(node.Protocol))
+
+	if strings.HasPrefix(tag, "anydoor-") || proto == "anydoor" || proto == "tunnel" || proto == "dokodemo-door" {
+		return false, "任意门转发节点不支持同端口多用户复用"
+	}
+
+	if proto == "ss" || proto == "shadowsocks" {
+		var config map[string]interface{}
+		if json.Unmarshal([]byte(node.ClashConfig), &config) != nil {
+			if json.Unmarshal([]byte(node.ParsedConfig), &config) != nil {
+				return false, "Shadowsocks 节点配置格式无效"
+			}
+		}
+		profile, ok := storage.ManagedShadowsocksProtocolProfile(config)
+		if !ok {
+			return false, "Shadowsocks 节点加密方式不支持多用户（如 ChaCha20 共享单密码）"
+		}
+		if profile == "shadowsocks-classic" {
+			multiUser, ok := config[storage.ManagedShadowsocksMultiUserMarker].(bool)
+			if !ok || !multiUser {
+				return false, "经典 Shadowsocks 节点未启用多用户模式"
+			}
+		}
+		return true, ""
+	}
+
+	if proto == "wireguard" {
+		if strings.TrimSpace(node.OriginalServer) == "" || strings.TrimSpace(node.InboundTag) == "" {
+			return false, "WireGuard 节点未受管，无法为每个用户独立分配 Peer 凭据"
+		}
+		return true, ""
+	}
+
+	switch proto {
+	case "vless", "vmess", "trojan", "hysteria", "hysteria2", "hy2", "snell", "socks", "socks5", "http", "chitanda":
+		return true, ""
+	default:
+		if strings.EqualFold(strings.TrimSpace(node.NodeType), "routed") {
+			return true, ""
+		}
+		return false, fmt.Sprintf("协议 %s 不支持同端口多用户复用", node.Protocol)
+	}
+}
+
+func validatePackageNodeMultiUserSupport(ctx context.Context, repo *storage.TrafficRepository, nodeIDs []int64) error {
+	if repo == nil {
+		return errors.New("package repository is unavailable")
+	}
+	for _, nodeID := range nodeIDs {
+		node, err := repo.GetNodeByID(ctx, nodeID)
+		if err != nil {
+			return fmt.Errorf("load package node %d: %w", nodeID, err)
+		}
+		if eligible, reason := isPackageNodeMultiUserEligible(node); !eligible {
+			return fmt.Errorf("节点 “%s” 无法加入套餐：%s", node.NodeName, reason)
+		}
+	}
+	return nil
+}
+
 // validatePackageNodeProtocolConflicts rejects templates that address the same
 // physical inbound with different credential protocols. The credential table
 // is intentionally keyed by (user, server, tag) for compatibility, so silently
@@ -281,6 +347,10 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	nodes := req.Nodes
 	if nodes == nil {
 		nodes = []int64{}
+	}
+	if err := validatePackageNodeMultiUserSupport(r.Context(), h.repo, nodes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 	if err := validatePackageNodeProtocolConflicts(r.Context(), h.repo, nodes); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -547,6 +617,10 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	nodes := req.Nodes
 	if nodes == nil {
 		nodes = []int64{}
+	}
+	if err := validatePackageNodeMultiUserSupport(r.Context(), h.repo, nodes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 	if err := validatePackageNodeProtocolConflicts(r.Context(), h.repo, nodes); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
