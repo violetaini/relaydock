@@ -60,6 +60,11 @@ refresh_wireguard_paths() {
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+UNDERLINE='\033[4m'
 NC='\033[0m' # No Color
 
 echo_info() {
@@ -76,18 +81,37 @@ echo_error() {
 
 # Preserve locations from installations created before the /usr/local layout.
 detect_existing_installation_paths() {
-    [ -f "$SERVICE_FILE" ] || return 0
+    command -v sed >/dev/null 2>&1 || return 0
+
+    # 优先检测已存在的 systemd 服务单元
+    if [ -f "$SYSTEMD_UNIT_DIR/relaydock.service" ]; then
+        SERVICE_NAME="relaydock"
+        SERVICE_FILE="$SYSTEMD_UNIT_DIR/relaydock.service"
+    elif [ -f "$SYSTEMD_UNIT_DIR/arcway.service" ]; then
+        SERVICE_NAME="arcway"
+        SERVICE_FILE="$SYSTEMD_UNIT_DIR/arcway.service"
+    else
+        SERVICE_NAME="${ARCWAY_SERVICE_NAME:-arcway}"
+        SERVICE_FILE="$SYSTEMD_UNIT_DIR/${SERVICE_NAME}.service"
+    fi
+
+    [ -f "$SERVICE_FILE" ] || {
+        refresh_wireguard_paths
+        return 0
+    }
 
     local existing_exec=""
     local existing_working_dir=""
     local existing_database=""
     local existing_guard_dir=""
     local existing_env_file=""
+    local existing_data_dir=""
 
     existing_exec=$(sed -n 's/^ExecStart=\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
     existing_working_dir=$(sed -n 's/^WorkingDirectory=\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
     existing_database=$(sed -n 's/^Environment="DATABASE_PATH=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
     existing_guard_dir=$(sed -n 's/^Environment="ARCWAY_GUARD_ASSET_DIR=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
+    existing_data_dir=$(sed -n 's/^Environment="ARCWAY_DATA_DIR=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
     existing_env_file=$(sed -n 's/^EnvironmentFile=-\{0,1\}\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
 
     if [ -n "$existing_env_file" ] && [ -f "$existing_env_file" ]; then
@@ -97,18 +121,29 @@ detect_existing_installation_paths() {
         if [ -z "$existing_guard_dir" ]; then
             existing_guard_dir=$(sed -n 's/^ARCWAY_GUARD_ASSET_DIR=\(.*\)$/\1/p' "$existing_env_file" | head -n 1)
         fi
+        if [ -z "$existing_data_dir" ]; then
+            existing_data_dir=$(sed -n 's/^ARCWAY_DATA_DIR=\(.*\)$/\1/p' "$existing_env_file" | head -n 1)
+        fi
     fi
 
     existing_database=${existing_database#\"}
     existing_database=${existing_database%\"}
     existing_guard_dir=${existing_guard_dir#\"}
     existing_guard_dir=${existing_guard_dir%\"}
+    existing_data_dir=${existing_data_dir#\"}
+    existing_data_dir=${existing_data_dir%\"}
 
-    if [ "${ARCWAY_INSTALL_DIR+x}" != "x" ] && [ -n "$existing_exec" ] && [ "$(basename "$existing_exec")" = "$SERVICE_NAME" ]; then
-        INSTALL_DIR=$(dirname "$existing_exec")
+    if [ "${ARCWAY_INSTALL_DIR+x}" != "x" ] && [ -n "$existing_exec" ]; then
+        case "$(basename "$existing_exec")" in
+            "$SERVICE_NAME"|server|relaydock|arcway)
+                INSTALL_DIR=$(dirname "$existing_exec")
+                ;;
+        esac
     fi
     if [ "${ARCWAY_DATA_DIR+x}" != "x" ]; then
-        if [ -n "$existing_database" ]; then
+        if [ -n "$existing_data_dir" ]; then
+            DATA_DIR="$existing_data_dir"
+        elif [ -n "$existing_database" ]; then
             DATA_DIR=$(dirname "$existing_database")
         elif [ -n "$existing_working_dir" ] && [ -d "$existing_working_dir/data" ]; then
             DATA_DIR="$existing_working_dir/data"
@@ -235,8 +270,56 @@ check_architecture() {
     esac
 }
 
+# 检测操作系统与包管理器
+detect_os() {
+    OS_TYPE=""
+    PKG_MGR=""
+    if [ -f /etc/os-release ]; then
+        OS_TYPE=$(sed -n 's/^ID=\(.*\)$/\1/p' /etc/os-release | head -n 1 | tr -d '"'\'' ')
+    elif command -v lsb_release >/dev/null 2>&1; then
+        OS_TYPE=$(lsb_release -si | tr '[:upper:]' '[:lower:]')
+    else
+        OS_TYPE="unknown"
+    fi
+
+    case "$OS_TYPE" in
+        debian|ubuntu|linuxmint|raspbian)
+            PKG_MGR="apt"
+            ;;
+        centos|rhel|rocky|almalinux|fedora|ol)
+            if command -v dnf >/dev/null 2>&1; then
+                PKG_MGR="dnf"
+            else
+                PKG_MGR="yum"
+            fi
+            ;;
+        alpine)
+            PKG_MGR="apk"
+            ;;
+        arch|manjaro)
+            PKG_MGR="pacman"
+            ;;
+        *)
+            if command -v apt-get >/dev/null 2>&1; then
+                PKG_MGR="apt"
+            elif command -v dnf >/dev/null 2>&1; then
+                PKG_MGR="dnf"
+            elif command -v yum >/dev/null 2>&1; then
+                PKG_MGR="yum"
+            elif command -v apk >/dev/null 2>&1; then
+                PKG_MGR="apk"
+            elif command -v pacman >/dev/null 2>&1; then
+                PKG_MGR="pacman"
+            else
+                PKG_MGR="unknown"
+            fi
+            ;;
+    esac
+}
+
 # 安装依赖
 install_dependencies() {
+    detect_os
     local packages=()
     command -v wget >/dev/null 2>&1 || packages+=(wget)
     command -v curl >/dev/null 2>&1 || packages+=(curl)
@@ -245,31 +328,71 @@ install_dependencies() {
     command -v sha256sum >/dev/null 2>&1 || packages+=(coreutils)
     command -v iptables >/dev/null 2>&1 || packages+=(iptables)
     command -v ip >/dev/null 2>&1 || packages+=(iproute2)
+    command -v flock >/dev/null 2>&1 || packages+=(util-linux)
 
     if [ "${#packages[@]}" -eq 0 ]; then
         echo_info "安装依赖已就绪"
         return 0
     fi
-    if ! command -v apt-get >/dev/null 2>&1; then
-        echo_error "缺少依赖且当前系统没有 apt: ${packages[*]}"
-        return 1
-    fi
 
     echo_info "安装缺少的依赖: ${packages[*]}"
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" >/dev/null 2>&1
+    case "$PKG_MGR" in
+        apt)
+            if ! command -v apt-get >/dev/null 2>&1; then
+                echo_error "缺少依赖且当前系统没有 apt: ${packages[*]}"
+                return 1
+            fi
+            apt-get update -qq >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" >/dev/null 2>&1
+            ;;
+        dnf)
+            dnf install -y "${packages[@]}" >/dev/null 2>&1
+            ;;
+        yum)
+            yum install -y "${packages[@]}" >/dev/null 2>&1
+            ;;
+        apk)
+            apk update >/dev/null 2>&1 || true
+            apk add --no-cache "${packages[@]}" >/dev/null 2>&1
+            ;;
+        pacman)
+            pacman -Sy --noconfirm "${packages[@]}" >/dev/null 2>&1
+            ;;
+        *)
+            echo_error "缺少依赖且未识别的包管理器: ${packages[*]}"
+            return 1
+            ;;
+    esac
 }
 
 # 获取最新版本号
 get_latest_version() {
     if [ -z "$VERSION" ]; then
         echo_info "获取最新版本..."
-        VERSION=$(curl -sL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name')
-        if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            echo_error "无法获取最新版本号，请检查网络连接"
-            exit 1
+        if command -v jq >/dev/null 2>&1; then
+            VERSION=$(curl -sL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)
         fi
-        echo_info "最新版本: $VERSION"
+
+        if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            local redirect_url
+            redirect_url=$(curl -fsSLI -o /dev/null -w "%{url_effective}" "https://github.com/${GITHUB_REPO}/releases/latest" 2>/dev/null || true)
+            local redirect_tag="${redirect_url##*/}"
+            if [ -n "$redirect_tag" ] && [ "$redirect_tag" != "releases" ] && [ "$redirect_tag" != "latest" ]; then
+                VERSION="$redirect_tag"
+            fi
+        fi
+
+        if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            if [ -f "$DATA_DIR/.version" ]; then
+                VERSION=$(cat "$DATA_DIR/.version")
+                echo_warn "无法从网络获取最新版本号，使用本地记录版本: $VERSION"
+            else
+                echo_error "无法获取最新版本号，请检查网络连接"
+                exit 1
+            fi
+        else
+            echo_info "最新版本: $VERSION"
+        fi
     fi
 }
 
@@ -1050,31 +1173,131 @@ start_service() {
     fi
 }
 
+get_configured_port() {
+    local port=""
+    if [ -f "$SERVICE_FILE" ]; then
+        port=$(grep "Environment=\"PORT=" "$SERVICE_FILE" 2>/dev/null | sed 's/.*PORT=\([0-9]*\).*/\1/')
+    fi
+    if [ -z "$port" ] && [ -f "$CONFIG_DIR/config.yaml" ]; then
+        port=$(grep "^port:" "$CONFIG_DIR/config.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"'\'' ')
+    fi
+    if [ -z "$port" ] && [ -f "/opt/relaydock/config.yaml" ]; then
+        port=$(grep "^port:" "/opt/relaydock/config.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"'\'' ')
+    fi
+    echo "${port:-12889}"
+}
+
+get_public_ip() {
+    if [ -n "${MOCK_STATE_DIR:-}" ]; then
+        echo "127.0.0.1"
+        return 0
+    fi
+    local ip=""
+    ip=$(curl -4 -s --connect-timeout 2 https://api.ipify.org 2>/dev/null || true)
+    [ -z "$ip" ] && ip=$(curl -4 -s --connect-timeout 2 https://ifconfig.me 2>/dev/null || true)
+    [ -z "$ip" ] && ip=$(curl -4 -s --connect-timeout 2 https://icanhazip.com 2>/dev/null || true)
+    [ -z "$ip" ] && ip=$(curl -4 -s --connect-timeout 2 https://ip.sb 2>/dev/null || true)
+    if [ -z "$ip" ]; then
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    echo "${ip:-127.0.0.1}"
+}
+
+get_local_ip() {
+    hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+check_port_in_use() {
+    local port="$1"
+    local pid=""
+    if command -v ss >/dev/null 2>&1; then
+        pid=$(ss -tlpn "sport = :$port" 2>/dev/null | grep -o 'pid=[0-9]*' | head -n 1 | cut -d= -f2 || true)
+    elif command -v netstat >/dev/null 2>&1; then
+        pid=$(netstat -tlpn 2>/dev/null | grep ":$port " | awk '{print $7}' | cut -d/ -f1 | head -n 1 || true)
+    elif command -v lsof >/dev/null 2>&1; then
+        pid=$(lsof -i ":$port" -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true)
+    fi
+    echo "$pid"
+}
+
+configure_firewall() {
+    [ -n "${MOCK_STATE_DIR:-}" ] && return 0
+    local port="$1"
+    [ -n "$port" ] || return 0
+    echo_info "检查并配置防火墙端口: $port/tcp..."
+
+    # 检查 ufw
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qw "active"; then
+        echo_info "检测到 UFW 防火墙正在运行，正在放行端口 $port..."
+        ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+        echo_info "UFW 防火墙端口 $port 放行完成"
+    fi
+
+    # 检查 firewalld
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        echo_info "检测到 Firewalld 正在运行，正在放行端口 $port..."
+        firewall-cmd --zone=public --add-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        echo_info "Firewalld 端口 $port 放行完成"
+    fi
+
+    # 检查 iptables
+    if command -v iptables >/dev/null 2>&1; then
+        if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+            iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+install_cli_shortcut() {
+    [ -n "${MOCK_STATE_DIR:-}" ] && return 0
+    local bin_link="/usr/local/bin/relaydock"
+    local alt_link="/usr/local/bin/arcway"
+
+    echo_info "配置终端快捷管理命令..."
+    mkdir -p "/usr/local/bin" 2>/dev/null || true
+
+    if [ -f "$0" ]; then
+        cp -f "$0" "$bin_link" 2>/dev/null || true
+        chmod +x "$bin_link" 2>/dev/null || true
+        ln -sf "$bin_link" "$alt_link" 2>/dev/null || true
+    fi
+
+    if [ -x "$bin_link" ]; then
+        echo_info "✓ 快捷命令已就绪！在终端输入 ${BOLD}relaydock${NC} 即可随时打开管理菜单"
+    fi
+}
+
 # 显示状态
 show_status() {
-    # 从 systemd 服务文件中读取端口号
-    CONFIGURED_PORT=$(grep "Environment=\"PORT=" "$SERVICE_FILE" | sed 's/.*PORT=\([0-9]*\).*/\1/')
-    CONFIGURED_PORT=${CONFIGURED_PORT:-12889}
+    local configured_port
+    configured_port=$(get_configured_port)
+    local public_ip
+    public_ip=$(get_public_ip)
+    local local_ip
+    local_ip=$(get_local_ip)
 
     echo ""
-    echo "======================================"
-    echo_info "RelayDock 安装完成！"
-    echo "======================================"
+    echo -e "${GREEN}================================================================${NC}"
+    echo -e "              ${BOLD}🎉 RelayDock 控制面板安装完成！${NC}"
+    echo -e "${GREEN}================================================================${NC}"
     echo ""
-    echo "📦 安装位置: $INSTALL_DIR/$SERVICE_NAME"
-    echo "💾 数据目录: $DATA_DIR"
-    echo "🌐 访问地址: http://$(hostname -I | awk '{print $1}'):$CONFIGURED_PORT"
+    echo -e "  🌐 ${BOLD}公网访问地址:${NC} ${UNDERLINE}http://${public_ip}:${configured_port}${NC}"
+    if [ -n "$local_ip" ] && [ "$local_ip" != "$public_ip" ]; then
+        echo -e "  🏠 ${BOLD}内网访问地址:${NC} ${UNDERLINE}http://${local_ip}:${configured_port}${NC}"
+    fi
+    echo -e "  📦 ${BOLD}程序文件位置:${NC} $INSTALL_DIR/$SERVICE_NAME"
+    echo -e "  💾 ${BOLD}数据存储目录:${NC} $DATA_DIR"
+    echo -e "  ⚡ ${BOLD}管理快捷命令:${NC} 在终端输入 ${CYAN}${BOLD}relaydock${NC} 随时打开管理菜单"
     echo ""
-    echo "常用命令:"
-    echo "  启动服务: systemctl start $SERVICE_NAME"
-    echo "  停止服务: systemctl stop $SERVICE_NAME"
-    echo "  重启服务: systemctl restart $SERVICE_NAME"
-    echo "  查看状态: systemctl status $SERVICE_NAME"
-    echo "  查看日志: journalctl -u $SERVICE_NAME -f"
-    echo "  更新、重装与卸载: 请按项目 README 下载脚本后执行对应操作"
-    echo "  使用说明: https://github.com/${GITHUB_REPO}#更新已安装的-relaydock"
+    echo -e "----------------------------------------------------------------"
+    echo -e "  🔔 ${YELLOW}${BOLD}云服务器安全组/防火墙提示:${NC}"
+    echo -e "     本机系统防火墙 (UFW / Firewalld / iptables) 已自动放行端口 ${BOLD}${configured_port}${NC}。"
+    echo -e "     若您使用的是 ${BOLD}阿里云、腾讯云、华为云、甲骨文、AWS、GCP${NC} 等云服务器，"
+    echo -e "     请务必登录云服务商控制台，在【安全组 / 网络入方向规则】中放行 TCP 端口 ${BOLD}${configured_port}${NC}！"
+    echo -e "----------------------------------------------------------------"
     echo ""
-    echo "⚠️  首次访问需要完成初始化配置"
+    echo -e "  💡 首次访问请打开浏览器访问上方地址完成管理员初始化设置。"
     echo ""
 }
 
@@ -1146,6 +1369,10 @@ update_service() {
         return 1
     fi
     commit_update_transaction
+    
+    configure_firewall "$PORT_INPUT"
+    install_cli_shortcut
+
     echo ""
     echo "======================================"
     echo_info "更新完成！"
@@ -1230,9 +1457,8 @@ uninstall_service() {
     echo_info "删除程序文件..."
     rm -f "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak" "$WIREGUARD_EGRESS_SCRIPT"
     rm -f "$INSTALL_DIR"/.arcway.arcway-stage.*
+    rm -f /usr/local/bin/relaydock /usr/local/bin/arcway 2>/dev/null || true
     rm -rf "$GUARD_ASSET_DIR"
-    # Legacy speedtester assets are intentionally left untouched. They are no
-    # longer managed by the panel and may be owned by an operator.
     echo_info "✓ 程序文件已删除"
     echo ""
 
@@ -1296,6 +1522,12 @@ reinstall_service() {
         return 1
     fi
     commit_update_transaction
+
+    local port
+    port=$(get_configured_port)
+    configure_firewall "$port"
+    install_cli_shortcut
+
     show_status
     echo_info "覆盖安装完成！数据已保留。"
     echo ""
@@ -1303,60 +1535,554 @@ reinstall_service() {
     echo ""
 }
 
+# 全新安装流程
+run_install_flow() {
+    echo_info "开始安装 RelayDock..."
+    echo ""
+
+    check_architecture
+    install_dependencies
+    get_latest_version
+    download_binary
+    resolve_wireguard_local_ipv4
+    begin_update_transaction
+    if ! stop_service_for_transaction; then
+        return 1
+    fi
+    if ! stop_wireguard_service_for_transaction; then
+        return 1
+    fi
+    snapshot_database_after_stop
+    install_binary
+    create_directories
+    create_systemd_service
+    install_wireguard_probe_assets
+
+    # 保存版本信息
+    atomic_write_version "$DATA_DIR/.version"
+
+    if ! start_service; then
+        echo_error "安装过程中出现错误，请查看日志: journalctl -u $SERVICE_NAME -n 50"
+        return 1
+    fi
+    commit_update_transaction
+
+    local port
+    port=$(get_configured_port)
+    configure_firewall "$port"
+    install_cli_shortcut
+
+    show_status
+}
+
+# 服务控制辅助函数
+start_service_cmd() {
+    check_root
+    detect_existing_installation_paths
+    echo_info "正在启动 $SERVICE_NAME 服务..."
+    systemctl start "$SERVICE_NAME"
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        echo_info "✓ $SERVICE_NAME 服务已成功启动！"
+    else
+        echo_error "服务启动失败，请使用 journalctl -u $SERVICE_NAME -n 50 查看日志"
+    fi
+}
+
+stop_service_cmd() {
+    check_root
+    detect_existing_installation_paths
+    echo_info "正在停止 $SERVICE_NAME 服务..."
+    systemctl stop "$SERVICE_NAME" || true
+    echo_info "✓ $SERVICE_NAME 服务已停止"
+}
+
+restart_service_cmd() {
+    check_root
+    detect_existing_installation_paths
+    echo_info "正在重启 $SERVICE_NAME 服务..."
+    systemctl restart "$SERVICE_NAME"
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        echo_info "✓ $SERVICE_NAME 服务重启成功！"
+    else
+        echo_error "服务重启失败，请使用 journalctl -u $SERVICE_NAME -n 50 查看日志"
+    fi
+}
+
+view_logs_cmd() {
+    detect_existing_installation_paths
+    echo_info "正在查看 $SERVICE_NAME 服务实时日志 (按 Ctrl+C 退出)..."
+    journalctl -u "$SERVICE_NAME" -n 50 -f
+}
+
+show_status_cmd() {
+    detect_existing_installation_paths
+    show_banner
+    echo ""
+    echo -e "${BOLD}--- systemctl status $SERVICE_NAME ---${NC}"
+    systemctl status "$SERVICE_NAME" --no-pager || true
+    echo ""
+}
+
+# 端口修改功能
+change_port() {
+    local new_port="${1:-}"
+    check_root
+    detect_existing_installation_paths
+    
+    local cur_port
+    cur_port=$(get_configured_port)
+    echo_info "当前面板监听端口: $cur_port"
+
+    if [ -z "$new_port" ]; then
+        if [ ! -t 0 ]; then { exec </dev/tty; } 2>/dev/null || true; fi
+        read -r -p "请输入新的监听端口 (1-65535): " new_port || true
+        if [ -z "$new_port" ]; then
+            echo_error "未输入有效端口"
+            return 1
+        fi
+    fi
+
+    case "$new_port" in
+        ''|*[!0-9]*)
+            echo_error "无效端口: $new_port（必须是 1 到 65535 之间的整数）"
+            return 1
+            ;;
+    esac
+    if [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+        echo_error "端口超出范围: $new_port（有效范围: 1-65535）"
+        return 1
+    fi
+
+    if [ "$new_port" -eq "$cur_port" ]; then
+        echo_warn "输入的端口与当前端口相同，无需修改"
+        return 0
+    fi
+
+    local occ_pid
+    occ_pid=$(check_port_in_use "$new_port")
+    if [ -n "$occ_pid" ]; then
+        echo_error "端口 $new_port 已被进程占用 (PID: $occ_pid)，请选择其他端口"
+        return 1
+    fi
+
+    echo_info "正在将面板端口从 $cur_port 修改为 $new_port..."
+    acquire_install_lock
+
+    if [ -f "$SERVICE_FILE" ]; then
+        if grep -q 'Environment="PORT=' "$SERVICE_FILE"; then
+            sed -i "s/Environment=\"PORT=[0-9]*\"/Environment=\"PORT=$new_port\"/" "$SERVICE_FILE"
+        else
+            sed -i "/\[Service\]/a Environment=\"PORT=$new_port\"" "$SERVICE_FILE"
+        fi
+    fi
+
+    for cfg in "$CONFIG_DIR/config.yaml" "/opt/relaydock/config.yaml"; do
+        if [ -f "$cfg" ]; then
+            sed -i "s/^port: .*/port: \"$new_port\"/" "$cfg" || true
+        fi
+    done
+
+    systemctl daemon-reload
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        echo_info "正在重启 $SERVICE_NAME 服务以应用新端口..."
+        systemctl restart "$SERVICE_NAME" || true
+    fi
+
+    configure_firewall "$new_port"
+
+    local pub_ip
+    pub_ip=$(get_public_ip)
+    echo ""
+    echo -e "${GREEN}================================================================${NC}"
+    echo -e "              ${BOLD}✓ 端口修改成功！${NC}"
+    echo -e "${GREEN}================================================================${NC}"
+    echo -e "  新端口: ${BOLD}$new_port${NC}"
+    echo -e "  新访问地址: ${UNDERLINE}http://${pub_ip}:${new_port}${NC}"
+    echo -e "  请确保已在云服务商安全组放行 TCP 端口 $new_port！"
+    echo -e "${GREEN}================================================================${NC}"
+    echo ""
+}
+
+# 重置管理员密码
+reset_admin_password() {
+    check_root
+    detect_existing_installation_paths
+    resolve_database_path
+
+    echo_info "正在定位数据库文件: $DATABASE_PATH"
+    if [ ! -f "$DATABASE_PATH" ]; then
+        for cand in /opt/relaydock/data/arcway.db "$DATA_DIR/data/arcway.db" "$DATA_DIR/arcway.db"; do
+            if [ -f "$cand" ]; then
+                DATABASE_PATH="$cand"
+                break
+            fi
+        done
+    fi
+
+    if [ ! -f "$DATABASE_PATH" ]; then
+        echo_error "找不到数据库文件 ($DATABASE_PATH)，请确认 RelayDock 是否已安装"
+        return 1
+    fi
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo_info "正在安装 sqlite3 依赖..."
+        install_dependencies
+    fi
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo_error "未找到 sqlite3，请先手动安装"
+        return 1
+    fi
+
+    local admins=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && admins+=("$line")
+    done < <(sqlite3 "$DATABASE_PATH" "SELECT username FROM users WHERE role='admin' AND is_active=1 ORDER BY username;" 2>/dev/null || true)
+
+    if [ "${#admins[@]}" -eq 0 ]; then
+        echo_error "数据库中未找到任何处于激活状态的管理员账号！"
+        return 1
+    fi
+
+    local target_user=""
+    if [ "${#admins[@]}" -eq 1 ]; then
+        target_user="${admins[0]}"
+        echo_info "检测到唯一管理员: ${BOLD}$target_user${NC}"
+    else
+        echo ""
+        echo -e "${BOLD}检测到以下管理员账号:${NC}"
+        for i in "${!admins[@]}"; do
+            echo -e "  [$((i + 1))] ${admins[$i]}"
+        done
+        echo ""
+        if [ ! -t 0 ]; then { exec </dev/tty; } 2>/dev/null || true; fi
+        read -r -p "请选择要重置的管理员编号 [1-${#admins[@]}]: " admin_idx || true
+        if [[ "$admin_idx" =~ ^[0-9]+$ ]] && [ "$admin_idx" -ge 1 ] && [ "$admin_idx" -le "${#admins[@]}" ]; then
+            target_user="${admins[$((admin_idx - 1))]}"
+        else
+            echo_error "无效的选项"
+            return 1
+        fi
+    fi
+
+    if [ ! -t 0 ]; then { exec </dev/tty; } 2>/dev/null || true; fi
+    local pass1=""
+    local pass2=""
+    echo ""
+    read -r -s -p "请输入 $target_user 的新密码: " pass1 || true
+    echo ""
+    if [ ${#pass1} -lt 6 ]; then
+        echo_error "密码长度至少需要 6 个字符！"
+        return 1
+    fi
+    read -r -s -p "请再次输入新密码确认: " pass2 || true
+    echo ""
+    if [ "$pass1" != "$pass2" ]; then
+        echo_error "两次输入的密码不一致！"
+        return 1
+    fi
+
+    echo_info "正在生成密码哈希..."
+    local pass_hash=""
+    if command -v htpasswd >/dev/null 2>&1; then
+        pass_hash=$(htpasswd -nbB dummy "$pass1" | cut -d: -f2)
+    elif command -v python3 >/dev/null 2>&1 && python3 -c 'import bcrypt' 2>/dev/null; then
+        pass_hash=$(python3 -c "import bcrypt; print(bcrypt.hashpw(b'''$pass1''', bcrypt.gensalt(10)).decode('ascii'))")
+    fi
+
+    if [ -z "$pass_hash" ]; then
+        case "$PKG_MGR" in
+            apt) apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y apache2-utils >/dev/null 2>&1 || true ;;
+            dnf|yum) $PKG_MGR install -y httpd-tools >/dev/null 2>&1 || true ;;
+            apk) apk add --no-cache apache2-utils >/dev/null 2>&1 || true ;;
+            pacman) pacman -Sy --noconfirm apache >/dev/null 2>&1 || true ;;
+        esac
+        if command -v htpasswd >/dev/null 2>&1; then
+            pass_hash=$(htpasswd -nbB dummy "$pass1" | cut -d: -f2)
+        fi
+    fi
+
+    if [ -z "$pass_hash" ]; then
+        echo_error "无法生成 bcrypt 哈希，请安装 apache2-utils (htpasswd) 或 python3-bcrypt"
+        return 1
+    fi
+
+    echo_info "正在更新数据库..."
+    local escaped_hash="${pass_hash//\'/\'\'}"
+    local escaped_user="${target_user//\'/\'\'}"
+    local update_sql="UPDATE users SET password_hash='$escaped_hash', updated_at=CURRENT_TIMESTAMP WHERE username='$escaped_user';"
+    
+    if sqlite3 "$DATABASE_PATH" "$update_sql"; then
+        echo_info "✓ 数据库管理员密码已更新！"
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            echo_info "正在重启服务以生效..."
+            systemctl restart "$SERVICE_NAME" || true
+        fi
+        echo ""
+        echo -e "${GREEN}================================================================${NC}"
+        echo -e "              ${BOLD}✓ 管理员密码重置成功！${NC}"
+        echo -e "${GREEN}================================================================${NC}"
+        echo -e "  账号: ${BOLD}$target_user${NC}"
+        echo -e "  新密码: ${BOLD}(已生效)${NC}"
+        echo -e "${GREEN}================================================================${NC}"
+        echo ""
+    else
+        echo_error "更新数据库失败"
+        return 1
+    fi
+}
+
+# 脚本顶部 Banner 与状态展示
+show_banner() {
+    detect_existing_installation_paths
+    clear 2>/dev/null || true
+    echo -e "${CYAN}"
+    cat <<'EOF'
+  ██████╗ ███████╗██╗      █████╗ ██╗   ██╗██████╗  ██████╗  ██████╗██╗  ██╗
+  ██╔══██╗██╔════╝██║     ██╔══██╗╚██╗ ██╔╝██╔══██╗██╔═══██╗██╔════╝██║ ██╔╝
+  ██████╔╝█████╗  ██║     ███████║ ╚████╔╝ ██║  ██║██║   ██║██║     █████═╝ 
+  ██╔══██╗██╔══╝  ██║     ██╔══██║  ╚██╔╝  ██║  ██║██║   ██║██║     ██╔═██╗ 
+  ██║  ██║███████╗███████╗██║  ██║   ██║   ██████╔╝╚██████╔╝╚██████╗██║  ██╗
+  ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚═════╝  ╚═════╝  ╚═════╝╚═╝  ╚═╝
+EOF
+    echo -e "       RelayDock 控制面板一键管理脚本 (RelayDock Manager)${NC}"
+    echo -e "${BLUE}================================================================${NC}"
+
+    local os_info=""
+    if [ -f /etc/os-release ]; then
+        os_info=$(grep -E '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+    fi
+    [ -z "$os_info" ] && os_info="$(uname -s) $(uname -r)"
+    local arch_info
+    arch_info=$(uname -m)
+
+    local status_text=""
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        local pid
+        pid=$(systemctl show -p MainPID "$SERVICE_NAME" 2>/dev/null | cut -d= -f2)
+        status_text="${GREEN}● 运行中 (Active, PID: ${pid:-运行中})${NC}"
+    elif [ -f "$SERVICE_FILE" ] || [ -f "$INSTALL_DIR/$SERVICE_NAME" ]; then
+        status_text="${RED}○ 已停止 (Stopped)${NC}"
+    else
+        status_text="${YELLOW}○ 未安装 (Not Installed)${NC}"
+    fi
+
+    local cur_ver=""
+    for vfile in "$DATA_DIR/.version" "/opt/relaydock/data/.version" "/opt/relaydock/.version"; do
+        if [ -f "$vfile" ]; then
+            cur_ver=$(cat "$vfile" | tr -d '\r\n ')
+            break
+        fi
+    done
+    if [ -z "$cur_ver" ]; then
+        local exec_bin="$INSTALL_DIR/$SERVICE_NAME"
+        [ -f "$exec_bin" ] || exec_bin="/opt/relaydock/bin/server"
+        [ -f "$exec_bin" ] || exec_bin="/opt/relaydock/server"
+        if [ -x "$exec_bin" ]; then
+            cur_ver=$("$exec_bin" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)
+            if [ -z "$cur_ver" ]; then
+                cur_ver=$("$exec_bin" 2>&1 | grep -oE 'version=v?[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | cut -d= -f2 || true)
+            fi
+        fi
+    fi
+    if [ -n "$cur_ver" ]; then
+        [ -d "$DATA_DIR" ] && [ ! -f "$DATA_DIR/.version" ] && echo "$cur_ver" > "$DATA_DIR/.version" 2>/dev/null || true
+    else
+        cur_ver="已就绪"
+    fi
+
+    local current_port
+    current_port=$(get_configured_port)
+    local pub_ip
+    pub_ip=$(get_public_ip)
+
+    echo -e "  💻 系统环境: ${BOLD}${os_info} (${arch_info})${NC}"
+    echo -e "  🚀 服务状态: ${status_text}"
+    echo -e "  📌 当前版本: ${BOLD}${cur_ver}${NC}"
+    echo -e "  🔌 监听端口: ${BOLD}${current_port}${NC}"
+    echo -e "  🌐 访问地址: ${UNDERLINE}http://${pub_ip}:${current_port}${NC}"
+    echo -e "${BLUE}================================================================${NC}"
+}
+
+# 交互式管理菜单
+interactive_menu() {
+    while true; do
+        show_banner
+        echo -e "  ${BOLD}1.${NC} 安装控制面板 (全新安装)"
+        echo -e "  ${BOLD}2.${NC} 更新控制面板 (平滑无损升级)"
+        echo -e "  ${BOLD}3.${NC} 覆盖/修复控制端 (Reinstall / Repair)"
+        echo -e "  ${BOLD}4.${NC} 卸载控制面板 (可选保留数据)"
+        echo -e "  --------------------------------------------------------------"
+        echo -e "  ${BOLD}5.${NC} 启动控制端"
+        echo -e "  ${BOLD}6.${NC} 停止控制端"
+        echo -e "  ${BOLD}7.${NC} 重启控制端"
+        echo -e "  ${BOLD}8.${NC} 查看运行状态 (systemctl status)"
+        echo -e "  ${BOLD}9.${NC} 实时查看运行日志 (journalctl -f)"
+        echo -e "  --------------------------------------------------------------"
+        echo -e "  ${BOLD}10.${NC} 修改面板监听端口"
+        echo -e "  ${BOLD}11.${NC} 重置管理员密码 (本地救急工具)"
+        echo -e "  ${BOLD}12.${NC} 配置/修复终端快捷命令 (relaydock)"
+        echo -e "  --------------------------------------------------------------"
+        echo -e "  ${BOLD}0.${NC} 退出脚本"
+        echo -e "${BLUE}================================================================${NC}"
+
+        local choice=""
+        if ! read -r -p "请输入选项编号 [0-12]: " choice; then
+            echo ""
+            echo_info "检测到输入流结束，已退出 RelayDock 管理脚本。"
+            exit 0
+        fi
+        case "$choice" in
+            1)
+                echo_info "进入安装流程..."
+                run_install_flow
+                break
+                ;;
+            2)
+                echo_info "进入更新流程..."
+                check_architecture
+                install_dependencies
+                get_latest_version
+                update_service
+                break
+                ;;
+            3)
+                echo_info "进入覆盖/修复安装流程..."
+                check_architecture
+                install_dependencies
+                get_latest_version
+                reinstall_service
+                break
+                ;;
+            4)
+                echo_info "进入卸载流程..."
+                uninstall_service
+                break
+                ;;
+            5)
+                start_service_cmd
+                ;;
+            6)
+                stop_service_cmd
+                ;;
+            7)
+                restart_service_cmd
+                ;;
+            8)
+                show_status_cmd
+                ;;
+            9)
+                view_logs_cmd
+                ;;
+            10)
+                change_port
+                ;;
+            11)
+                reset_admin_password
+                ;;
+            12)
+                install_cli_shortcut
+                ;;
+            0|q|Q)
+                echo_info "已退出 RelayDock 管理脚本。"
+                exit 0
+                ;;
+            *)
+                echo_warn "无效选项，请重新输入"
+                sleep 1
+                ;;
+        esac
+        echo ""
+        read -r -p "按回车键返回主菜单..." dummy || true
+    done
+}
+
 # 主函数
 main() {
-    check_root
-    acquire_install_lock
-    detect_existing_installation_paths "${1:-}"
-
-    # 检查命令行参数
-    if [ "$1" = "update" ]; then
-        echo_info "进入更新模式..."
-        check_architecture
-        install_dependencies
-        get_latest_version
-        update_service
-    elif [ "$1" = "reinstall" ]; then
-        echo_info "进入覆盖安装模式..."
-        check_architecture
-        install_dependencies
-        get_latest_version
-        reinstall_service
-    elif [ "$1" = "uninstall" ]; then
-        echo_info "进入卸载模式..."
-        uninstall_service
-    else
-        echo_info "开始安装 RelayDock..."
-        echo ""
-
-        check_architecture
-        install_dependencies
-        get_latest_version
-        download_binary
-        resolve_wireguard_local_ipv4
-        begin_update_transaction
-        if ! stop_service_for_transaction; then
-            return 1
-        fi
-        if ! stop_wireguard_service_for_transaction; then
-            return 1
-        fi
-        snapshot_database_after_stop
-        install_binary
-        create_directories
-        create_systemd_service
-        install_wireguard_probe_assets
-
-        # 保存版本信息
-        atomic_write_version "$DATA_DIR/.version"
-
-        if ! start_service; then
-            echo_error "安装过程中出现错误，请查看日志: journalctl -u $SERVICE_NAME -n 50"
-            return 1
-        fi
-        commit_update_transaction
-        show_status
-    fi
+    case "${1:-}" in
+        update|--update)
+            check_root
+            acquire_install_lock
+            detect_existing_installation_paths "${1:-}"
+            echo_info "进入更新模式..."
+            check_architecture
+            install_dependencies
+            get_latest_version
+            update_service
+            ;;
+        reinstall|--reinstall)
+            check_root
+            acquire_install_lock
+            detect_existing_installation_paths "${1:-}"
+            echo_info "进入覆盖安装模式..."
+            check_architecture
+            install_dependencies
+            get_latest_version
+            reinstall_service
+            ;;
+        uninstall|--uninstall)
+            check_root
+            acquire_install_lock
+            detect_existing_installation_paths "${1:-}"
+            echo_info "进入卸载模式..."
+            uninstall_service
+            ;;
+        install|--install)
+            check_root
+            acquire_install_lock
+            detect_existing_installation_paths "${1:-}"
+            run_install_flow
+            ;;
+        start|--start)
+            start_service_cmd
+            ;;
+        stop|--stop)
+            stop_service_cmd
+            ;;
+        restart|--restart)
+            restart_service_cmd
+            ;;
+        status|--status)
+            show_status_cmd
+            ;;
+        log|logs|--log|--logs)
+            view_logs_cmd
+            ;;
+        port|--port)
+            change_port "${2:-}"
+            ;;
+        reset-password|--reset-password|reset_password)
+            reset_admin_password
+            ;;
+        shortcut|--shortcut)
+            check_root
+            install_cli_shortcut
+            ;;
+        menu|--menu)
+            check_root
+            interactive_menu
+            ;;
+        *)
+            if [ $# -eq 0 ]; then
+                check_root
+                if [ -t 0 ]; then
+                    interactive_menu
+                elif { exec </dev/tty; } 2>/dev/null; then
+                    interactive_menu
+                elif [ ! -t 0 ]; then
+                    interactive_menu
+                else
+                    acquire_install_lock
+                    detect_existing_installation_paths "${1:-}"
+                    run_install_flow
+                fi
+            else
+                echo_error "未知命令: $1"
+                echo "可用命令: install | update | reinstall | uninstall | start | stop | restart | status | log | port | reset-password | shortcut | menu"
+                exit 1
+            fi
+            ;;
+    esac
 }
 
 cleanup() {

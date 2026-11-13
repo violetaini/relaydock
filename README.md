@@ -47,55 +47,58 @@ RelayDock 面向合租节点和小型代理服务运营场景。管理员集中�
 
 其他 Linux 发行版可以从源码运行，但不在当前安装脚本的支持范围内。
 
-## 快速安装
+## 快速安装与一键管理
 
-安装器会从 GitHub Release 下载控制端、节点到期守卫和测速资产，并使用 Release 中发布的 SHA-256 清单完成校验后再替换文件。受管服务器接入时，节点安装脚本会从对应版本的 GitHub Release 直接下载两种 Linux 架构的 Agent 并校验 `checksums.txt`；面板不再托管 Agent 二进制。
+安装器支持主流 Linux 发行版（Debian / Ubuntu / CentOS / Rocky / AlmaLinux / Alpine / Arch），自动适配 AMD64 (`x86_64`) 与 ARM64 (`aarch64`) 架构。
+
+在终端执行以下一键命令即可启动安装与管理：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/quick-install.sh | sudo bash
+```
+
+或者使用主安装脚本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash
 ```
 
-安装完成后访问：
+### ⚡ 终端快捷运维命令（像 Nezha / Komari 一样便捷）
+
+安装完成后，脚本会自动注册系统快捷命令，您可以在 SSH 终端**随时随地**输入：
+
+```bash
+relaydock
+```
+
+即可调出完整的交互式管理控制台，支持实时监控系统状态、运行端口、公网访问地址，并执行以下操作：
+
+- **1 ~ 4**：安装 / 平滑更新 / 覆盖修复 / 卸载面板
+- **5 ~ 9**：启动 / 停止 / 重启 / 运行状态 / 实时日志
+- **10 ~ 12**：修改面板监听端口 / 本地重置管理员密码 / 修复终端快捷命令
+
+你也可以直接带参数执行快捷命令，适合自动化脚本与快速运维：
+
+```bash
+relaydock status                 # 查看当前服务状态与系统信息
+relaydock restart                # 重启控制端服务
+relaydock log                    # 实时追踪运行日志 (Ctrl+C 退出)
+relaydock port 18080             # 修改面板监听端口为 18080 并自动放行防火墙
+relaydock reset-password         # 本地救急重置管理员密码
+relaydock update                 # 平滑升级到最新版本
+relaydock reinstall              # 覆盖修复当前版本（保留数据）
+relaydock uninstall              # 卸载面板（默认保留数据）
+```
+
+安装完成后请通过浏览器访问：
 
 ```text
-http://SERVER_IP:12889
+http://<你的服务器公网IP>:12889
 ```
 
-首次访问会进入初始化向导，由你创建第一个管理员账号；项目不提供默认用户名或默认密码。安装路径保持兼容：二进制为 `/usr/local/bin/arcway`，数据目录为 `/etc/arcway`，systemd 服务名为 `arcway`。
-
-自定义面板端口：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo env PORT=18080 bash
-```
-
-### 重装与卸载
-
-以下命令采用安全的非交互默认值：重装保留当前端口，卸载保留 `/etc/arcway` 数据。覆盖重装前仍应先备份：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash -s -- reinstall
-```
-
-卸载程序但保留数据：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash -s -- uninstall
-```
-
-彻底卸载并删除 `/etc/arcway` 前请先备份：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo env ARCWAY_KEEP_DATA=false bash -s -- uninstall
-```
-
-常用运维命令：
-
-```bash
-systemctl status arcway
-journalctl -u arcway -f
-systemctl restart arcway
-```
+> [!NOTE]
+> 首次访问会进入初始化向导，由您创建第一个管理员账号。
+> 本机系统防火墙（UFW / Firewalld / iptables）已自动放行对应端口；若您使用的是阿里云、腾讯云、华为云、甲骨文、AWS 等云服务器，请务必前往【云控制台 - 安全组 / 网络规则】放行 TCP 对应端口！
 
 ## 更新已安装的 RelayDock
 
