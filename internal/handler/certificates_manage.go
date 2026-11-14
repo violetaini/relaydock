@@ -1816,6 +1816,10 @@ func (h *CertificateHandler) RevealDNSProviderCredentials(w http.ResponseWriter,
 		respondJSON(w, http.StatusMethodNotAllowed, map[string]any{"success": false, "message": "不支持的请求方法"})
 		return
 	}
+	if !h.requireAdmin(r) {
+		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+		return
+	}
 	username, ok := h.authenticateUser(w, r)
 	if !ok {
 		return

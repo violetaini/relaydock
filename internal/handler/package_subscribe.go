@@ -654,7 +654,7 @@ func applyUserCredentials(proxy map[string]any, node storage.Node, credMap map[c
 	if strings.EqualFold(strings.TrimSpace(node.Protocol), "wireguard") && !managed {
 		return false
 	}
-	if !managed || strings.EqualFold(node.RoutedOwner, "shared") {
+	if !managed || (node.NodeType == "routed" && strings.EqualFold(node.RoutedOwner, "shared")) {
 		return true
 	}
 	// A half-associated node is not safe to publish: without both coordinates

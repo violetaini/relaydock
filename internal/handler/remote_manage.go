@@ -979,10 +979,6 @@ func (h *RemoteManageHandler) requireExternalManagedXray(ctx context.Context, w 
 		remoteWriteError(w, http.StatusNotFound, "server not found: "+err.Error())
 		return false
 	}
-	if server.XrayMode == "embedded" {
-		remoteWriteError(w, http.StatusConflict, "内嵌 Xray 随 Agent 更新，不能调用外置 Xray 安装或卸载程序")
-		return false
-	}
 	servers, err := h.repo.ListRemoteServers(ctx)
 	if err != nil {
 		remoteWriteError(w, http.StatusInternalServerError, "unable to verify server ownership: "+err.Error())
@@ -993,6 +989,10 @@ func (h *RemoteManageHandler) requireExternalManagedXray(ctx context.Context, w 
 			remoteWriteError(w, http.StatusConflict, "共享服务器的 Xray 核心由拥有方控制端管理")
 			return false
 		}
+	}
+	if server.XrayMode == "embedded" {
+		remoteWriteError(w, http.StatusConflict, "内嵌 Xray 随 Agent 更新，不能调用外置 Xray 安装或卸载程序")
+		return false
 	}
 	return true
 }

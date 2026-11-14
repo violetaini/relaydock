@@ -1137,7 +1137,11 @@ func (h *ForwardingHandler) writeForwardClientConfig(w http.ResponseWriter, r *h
 		writeForwardingError(w, storage.ErrForwardingForbidden)
 		return
 	}
-	node, _, _, _, err := h.resolveManagedForwardTarget(r.Context(), f.Username, f.TargetNodeID)
+	targetUser := username
+	if targetUser == "" {
+		targetUser = f.Username
+	}
+	node, _, _, _, err := h.resolveManagedForwardTarget(r.Context(), targetUser, f.TargetNodeID)
 	if err != nil {
 		writeForwardingError(w, err)
 		return
