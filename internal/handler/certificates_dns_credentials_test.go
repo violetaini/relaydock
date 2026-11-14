@@ -86,11 +86,12 @@ func TestRevealDNSProviderCredentialsRejectsUnauthenticatedAndNonAdmin(t *testin
 	}
 	path := "/api/admin/dns-providers/" + strconv.FormatInt(fixture.provider.ID, 10) + "/credentials"
 	tests := []struct {
-		name    string
-		request *http.Request
+		name     string
+		request  *http.Request
+		wantCode int
 	}{
-		{name: "unauthenticated", request: httptest.NewRequest(http.MethodGet, path, nil)},
-		{name: "non-admin", request: httptest.NewRequest(http.MethodGet, path, nil)},
+		{name: "unauthenticated", request: httptest.NewRequest(http.MethodGet, path, nil), wantCode: http.StatusForbidden},
+		{name: "non-admin", request: httptest.NewRequest(http.MethodGet, path, nil), wantCode: http.StatusNotFound},
 	}
 	tests[1].request = tests[1].request.WithContext(auth.ContextWithUsername(tests[1].request.Context(), "viewer"))
 
@@ -98,12 +99,12 @@ func TestRevealDNSProviderCredentialsRejectsUnauthenticatedAndNonAdmin(t *testin
 		t.Run(test.name, func(t *testing.T) {
 			response := httptest.NewRecorder()
 			fixture.handler.RevealDNSProviderCredentials(response, test.request)
-			if response.Code != http.StatusForbidden {
-				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			if response.Code != test.wantCode {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.wantCode, response.Body.String())
 			}
 			assertDNSCredentialsNoStore(t, response)
 			if strings.Contains(response.Body.String(), "top-secret-token") {
-				t.Fatalf("forbidden response leaked credentials: %s", response.Body.String())
+				t.Fatalf("rejected response leaked credentials: %s", response.Body.String())
 			}
 		})
 	}
