@@ -1443,6 +1443,10 @@ CREATE INDEX IF NOT EXISTS idx_tg_audit_at ON tg_audit(at);
 		return fmt.Errorf("migrate tg_audit: %w", err)
 	}
 
+	if err := migrateOAuthIdentities(r.db); err != nil {
+		return fmt.Errorf("migrate user_oauth_identities: %w", err)
+	}
+
 	const historySchema = `
 CREATE TABLE IF NOT EXISTS rule_versions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

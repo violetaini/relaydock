@@ -995,6 +995,39 @@ func main() {
 	// Turnstile 配置自测:前端 widget 验完拿 token,后端用 DB 已存 secret 调 cloudflare siteverify,
 	// 返回详细 error_codes 供前端诊断"两 key 配错 / 域名没白名单 / 网络不通"等场景。
 	mux.Handle("/api/admin/security-settings/turnstile/test", auth.RequireAdmin(tokenStore, userRepo, handler.NewTurnstileTestHandler(turnstileVerifier)))
+
+	// 第三方快捷登录 (GitHub / Google / OIDC)
+	oauthHandler := handler.NewOAuthHandler(repo, tokenStore)
+	mux.HandleFunc("/api/public/oauth/providers", oauthHandler.GetPublicProviders)
+	mux.HandleFunc("/api/oauth/", func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/oauth/"), "/"), "/")
+		if len(parts) < 2 {
+			http.NotFound(w, r)
+			return
+		}
+		provider, action := parts[0], parts[1]
+		switch action {
+		case "login":
+			oauthHandler.HandleLogin(w, r, provider)
+		case "callback":
+			oauthHandler.HandleCallback(w, r, provider)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	mux.Handle("/api/admin/oauth/config", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			oauthHandler.GetAdminConfig(w, r)
+		case http.MethodPost, http.MethodPut:
+			oauthHandler.SaveAdminConfig(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})))
+	mux.Handle("/api/user/oauth/identities", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(oauthHandler.GetUserIdentities)))
+	mux.Handle("/api/user/oauth/prepare-bind", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(oauthHandler.PrepareBind)))
+	mux.Handle("/api/user/oauth/unbind", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(oauthHandler.UnbindUserIdentity)))
 	mux.Handle("/api/admin/system-settings/api-token", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(systemSettingsHandler.GetAPIToken)))
 	mux.Handle("/api/admin/system-settings/api-token/regenerate", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(systemSettingsHandler.RegenerateAPIToken)))
 	mux.Handle("/api/admin/system-settings/master-url", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
