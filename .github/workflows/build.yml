@@ -1,6 +1,9 @@
 name: Backend CI and Release
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       publish:
@@ -13,7 +16,7 @@ permissions:
   contents: read
 
 env:
-  AGENT_SOURCE_SHA: 7953f242169d320966c73dcf20fa6ee62bf7bb8f
+  AGENT_SOURCE_SHA: 262d5f7a67d51c73298f1ccb44567e92083c7583
 
 jobs:
   verify:
@@ -24,7 +27,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Verify tagged release notes
-        if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ (inputs.publish || github.event_name == 'push') && startsWith(github.ref, 'refs/tags/v') }}
         run: scripts/verify-release-notes.sh "$GITHUB_REF_NAME"
 
       - name: Setup Go
@@ -255,7 +258,7 @@ jobs:
   package:
     name: Assemble verified release bundle
     needs: [build, guard, agent, speedtester]
-    if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ (inputs.publish || github.event_name == 'push') && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -329,7 +332,7 @@ jobs:
   docker:
     name: Build and Push Docker Image
     needs: package
-    if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ (inputs.publish || github.event_name == 'push') && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -389,7 +392,7 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: docker
-    if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ (inputs.publish || github.event_name == 'push') && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
