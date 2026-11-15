@@ -3,8 +3,13 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -317,6 +322,9 @@ func TestOAuth_HandleCallback_AutoRegister(t *testing.T) {
 	exchBody, _ := json.Marshal(map[string]string{"code": code})
 	exchReq := httptest.NewRequest(http.MethodPost, "/api/public/oauth/exchange", bytes.NewReader(exchBody))
 	exchRec := httptest.NewRecorder()
+	for _, c := range rec.Result().Cookies() {
+		exchReq.AddCookie(c)
+	}
 	h.ExchangeOAuthCode(exchRec, exchReq)
 
 	if exchRec.Code != http.StatusOK {
@@ -371,7 +379,7 @@ func TestOAuth_HandleCallback_AutoLinkEmail(t *testing.T) {
 	_ = repo.SetSystemSetting(ctx, SettingOAuthGoogleEnabled, "1")
 	_ = repo.SetSystemSetting(ctx, SettingOAuthGoogleClientID, "g-client-1")
 	_ = repo.SetSystemSetting(ctx, SettingOAuthGoogleClientSecret, "g-secret-1")
-	_ = repo.SetSystemSetting(ctx, SettingOAuthAutoRegister, "0") // 禁用自动注册
+	_ = repo.SetSystemSetting(ctx, SettingOAuthAutoRegister, "0")  // 禁用自动注册
 	_ = repo.SetSystemSetting(ctx, SettingOAuthAutoLinkEmail, "1") // 启用邮箱自动关联
 
 	nonce := "nonce_google_test"
@@ -436,6 +444,9 @@ func TestOAuth_HandleCallback_AutoLinkEmail(t *testing.T) {
 	exchBody, _ := json.Marshal(map[string]string{"code": code})
 	exchReq := httptest.NewRequest(http.MethodPost, "/api/public/oauth/exchange", bytes.NewReader(exchBody))
 	exchRec := httptest.NewRecorder()
+	for _, c := range rec.Result().Cookies() {
+		exchReq.AddCookie(c)
+	}
 	h.ExchangeOAuthCode(exchRec, exchReq)
 
 	if exchRec.Code != http.StatusOK {
@@ -459,11 +470,15 @@ func TestOAuth_HandleCallback_AutoLinkEmail(t *testing.T) {
 	}
 }
 
+var testOIDCKey, _ = rsa.GenerateKey(rand.Reader, 2048)
+
 func createMockJWT(claims map[string]any) string {
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"test","typ":"JWT"}`))
 	payloadBytes, _ := json.Marshal(claims)
 	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
-	return header + "." + payload + ".mock_sig"
+	sum := sha256.Sum256([]byte(header + "." + payload))
+	sig, _ := rsa.SignPKCS1v15(rand.Reader, testOIDCKey, crypto.SHA256, sum[:])
+	return header + "." + payload + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
 
 func TestOAuth_HandleCallback_OIDC(t *testing.T) {
@@ -473,11 +488,14 @@ func TestOAuth_HandleCallback_OIDC(t *testing.T) {
 	nonce := "nonce_oidc_test"
 	var mockServerURL string
 
-	mockOIDC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mockOIDC := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/jwks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{"kty": "RSA", "kid": "test", "n": base64.RawURLEncoding.EncodeToString(testOIDCKey.N.Bytes()), "e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(testOIDCKey.E)).Bytes())}}})
 		case "/.well-known/openid-configuration":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]string{
+				"issuer": mockServerURL, "jwks_uri": mockServerURL + "/jwks",
 				"authorization_endpoint": mockServerURL + "/oauth/authorize",
 				"token_endpoint":         mockServerURL + "/oauth/token",
 				"userinfo_endpoint":      mockServerURL + "/oauth/userinfo",
@@ -512,9 +530,10 @@ func TestOAuth_HandleCallback_OIDC(t *testing.T) {
 	}))
 	defer mockOIDC.Close()
 	mockServerURL = mockOIDC.URL
+	h.SetHTTPClient(mockOIDC.Client())
 
 	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCEnabled, "1")
-	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCIssuer, mockOIDC.URL)
+	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCIssuer, mockServerURL)
 	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCClientID, "oidc-client-1")
 	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCClientSecret, "oidc-secret-1")
 	_ = repo.SetSystemSetting(ctx, SettingOAuthAutoRegister, "1")
@@ -532,7 +551,7 @@ func TestOAuth_HandleCallback_OIDC(t *testing.T) {
 			targetURL := mockOIDC.URL + path
 			newReq, _ := http.NewRequestWithContext(req.Context(), req.Method, targetURL, req.Body)
 			newReq.Header = req.Header
-			return http.DefaultClient.Do(newReq)
+			return mockOIDC.Client().Do(newReq)
 		}),
 	})
 
@@ -556,6 +575,9 @@ func TestOAuth_HandleCallback_OIDC(t *testing.T) {
 	exchBody, _ := json.Marshal(map[string]string{"code": code})
 	exchReq := httptest.NewRequest(http.MethodPost, "/api/public/oauth/exchange", bytes.NewReader(exchBody))
 	exchRec := httptest.NewRecorder()
+	for _, c := range rec.Result().Cookies() {
+		exchReq.AddCookie(c)
+	}
 	h.ExchangeOAuthCode(exchRec, exchReq)
 
 	if exchRec.Code != http.StatusOK {
@@ -576,9 +598,10 @@ func TestOAuth_SilentSSO(t *testing.T) {
 	h, repo, _ := setupTestOAuthEnv(t)
 	ctx := context.Background()
 
-	mockOIDC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mockOIDC := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer": "https://sso.example.com", "jwks_uri": "https://sso.example.com/jwks",
 			"authorization_endpoint": "https://sso.example.com/oauth/authorize",
 			"token_endpoint":         "https://sso.example.com/oauth/token",
 			"userinfo_endpoint":      "https://sso.example.com/oauth/userinfo",
@@ -587,7 +610,7 @@ func TestOAuth_SilentSSO(t *testing.T) {
 	defer mockOIDC.Close()
 
 	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCEnabled, "1")
-	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCIssuer, mockOIDC.URL)
+	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCIssuer, "https://sso.example.com")
 	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCClientID, "client-test")
 
 	h.SetHTTPClient(&http.Client{
@@ -595,7 +618,7 @@ func TestOAuth_SilentSSO(t *testing.T) {
 			targetURL := mockOIDC.URL + req.URL.Path
 			newReq, _ := http.NewRequestWithContext(req.Context(), req.Method, targetURL, req.Body)
 			newReq.Header = req.Header
-			return http.DefaultClient.Do(newReq)
+			return mockOIDC.Client().Do(newReq)
 		}),
 	})
 
@@ -664,7 +687,7 @@ func TestOAuth_AutoLinkEmail_UnverifiedRejected(t *testing.T) {
 	_ = repo.SetSystemSetting(ctx, SettingOAuthGoogleEnabled, "1")
 	_ = repo.SetSystemSetting(ctx, SettingOAuthGoogleClientID, "g-client-1")
 	_ = repo.SetSystemSetting(ctx, SettingOAuthGoogleClientSecret, "g-secret-1")
-	_ = repo.SetSystemSetting(ctx, SettingOAuthAutoRegister, "0") // 关闭注册
+	_ = repo.SetSystemSetting(ctx, SettingOAuthAutoRegister, "0")  // 关闭注册
 	_ = repo.SetSystemSetting(ctx, SettingOAuthAutoLinkEmail, "1") // 开启自动关联
 
 	nonce := "nonce_unverified_test"

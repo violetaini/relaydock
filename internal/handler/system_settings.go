@@ -976,6 +976,15 @@ const (
 )
 
 type brandingSettings struct {
+	LoginBackgroundMode string   `json:"login_background_mode"`
+	LoginBackgroundURLs []string `json:"login_background_urls"`
+	AutoSSO             bool     `json:"auto_sso"`
+	LoginTheme          string   `json:"login_theme"`
+	LoginTitle          string   `json:"login_title"`
+	LoginSubtitle       string   `json:"login_subtitle"`
+	LoginKicker         string   `json:"login_kicker"`
+	FontPreset          string   `json:"font_preset"`
+
 	Name    string `json:"name"`
 	Logo    string `json:"logo"`
 	Favicon string `json:"favicon"`
@@ -998,7 +1007,50 @@ func (h *SystemSettingsHandler) brandingSettings(ctx context.Context) (brandingS
 	if name == "" {
 		name = defaultBrandingName
 	}
-	return brandingSettings{Name: name, Logo: logo, Favicon: favicon}, nil
+	b := brandingSettings{Name: name, Logo: logo, Favicon: favicon}
+	b.LoginTheme, err = h.repo.GetSystemSetting(ctx, "branding_login_theme")
+	if err != nil {
+		return b, err
+	}
+	b.LoginTitle, err = h.repo.GetSystemSetting(ctx, "branding_login_title")
+	if err != nil {
+		return b, err
+	}
+	b.LoginSubtitle, err = h.repo.GetSystemSetting(ctx, "branding_login_subtitle")
+	if err != nil {
+		return b, err
+	}
+	b.LoginKicker, err = h.repo.GetSystemSetting(ctx, "branding_login_kicker")
+	if err != nil {
+		return b, err
+	}
+	b.FontPreset, err = h.repo.GetSystemSetting(ctx, "branding_font_preset")
+	if err != nil {
+		return b, err
+	}
+	v, err := h.repo.GetSystemSetting(ctx, "branding_auto_sso")
+	if err != nil {
+		return b, err
+	}
+	b.AutoSSO = v == "true"
+	b.LoginBackgroundMode, err = h.repo.GetSystemSetting(ctx, "branding_login_background_mode")
+	if err != nil {
+		return b, err
+	}
+	raw, err := h.repo.GetSystemSetting(ctx, "branding_login_background_urls")
+	if err != nil {
+		return b, err
+	}
+	b.LoginBackgroundURLs = []string{}
+	if raw != "" {
+		if err = json.Unmarshal([]byte(raw), &b.LoginBackgroundURLs); err != nil {
+			return b, err
+		}
+	}
+	if b.LoginTheme == "" {
+		b.LoginTheme = "glass"
+	}
+	return b, nil
 }
 
 func normalizeBrandingName(raw string) (string, error) {
@@ -1054,10 +1106,17 @@ func (h *SystemSettingsHandler) GetBranding(w http.ResponseWriter, r *http.Reque
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"success": true,
-		"name":    branding.Name,
-		"logo":    branding.Logo,
-		"favicon": branding.Favicon,
+		"success":               true,
+		"name":                  branding.Name,
+		"logo":                  branding.Logo,
+		"favicon":               branding.Favicon,
+		"auto_sso":              branding.AutoSSO,
+		"login_background_mode": branding.LoginBackgroundMode, "login_background_urls": branding.LoginBackgroundURLs,
+		"login_theme":    branding.LoginTheme,
+		"login_title":    branding.LoginTitle,
+		"login_subtitle": branding.LoginSubtitle,
+		"login_kicker":   branding.LoginKicker,
+		"font_preset":    branding.FontPreset,
 	})
 }
 
@@ -1076,6 +1135,32 @@ func (h *SystemSettingsHandler) SetBranding(w http.ResponseWriter, r *http.Reque
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "请求格式错误"})
 		return
 	}
+	if (req.LoginTheme != "" && req.LoginTheme != "default" && req.LoginTheme != "glass") || (req.FontPreset != "" && req.FontPreset != "default" && req.FontPreset != "classic-serif") {
+		http.Error(w, "Invalid appearance option", 400)
+		return
+	}
+	for _, v := range []string{req.LoginTitle, req.LoginSubtitle, req.LoginKicker} {
+		if len([]rune(v)) > 160 || strings.IndexFunc(v, unicode.IsControl) >= 0 {
+			http.Error(w, "Invalid login text", 400)
+			return
+		}
+	}
+	if req.LoginBackgroundMode != "" && req.LoginBackgroundMode != "gradient" && req.LoginBackgroundMode != "fixed" && req.LoginBackgroundMode != "random" {
+		http.Error(w, "Invalid background mode", 400)
+		return
+	}
+	if len(req.LoginBackgroundURLs) > 30 {
+		http.Error(w, "At most 30 backgrounds", 400)
+		return
+	}
+	for _, raw := range req.LoginBackgroundURLs {
+		u, e := url.Parse(raw)
+		if e != nil || len(raw) > 2000 || strings.IndexFunc(raw, unicode.IsSpace) >= 0 || u.User != nil || !(u.Scheme == "https" && u.Host != "" || strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//")) {
+			http.Error(w, "Backgrounds require HTTPS or a same-origin path", 400)
+			return
+		}
+	}
+	backgrounds, _ := json.Marshal(req.LoginBackgroundURLs)
 	name, err := normalizeBrandingName(req.Name)
 	if err == nil {
 		req.Logo, err = normalizeBrandingImage(req.Logo)
@@ -1094,6 +1179,13 @@ func (h *SystemSettingsHandler) SetBranding(w http.ResponseWriter, r *http.Reque
 		{brandingNameKey, name},
 		{brandingLogoKey, req.Logo},
 		{brandingFaviconKey, req.Favicon},
+		{"branding_auto_sso", strconv.FormatBool(req.AutoSSO)},
+		{"branding_login_background_mode", req.LoginBackgroundMode}, {"branding_login_background_urls", string(backgrounds)},
+		{"branding_login_theme", req.LoginTheme},
+		{"branding_login_title", req.LoginTitle},
+		{"branding_login_subtitle", req.LoginSubtitle},
+		{"branding_login_kicker", req.LoginKicker},
+		{"branding_font_preset", req.FontPreset},
 	} {
 		if err := h.repo.SetSystemSetting(r.Context(), setting.key, setting.value); err != nil {
 			w.Header().Set("Content-Type", "application/json")
@@ -1112,11 +1204,18 @@ func (h *SystemSettingsHandler) SetBranding(w http.ResponseWriter, r *http.Reque
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"success": true,
-		"message": "项目品牌已更新",
-		"name":    branding.Name,
-		"logo":    branding.Logo,
-		"favicon": branding.Favicon,
+		"success":               true,
+		"message":               "项目品牌已更新",
+		"name":                  branding.Name,
+		"logo":                  branding.Logo,
+		"favicon":               branding.Favicon,
+		"auto_sso":              branding.AutoSSO,
+		"login_background_mode": branding.LoginBackgroundMode, "login_background_urls": branding.LoginBackgroundURLs,
+		"login_theme":    branding.LoginTheme,
+		"login_title":    branding.LoginTitle,
+		"login_subtitle": branding.LoginSubtitle,
+		"login_kicker":   branding.LoginKicker,
+		"font_preset":    branding.FontPreset,
 	})
 }
 

@@ -2,8 +2,10 @@ package handler
 
 import (
 	"context"
+	"crypto"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -35,11 +38,11 @@ const (
 	SettingOAuthGoogleClientID     = "oauth_google_client_id"
 	SettingOAuthGoogleClientSecret = "oauth_google_client_secret"
 
-	SettingOAuthOIDCEnabled        = "oauth_oidc_enabled"
-	SettingOAuthOIDCIssuer         = "oauth_oidc_issuer"
-	SettingOAuthOIDCClientID       = "oauth_oidc_client_id"
-	SettingOAuthOIDCClientSecret   = "oauth_oidc_client_secret"
-	SettingOAuthOIDCDisplayName    = "oauth_oidc_display_name"
+	SettingOAuthOIDCEnabled      = "oauth_oidc_enabled"
+	SettingOAuthOIDCIssuer       = "oauth_oidc_issuer"
+	SettingOAuthOIDCClientID     = "oauth_oidc_client_id"
+	SettingOAuthOIDCClientSecret = "oauth_oidc_client_secret"
+	SettingOAuthOIDCDisplayName  = "oauth_oidc_display_name"
 
 	SettingOAuthAutoRegister  = "oauth_auto_register"
 	SettingOAuthAutoLinkEmail = "oauth_auto_link_email"
@@ -92,6 +95,8 @@ type OAuthUserProfile struct {
 }
 
 type oidcDiscoveryDoc struct {
+	Issuer                string `json:"issuer"`
+	JWKSURI               string `json:"jwks_uri"`
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
 	TokenEndpoint         string `json:"token_endpoint"`
 	UserinfoEndpoint      string `json:"userinfo_endpoint"`
@@ -110,6 +115,7 @@ type oauthExchangeItem struct {
 	Token     string
 	Username  string
 	ExpiresAt time.Time
+	Browser   string
 }
 
 // OAuthHandler 处理第三方快捷登录 (GitHub, Google, Generic OIDC)
@@ -216,11 +222,13 @@ func (h *OAuthHandler) ExchangeOAuthCode(w http.ResponseWriter, r *http.Request)
 	}
 	h.exchangeMu.Unlock()
 
-	if !ok || time.Now().After(item.ExpiresAt) {
+	if !ok || time.Now().After(item.ExpiresAt) || item.Browser == "" || item.Browser != getOAuthCookie(r, "relaydock_oauth_exchange") {
 		writeJSONError(w, http.StatusUnauthorized, "invalid_or_expired_code")
 		return
 	}
 
+	clearOAuthCookie(w, r, "relaydock_oauth_exchange")
+	w.Header().Set("Cache-Control", "no-store")
 	respondJSON(w, http.StatusOK, map[string]any{
 		"token":      item.Token,
 		"username":   item.Username,
@@ -228,7 +236,7 @@ func (h *OAuthHandler) ExchangeOAuthCode(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-func (h *OAuthHandler) createExchangeCode(token, username string) string {
+func (h *OAuthHandler) createExchangeCode(token, username, browser string) string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		b = []byte(fmt.Sprintf("%d-%s", time.Now().UnixNano(), username))
@@ -248,6 +256,7 @@ func (h *OAuthHandler) createExchangeCode(token, username string) string {
 
 	h.exchangeCodes[code] = oauthExchangeItem{
 		Token:     token,
+		Browser:   browser,
 		Username:  username,
 		ExpiresAt: now.Add(60 * time.Second),
 	}
@@ -474,7 +483,7 @@ func (h *OAuthHandler) buildAuthURL(w http.ResponseWriter, r *http.Request, prov
 	redirectURI := fmt.Sprintf("%s/api/oauth/%s/callback", baseURL, provider)
 
 	// 生成安全加密状态参数与防 CSRF Cookie
-	nonceBytes := make([]byte, 16)
+	nonceBytes := make([]byte, 32)
 	_, _ = rand.Read(nonceBytes)
 	nonce := hex.EncodeToString(nonceBytes)
 
@@ -526,6 +535,7 @@ func (h *OAuthHandler) buildAuthURL(w http.ResponseWriter, r *http.Request, prov
 			logger.Error("[OAuth] OIDC Discovery 失败", "issuer", cfg.OIDCIssuer, "err", err)
 			return "", errors.New("oidc_discovery_failed")
 		}
+		challenge := sha256.Sum256([]byte(nonce))
 		authURL := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s&nonce=%s",
 			doc.AuthorizationEndpoint,
 			url.QueryEscape(cfg.OIDCClientID),
@@ -534,6 +544,7 @@ func (h *OAuthHandler) buildAuthURL(w http.ResponseWriter, r *http.Request, prov
 			url.QueryEscape(stateToken),
 			url.QueryEscape(nonce),
 		)
+		authURL += "&code_challenge_method=S256&code_challenge=" + base64.RawURLEncoding.EncodeToString(challenge[:])
 		if silent {
 			authURL += "&prompt=none"
 		}
@@ -783,7 +794,14 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request, pr
 		return
 	}
 
-	exchangeCode := h.createExchangeCode(token, targetUser.Username)
+	browserBytes := make([]byte, 32)
+	if _, err := rand.Read(browserBytes); err != nil {
+		http.Error(w, "Random source unavailable", 503)
+		return
+	}
+	browser := hex.EncodeToString(browserBytes)
+	setOAuthCookie(w, r, "relaydock_oauth_exchange", browser, 60)
+	exchangeCode := h.createExchangeCode(token, targetUser.Username, browser)
 	logger.Info("[OAuth] 快捷登录成功，签发授权兑换码", "username", targetUser.Username, "provider", provider)
 	http.Redirect(w, r, fmt.Sprintf("/?oauth_code=%s", url.QueryEscape(exchangeCode)), http.StatusFound)
 }
@@ -985,6 +1003,7 @@ func (h *OAuthHandler) exchangeOIDC(ctx context.Context, cfg *OAuthConfig, code,
 	// 1. 换取 Token
 	data := url.Values{}
 	data.Set("grant_type", "authorization_code")
+	data.Set("code_verifier", expectedNonce)
 	data.Set("code", code)
 	data.Set("client_id", cfg.OIDCClientID)
 	data.Set("client_secret", cfg.OIDCClientSecret)
@@ -1020,12 +1039,15 @@ func (h *OAuthHandler) exchangeOIDC(ctx context.Context, cfg *OAuthConfig, code,
 	if tokenResp.Error != "" {
 		return nil, fmt.Errorf("oidc error: %s (%s)", tokenResp.Error, tokenResp.ErrorDesc)
 	}
-	if tokenResp.AccessToken == "" && tokenResp.IDToken == "" {
+	if tokenResp.IDToken == "" {
 		return nil, errors.New("oidc returned neither access_token nor id_token")
 	}
 
 	var claims *oidcIDTokenClaims
 	if tokenResp.IDToken != "" {
+		if err := h.verifyOIDCSignature(ctx, tokenResp.IDToken, doc.JWKSURI); err != nil {
+			return nil, err
+		}
 		parsedClaims, err := parseAndValidateIDToken(tokenResp.IDToken, cfg.OIDCIssuer, cfg.OIDCClientID, expectedNonce)
 		if err != nil {
 			logger.Warn("[OAuth] OIDC id_token 校验未通过", "err", err)
@@ -1123,7 +1145,7 @@ type oidcIDTokenClaims struct {
 
 func parseAndValidateIDToken(rawToken, expectedIssuer, expectedClientID, expectedNonce string) (*oidcIDTokenClaims, error) {
 	parts := strings.Split(rawToken, ".")
-	if len(parts) < 2 {
+	if len(parts) != 3 {
 		return nil, errors.New("invalid jwt format")
 	}
 
@@ -1148,10 +1170,13 @@ func parseAndValidateIDToken(rawToken, expectedIssuer, expectedClientID, expecte
 	// 校验 Issuer
 	cleanExpectedIss := strings.TrimRight(strings.TrimSpace(expectedIssuer), "/")
 	cleanIss := strings.TrimRight(strings.TrimSpace(claims.Issuer), "/")
-	if cleanExpectedIss != "" && cleanIss != "" && cleanExpectedIss != cleanIss {
+	if cleanExpectedIss == "" || cleanExpectedIss != cleanIss {
 		return nil, fmt.Errorf("oidc id_token issuer mismatch: got %q, expected %q", claims.Issuer, expectedIssuer)
 	}
 
+	if len(claims.Audience) == 0 || claims.ExpiresAt <= 0 || claims.IssuedAt > time.Now().Unix()+60 {
+		return nil, errors.New("missing or invalid required claims")
+	}
 	// 校验 Audience (支持 string 与 []string)
 	if expectedClientID != "" && len(claims.Audience) > 0 {
 		var singleAud string
@@ -1186,7 +1211,7 @@ func parseAndValidateIDToken(rawToken, expectedIssuer, expectedClientID, expecte
 	}
 
 	// 校验 Nonce 防重放
-	if expectedNonce != "" && claims.Nonce != "" {
+	if expectedNonce != "" {
 		if claims.Nonce != expectedNonce {
 			return nil, fmt.Errorf("oidc id_token nonce mismatch: got %q, expected %q", claims.Nonce, expectedNonce)
 		}
@@ -1246,7 +1271,7 @@ func (h *OAuthHandler) getOIDCDiscovery(ctx context.Context, issuer string) (oid
 		return oidcDiscoveryDoc{}, fmt.Errorf("decode oidc well-known: %w", err)
 	}
 
-	if doc.AuthorizationEndpoint == "" || doc.TokenEndpoint == "" {
+	if doc.Issuer != issuer || doc.JWKSURI == "" || doc.AuthorizationEndpoint == "" || doc.TokenEndpoint == "" {
 		return oidcDiscoveryDoc{}, errors.New("invalid oidc discovery: missing endpoints")
 	}
 	if doc.UserinfoEndpoint == "" {
@@ -1415,4 +1440,79 @@ func boolToStr(b bool) string {
 		return "1"
 	}
 	return "0"
+}
+
+// verifyOIDCSignature accepts only RS256 keys published by the configured issuer.
+func (h *OAuthHandler) verifyOIDCSignature(ctx context.Context, raw, jwks string) error {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return errors.New("invalid JWT")
+	}
+	var header struct {
+		Alg string `json:"alg"`
+		Kid string `json:"kid"`
+	}
+	b, e := base64.RawURLEncoding.DecodeString(parts[0])
+	if e != nil {
+		return e
+	}
+	if e = json.Unmarshal(b, &header); e != nil {
+		return e
+	}
+	if header.Alg != "RS256" || header.Kid == "" {
+		return errors.New("unsupported signing algorithm or missing kid")
+	}
+	u, e := url.Parse(jwks)
+	if e != nil || u.Scheme != "https" {
+		return errors.New("HTTPS JWKS required")
+	}
+	req, e := http.NewRequestWithContext(ctx, "GET", jwks, nil)
+	if e != nil {
+		return e
+	}
+	r, e := h.httpClient.Do(req)
+	if e != nil {
+		return e
+	}
+	defer r.Body.Close()
+	if r.StatusCode != 200 {
+		return errors.New("JWKS unavailable")
+	}
+	var doc struct {
+		Keys []struct {
+			Kty string `json:"kty"`
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+			Alg string `json:"alg"`
+			Use string `json:"use"`
+		} `json:"keys"`
+	}
+	if e = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&doc); e != nil {
+		return e
+	}
+	for _, k := range doc.Keys {
+		if k.Kid != header.Kid || k.Kty != "RSA" || (k.Alg != "" && k.Alg != "RS256") || (k.Use != "" && k.Use != "sig") {
+			continue
+		}
+		n, e := base64.RawURLEncoding.DecodeString(k.N)
+		if e != nil {
+			return e
+		}
+		eb, e := base64.RawURLEncoding.DecodeString(k.E)
+		if e != nil || len(eb) > 4 {
+			return errors.New("invalid RSA exponent")
+		}
+		exp := 0
+		for _, x := range eb {
+			exp = exp*256 + int(x)
+		}
+		sig, e := base64.RawURLEncoding.DecodeString(parts[2])
+		if e != nil {
+			return e
+		}
+		sum := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		return rsa.VerifyPKCS1v15(&rsa.PublicKey{N: new(big.Int).SetBytes(n), E: exp}, crypto.SHA256, sum[:], sig)
+	}
+	return errors.New("signing key not found")
 }
