@@ -16,4 +16,4 @@ For upgrades, preserve the configured data directory (database and uploaded asse
 
 Successful login and OIDC callbacks land on #/dashboard. During authorization-code exchange, the UI shows a connection state and suppresses the public probe, including when an old probe=1 preview parameter is present. Anonymous visits to the site root retain the public probe behavior.
 
-The bundled frontend corresponds to relaydock-frontend revision fac4ac75da79b84dd4634c6f901cbcdc92a69fe6.
+The bundled frontend corresponds to relaydock-frontend revision 247184bd66e9c03e30d3f76775ca9be277ac9005.
