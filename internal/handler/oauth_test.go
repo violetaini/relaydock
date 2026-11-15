@@ -3,9 +3,11 @@ package handler
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -301,8 +303,41 @@ func TestOAuth_HandleCallback_AutoRegister(t *testing.T) {
 	}
 
 	redirectURL := rec.Header().Get("Location")
-	if !strings.Contains(redirectURL, "oauth_token=") {
-		t.Fatalf("expected redirect with oauth_token, got: %s", redirectURL)
+	if !strings.Contains(redirectURL, "oauth_code=") {
+		t.Fatalf("expected redirect with oauth_code, got: %s", redirectURL)
+	}
+
+	u, _ := url.Parse(redirectURL)
+	code := u.Query().Get("oauth_code")
+	if code == "" {
+		t.Fatalf("missing oauth_code in redirect: %s", redirectURL)
+	}
+
+	// 验证一次性兑换
+	exchBody, _ := json.Marshal(map[string]string{"code": code})
+	exchReq := httptest.NewRequest(http.MethodPost, "/api/public/oauth/exchange", bytes.NewReader(exchBody))
+	exchRec := httptest.NewRecorder()
+	h.ExchangeOAuthCode(exchRec, exchReq)
+
+	if exchRec.Code != http.StatusOK {
+		t.Fatalf("expected exchange 200, got %d, body: %s", exchRec.Code, exchRec.Body.String())
+	}
+
+	var exchResp struct {
+		Token    string `json:"token"`
+		Username string `json:"username"`
+	}
+	_ = json.NewDecoder(exchRec.Body).Decode(&exchResp)
+	if exchResp.Token == "" || exchResp.Username != "coder" {
+		t.Fatalf("unexpected exchange resp: %+v", exchResp)
+	}
+
+	// 重复使用同一授权码必须失败 (防重放)
+	exchRec2 := httptest.NewRecorder()
+	exchReq2 := httptest.NewRequest(http.MethodPost, "/api/public/oauth/exchange", bytes.NewReader(exchBody))
+	h.ExchangeOAuthCode(exchRec2, exchReq2)
+	if exchRec2.Code != http.StatusUnauthorized {
+		t.Fatalf("expected second exchange to fail with 401, got %d", exchRec2.Code)
 	}
 
 	// 验证新用户已成功自动创建并绑定
@@ -392,8 +427,26 @@ func TestOAuth_HandleCallback_AutoLinkEmail(t *testing.T) {
 	}
 
 	loc := rec.Header().Get("Location")
-	if !strings.Contains(loc, "oauth_token=") || !strings.Contains(loc, "oauth_username=existing_alice") {
-		t.Fatalf("expected logged in as existing_alice, got location: %s", loc)
+	if !strings.Contains(loc, "oauth_code=") {
+		t.Fatalf("expected redirect with oauth_code, got location: %s", loc)
+	}
+
+	u, _ := url.Parse(loc)
+	code := u.Query().Get("oauth_code")
+	exchBody, _ := json.Marshal(map[string]string{"code": code})
+	exchReq := httptest.NewRequest(http.MethodPost, "/api/public/oauth/exchange", bytes.NewReader(exchBody))
+	exchRec := httptest.NewRecorder()
+	h.ExchangeOAuthCode(exchRec, exchReq)
+
+	if exchRec.Code != http.StatusOK {
+		t.Fatalf("expected exchange 200, got %d", exchRec.Code)
+	}
+	var exchResp struct {
+		Username string `json:"username"`
+	}
+	_ = json.NewDecoder(exchRec.Body).Decode(&exchResp)
+	if exchResp.Username != "existing_alice" {
+		t.Fatalf("expected existing_alice, got %s", exchResp.Username)
 	}
 
 	// 确认绑定记录已写入
@@ -406,29 +459,50 @@ func TestOAuth_HandleCallback_AutoLinkEmail(t *testing.T) {
 	}
 }
 
+func createMockJWT(claims map[string]any) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payloadBytes, _ := json.Marshal(claims)
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	return header + "." + payload + ".mock_sig"
+}
+
 func TestOAuth_HandleCallback_OIDC(t *testing.T) {
 	h, repo, _ := setupTestOAuthEnv(t)
 	ctx := context.Background()
+
+	nonce := "nonce_oidc_test"
+	var mockServerURL string
 
 	mockOIDC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/openid-configuration":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]string{
-				"authorization_endpoint": "https://auth.example.com/oauth/authorize",
-				"token_endpoint":         "https://auth.example.com/oauth/token",
-				"userinfo_endpoint":      "https://auth.example.com/oauth/userinfo",
+				"authorization_endpoint": mockServerURL + "/oauth/authorize",
+				"token_endpoint":         mockServerURL + "/oauth/token",
+				"userinfo_endpoint":      mockServerURL + "/oauth/userinfo",
 			})
 		case "/oauth/token":
+			idToken := createMockJWT(map[string]any{
+				"iss":            mockServerURL,
+				"aud":            "oidc-client-1",
+				"sub":            "authentik_user_777",
+				"nonce":          nonce,
+				"exp":            time.Now().Add(10 * time.Minute).Unix(),
+				"email":          "bob@authentik.example",
+				"email_verified": true,
+			})
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"access_token": "mock_oidc_access_token_123",
+				"id_token":     idToken,
 			})
 		case "/oauth/userinfo":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"sub":                "authentik_user_777",
 				"email":              "bob@authentik.example",
+				"email_verified":     true,
 				"preferred_username": "bob_sso",
 				"name":               "Bob SSO",
 			})
@@ -437,6 +511,7 @@ func TestOAuth_HandleCallback_OIDC(t *testing.T) {
 		}
 	}))
 	defer mockOIDC.Close()
+	mockServerURL = mockOIDC.URL
 
 	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCEnabled, "1")
 	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCIssuer, mockOIDC.URL)
@@ -444,7 +519,6 @@ func TestOAuth_HandleCallback_OIDC(t *testing.T) {
 	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCClientSecret, "oidc-secret-1")
 	_ = repo.SetSystemSetting(ctx, SettingOAuthAutoRegister, "1")
 
-	nonce := "nonce_oidc_test"
 	stateToken := h.generateStateToken(oauthStateData{
 		Nonce:     nonce,
 		Provider:  "oidc",
@@ -473,8 +547,19 @@ func TestOAuth_HandleCallback_OIDC(t *testing.T) {
 	}
 
 	loc := rec.Header().Get("Location")
-	if !strings.Contains(loc, "oauth_token=") {
-		t.Fatalf("expected logged in via oidc, got location: %s", loc)
+	if !strings.Contains(loc, "oauth_code=") {
+		t.Fatalf("expected logged in via oidc with oauth_code, got location: %s", loc)
+	}
+
+	u, _ := url.Parse(loc)
+	code := u.Query().Get("oauth_code")
+	exchBody, _ := json.Marshal(map[string]string{"code": code})
+	exchReq := httptest.NewRequest(http.MethodPost, "/api/public/oauth/exchange", bytes.NewReader(exchBody))
+	exchRec := httptest.NewRecorder()
+	h.ExchangeOAuthCode(exchRec, exchReq)
+
+	if exchRec.Code != http.StatusOK {
+		t.Fatalf("expected exchange 200, got %d", exchRec.Code)
 	}
 
 	// 确认绑定与用户创建
@@ -484,6 +569,231 @@ func TestOAuth_HandleCallback_OIDC(t *testing.T) {
 	}
 	if ident.Email != "bob@authentik.example" {
 		t.Errorf("unexpected email in identity: %s", ident.Email)
+	}
+}
+
+func TestOAuth_SilentSSO(t *testing.T) {
+	h, repo, _ := setupTestOAuthEnv(t)
+	ctx := context.Background()
+
+	mockOIDC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"authorization_endpoint": "https://sso.example.com/oauth/authorize",
+			"token_endpoint":         "https://sso.example.com/oauth/token",
+			"userinfo_endpoint":      "https://sso.example.com/oauth/userinfo",
+		})
+	}))
+	defer mockOIDC.Close()
+
+	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCEnabled, "1")
+	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCIssuer, mockOIDC.URL)
+	_ = repo.SetSystemSetting(ctx, SettingOAuthOIDCClientID, "client-test")
+
+	h.SetHTTPClient(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			targetURL := mockOIDC.URL + req.URL.Path
+			newReq, _ := http.NewRequestWithContext(req.Context(), req.Method, targetURL, req.Body)
+			newReq.Header = req.Header
+			return http.DefaultClient.Do(newReq)
+		}),
+	})
+
+	// 1. 发起静默登录检测
+	reqLogin := httptest.NewRequest(http.MethodGet, "/api/oauth/oidc/login?silent=true", nil)
+	recLogin := httptest.NewRecorder()
+	h.HandleLogin(recLogin, reqLogin, "oidc")
+
+	if recLogin.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", recLogin.Code)
+	}
+	targetURL := recLogin.Header().Get("Location")
+	if !strings.Contains(targetURL, "prompt=none") {
+		t.Fatalf("expected prompt=none in silent auth url, got: %s", targetURL)
+	}
+
+	u, _ := url.Parse(targetURL)
+	stateParam := u.Query().Get("state")
+	stateData, err := h.verifyStateToken(stateParam)
+	if err != nil {
+		t.Fatalf("verify state token failed: %v", err)
+	}
+	if !stateData.Silent {
+		t.Fatal("expected stateData.Silent to be true")
+	}
+
+	// 2. 模拟 SSO 端因用户未登录返回 login_required
+	reqCallback := httptest.NewRequest(http.MethodGet, "/api/oauth/oidc/callback?error=login_required&state="+stateParam, nil)
+	recCallback := httptest.NewRecorder()
+	h.HandleCallback(recCallback, reqCallback, "oidc")
+
+	if recCallback.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d", recCallback.Code)
+	}
+	cbLoc := recCallback.Header().Get("Location")
+	if cbLoc != "/?sso_silent=guest" {
+		t.Fatalf("expected redirect to /?sso_silent=guest, got: %s", cbLoc)
+	}
+
+	// 3. 对比: 非静默登录请求若返回 error=login_required，则应重定向至 oauth_error
+	nonSilentState := h.generateStateToken(oauthStateData{
+		Nonce:     "ns_nonce",
+		Provider:  "oidc",
+		Silent:    false,
+		ExpiresAt: time.Now().Add(5 * time.Minute).Unix(),
+	})
+	reqNormal := httptest.NewRequest(http.MethodGet, "/api/oauth/oidc/callback?error=login_required&state="+nonSilentState, nil)
+	recNormal := httptest.NewRecorder()
+	h.HandleCallback(recNormal, reqNormal, "oidc")
+
+	if recNormal.Header().Get("Location") != "/?oauth_error=login_required" {
+		t.Fatalf("expected oauth_error=login_required for non-silent, got: %s", recNormal.Header().Get("Location"))
+	}
+}
+
+func TestOAuth_AutoLinkEmail_UnverifiedRejected(t *testing.T) {
+	h, repo, _ := setupTestOAuthEnv(t)
+	ctx := context.Background()
+
+	// 创建本地已有用户
+	hash, _ := bcrypt.GenerateFromPassword([]byte("123456"), bcrypt.MinCost)
+	if err := repo.CreateUser(ctx, "victim_user", "victim@example.com", "Victim", string(hash), storage.RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = repo.SetSystemSetting(ctx, SettingOAuthGoogleEnabled, "1")
+	_ = repo.SetSystemSetting(ctx, SettingOAuthGoogleClientID, "g-client-1")
+	_ = repo.SetSystemSetting(ctx, SettingOAuthGoogleClientSecret, "g-secret-1")
+	_ = repo.SetSystemSetting(ctx, SettingOAuthAutoRegister, "0") // 关闭注册
+	_ = repo.SetSystemSetting(ctx, SettingOAuthAutoLinkEmail, "1") // 开启自动关联
+
+	nonce := "nonce_unverified_test"
+	stateToken := h.generateStateToken(oauthStateData{
+		Nonce:     nonce,
+		Provider:  "google",
+		ExpiresAt: time.Now().Add(5 * time.Minute).Unix(),
+	})
+
+	// 模拟第三方返回该邮箱但 email_verified 为 false
+	mockGoogle := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "mock_tok"})
+		case "/oauth2/v3/userinfo":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"sub":            "attacker_sub_666",
+				"email":          "victim@example.com",
+				"email_verified": false, // 未验证邮箱！
+				"name":           "Attacker",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockGoogle.Close()
+
+	h.SetHTTPClient(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			path := req.URL.Path
+			if strings.HasSuffix(path, "/token") {
+				path = "/token"
+			}
+			targetURL := mockGoogle.URL + path
+			newReq, _ := http.NewRequestWithContext(req.Context(), req.Method, targetURL, req.Body)
+			newReq.Header = req.Header
+			return http.DefaultClient.Do(newReq)
+		}),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/oauth/google/callback?code=mock_code&state="+stateToken, nil)
+	req.AddCookie(&http.Cookie{Name: oauthStateCookieName, Value: nonce})
+	rec := httptest.NewRecorder()
+
+	h.HandleCallback(rec, req, "google")
+
+	// 自动关联被拒绝，由于 auto_register=false，返回 registration_disabled
+	if rec.Header().Get("Location") != "/?oauth_error=registration_disabled" {
+		t.Fatalf("expected registration_disabled due to unverified email rejected, got: %s", rec.Header().Get("Location"))
+	}
+
+	// 确认 victim_user 未被第三方身份绑定
+	ident, _ := repo.GetOAuthIdentity(ctx, "google", "attacker_sub_666")
+	if ident != nil {
+		t.Fatal("security breach: unverified email was erroneously linked to victim!")
+	}
+}
+
+func TestOAuth_OIDC_IDTokenValidation(t *testing.T) {
+	expectedIssuer := "https://sso.example.com"
+	expectedClientID := "my-panel-client"
+	expectedNonce := "secure-nonce-123"
+
+	// 1. 合法 ID Token
+	validToken := createMockJWT(map[string]any{
+		"iss":            expectedIssuer,
+		"aud":            expectedClientID,
+		"sub":            "user-1",
+		"nonce":          expectedNonce,
+		"exp":            time.Now().Add(10 * time.Minute).Unix(),
+		"email":          "test@example.com",
+		"email_verified": true,
+	})
+	claims, err := parseAndValidateIDToken(validToken, expectedIssuer, expectedClientID, expectedNonce)
+	if err != nil {
+		t.Fatalf("expected valid token to pass, got: %v", err)
+	}
+	if claims.Subject != "user-1" {
+		t.Errorf("expected sub user-1, got %s", claims.Subject)
+	}
+
+	// 2. Issuer 不匹配
+	badIssToken := createMockJWT(map[string]any{
+		"iss":   "https://evil-issuer.com",
+		"aud":   expectedClientID,
+		"sub":   "user-1",
+		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+		"nonce": expectedNonce,
+	})
+	if _, err := parseAndValidateIDToken(badIssToken, expectedIssuer, expectedClientID, expectedNonce); err == nil {
+		t.Fatal("expected error on mismatched issuer, got nil")
+	}
+
+	// 3. Audience 不匹配
+	badAudToken := createMockJWT(map[string]any{
+		"iss":   expectedIssuer,
+		"aud":   "wrong-client-id",
+		"sub":   "user-1",
+		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+		"nonce": expectedNonce,
+	})
+	if _, err := parseAndValidateIDToken(badAudToken, expectedIssuer, expectedClientID, expectedNonce); err == nil {
+		t.Fatal("expected error on mismatched audience, got nil")
+	}
+
+	// 4. Nonce 不匹配
+	badNonceToken := createMockJWT(map[string]any{
+		"iss":   expectedIssuer,
+		"aud":   expectedClientID,
+		"sub":   "user-1",
+		"exp":   time.Now().Add(10 * time.Minute).Unix(),
+		"nonce": "tampered-nonce",
+	})
+	if _, err := parseAndValidateIDToken(badNonceToken, expectedIssuer, expectedClientID, expectedNonce); err == nil {
+		t.Fatal("expected error on mismatched nonce, got nil")
+	}
+
+	// 5. 过期 Token
+	expiredToken := createMockJWT(map[string]any{
+		"iss":   expectedIssuer,
+		"aud":   expectedClientID,
+		"sub":   "user-1",
+		"exp":   time.Now().Add(-10 * time.Minute).Unix(),
+		"nonce": expectedNonce,
+	})
+	if _, err := parseAndValidateIDToken(expiredToken, expectedIssuer, expectedClientID, expectedNonce); err == nil {
+		t.Fatal("expected error on expired token, got nil")
 	}
 }
 

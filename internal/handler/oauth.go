@@ -83,11 +83,12 @@ type OAuthPublicResponse struct {
 
 // OAuthUserProfile 统一的第三方用户资料归一化模型
 type OAuthUserProfile struct {
-	Provider  string
-	OAuthID   string
-	Email     string
-	Name      string
-	AvatarURL string
+	Provider      string
+	OAuthID       string
+	Email         string
+	EmailVerified bool
+	Name          string
+	AvatarURL     string
 }
 
 type oidcDiscoveryDoc struct {
@@ -101,7 +102,14 @@ type oauthStateData struct {
 	Provider  string `json:"p"`
 	Bind      bool   `json:"b,omitempty"`
 	Username  string `json:"u,omitempty"`
+	Silent    bool   `json:"s,omitempty"`
 	ExpiresAt int64  `json:"e"`
+}
+
+type oauthExchangeItem struct {
+	Token     string
+	Username  string
+	ExpiresAt time.Time
 }
 
 // OAuthHandler 处理第三方快捷登录 (GitHub, Google, Generic OIDC)
@@ -113,6 +121,9 @@ type OAuthHandler struct {
 
 	oidcCacheMu sync.RWMutex
 	oidcCache   map[string]cachedDiscovery
+
+	exchangeMu    sync.Mutex
+	exchangeCodes map[string]oauthExchangeItem
 }
 
 type cachedDiscovery struct {
@@ -127,11 +138,12 @@ func NewOAuthHandler(repo *storage.TrafficRepository, tokens *auth.TokenStore) *
 		secret = []byte("relaydock_oauth_default_state_secret_fallback_32b")
 	}
 	return &OAuthHandler{
-		repo:        repo,
-		tokens:      tokens,
-		httpClient:  &http.Client{Timeout: 15 * time.Second},
-		stateSecret: secret,
-		oidcCache:   make(map[string]cachedDiscovery),
+		repo:          repo,
+		tokens:        tokens,
+		httpClient:    &http.Client{Timeout: 15 * time.Second},
+		stateSecret:   secret,
+		oidcCache:     make(map[string]cachedDiscovery),
+		exchangeCodes: make(map[string]oauthExchangeItem),
 	}
 }
 
@@ -174,6 +186,72 @@ func (h *OAuthHandler) GetPublicProviders(w http.ResponseWriter, r *http.Request
 		Providers:    list,
 		AutoRegister: cfg.AutoRegister,
 	})
+}
+
+// ExchangeOAuthCode 公开接口: 客户端使用一次性授权码兑换会话 Token
+func (h *OAuthHandler) ExchangeOAuthCode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error())
+		return
+	}
+
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		writeJSONError(w, http.StatusBadRequest, "Code is required")
+		return
+	}
+
+	h.exchangeMu.Lock()
+	item, ok := h.exchangeCodes[code]
+	if ok {
+		delete(h.exchangeCodes, code) // 单次使用，立即作废
+	}
+	h.exchangeMu.Unlock()
+
+	if !ok || time.Now().After(item.ExpiresAt) {
+		writeJSONError(w, http.StatusUnauthorized, "invalid_or_expired_code")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"token":      item.Token,
+		"username":   item.Username,
+		"expires_at": item.ExpiresAt.Unix(),
+	})
+}
+
+func (h *OAuthHandler) createExchangeCode(token, username string) string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		b = []byte(fmt.Sprintf("%d-%s", time.Now().UnixNano(), username))
+	}
+	code := "rd_auth_" + hex.EncodeToString(b)
+
+	h.exchangeMu.Lock()
+	defer h.exchangeMu.Unlock()
+
+	now := time.Now()
+	// 清理过期项
+	for k, v := range h.exchangeCodes {
+		if now.After(v.ExpiresAt) {
+			delete(h.exchangeCodes, k)
+		}
+	}
+
+	h.exchangeCodes[code] = oauthExchangeItem{
+		Token:     token,
+		Username:  username,
+		ExpiresAt: now.Add(60 * time.Second),
+	}
+	return code
 }
 
 // GetAdminConfig 管理员获取 OAuth 设置与回调地址
@@ -352,7 +430,7 @@ func (h *OAuthHandler) PrepareBind(w http.ResponseWriter, r *http.Request) {
 	}
 
 	provider := strings.ToLower(strings.TrimSpace(req.Provider))
-	authURL, err := h.buildAuthURL(w, r, provider, true, username)
+	authURL, err := h.buildAuthURL(w, r, provider, true, username, false)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -361,9 +439,10 @@ func (h *OAuthHandler) PrepareBind(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]string{"url": authURL})
 }
 
-// HandleLogin 发起第三方授权跳转: /api/oauth/{provider}/login?bind=true
+// HandleLogin 发起第三方授权跳转: /api/oauth/{provider}/login?bind=true&silent=true
 func (h *OAuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request, provider string) {
 	bind := r.URL.Query().Get("bind") == "true"
+	silent := r.URL.Query().Get("silent") == "true"
 	var username string
 	if bind {
 		username = auth.UsernameFromContext(r.Context())
@@ -374,7 +453,7 @@ func (h *OAuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request, provi
 		}
 	}
 
-	authURL, err := h.buildAuthURL(w, r, provider, bind, username)
+	authURL, err := h.buildAuthURL(w, r, provider, bind, username, silent)
 	if err != nil {
 		http.Redirect(w, r, "/?oauth_error="+url.QueryEscape(err.Error()), http.StatusFound)
 		return
@@ -383,7 +462,7 @@ func (h *OAuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request, provi
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
-func (h *OAuthHandler) buildAuthURL(w http.ResponseWriter, r *http.Request, provider string, bind bool, username string) (string, error) {
+func (h *OAuthHandler) buildAuthURL(w http.ResponseWriter, r *http.Request, provider string, bind bool, username string, silent bool) (string, error) {
 	ctx := r.Context()
 	cfg, err := h.loadConfig(ctx)
 	if err != nil {
@@ -404,6 +483,7 @@ func (h *OAuthHandler) buildAuthURL(w http.ResponseWriter, r *http.Request, prov
 		Provider:  provider,
 		Bind:      bind,
 		Username:  username,
+		Silent:    silent,
 		ExpiresAt: time.Now().Add(10 * time.Minute).Unix(),
 	})
 
@@ -425,11 +505,16 @@ func (h *OAuthHandler) buildAuthURL(w http.ResponseWriter, r *http.Request, prov
 		if !cfg.GoogleEnabled || cfg.GoogleClientID == "" {
 			return "", errors.New("provider_disabled")
 		}
-		return fmt.Sprintf("https://accounts.google.com/o/oauth2/v2/auth?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s&access_type=offline&prompt=select_account",
+		prompt := "select_account"
+		if silent {
+			prompt = "none"
+		}
+		return fmt.Sprintf("https://accounts.google.com/o/oauth2/v2/auth?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s&access_type=offline&prompt=%s",
 			url.QueryEscape(cfg.GoogleClientID),
 			url.QueryEscape(redirectURI),
 			url.QueryEscape("openid email profile"),
 			url.QueryEscape(stateToken),
+			url.QueryEscape(prompt),
 		), nil
 
 	case "oidc":
@@ -441,13 +526,18 @@ func (h *OAuthHandler) buildAuthURL(w http.ResponseWriter, r *http.Request, prov
 			logger.Error("[OAuth] OIDC Discovery 失败", "issuer", cfg.OIDCIssuer, "err", err)
 			return "", errors.New("oidc_discovery_failed")
 		}
-		return fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s",
+		authURL := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s&nonce=%s",
 			doc.AuthorizationEndpoint,
 			url.QueryEscape(cfg.OIDCClientID),
 			url.QueryEscape(redirectURI),
 			url.QueryEscape("openid email profile"),
 			url.QueryEscape(stateToken),
-		), nil
+			url.QueryEscape(nonce),
+		)
+		if silent {
+			authURL += "&prompt=none"
+		}
+		return authURL, nil
 
 	default:
 		return "", errors.New("unsupported_provider")
@@ -459,8 +549,27 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request, pr
 	ctx := r.Context()
 	provider = strings.ToLower(strings.TrimSpace(provider))
 
-	// 1. 检查是否存在上游错误（例如用户取消授权）
+	// 1. 检查是否存在上游错误（例如用户取消授权或静默检测未登录）
 	if upstreamErr := r.URL.Query().Get("error"); upstreamErr != "" {
+		stateParam := r.URL.Query().Get("state")
+		if stateParam != "" {
+			stateData, err := h.verifyStateToken(stateParam)
+			if err == nil && stateData != nil && stateData.Silent {
+				// 静默检测时，若用户在 SSO 端未登录或未授权，属于预期状态，不抛出异常警告，直接回到登录页面
+				isSilentGuest := upstreamErr == "login_required" ||
+					upstreamErr == "interaction_required" ||
+					upstreamErr == "consent_required" ||
+					upstreamErr == "account_selection_required"
+				if isSilentGuest {
+					clearOAuthCookie(w, r, oauthStateCookieName)
+					logger.Info("[OAuth] SSO 静默检测完成: 用户未在 SSO 端登录，安全停留在面板登录页",
+						"provider", provider, "reason", upstreamErr)
+					http.Redirect(w, r, "/?sso_silent=guest", http.StatusFound)
+					return
+				}
+			}
+		}
+
 		logger.Warn("[OAuth] 第三方授权上游返回错误", "provider", provider, "error", upstreamErr)
 		http.Redirect(w, r, "/?oauth_error="+url.QueryEscape(upstreamErr), http.StatusFound)
 		return
@@ -512,7 +621,7 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request, pr
 	case "google":
 		profile, err = h.exchangeGoogle(ctx, cfg, code, redirectURI)
 	case "oidc":
-		profile, err = h.exchangeOIDC(ctx, cfg, code, redirectURI)
+		profile, err = h.exchangeOIDC(ctx, cfg, code, redirectURI, stateData.Nonce)
 	default:
 		err = errors.New("unsupported provider")
 	}
@@ -576,19 +685,23 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request, pr
 
 	// 5.2 如果未绑定且开启了邮箱自动关联，则通过第三方邮箱查找已有用户
 	if targetUser == nil && cfg.AutoLinkEmail && profile.Email != "" {
-		matched, err := h.repo.GetUserByEmail(ctx, profile.Email)
-		if err == nil && matched.Username != "" {
-			targetUser = &matched
-			// 自动建立绑定关联
-			_ = h.repo.BindOAuthIdentity(ctx, &storage.UserOAuthIdentity{
-				Username:  matched.Username,
-				Provider:  provider,
-				OAuthID:   profile.OAuthID,
-				Email:     profile.Email,
-				Name:      profile.Name,
-				AvatarURL: profile.AvatarURL,
-			})
-			logger.Info("[OAuth] 第三方账号邮箱匹配已有用户，自动建立绑定", "user", matched.Username, "provider", provider, "email", profile.Email)
+		if !profile.EmailVerified {
+			logger.Warn("[OAuth] 第三方账号邮箱未通过身份提供商验证，跳过自动关联以防未授权接管", "provider", provider, "email", profile.Email)
+		} else {
+			matched, err := h.repo.GetUserByEmail(ctx, profile.Email)
+			if err == nil && matched.Username != "" {
+				targetUser = &matched
+				// 自动建立绑定关联
+				_ = h.repo.BindOAuthIdentity(ctx, &storage.UserOAuthIdentity{
+					Username:  matched.Username,
+					Provider:  provider,
+					OAuthID:   profile.OAuthID,
+					Email:     profile.Email,
+					Name:      profile.Name,
+					AvatarURL: profile.AvatarURL,
+				})
+				logger.Info("[OAuth] 第三方账号邮箱匹配已有用户，自动建立绑定", "user", matched.Username, "provider", provider, "email", profile.Email)
+			}
 		}
 	}
 
@@ -662,7 +775,7 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request, pr
 		return
 	}
 
-	// 5.5 签发会话 Token
+	// 5.5 签发会话 Token 与一次性授权兑换码，杜绝令牌在 URL 中明文暴露
 	token, _, err := createLoginSession(ctx, h.tokens, h.repo, *targetUser, true)
 	if err != nil {
 		logger.Error("[OAuth] 创建会话失败", "username", targetUser.Username, "err", err)
@@ -670,8 +783,9 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request, pr
 		return
 	}
 
-	logger.Info("[OAuth] 快捷登录成功", "username", targetUser.Username, "provider", provider)
-	http.Redirect(w, r, fmt.Sprintf("/?oauth_token=%s&oauth_username=%s", url.QueryEscape(token), url.QueryEscape(targetUser.Username)), http.StatusFound)
+	exchangeCode := h.createExchangeCode(token, targetUser.Username)
+	logger.Info("[OAuth] 快捷登录成功，签发授权兑换码", "username", targetUser.Username, "provider", provider)
+	http.Redirect(w, r, fmt.Sprintf("/?oauth_code=%s", url.QueryEscape(exchangeCode)), http.StatusFound)
 }
 
 // === 第三方提供商具体交换与用户资料抓取 ===
@@ -743,42 +857,43 @@ func (h *OAuthHandler) exchangeGitHub(ctx context.Context, cfg *OAuthConfig, cod
 	}
 
 	profile := &OAuthUserProfile{
-		Provider:  "github",
-		OAuthID:   strconv.FormatInt(ghUser.ID, 10),
-		Email:     strings.TrimSpace(ghUser.Email),
-		Name:      strings.TrimSpace(ghUser.Name),
-		AvatarURL: strings.TrimSpace(ghUser.AvatarURL),
+		Provider:      "github",
+		OAuthID:       strconv.FormatInt(ghUser.ID, 10),
+		Email:         strings.TrimSpace(ghUser.Email),
+		EmailVerified: false,
+		Name:          strings.TrimSpace(ghUser.Name),
+		AvatarURL:     strings.TrimSpace(ghUser.AvatarURL),
 	}
 	if profile.Name == "" {
 		profile.Name = ghUser.Login
 	}
 
-	// 3. 若公开资料中邮箱为空，额外请求 /user/emails 获取主邮箱
-	if profile.Email == "" {
-		eReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user/emails", nil)
-		if err == nil {
-			eReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
-			eReq.Header.Set("User-Agent", "RelayDock")
-			if eResp, err := h.httpClient.Do(eReq); err == nil {
-				defer eResp.Body.Close()
-				var emails []struct {
-					Email    string `json:"email"`
-					Primary  bool   `json:"primary"`
-					Verified bool   `json:"verified"`
-				}
-				if json.NewDecoder(eResp.Body).Decode(&emails) == nil {
-					for _, item := range emails {
-						if item.Primary && item.Verified {
-							profile.Email = item.Email
-							break
-						}
+	// 3. 额外请求 /user/emails 获取主邮箱及验证状态
+	eReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user/emails", nil)
+	if err == nil {
+		eReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
+		eReq.Header.Set("User-Agent", "RelayDock")
+		if eResp, err := h.httpClient.Do(eReq); err == nil {
+			defer eResp.Body.Close()
+			var emails []struct {
+				Email    string `json:"email"`
+				Primary  bool   `json:"primary"`
+				Verified bool   `json:"verified"`
+			}
+			if json.NewDecoder(eResp.Body).Decode(&emails) == nil {
+				for _, item := range emails {
+					if item.Primary && item.Verified {
+						profile.Email = item.Email
+						profile.EmailVerified = true
+						break
 					}
-					if profile.Email == "" {
-						for _, item := range emails {
-							if item.Verified {
-								profile.Email = item.Email
-								break
-							}
+				}
+				if profile.Email == "" || !profile.EmailVerified {
+					for _, item := range emails {
+						if item.Verified {
+							profile.Email = item.Email
+							profile.EmailVerified = true
+							break
 						}
 					}
 				}
@@ -852,15 +967,16 @@ func (h *OAuthHandler) exchangeGoogle(ctx context.Context, cfg *OAuthConfig, cod
 	}
 
 	return &OAuthUserProfile{
-		Provider:  "google",
-		OAuthID:   gUser.Sub,
-		Email:     strings.TrimSpace(gUser.Email),
-		Name:      strings.TrimSpace(gUser.Name),
-		AvatarURL: strings.TrimSpace(gUser.Picture),
+		Provider:      "google",
+		OAuthID:       gUser.Sub,
+		Email:         strings.TrimSpace(gUser.Email),
+		EmailVerified: gUser.EmailVerified,
+		Name:          strings.TrimSpace(gUser.Name),
+		AvatarURL:     strings.TrimSpace(gUser.Picture),
 	}, nil
 }
 
-func (h *OAuthHandler) exchangeOIDC(ctx context.Context, cfg *OAuthConfig, code, redirectURI string) (*OAuthUserProfile, error) {
+func (h *OAuthHandler) exchangeOIDC(ctx context.Context, cfg *OAuthConfig, code, redirectURI, expectedNonce string) (*OAuthUserProfile, error) {
 	doc, err := h.getOIDCDiscovery(ctx, cfg.OIDCIssuer)
 	if err != nil {
 		return nil, err
@@ -894,52 +1010,205 @@ func (h *OAuthHandler) exchangeOIDC(ctx context.Context, cfg *OAuthConfig, code,
 
 	var tokenResp struct {
 		AccessToken string `json:"access_token"`
+		IDToken     string `json:"id_token"`
 		Error       string `json:"error"`
+		ErrorDesc   string `json:"error_description"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return nil, fmt.Errorf("decode oidc token: %w", err)
 	}
-	if tokenResp.AccessToken == "" {
-		return nil, errors.New("oidc returned empty access_token")
+	if tokenResp.Error != "" {
+		return nil, fmt.Errorf("oidc error: %s (%s)", tokenResp.Error, tokenResp.ErrorDesc)
+	}
+	if tokenResp.AccessToken == "" && tokenResp.IDToken == "" {
+		return nil, errors.New("oidc returned neither access_token nor id_token")
 	}
 
-	// 2. 获取 userinfo
-	uReq, err := http.NewRequestWithContext(ctx, http.MethodGet, doc.UserinfoEndpoint, nil)
-	if err != nil {
-		return nil, err
+	var claims *oidcIDTokenClaims
+	if tokenResp.IDToken != "" {
+		parsedClaims, err := parseAndValidateIDToken(tokenResp.IDToken, cfg.OIDCIssuer, cfg.OIDCClientID, expectedNonce)
+		if err != nil {
+			logger.Warn("[OAuth] OIDC id_token 校验未通过", "err", err)
+			return nil, fmt.Errorf("validate id_token: %w", err)
+		}
+		claims = parsedClaims
 	}
-	uReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
 
-	uResp, err := h.httpClient.Do(uReq)
-	if err != nil {
-		return nil, fmt.Errorf("oidc userinfo: %w", err)
-	}
-	defer uResp.Body.Close()
-
+	// 2. 获取 userinfo (若提供了 access_token 且存在 userinfo_endpoint)
 	var oidcUser struct {
 		Sub               string `json:"sub"`
 		Email             string `json:"email"`
-		EmailVerified     bool   `json:"email_verified"`
+		EmailVerified     any    `json:"email_verified"`
 		Name              string `json:"name"`
 		PreferredUsername string `json:"preferred_username"`
 		Picture           string `json:"picture"`
 	}
-	if err := json.NewDecoder(uResp.Body).Decode(&oidcUser); err != nil {
-		return nil, fmt.Errorf("decode oidc userinfo: %w", err)
+
+	if tokenResp.AccessToken != "" && doc.UserinfoEndpoint != "" {
+		uReq, err := http.NewRequestWithContext(ctx, http.MethodGet, doc.UserinfoEndpoint, nil)
+		if err == nil {
+			uReq.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
+			if uResp, err := h.httpClient.Do(uReq); err == nil {
+				defer uResp.Body.Close()
+				if uResp.StatusCode == http.StatusOK {
+					_ = json.NewDecoder(uResp.Body).Decode(&oidcUser)
+				}
+			}
+		}
+	}
+
+	// 3. 校验并汇聚资料
+	sub := ""
+	if claims != nil {
+		sub = claims.Subject
+		if oidcUser.Sub != "" && oidcUser.Sub != claims.Subject {
+			return nil, fmt.Errorf("oidc sub mismatch between id_token (%s) and userinfo (%s)", claims.Subject, oidcUser.Sub)
+		}
+	} else {
+		sub = oidcUser.Sub
+	}
+	if sub == "" {
+		return nil, errors.New("oidc returned empty sub")
+	}
+
+	email := strings.TrimSpace(oidcUser.Email)
+	if email == "" && claims != nil {
+		email = strings.TrimSpace(claims.Email)
+	}
+
+	emailVerified := parseEmailVerified(oidcUser.EmailVerified)
+	if !emailVerified && claims != nil {
+		emailVerified = parseEmailVerified(claims.EmailVerified)
 	}
 
 	displayName := strings.TrimSpace(oidcUser.Name)
 	if displayName == "" {
 		displayName = strings.TrimSpace(oidcUser.PreferredUsername)
 	}
+	if displayName == "" && claims != nil {
+		displayName = strings.TrimSpace(claims.Name)
+		if displayName == "" {
+			displayName = strings.TrimSpace(claims.PreferredName)
+		}
+	}
+
+	picture := strings.TrimSpace(oidcUser.Picture)
+	if picture == "" && claims != nil {
+		picture = strings.TrimSpace(claims.Picture)
+	}
 
 	return &OAuthUserProfile{
-		Provider:  "oidc",
-		OAuthID:   oidcUser.Sub,
-		Email:     strings.TrimSpace(oidcUser.Email),
-		Name:      displayName,
-		AvatarURL: strings.TrimSpace(oidcUser.Picture),
+		Provider:      "oidc",
+		OAuthID:       sub,
+		Email:         email,
+		EmailVerified: emailVerified,
+		Name:          displayName,
+		AvatarURL:     picture,
 	}, nil
+}
+
+type oidcIDTokenClaims struct {
+	Issuer        string          `json:"iss"`
+	Audience      json.RawMessage `json:"aud"`
+	Subject       string          `json:"sub"`
+	ExpiresAt     int64           `json:"exp"`
+	IssuedAt      int64           `json:"iat"`
+	Nonce         string          `json:"nonce"`
+	Email         string          `json:"email"`
+	EmailVerified any             `json:"email_verified"`
+	Name          string          `json:"name"`
+	PreferredName string          `json:"preferred_username"`
+	Picture       string          `json:"picture"`
+}
+
+func parseAndValidateIDToken(rawToken, expectedIssuer, expectedClientID, expectedNonce string) (*oidcIDTokenClaims, error) {
+	parts := strings.Split(rawToken, ".")
+	if len(parts) < 2 {
+		return nil, errors.New("invalid jwt format")
+	}
+
+	payloadB64 := parts[1]
+	var payloadBytes []byte
+	var err error
+	if payloadBytes, err = base64.RawURLEncoding.DecodeString(payloadB64); err != nil {
+		if payloadBytes, err = base64.URLEncoding.DecodeString(payloadB64); err != nil {
+			return nil, fmt.Errorf("decode id_token payload: %w", err)
+		}
+	}
+
+	var claims oidcIDTokenClaims
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+		return nil, fmt.Errorf("unmarshal id_token claims: %w", err)
+	}
+
+	if claims.Subject == "" {
+		return nil, errors.New("oidc id_token missing sub")
+	}
+
+	// 校验 Issuer
+	cleanExpectedIss := strings.TrimRight(strings.TrimSpace(expectedIssuer), "/")
+	cleanIss := strings.TrimRight(strings.TrimSpace(claims.Issuer), "/")
+	if cleanExpectedIss != "" && cleanIss != "" && cleanExpectedIss != cleanIss {
+		return nil, fmt.Errorf("oidc id_token issuer mismatch: got %q, expected %q", claims.Issuer, expectedIssuer)
+	}
+
+	// 校验 Audience (支持 string 与 []string)
+	if expectedClientID != "" && len(claims.Audience) > 0 {
+		var singleAud string
+		if err := json.Unmarshal(claims.Audience, &singleAud); err == nil {
+			if singleAud != expectedClientID {
+				return nil, fmt.Errorf("oidc id_token aud mismatch: got %q, expected %q", singleAud, expectedClientID)
+			}
+		} else {
+			var multiAud []string
+			if err := json.Unmarshal(claims.Audience, &multiAud); err == nil {
+				found := false
+				for _, aud := range multiAud {
+					if aud == expectedClientID {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return nil, fmt.Errorf("oidc id_token aud does not contain client_id %q", expectedClientID)
+				}
+			} else {
+				return nil, errors.New("oidc id_token invalid aud claim format")
+			}
+		}
+	}
+
+	// 校验过期时间 (容差 120 秒)
+	if claims.ExpiresAt > 0 {
+		if time.Now().Unix() > claims.ExpiresAt+120 {
+			return nil, errors.New("oidc id_token expired")
+		}
+	}
+
+	// 校验 Nonce 防重放
+	if expectedNonce != "" && claims.Nonce != "" {
+		if claims.Nonce != expectedNonce {
+			return nil, fmt.Errorf("oidc id_token nonce mismatch: got %q, expected %q", claims.Nonce, expectedNonce)
+		}
+	}
+
+	return &claims, nil
+}
+
+func parseEmailVerified(v any) bool {
+	if v == nil {
+		return false
+	}
+	switch val := v.(type) {
+	case bool:
+		return val
+	case string:
+		return strings.EqualFold(val, "true") || val == "1"
+	case float64:
+		return val == 1
+	default:
+		return false
+	}
 }
 
 // getOIDCDiscovery 解析并缓存 OIDC Well-Known 配置

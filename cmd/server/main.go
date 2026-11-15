@@ -999,6 +999,7 @@ func main() {
 	// 第三方快捷登录 (GitHub / Google / OIDC)
 	oauthHandler := handler.NewOAuthHandler(repo, tokenStore)
 	mux.HandleFunc("/api/public/oauth/providers", oauthHandler.GetPublicProviders)
+	mux.HandleFunc("/api/public/oauth/exchange", oauthHandler.ExchangeOAuthCode)
 	mux.HandleFunc("/api/oauth/", func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/oauth/"), "/"), "/")
 		if len(parts) < 2 {
