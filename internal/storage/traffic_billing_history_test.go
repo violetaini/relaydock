@@ -198,3 +198,55 @@ func TestCollectionTimeBillingCarriesFractionAcrossSmallDeltas(t *testing.T) {
 		t.Fatalf("billable after 100 one-byte deltas at 0.5x = %d, %v; want 50", used, err)
 	}
 }
+
+func TestDefaultPhysicalInboundClientAttribution(t *testing.T) {
+	ctx := context.Background()
+	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "default-client.db"))
+	if err != nil {
+		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	defer repo.Close()
+
+	server := &RemoteServer{Name: "ddps-jp", Token: "ddps-token"}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatalf("CreateRemoteServer: %v", err)
+	}
+	node, err := repo.CreateNode(ctx, Node{
+		Username:       "admin",
+		RawURL:         "ss://default-client-test",
+		NodeName:       "ddps-node",
+		Protocol:       "ss",
+		ClashConfig:    `{}`,
+		Enabled:        true,
+		OriginalServer: server.Name,
+		InboundTag:     "inbound-28978",
+	})
+	if err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+
+	// Save inbound into remote_inbound_desired with default client email pg3jj3ph
+	inboundJSON := `{"tag":"inbound-28978","protocol":"shadowsocks","settings":{"clients":[{"email":"pg3jj3ph","password":"secret"}]}}`
+	if _, err := repo.db.ExecContext(ctx, `
+		INSERT INTO remote_inbound_desired (server_id, inbound_tag, inbound_json, mutation_id, desired_state)
+		VALUES (?, ?, ?, ?, ?)`,
+		server.ID, "inbound-28978", inboundJSON, "mutation-1", "active"); err != nil {
+		t.Fatalf("insert remote_inbound_desired: %v", err)
+	}
+	repo.invalidateTrafficBillingCache()
+
+	resolved, err := repo.ResolveUserTrafficBilling(ctx, server.ID, []string{"pg3jj3ph"})
+	if err != nil {
+		t.Fatalf("ResolveUserTrafficBilling: %v", err)
+	}
+	billing, ok := resolved["pg3jj3ph"]
+	if !ok || billing.Username != "admin" {
+		t.Fatalf("expected client pg3jj3ph to resolve to admin, got %#v", billing)
+	}
+	if billing.Multiplier != 1.0 {
+		t.Fatalf("expected multiplier 1.0, got %f", billing.Multiplier)
+	}
+	if node.ID <= 0 {
+		t.Fatalf("unexpected node ID: %d", node.ID)
+	}
+}

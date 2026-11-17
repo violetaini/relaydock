@@ -3283,6 +3283,17 @@ CREATE TABLE IF NOT EXISTS announcement_bot_deliveries (
 		log.Printf("[Migrate] remove deprecated routing rules from snapshots: %v", err)
 	}
 
+	// 针对历史缺少 traffic_records 快照的环境进行补偿回填(从已有的按日系统流量快照表 server_system_traffic_snapshots 聚合)
+	var recordsCount int
+	if err := r.db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM traffic_records").Scan(&recordsCount); err == nil && recordsCount == 0 {
+		_, _ = r.db.ExecContext(context.Background(), `
+			INSERT OR IGNORE INTO traffic_records (date, total_limit, total_used, total_remaining)
+			SELECT date, 0, SUM(rx_cycle + tx_cycle), 0
+			FROM server_system_traffic_snapshots
+			GROUP BY date
+		`)
+	}
+
 	return nil
 }
 
@@ -10531,6 +10542,12 @@ func (r *TrafficRepository) buildTrafficBillingSnapshot(ctx context.Context, ser
 	if err != nil {
 		return nil, fmt.Errorf("list billing nodes: %w", err)
 	}
+	type physicalNodeInfo struct {
+		id       int64
+		username string
+	}
+	physicalNodes := make(map[string]physicalNodeInfo)
+
 	for rows.Next() {
 		var id, parentID int64
 		var username, nodeType, serverName, inboundTag, adminEmail string
@@ -10545,6 +10562,7 @@ func (r *TrafficRepository) buildTrafficBillingSnapshot(ctx context.Context, ser
 		}
 		if nodeType != "routed" && parentID == 0 && serverName == snapshot.serverName && inboundTag != "" {
 			snapshot.physicalByTag[inboundTag] = id
+			physicalNodes[inboundTag] = physicalNodeInfo{id: id, username: username}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -10552,7 +10570,134 @@ func (r *TrafficRepository) buildTrafficBillingSnapshot(ctx context.Context, ser
 		return nil, fmt.Errorf("iterate billing nodes: %w", err)
 	}
 	rows.Close()
+
+	// 将物理节点入站里声明的默认客户端 (如 pg3jj3ph) 自动归属到节点所有者 (admin),
+	// 避免用户直连或订阅使用原始节点凭据时流量丢失、无法计入用户/面板统计。
+	if len(physicalNodes) > 0 {
+		desiredRows, err := r.db.QueryContext(ctx, `
+			SELECT inbound_tag, inbound_json
+			FROM remote_inbound_desired
+			WHERE server_id = ? AND desired_state = 'active'`, serverID)
+		foundAny := false
+		if err == nil {
+			for desiredRows.Next() {
+				var tag, configJSON string
+				if err := desiredRows.Scan(&tag, &configJSON); err == nil {
+					foundAny = true
+					pNode, ok := physicalNodes[tag]
+					if !ok {
+						continue
+					}
+					for _, clientEmail := range extractInboundClientEmails(configJSON) {
+						if _, claimed := snapshot.subaccounts[clientEmail]; !claimed {
+							if _, exists := snapshot.adminClients[clientEmail]; !exists {
+								snapshot.adminClients[clientEmail] = trafficBillingNode{
+									username: pNode.username,
+									nodeID:   pNode.id,
+								}
+							}
+						}
+					}
+				}
+			}
+			_ = desiredRows.Close()
+		}
+		if !foundAny {
+			var configJSON string
+			if err := r.db.QueryRowContext(ctx, `
+				SELECT config_json FROM server_xray_config_snapshots
+				WHERE server_id = ? AND status = 'current'
+				ORDER BY updated_at DESC LIMIT 1`, serverID).Scan(&configJSON); err == nil {
+				for tag, emails := range extractSnapshotInboundClientEmails(configJSON) {
+					pNode, ok := physicalNodes[tag]
+					if !ok {
+						continue
+					}
+					for _, clientEmail := range emails {
+						if _, claimed := snapshot.subaccounts[clientEmail]; !claimed {
+							if _, exists := snapshot.adminClients[clientEmail]; !exists {
+								snapshot.adminClients[clientEmail] = trafficBillingNode{
+									username: pNode.username,
+									nodeID:   pNode.id,
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return snapshot, nil
+}
+
+func extractInboundClientEmails(inboundJSON string) []string {
+	if strings.TrimSpace(inboundJSON) == "" {
+		return nil
+	}
+	var doc struct {
+		Settings map[string]any `json:"settings"`
+	}
+	if err := json.Unmarshal([]byte(inboundJSON), &doc); err != nil || doc.Settings == nil {
+		return nil
+	}
+	var emails []string
+	seen := make(map[string]bool)
+	addEmail := func(val any) {
+		if s, ok := val.(string); ok {
+			s = strings.TrimSpace(s)
+			if s != "" && !seen[s] {
+				seen[s] = true
+				emails = append(emails, s)
+			}
+		}
+	}
+	for _, listKey := range []string{"clients", "users", "accounts", "peers"} {
+		rawList, ok := doc.Settings[listKey]
+		if !ok {
+			continue
+		}
+		items, ok := rawList.([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range items {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if em, exists := m["email"]; exists {
+				addEmail(em)
+			}
+		}
+	}
+	return emails
+}
+
+func extractSnapshotInboundClientEmails(configJSON string) map[string][]string {
+	if strings.TrimSpace(configJSON) == "" {
+		return nil
+	}
+	var root struct {
+		Inbounds []json.RawMessage `json:"inbounds"`
+	}
+	if err := json.Unmarshal([]byte(configJSON), &root); err != nil {
+		return nil
+	}
+	result := make(map[string][]string, len(root.Inbounds))
+	for _, raw := range root.Inbounds {
+		var header struct {
+			Tag string `json:"tag"`
+		}
+		if err := json.Unmarshal(raw, &header); err != nil || header.Tag == "" {
+			continue
+		}
+		emails := extractInboundClientEmails(string(raw))
+		if len(emails) > 0 {
+			result[header.Tag] = emails
+		}
+	}
+	return result
 }
 
 // ResolveUserTrafficBilling resolves a whole collector batch from one cached
@@ -10603,7 +10748,7 @@ func (r *TrafficRepository) initializeLegacyBillableTraffic(ctx context.Context)
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, server_id, email,
 		       MAX(uplink - cycle_base_uplink, 0) + MAX(downlink - cycle_base_downlink, 0)
-		FROM user_email_traffic WHERE billable_initialized = 0`)
+		FROM user_email_traffic WHERE billable_initialized = 0 OR billable_username = ''`)
 	if err != nil {
 		return fmt.Errorf("list legacy billable traffic: %w", err)
 	}
@@ -10646,7 +10791,7 @@ func (r *TrafficRepository) initializeLegacyBillableTraffic(ctx context.Context)
 		if _, err := tx.ExecContext(ctx, `UPDATE user_email_traffic
 			SET billable_bytes = ?, billable_fraction = ?, billable_initialized = 1,
 			    billable_username = ?, updated_at = CURRENT_TIMESTAMP
-			WHERE id = ? AND billable_initialized = 0`,
+			WHERE id = ? AND (billable_initialized = 0 OR billable_username = '')`,
 			billedBytes, billedFraction, billing.Username, row.id); err != nil {
 			return fmt.Errorf("initialize legacy billable row %d: %w", row.id, err)
 		}
