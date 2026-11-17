@@ -3294,6 +3294,22 @@ CREATE TABLE IF NOT EXISTS announcement_bot_deliveries (
 		`)
 	}
 
+	// 确保所有物理节点的 username 为 admin（若为空），避免默认客户端无法归因到管理员
+	_, _ = r.db.ExecContext(context.Background(), `UPDATE nodes SET username = 'admin' WHERE (username IS NULL OR username = '')`)
+
+	// 修复历史未归因的物理客户端为 admin
+	_, _ = r.db.ExecContext(context.Background(), `UPDATE user_email_traffic SET billable_username = 'admin' WHERE (billable_username IS NULL OR billable_username = '')`)
+
+	// 针对 user_traffic 中周期流量为 0 但 user_email_traffic 已有累计的 admin 记录，补偿同步当前周期流量
+	_, _ = r.db.ExecContext(context.Background(), `
+		UPDATE user_traffic
+		SET uplink = (SELECT COALESCE(SUM(uet.uplink), 0) FROM user_email_traffic uet WHERE uet.server_id = user_traffic.server_id AND uet.billable_username = user_traffic.username),
+		    downlink = (SELECT COALESCE(SUM(uet.downlink), 0) FROM user_email_traffic uet WHERE uet.server_id = user_traffic.server_id AND uet.billable_username = user_traffic.username),
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE uplink = 0 AND downlink = 0
+		  AND EXISTS (SELECT 1 FROM user_email_traffic uet WHERE uet.server_id = user_traffic.server_id AND uet.billable_username = user_traffic.username AND (uet.uplink > 0 OR uet.downlink > 0))
+	`)
+
 	return nil
 }
 
@@ -10562,7 +10578,11 @@ func (r *TrafficRepository) buildTrafficBillingSnapshot(ctx context.Context, ser
 		}
 		if nodeType != "routed" && parentID == 0 && serverName == snapshot.serverName && inboundTag != "" {
 			snapshot.physicalByTag[inboundTag] = id
-			physicalNodes[inboundTag] = physicalNodeInfo{id: id, username: username}
+			owner := username
+			if owner == "" {
+				owner = "admin"
+			}
+			physicalNodes[inboundTag] = physicalNodeInfo{id: id, username: owner}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -10588,11 +10608,15 @@ func (r *TrafficRepository) buildTrafficBillingSnapshot(ctx context.Context, ser
 					if !ok {
 						continue
 					}
+					owner := pNode.username
+					if owner == "" {
+						owner = "admin"
+					}
 					for _, clientEmail := range extractInboundClientEmails(configJSON) {
 						if _, claimed := snapshot.subaccounts[clientEmail]; !claimed {
 							if _, exists := snapshot.adminClients[clientEmail]; !exists {
 								snapshot.adminClients[clientEmail] = trafficBillingNode{
-									username: pNode.username,
+									username: owner,
 									nodeID:   pNode.id,
 								}
 							}
@@ -10613,11 +10637,15 @@ func (r *TrafficRepository) buildTrafficBillingSnapshot(ctx context.Context, ser
 					if !ok {
 						continue
 					}
+					owner := pNode.username
+					if owner == "" {
+						owner = "admin"
+					}
 					for _, clientEmail := range emails {
 						if _, claimed := snapshot.subaccounts[clientEmail]; !claimed {
 							if _, exists := snapshot.adminClients[clientEmail]; !exists {
 								snapshot.adminClients[clientEmail] = trafficBillingNode{
-									username: pNode.username,
+									username: owner,
 									nodeID:   pNode.id,
 								}
 							}

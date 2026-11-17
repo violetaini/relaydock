@@ -88,8 +88,8 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 
 	if isAdmin {
 		// 管理员:汇总所有服务器(含主控本机,它也是 remote_servers 一行)。
-		// 限流服务器(traffic_limit>0)计入 已用/限额;不限流量服务器(=0)的已用单独汇总,
-		// 前端在"已用流量"旁用图标 hover 展示,不计入百分比(否则分母没有限额会失真)。
+		// 限流服务器(traffic_limit>0)计入已用/限额;不限流量服务器(=0)的已用累加至 unlimitedUsed。
+		// 管理员的全局用量(displayTotalUsed)包含全量已用流量(限流 + 不限流服务器)。
 		if servers, err := h.repo.ListRemoteServers(ctx); err == nil {
 			serverListOK = true
 			for _, s := range servers {
@@ -161,7 +161,9 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	}
 
 	displayTotalUsed := totalUsed
-	if totalLimit == 0 && displayTotalUsed == 0 {
+	if isAdmin {
+		displayTotalUsed = totalUsed + unlimitedUsed
+	} else if totalLimit == 0 && displayTotalUsed == 0 {
 		displayTotalUsed = unlimitedUsed
 	}
 
