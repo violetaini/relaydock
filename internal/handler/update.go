@@ -19,6 +19,7 @@ import (
 
 	"github.com/violetaini/relaydock/internal/logger"
 	"github.com/violetaini/relaydock/internal/productrelease"
+	"github.com/violetaini/relaydock/internal/util"
 	"github.com/violetaini/relaydock/internal/version"
 )
 
@@ -1199,15 +1200,7 @@ func copyFileAtomically(src, dst string, mode os.FileMode) error {
 var syncUpdateDirectory = syncUpdateDirectoryOnDisk
 
 func syncUpdateDirectoryOnDisk(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	if err := directory.Sync(); err != nil {
-		_ = directory.Close()
-		return err
-	}
-	return directory.Close()
+	return util.SyncDir(path)
 }
 
 func backupUpdateFiles(files []preparedUpdateFile) error {

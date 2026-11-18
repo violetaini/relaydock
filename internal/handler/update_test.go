@@ -35,6 +35,9 @@ func TestVerifyBinaryChecksum(t *testing.T) {
 }
 
 func TestDetectUpdateEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("in-place system update is supported on Linux deployments only")
+	}
 	tests := []struct {
 		name        string
 		docker      bool
@@ -100,6 +103,9 @@ func TestPopulateUpdateEnvironmentDisablesMissingAsset(t *testing.T) {
 }
 
 func TestPopulateGuardEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("in-place system update is supported on Linux deployments only")
+	}
 	base := detectUpdateEnvironment(false, "")
 	withoutDir := populateGuardEnvironment(base, "")
 	if withoutDir.UpdateScope != updateScopeControlPlane || !withoutDir.CanApply {
@@ -236,6 +242,9 @@ func TestUpdateConcurrencyGuard(t *testing.T) {
 }
 
 func TestSystemUpdateLockExcludesInstallerAndOtherProcesses(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("system update lock is Linux-specific")
+	}
 	t.Setenv("ARCWAY_INSTALL_LOCK_FILE", filepath.Join(t.TempDir(), "arcway-install.lock"))
 	first, err := acquireSystemUpdateLock()
 	if err != nil {
@@ -259,6 +268,9 @@ func TestSystemUpdateLockExcludesInstallerAndOtherProcesses(t *testing.T) {
 }
 
 func TestBeginUpdateSessionReleasesMemoryGuardWhenSystemLockIsBusy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("system update lock is Linux-specific")
+	}
 	finishUpdate()
 	t.Setenv("ARCWAY_INSTALL_LOCK_FILE", filepath.Join(t.TempDir(), "arcway-install.lock"))
 	installerLock, err := acquireSystemUpdateLock()
@@ -399,8 +411,10 @@ func TestReplaceBinaryIsAtomicAndExecutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0755 {
-		t.Fatalf("target mode = %o, want 755", info.Mode().Perm())
+	if runtime.GOOS != "windows" {
+		if info.Mode().Perm() != 0755 {
+			t.Fatalf("target mode = %o, want 755", info.Mode().Perm())
+		}
 	}
 }
 

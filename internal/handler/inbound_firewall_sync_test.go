@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -37,6 +38,9 @@ func TestReconcileInboundFirewallIsNoopWithoutOwnedHelper(t *testing.T) {
 }
 
 func TestSyncArcwayInboundFirewallRejectsOutdatedHelper(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Arcway host firewall helper is Linux-specific")
+	}
 	directory := t.TempDir()
 	helperPath := filepath.Join(directory, "firewall")
 	if err := os.WriteFile(helperPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
@@ -49,6 +53,9 @@ func TestSyncArcwayInboundFirewallRejectsOutdatedHelper(t *testing.T) {
 }
 
 func TestSyncArcwayInboundFirewallExecutesCurrentHelper(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Arcway host firewall helper is Linux-specific")
+	}
 	directory := t.TempDir()
 	helperPath := filepath.Join(directory, "firewall")
 	helper := "#!/bin/sh\n# PUBLIC_RULES_RAW= -arcway-firewall-rules=\nexit 0\n"

@@ -25,6 +25,7 @@ type websocketTicket struct {
 	username     string
 	sessionToken string
 	expiry       time.Time
+	sequence     uint64
 }
 
 type contextKey string
@@ -42,11 +43,12 @@ const GlobalAPITokenSubject = "api-token-admin"
 const AuthHeader = "Authorization"
 
 type TokenStore struct {
-	mu      sync.RWMutex
-	tokens  map[string]session
-	tickets map[string]websocketTicket
-	ttl     time.Duration
-	secret  []byte // HMAC signing secret; nil = use plain random tokens
+	mu        sync.RWMutex
+	tokens    map[string]session
+	tickets   map[string]websocketTicket
+	ticketSeq uint64
+	ttl       time.Duration
+	secret    []byte // HMAC signing secret; nil = use plain random tokens
 }
 
 func NewTokenStore(ttl time.Duration) *TokenStore {
@@ -262,6 +264,7 @@ func (s *TokenStore) IssueWebSocketTicket(username, sessionToken string, ttl tim
 	s.mu.Lock()
 	now := time.Now()
 	oldestTicket := ""
+	var oldestSeq uint64
 	oldestExpiry := time.Time{}
 	userTicketCount := 0
 	for existing, pending := range s.tickets {
@@ -271,15 +274,16 @@ func (s *TokenStore) IssueWebSocketTicket(username, sessionToken string, ttl tim
 		}
 		if pending.username == username {
 			userTicketCount++
-			if oldestTicket == "" || pending.expiry.Before(oldestExpiry) {
-				oldestTicket, oldestExpiry = existing, pending.expiry
+			if oldestTicket == "" || (pending.sequence > 0 && pending.sequence < oldestSeq) || (oldestSeq == 0 && pending.expiry.Before(oldestExpiry)) {
+				oldestTicket, oldestSeq, oldestExpiry = existing, pending.sequence, pending.expiry
 			}
 		}
 	}
 	if userTicketCount >= maxWebSocketTicketsPerUser && oldestTicket != "" {
 		delete(s.tickets, oldestTicket)
 	}
-	s.tickets[ticket] = websocketTicket{username: username, sessionToken: sessionToken, expiry: expiry}
+	s.ticketSeq++
+	s.tickets[ticket] = websocketTicket{username: username, sessionToken: sessionToken, expiry: expiry, sequence: s.ticketSeq}
 	s.mu.Unlock()
 	return ticket, expiry, nil
 }

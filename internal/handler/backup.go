@@ -365,7 +365,7 @@ func addDirToZipFiltered(zipWriter *zip.Writer, srcDir, baseInZip string, skip f
 		if err != nil {
 			return err
 		}
-		header.Name = zipPath
+		header.Name = filepath.ToSlash(zipPath)
 		header.Method = zip.Deflate
 
 		writer, err := zipWriter.CreateHeader(header)

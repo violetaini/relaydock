@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/violetaini/relaydock/internal/acme"
+	"github.com/violetaini/relaydock/internal/util"
 	"github.com/violetaini/relaydock/internal/xrpc/client"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
@@ -1994,14 +1995,8 @@ func writeManagedClientExpirations(path string, entries map[string]managedClient
 	if err := os.Chmod(path, 0600); err != nil {
 		return err
 	}
-	if directory, openErr := os.Open(filepath.Dir(path)); openErr == nil {
-		if syncErr := directory.Sync(); syncErr != nil {
-			_ = directory.Close()
-			return syncErr
-		}
-		if closeErr := directory.Close(); closeErr != nil {
-			return closeErr
-		}
+	if err := util.SyncDir(filepath.Dir(path)); err != nil {
+		return err
 	}
 	return nil
 }

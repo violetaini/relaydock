@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -131,14 +132,16 @@ func TestExtractLegacyPanelBackupSetsPrivateModesAndLimitsBombs(t *testing.T) {
 	if _, _, err := extractLegacyPanelBackup(zipPath, dbPath, subsPath); err != nil {
 		t.Fatal(err)
 	}
-	if mode := mustMode(t, dbPath); mode.Perm() != migrateTempFilePerm {
-		t.Fatalf("db mode=%o, want %o", mode.Perm(), migrateTempFilePerm)
-	}
-	if mode := mustMode(t, subsPath); mode.Perm() != migrateWorkPerm {
-		t.Fatalf("subs mode=%o, want %o", mode.Perm(), migrateWorkPerm)
-	}
-	if mode := mustMode(t, filepath.Join(subsPath, "example.yaml")); mode.Perm() != migrateTempFilePerm {
-		t.Fatalf("sub mode=%o, want %o", mode.Perm(), migrateTempFilePerm)
+	if runtime.GOOS != "windows" {
+		if mode := mustMode(t, dbPath); mode.Perm() != migrateTempFilePerm {
+			t.Fatalf("db mode=%o, want %o", mode.Perm(), migrateTempFilePerm)
+		}
+		if mode := mustMode(t, subsPath); mode.Perm() != migrateWorkPerm {
+			t.Fatalf("subs mode=%o, want %o", mode.Perm(), migrateWorkPerm)
+		}
+		if mode := mustMode(t, filepath.Join(subsPath, "example.yaml")); mode.Perm() != migrateTempFilePerm {
+			t.Fatalf("sub mode=%o, want %o", mode.Perm(), migrateTempFilePerm)
+		}
 	}
 
 	// The copy helper is also guarded at the actual stream boundary, not only

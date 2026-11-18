@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -221,12 +222,11 @@ func TestPrepareMihomoWireGuardRelaysSkipsDialerAndFullPeerConfigs(t *testing.T)
 }
 
 func TestStartMihomoLatencySessionRewritesOnlyItsWireGuardCopy(t *testing.T) {
-	resetProcessWireGuardRelayHubForTest(t)
-	root, err := os.MkdirTemp("/tmp", "arcway-wg-relay-test-")
-	if err != nil {
-		t.Fatalf("MkdirTemp(): %v", err)
+	if runtime.GOOS == "windows" {
+		t.Skip("Mihomo latency sessions use a Unix controller socket")
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	resetProcessWireGuardRelayHubForTest(t)
+	root := t.TempDir()
 	t.Chdir(root)
 	helper, helperErrors := writeMihomoLatencyHelper(t)
 	relayPort := unusedUDP4Port(t)
@@ -253,12 +253,11 @@ func TestStartMihomoLatencySessionRewritesOnlyItsWireGuardCopy(t *testing.T) {
 }
 
 func TestStartMihomoLatencySessionBypassesRelayForSelectedWireGuardProxy(t *testing.T) {
-	resetProcessWireGuardRelayHubForTest(t)
-	root, err := os.MkdirTemp("/tmp", "arcway-wg-relay-bypass-test-")
-	if err != nil {
-		t.Fatalf("MkdirTemp(): %v", err)
+	if runtime.GOOS == "windows" {
+		t.Skip("Mihomo latency sessions use a Unix controller socket")
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	resetProcessWireGuardRelayHubForTest(t)
+	root := t.TempDir()
 	t.Chdir(root)
 	helper, helperErrors := writeMihomoLatencyHelper(t)
 	relayPort := unusedUDP4Port(t)

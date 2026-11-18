@@ -18,6 +18,8 @@ import (
 
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
+
+	"github.com/violetaini/relaydock/internal/util"
 )
 
 const (
@@ -82,16 +84,8 @@ func LoadOrGenerate(path string) (*MasterIdentity, error) {
 	if err := file.Close(); err != nil {
 		return nil, fmt.Errorf("close key: %w", err)
 	}
-	parent, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return nil, fmt.Errorf("open key directory for sync: %w", err)
-	}
-	if err := parent.Sync(); err != nil {
-		_ = parent.Close()
+	if err := util.SyncDir(filepath.Dir(path)); err != nil {
 		return nil, fmt.Errorf("sync key directory: %w", err)
-	}
-	if err := parent.Close(); err != nil {
-		return nil, fmt.Errorf("close key directory: %w", err)
 	}
 
 	return &MasterIdentity{PrivateKey: priv, PublicKey: pub}, nil

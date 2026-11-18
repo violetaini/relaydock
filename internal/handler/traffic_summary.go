@@ -417,7 +417,7 @@ func (h *TrafficSummaryHandler) loadHistory(ctx context.Context, days int) ([]tr
 		return nil, nil
 	}
 
-	records, err := h.repo.ListRecent(ctx, days)
+	records, err := h.repo.ListRecent(ctx, days+1)
 	if err != nil {
 		return nil, err
 	}
@@ -430,16 +430,24 @@ func (h *TrafficSummaryHandler) loadHistory(ctx context.Context, days int) ([]tr
 		return records[i].Date.Before(records[j].Date)
 	})
 
-	usages := make([]trafficDailyUsage, 0, len(records))
+	startIdx := 0
 	var prevUsed int64
-	var hasPrev bool
+	hasPrev := false
+	if len(records) > days {
+		prevUsed = records[0].TotalUsed
+		hasPrev = true
+		startIdx = 1
+	}
 
-	for _, record := range records {
+	usages := make([]trafficDailyUsage, 0, len(records)-startIdx)
+	for i := startIdx; i < len(records); i++ {
+		record := records[i]
 		delta := record.TotalUsed
 		if hasPrev {
-			delta = record.TotalUsed - prevUsed
-			if delta < 0 {
-				delta = 0
+			if record.TotalUsed >= prevUsed {
+				delta = record.TotalUsed - prevUsed
+			} else {
+				delta = record.TotalUsed
 			}
 		}
 
@@ -459,7 +467,7 @@ func (h *TrafficSummaryHandler) loadUserHistory(ctx context.Context, username st
 	if h.repo == nil {
 		return nil, nil
 	}
-	records, err := h.repo.ListUserRecent(ctx, username, days)
+	records, err := h.repo.ListUserRecent(ctx, username, days+1)
 	if err != nil {
 		return nil, err
 	}
@@ -469,15 +477,25 @@ func (h *TrafficSummaryHandler) loadUserHistory(ctx context.Context, username st
 	sort.SliceStable(records, func(i, j int) bool {
 		return records[i].Date.Before(records[j].Date)
 	})
-	usages := make([]trafficDailyUsage, 0, len(records))
+
+	startIdx := 0
 	var prevUsed int64
-	var hasPrev bool
-	for _, record := range records {
+	hasPrev := false
+	if len(records) > days {
+		prevUsed = records[0].TotalUsed
+		hasPrev = true
+		startIdx = 1
+	}
+
+	usages := make([]trafficDailyUsage, 0, len(records)-startIdx)
+	for i := startIdx; i < len(records); i++ {
+		record := records[i]
 		delta := record.TotalUsed
 		if hasPrev {
-			delta = record.TotalUsed - prevUsed
-			if delta < 0 {
-				delta = 0
+			if record.TotalUsed >= prevUsed {
+				delta = record.TotalUsed - prevUsed
+			} else {
+				delta = record.TotalUsed
 			}
 		}
 		prevUsed = record.TotalUsed

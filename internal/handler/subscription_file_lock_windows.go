@@ -4,6 +4,7 @@ package handler
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"path/filepath"
 
@@ -25,7 +26,10 @@ func acquireSubscriptionFilenameOSLock(path string) (*subscriptionFilenameOSLock
 		return nil, fmt.Errorf("encode subscription filename lock: %w", err)
 	}
 	handle, err := windows.CreateMutex(nil, false, name)
-	if err != nil {
+	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		return nil, fmt.Errorf("create subscription filename mutex: %w", err)
+	}
+	if handle == 0 {
 		return nil, fmt.Errorf("create subscription filename mutex: %w", err)
 	}
 	status, err := windows.WaitForSingleObject(handle, windows.INFINITE)

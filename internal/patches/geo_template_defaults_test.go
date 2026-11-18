@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -52,8 +53,10 @@ func TestApplyGEODefaultsAddsBuiltInTemplatesAndIsIdempotent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat %s: %v", name, err)
 		}
-		if got := info.Mode().Perm(); got != 0o600 {
-			t.Errorf("%s mode = %o, want 600", name, got)
+		if runtime.GOOS != "windows" {
+			if got := info.Mode().Perm(); got != 0o600 {
+				t.Errorf("%s mode = %o, want 600", name, got)
+			}
 		}
 	}
 

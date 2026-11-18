@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -500,6 +501,9 @@ func TestResumeScheduledProductUpdateFailureAllowsOldControlPlaneToStart(t *test
 	oldCommand := productUpdateCommand
 	productUpdateCommand = func(ctx context.Context, name string, _ ...string) *exec.Cmd {
 		if name == "systemctl" {
+			if runtime.GOOS == "windows" {
+				return exec.CommandContext(ctx, "cmd.exe", "/c", "exit 3")
+			}
 			return exec.CommandContext(ctx, "sh", "-c", "exit 3")
 		}
 		command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestProductUpdateSystemctlCommand$")

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -56,8 +57,10 @@ func TestGuardHTTPAuthAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != 0600 {
-		t.Fatalf("state mode = %o, want 600", got)
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != 0600 {
+			t.Fatalf("state mode = %o, want 600", got)
+		}
 	}
 
 	reloaded, err := New(statePath, "guard-secret", "secret-token", "http://127.0.0.1:1", nil)

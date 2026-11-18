@@ -29,8 +29,9 @@ import (
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
+var migrateWorkDir = filepath.Join(os.TempDir(), "relaydock-migrate")
+
 const (
-	migrateWorkDir      = "/tmp/relaydock-migrate"
 	defaultFetchTimeout = 5 * time.Minute // legacyPanel 备份可能几十 MB,跨网络下载留足时间
 	maxBackupSizeBytes  = 500 << 20       // 500 MB,防止恶意 URL 让主控 OOM
 	maxExtractedBytes   = 1 << 30         // 1 GiB, ZIP 解压后所有有效条目的总上限
@@ -548,7 +549,8 @@ func validateMigrationArtifact(path, id, suffix string, wantDir bool) (string, e
 		expected = paths.Subs
 	}
 	clean, err := filepath.Abs(filepath.Clean(strings.TrimSpace(path)))
-	if err != nil || clean != expected {
+	expectedAbs, _ := filepath.Abs(expected)
+	if err != nil || clean != expectedAbs {
 		return "", errors.New("migration artifact path 不在当前会话工作目录中")
 	}
 	info, err := os.Lstat(expected)
@@ -567,7 +569,8 @@ func resolveLegacyMigrationPaths(dbPath, subsDir string) (string, string, error)
 	if err != nil {
 		return "", "", errors.New("db_path 无效")
 	}
-	rel, err := filepath.Rel(migrateWorkDir, clean)
+	workDirAbs, _ := filepath.Abs(migrateWorkDir)
+	rel, err := filepath.Rel(workDirAbs, clean)
 	if err != nil || strings.Contains(rel, string(filepath.Separator)) || filepath.Dir(rel) != "." || !strings.HasSuffix(rel, ".db") {
 		return "", "", errors.New("db_path 只能指向迁移工作目录内的会话数据库")
 	}

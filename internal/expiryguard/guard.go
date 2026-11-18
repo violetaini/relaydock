@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/violetaini/relaydock/internal/guardwire"
+	"github.com/violetaini/relaydock/internal/util"
 	"github.com/violetaini/relaydock/internal/version"
 )
 
@@ -191,12 +192,7 @@ func (g *Guard) persistLocked() (bool, error) {
 	if err := os.Rename(temporaryPath, g.statePath); err != nil {
 		return false, fmt.Errorf("replace expiry state: %w", err)
 	}
-	directory, err := os.Open(dir)
-	if err != nil {
-		return true, fmt.Errorf("open expiry state directory: %w", err)
-	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil {
+	if err := util.SyncDir(dir); err != nil {
 		return true, fmt.Errorf("sync expiry state directory: %w", err)
 	}
 	return true, nil

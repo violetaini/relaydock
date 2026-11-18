@@ -131,7 +131,7 @@ func TestManagedWebRootAcceptsCanonicalAbsoluteCurrentLink(t *testing.T) {
 	if err := ActivatePreparedWebRelease(root, activation); err != nil {
 		t.Fatal(err)
 	}
-	if target, err := os.Readlink(currentLink); err != nil || target != "releases/v1.0.1" {
+	if target, err := os.Readlink(currentLink); err != nil || filepath.ToSlash(target) != "releases/v1.0.1" {
 		t.Fatalf("new current link = %q, %v", target, err)
 	}
 }
@@ -201,7 +201,7 @@ func TestRollbackWebActivationRejectsMissingRecordedRelease(t *testing.T) {
 	if err := RollbackWebActivation(root, activation); err == nil {
 		t.Fatal("rollback accepted a missing recorded release")
 	}
-	if target, err := os.Readlink(filepath.Join(root, "current")); err != nil || target != "releases/v1.0.1" {
+	if target, err := os.Readlink(filepath.Join(root, "current")); err != nil || filepath.ToSlash(target) != "releases/v1.0.1" {
 		t.Fatalf("rollback changed current link after validation failure: %q, %v", target, err)
 	}
 }

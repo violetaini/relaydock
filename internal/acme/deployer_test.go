@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -17,8 +18,10 @@ func TestDeployCertFilesAtomicallyReplacesPair(t *testing.T) {
 	}
 	assertFileContent(t, certPath, "new-cert")
 	assertFileContent(t, keyPath, "new-key")
-	if info, err := os.Stat(keyPath); err != nil || info.Mode().Perm() != 0600 {
-		t.Fatalf("key mode = %v, err=%v; want 0600", infoMode(info), err)
+	if runtime.GOOS != "windows" {
+		if info, err := os.Stat(keyPath); err != nil || info.Mode().Perm() != 0600 {
+			t.Fatalf("key mode = %v, err=%v; want 0600", infoMode(info), err)
+		}
 	}
 	assertNoCertTemps(t, filepath.Dir(certPath))
 }
@@ -52,8 +55,10 @@ func TestDeployRollbackRestoresOldPairAndReloadsOldState(t *testing.T) {
 	}
 	assertFileContent(t, certPath, "old-cert")
 	assertFileContent(t, keyPath, "old-key")
-	if info, statErr := os.Stat(certPath); statErr != nil || info.Mode().Perm() != 0640 {
-		t.Fatalf("restored cert mode = %v, err=%v; want 0640", infoMode(info), statErr)
+	if runtime.GOOS != "windows" {
+		if info, statErr := os.Stat(certPath); statErr != nil || info.Mode().Perm() != 0640 {
+			t.Fatalf("restored cert mode = %v, err=%v; want 0640", infoMode(info), statErr)
+		}
 	}
 	assertNoCertTemps(t, dir)
 }

@@ -12,10 +12,12 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/violetaini/relaydock/internal/util"
 	"golang.org/x/net/html"
 )
 
@@ -811,7 +813,7 @@ func syncWebReleaseTree(root string) error {
 		if !entry.Type().IsRegular() {
 			return fmt.Errorf("frontend release contains an unsafe entry: %s", path)
 		}
-		file, err := os.Open(path)
+		file, err := os.OpenFile(path, os.O_WRONLY, 0)
 		if err != nil {
 			return err
 		}
@@ -838,15 +840,7 @@ func syncWebReleaseTree(root string) error {
 }
 
 func syncWebDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	if err := directory.Sync(); err != nil {
-		_ = directory.Close()
-		return err
-	}
-	return directory.Close()
+	return util.SyncDir(path)
 }
 
 func rejectSymlinks(root string) error {
@@ -896,6 +890,9 @@ func replaceManagedLink(root, name, target string) error {
 	temporary := filepath.Join(root, "."+name+"-"+releaseID+fmt.Sprintf("-%d", time.Now().UnixNano()))
 	if err := os.Symlink(target, temporary); err != nil {
 		return err
+	}
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(linkPath)
 	}
 	if err := os.Rename(temporary, linkPath); err != nil {
 		_ = os.Remove(temporary)

@@ -9,10 +9,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 func TestApplySelfUpdateVerifiesAndReplacesExecutable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows self-update defers file replacement to an external process after application exit")
+	}
 	assetName := "relaydock-speedtester-linux-amd64"
 	asset := []byte("verified speedtester update")
 	checksum := sha256.Sum256(asset)

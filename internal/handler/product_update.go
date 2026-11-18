@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/violetaini/relaydock/internal/productrelease"
+	"github.com/violetaini/relaydock/internal/util"
 	"github.com/violetaini/relaydock/internal/version"
 )
 
@@ -205,16 +206,8 @@ func writeProductUpdateJob(job productUpdateJob) error {
 }
 
 func syncProductUpdateStateDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open update state directory: %w", err)
-	}
-	if err := directory.Sync(); err != nil {
-		_ = directory.Close()
+	if err := util.SyncDir(path); err != nil {
 		return fmt.Errorf("sync update state directory: %w", err)
-	}
-	if err := directory.Close(); err != nil {
-		return fmt.Errorf("close update state directory: %w", err)
 	}
 	return nil
 }

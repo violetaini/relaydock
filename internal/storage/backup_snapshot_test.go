@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -79,15 +80,17 @@ func TestCreateConsistentSnapshotDuringConcurrentWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat snapshot: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
-		t.Fatalf("snapshot mode=%#o, want 0600", got)
-	}
-	directoryInfo, err := os.Stat(filepath.Dir(snapshotPath))
-	if err != nil {
-		t.Fatalf("stat snapshot directory: %v", err)
-	}
-	if got := directoryInfo.Mode().Perm(); got != 0o700 {
-		t.Fatalf("snapshot directory mode=%#o, want 0700", got)
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("snapshot mode=%#o, want 0600", got)
+		}
+		directoryInfo, err := os.Stat(filepath.Dir(snapshotPath))
+		if err != nil {
+			t.Fatalf("stat snapshot directory: %v", err)
+		}
+		if got := directoryInfo.Mode().Perm(); got != 0o700 {
+			t.Fatalf("snapshot directory mode=%#o, want 0700", got)
+		}
 	}
 	for _, sidecar := range []string{snapshotPath + "-wal", snapshotPath + "-shm"} {
 		if _, err := os.Stat(sidecar); !os.IsNotExist(err) {

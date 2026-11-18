@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/violetaini/relaydock/internal/auth"
 	"github.com/violetaini/relaydock/internal/storage"
@@ -173,5 +174,57 @@ func TestTrafficSummaryMixedUnlimitedAndLimitedServersIncludeUnlimitedInTotalUse
 	// UsagePercentage = 20.0% (10 GB / 50 GB * 100)
 	if resp.Metrics.UsagePercentage < 19.9 || resp.Metrics.UsagePercentage > 20.1 {
 		t.Fatalf("UsagePercentage = %f, want ~20.0", resp.Metrics.UsagePercentage)
+	}
+}
+
+func TestTrafficSummaryHistoryBaselineAndReset(t *testing.T) {
+	ctx := context.Background()
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic-summary-history.db"))
+	if err != nil {
+		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	defer repo.Close()
+
+	const gigabyte = 1024 * 1024 * 1024
+	h := NewTrafficSummaryHandler(repo)
+
+	// Record 3 days of snapshots:
+	// Day 1: 100 GB cumulative
+	// Day 2: 110 GB cumulative (+10 GB delta)
+	// Day 3: 50 GB cumulative (monthly reset, +50 GB delta)
+	now := time.Now()
+	day1 := now.AddDate(0, 0, -2)
+	day2 := now.AddDate(0, 0, -1)
+	day3 := now
+
+	if err := repo.RecordDaily(ctx, day1, 200*gigabyte, 100*gigabyte, 100*gigabyte); err != nil {
+		t.Fatalf("RecordDaily day1: %v", err)
+	}
+	if err := repo.RecordDaily(ctx, day2, 200*gigabyte, 110*gigabyte, 90*gigabyte); err != nil {
+		t.Fatalf("RecordDaily day2: %v", err)
+	}
+	if err := repo.RecordDaily(ctx, day3, 200*gigabyte, 50*gigabyte, 150*gigabyte); err != nil {
+		t.Fatalf("RecordDaily day3: %v", err)
+	}
+
+	// Request history for 2 days. Because we have 3 records, day 1 serves as baseline.
+	// Only day 2 and day 3 are emitted in history.
+	history, err := h.loadHistory(ctx, 2)
+	if err != nil {
+		t.Fatalf("loadHistory: %v", err)
+	}
+
+	if len(history) != 2 {
+		t.Fatalf("history length = %d, want 2", len(history))
+	}
+
+	// Day 2 delta: 110 - 100 = 10 GB
+	if history[0].UsedGB < 9.9 || history[0].UsedGB > 10.1 {
+		t.Errorf("history[0] UsedGB = %f, want ~10.0", history[0].UsedGB)
+	}
+
+	// Day 3 delta: reset to 50 GB, so delta = 50 GB (NOT 0!)
+	if history[1].UsedGB < 49.9 || history[1].UsedGB > 50.1 {
+		t.Errorf("history[1] UsedGB = %f, want ~50.0", history[1].UsedGB)
 	}
 }

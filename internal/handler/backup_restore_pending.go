@@ -11,9 +11,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -72,6 +72,12 @@ func newSecureAnonymousTemp(pattern string) (*os.File, func(), error) {
 		_ = file.Close()
 		_ = os.Remove(name)
 		return nil, nil, err
+	}
+	if runtime.GOOS == "windows" {
+		return file, func() {
+			_ = file.Close()
+			_ = os.Remove(name)
+		}, nil
 	}
 	if err := os.Remove(name); err != nil {
 		_ = file.Close()
@@ -356,11 +362,11 @@ func validateRestoredSQLite(databasePath string) error {
 	if err != nil {
 		return fmt.Errorf("resolve restored database path: %w", err)
 	}
-	dsn := (&url.URL{
-		Scheme:   "file",
-		Path:     filepath.ToSlash(absolutePath),
-		RawQuery: "mode=ro&immutable=1&_pragma=query_only(1)&_pragma=busy_timeout(5000)",
-	}).String()
+	slashPath := filepath.ToSlash(absolutePath)
+	if !strings.HasPrefix(slashPath, "/") {
+		slashPath = "/" + slashPath
+	}
+	dsn := "file://" + slashPath + "?mode=ro&immutable=1&_pragma=query_only(1)&_pragma=busy_timeout(5000)"
 	database, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("open restored database read-only: %w", err)
