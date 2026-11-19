@@ -268,3 +268,41 @@ func TestBruteForceProtectorReclaimsExpiredStateAtCapacity(t *testing.T) {
 		t.Fatalf("new failure record = %#v", got)
 	}
 }
+
+func TestLoginDisabledAccountReturnsForbidden(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "disabled-auth.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	ctx := context.Background()
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte("correct-password"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateUser(ctx, "bob", "", "", string(passwordHash), storage.RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateUserStatus(ctx, "bob", false); err != nil {
+		t.Fatal(err)
+	}
+
+	tokens := auth.NewTokenStore(time.Hour)
+	manager, err := auth.NewManager(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limiter := NewLoginRateLimiter()
+	limiter.SetSkipLocalIP(true)
+	loginHandler := NewLoginHandler(manager, tokens, repo, limiter, nil, nil)
+
+	body := []byte(`{"username":"bob","password":"correct-password"}`)
+	request := httptest.NewRequest("POST", "/api/login", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	loginHandler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("disabled user status code = %d, want %d (body: %s)", response.Code, http.StatusForbidden, response.Body.String())
+	}
+}

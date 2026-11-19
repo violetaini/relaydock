@@ -11,6 +11,8 @@ import (
 	"github.com/violetaini/relaydock/internal/storage"
 )
 
+var ErrUserDisabled = errors.New("user is disabled")
+
 type Credentials struct {
 	Username     string `json:"username"`
 	PasswordHash string `json:"password_hash"`
@@ -86,7 +88,7 @@ func (m *Manager) authenticateLocked(ctx context.Context, username, password str
 		return storage.User{}, false, err
 	}
 	if !user.IsActive {
-		return storage.User{}, false, nil
+		return storage.User{}, false, ErrUserDisabled
 	}
 
 	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)) != nil {
@@ -102,7 +104,7 @@ func (m *Manager) activeUserLocked(ctx context.Context, username string) (storag
 		return storage.User{}, err
 	}
 	if !user.IsActive {
-		return storage.User{}, errors.New("user is disabled")
+		return storage.User{}, ErrUserDisabled
 	}
 	return user, nil
 }
@@ -238,7 +240,7 @@ func (m *Manager) ValidatePassword(ctx context.Context, username, password strin
 	}
 
 	if !user.IsActive {
-		return errors.New("user is disabled")
+		return ErrUserDisabled
 	}
 
 	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)) != nil {

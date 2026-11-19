@@ -73,6 +73,14 @@ func NewTwoFactorLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, re
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		if !user.IsActive {
+			tfStore.Finish(payload.TwoFactorToken, false)
+			if rateLimiter != nil {
+				rateLimiter.Release(clientIP, username)
+			}
+			writeError(w, http.StatusForbidden, errors.New("account is disabled"))
+			return
+		}
 
 		if !auth.ValidateTOTPCode(user.TOTPSecret, payload.Code) {
 			tfStore.Finish(payload.TwoFactorToken, false)
@@ -104,6 +112,13 @@ func NewTwoFactorLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, re
 		})
 		if err != nil {
 			tfStore.Finish(payload.TwoFactorToken, false)
+			if errors.Is(err, auth.ErrUserDisabled) {
+				if rateLimiter != nil {
+					rateLimiter.Release(clientIP, username)
+				}
+				writeError(w, http.StatusForbidden, errors.New("account is disabled"))
+				return
+			}
 			if rateLimiter != nil {
 				rateLimiter.RecordFailure(clientIP, username)
 			}
@@ -174,6 +189,14 @@ func NewRecoveryLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, rep
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		if !user.IsActive {
+			tfStore.Finish(payload.TwoFactorToken, false)
+			if rateLimiter != nil {
+				rateLimiter.Release(clientIP, username)
+			}
+			writeError(w, http.StatusForbidden, errors.New("account is disabled"))
+			return
+		}
 
 		hashedCodes, err := parseRecoveryCodes(user.RecoveryCodes)
 		if err != nil {
@@ -219,6 +242,13 @@ func NewRecoveryLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, rep
 		})
 		if err != nil {
 			tfStore.Finish(payload.TwoFactorToken, false)
+			if errors.Is(err, auth.ErrUserDisabled) {
+				if rateLimiter != nil {
+					rateLimiter.Release(clientIP, username)
+				}
+				writeError(w, http.StatusForbidden, errors.New("account is disabled"))
+				return
+			}
 			if rateLimiter != nil {
 				rateLimiter.RecordFailure(clientIP, username)
 			}

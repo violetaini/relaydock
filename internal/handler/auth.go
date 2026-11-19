@@ -156,6 +156,14 @@ func NewLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, repo *stora
 			if rateLimiter != nil {
 				rateLimiter.Release(clientIP, username)
 			}
+			if errors.Is(err, auth.ErrUserDisabled) {
+				logger.Warn("🚫 [LOGIN_DISABLED] 账号已停用尝试登录",
+					"username", username,
+					"client_ip", clientIP,
+					"time", time.Now().Format("2006-01-02 15:04:05"))
+				writeError(w, http.StatusForbidden, errors.New("account is disabled"))
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
