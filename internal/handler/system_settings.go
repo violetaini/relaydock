@@ -970,9 +970,10 @@ const (
 	brandingLogoKey    = "branding_logo"
 	brandingFaviconKey = "branding_favicon"
 
-	defaultBrandingName   = "RelayDock"
-	brandingImageMaxBytes = 128 * 1024
-	brandingNameMaxRunes  = 64
+	defaultBrandingName       = "RelayDock"
+	defaultLoginBackgroundURL = "https://api.timelessq.com/bing/random"
+	brandingImageMaxBytes     = 128 * 1024
+	brandingNameMaxRunes      = 64
 )
 
 type brandingSettings struct {
@@ -1041,7 +1042,9 @@ func (h *SystemSettingsHandler) brandingSettings(ctx context.Context) (brandingS
 	if err != nil {
 		return b, err
 	}
-	b.LoginBackgroundURLs = []string{}
+	// Only an absent setting inherits the product default. Persisted custom
+	// sources (including an intentionally empty list) remain instance-owned.
+	b.LoginBackgroundURLs = []string{defaultLoginBackgroundURL}
 	if raw != "" {
 		if err = json.Unmarshal([]byte(raw), &b.LoginBackgroundURLs); err != nil {
 			return b, err
