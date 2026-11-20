@@ -219,6 +219,12 @@ func forwardingID(prefix string) string {
 
 func (r *TrafficRepository) migrateForwarding() error {
 	const schema = `
+CREATE TABLE IF NOT EXISTS node_forward_targets (
+ node_id INTEGER PRIMARY KEY, target_node_id INTEGER NOT NULL,
+ target_host TEXT NOT NULL DEFAULT '',
+ updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ CHECK(node_id != target_node_id)
+);
 CREATE TABLE IF NOT EXISTS tunnel_templates (
  id INTEGER PRIMARY KEY AUTOINCREMENT, public_id TEXT NOT NULL UNIQUE,
  name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
@@ -319,6 +325,9 @@ CREATE INDEX IF NOT EXISTS idx_tunnel_audit_entity ON tunnel_audit_events(entity
 `
 	if _, err := r.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate forwarding: %w", err)
+	}
+	if err := r.ensureTableColumn("node_forward_targets", "target_host", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate forwarding target host: %w", err)
 	}
 	if err := r.ensureTableColumn("user_forward_rules", "source_cidrs", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return fmt.Errorf("migrate user_forward_rules.source_cidrs: %w", err)

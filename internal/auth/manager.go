@@ -87,12 +87,11 @@ func (m *Manager) authenticateLocked(ctx context.Context, username, password str
 		}
 		return storage.User{}, false, err
 	}
-	if !user.IsActive {
-		return storage.User{}, false, ErrUserDisabled
-	}
-
 	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)) != nil {
 		return storage.User{}, false, nil
+	}
+	if !user.IsActive {
+		return storage.User{}, false, ErrUserDisabled
 	}
 
 	return user, true, nil

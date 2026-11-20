@@ -105,6 +105,15 @@ func NewLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, repo *stora
 			writeError(w, http.StatusBadRequest, errors.New("username is too long"))
 			return
 		}
+		if repo != nil {
+			canonical, err := repo.ResolveLoginUsername(r.Context(), username)
+			if err == nil {
+				username = canonical
+			} else if !errors.Is(err, storage.ErrUserNotFound) {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
 		clientIP := GetClientIP(r)
 
 		if rateLimiter != nil {

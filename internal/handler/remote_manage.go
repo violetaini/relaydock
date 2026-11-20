@@ -46,6 +46,11 @@ type RemoteManageHandler struct {
 	xrayVersionsFetch   chan struct{}
 	publishInboundEvent func(event.InboundEvent) error
 	limiterPusher       *LimiterConfigPusher
+	forwardNodeYAMLSync *YAMLSyncManager
+}
+
+func (h *RemoteManageHandler) SetForwardNodeYAMLSync(manager *YAMLSyncManager) {
+	h.forwardNodeYAMLSync = manager
 }
 
 const (

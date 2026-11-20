@@ -94,6 +94,92 @@ func TestMakeNodeURIItemNormalizesSocksAndRejectsUnsupportedProtocol(t *testing.
 	}
 }
 
+func TestNodeURIUsesCurrentServerDomainWithoutChangingStoredCredentials(t *testing.T) {
+	ctx := context.Background()
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "admin", storage.RoleAdmin)
+	server := storage.RemoteServer{Name: "HKT", Token: "fixture-token", IPAddress: "192.0.2.10", Domain: "old.example.test"}
+	if err := repo.CreateRemoteServer(ctx, &server); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"name":"HKT SS","type":"ss","server":"192.0.2.10","port":2024,"cipher":"aes-128-gcm","password":"fixture-secret"}`
+	node := createNodeURITestNode(t, repo, "admin", "HKT SS", "shadowsocks", config)
+	node.OriginalServer = server.Name
+	node.InboundTag = "source"
+	var err error
+	if node, err = repo.UpdateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	h := NewNodesHandler(repo, t.TempDir(), nil)
+	for _, domain := range []string{"old.example.test", "new.example.test"} {
+		if err := repo.UpdateRemoteServerDomain(ctx, server.ID, domain); err != nil {
+			t.Fatal(err)
+		}
+		response := requestNodeURI(t, h, "admin", node.ID)
+		if response.Code != 200 {
+			t.Fatalf("share status=%d", response.Code)
+		}
+		var result struct {
+			Item nodeURIItem `json:"item"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		proxy, err := proxyparser.Parse(result.Item.URI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if proxy["server"] != domain || proxy["password"] != "fixture-secret" || proxy["port"] != 2024 {
+			t.Fatalf("share endpoint or credential changed incorrectly: host=%v port=%v", proxy["server"], proxy["port"])
+		}
+	}
+	stored, err := repo.GetNodeByID(ctx, node.ID)
+	if err != nil || stored.ClashConfig != node.ClashConfig {
+		t.Fatal("QR lookup mutated stored node")
+	}
+}
+
+func TestNodeURIKeepsSelectedRelayAndSpecialEndpoints(t *testing.T) {
+	for _, kind := range []string{"forwarded", "relay", "routed", "imported", "ipv6"} {
+		t.Run(kind, func(t *testing.T) {
+			host := "192.0.2.20"
+			if kind == "ipv6" {
+				host = "2001:db8::20"
+			}
+			config, _ := json.Marshal(map[string]any{"name": "entry", "type": "vless", "server": host, "port": 443, "uuid": "10000000-0000-4000-8000-000000000001"})
+			n := storage.Node{ID: 1, NodeName: "entry", Protocol: "vless", OriginalServer: "entry server", InboundTag: "entry", NodeType: "physical", ClashConfig: string(config)}
+			if kind == "forwarded" {
+				n.NodeType = "forwarded"
+			}
+			if kind == "routed" {
+				n.NodeType = "routed"
+			}
+			if kind == "relay" {
+				n.RelayOrigServer = "origin.example.test"
+			}
+			if kind == "imported" {
+				n.OriginalServer = ""
+				n.InboundTag = ""
+			}
+			item, err := makeNodeURIItem("admin", n, substore.NewURIProducer(), "entry.example.test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxy, err := proxyparser.Parse(item.URI)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := host
+			if kind == "forwarded" {
+				want = "entry.example.test"
+			}
+			if strings.Trim(proxy["server"].(string), "[]") != want {
+				t.Fatalf("%s endpoint changed incorrectly", kind)
+			}
+		})
+	}
+}
+
 func TestMakeNodeURIItemCanonicalWireGuardRoundTripDualStack(t *testing.T) {
 	privateKey := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+="
 	publicKey := "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB+="

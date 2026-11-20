@@ -612,6 +612,7 @@ func main() {
 
 	// 远程服务器管理代理（将命令转发到子服务器）
 	remoteManageHandler := handler.NewRemoteManageHandler(repo, remoteWSHandler)
+	remoteManageHandler.SetForwardNodeYAMLSync(handler.NewYAMLSyncManager(subscribeDir, repo))
 	remoteManageHandler.SetCrypto(cryptoConfig)
 	remoteManageHandler.SetLimiterPusher(limiterPusher)
 	// inbound cache: 套餐绑/换绑时 in-memory 算 cred 用,从 xray config snapshot 派生。
@@ -826,6 +827,7 @@ func main() {
 	mux.Handle("/api/admin/remote/inbounds", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleInbounds)))
 	mux.Handle("/api/admin/remote/port-check", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleRemotePortCheck)))
 	mux.Handle("/api/admin/managed-nodes/create", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleCreateManagedNode)))
+	mux.Handle("/api/admin/forward-nodes/", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleForwardNodeTarget)))
 	mux.Handle("/api/admin/managed-inbound-resources", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleManagedInboundResources)))
 	mux.Handle("/api/admin/managed-inbound-resources/", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleManagedInboundResources)))
 	mux.Handle("/api/admin/remote/outbounds", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleOutbounds)))

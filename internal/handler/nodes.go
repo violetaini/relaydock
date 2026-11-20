@@ -8,6 +8,7 @@ import (
 	"github.com/violetaini/relaydock/internal/logger"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -307,7 +308,18 @@ func (h *nodesHandler) handleGetURI(w http.ResponseWriter, r *http.Request, idSe
 		}
 	}
 
-	item, err := makeNodeURIItem(username, node, substore.NewURIProducer())
+	serverDomain := ""
+	if isDatabaseManagedNode(&node) {
+		server, lookupErr := h.repo.GetRemoteServerByName(r.Context(), node.OriginalServer)
+		if lookupErr != nil && !errors.Is(lookupErr, storage.ErrRemoteServerNotFound) {
+			writeError(w, http.StatusInternalServerError, errors.New("读取服务器节点域名失败"))
+			return
+		}
+		if server != nil {
+			serverDomain = server.Domain
+		}
+	}
+	item, err := makeNodeURIItem(username, node, substore.NewURIProducer(), serverDomain)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err)
 		return
@@ -861,6 +873,10 @@ func (h *nodesHandler) handleUpdate(w http.ResponseWriter, r *http.Request, idSe
 		return
 	}
 	req.parseChainProxyNodeID()
+	if isAdmin && existing.NodeType == "forwarded" && (req.ClashConfig != "" || req.ParsedConfig != "" || req.Protocol != "" || req.RawURL != "") {
+		writeBadRequest(w, "转发节点的配置由目标节点继承，请使用转发目标选择器修改")
+		return
+	}
 	if isAdmin && req.hasChainProxyNodeID() && req.ChainProxyNodeID != nil {
 		if !isDatabaseManagedNode(&existing) {
 			writeBadRequest(w, "导入节点只用于订阅、测速和用户分配，不能设置链式代理")
@@ -1403,6 +1419,10 @@ func (h *nodesHandler) handleUpdateConfig(w http.ResponseWriter, r *http.Request
 	}
 
 	oldNodeName := node.NodeName
+	if node.NodeType == "forwarded" {
+		writeBadRequest(w, "转发节点的配置由目标节点继承，请使用转发目标选择器修改")
+		return
+	}
 
 	// The raw editor receives marker-free JSON. Preserve the server-owned
 	// capability only for a same-cipher edit of the same managed physical node.
@@ -2377,8 +2397,10 @@ type nodeDTO struct {
 	OriginalDomain    string   `json:"original_domain"`
 	InboundTag        string   `json:"inbound_tag"`
 	ChainProxyNodeID  *int64   `json:"chain_proxy_node_id"`
-	NodeType          string   `json:"node_type"`              // 'physical' | 'routed' | 'forwarded'
-	ParentNodeID      *int64   `json:"parent_node_id"`         // routed 节点指向其父物理节点
+	NodeType          string   `json:"node_type"`      // 'physical' | 'routed' | 'forwarded'
+	ParentNodeID      *int64   `json:"parent_node_id"` // routed 节点指向其父物理节点
+	ForwardNodeID     *int64   `json:"forward_node_id,omitempty"`
+	ForwardTargetHost string   `json:"forward_target_host,omitempty"`
 	RoutedOutboundTag string   `json:"routed_outbound_tag"`    // routed 节点专用:绑定的出站 tag(便于 UI 直接展示)
 	RoutedOwner       string   `json:"routed_owner,omitempty"` // routed 节点专用:'shared'(admin 套餐分配) | 'user'(用户私有)
 	CreatedBy         string   `json:"created_by,omitempty"`   // routed 节点专用:创建者用户名(user 视角下用于鉴别"是不是我创建的")
@@ -2402,14 +2424,28 @@ type nodeURIItem struct {
 	URI      string `json:"uri"`
 }
 
-func makeNodeURIItem(username string, node storage.Node, producer *substore.URIProducer) (nodeURIItem, error) {
+func makeNodeURIItem(username string, node storage.Node, producer *substore.URIProducer, serverDomains ...string) (nodeURIItem, error) {
 	if strings.TrimSpace(node.ClashConfig) == "" {
 		return nodeURIItem{}, errors.New("当前节点没有可用于生成二维码的客户端配置")
 	}
 	clashConfig, _, _, _ := sanitizeManagedShadowsocksConfig(node.ClashConfig)
 	var proxy map[string]any
-	if err := json.Unmarshal([]byte(clashConfig), &proxy); err != nil {
+	if err := json.Unmarshal([]byte(clashConfig), &proxy); err != nil || proxy == nil {
 		return nodeURIItem{}, errors.New("当前节点的客户端配置格式无效")
+	}
+	// Generate from current server metadata, rather than a possibly stale IP in
+	// the stored proxy. Forwarded nodes use their ENTRY server's domain. Relays,
+	// routed proxies and explicitly IPv6 endpoints retain their selected entry.
+	if len(serverDomains) > 0 && strings.TrimSpace(serverDomains[0]) != "" && isDatabaseManagedNode(&node) && node.RelayOrigServer == "" && node.NodeType != "routed" {
+		host, _ := proxy["server"].(string)
+		ip := net.ParseIP(strings.Trim(host, "[]"))
+		if ip == nil || ip.To4() != nil {
+			domain, err := normalizeForwardTargetDomain(serverDomains[0])
+			if err != nil {
+				return nodeURIItem{}, errors.New("服务器节点域名无效，请在服务器管理中修正")
+			}
+			proxy["server"] = domain
+		}
 	}
 	protocol, _ := proxy["type"].(string)
 	protocol = strings.ToLower(strings.TrimSpace(protocol))
@@ -2455,6 +2491,15 @@ func NewNodeURIsHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 		ctx := r.Context()
+		servers, err := repo.ListRemoteServers(ctx)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		domains := make(map[string]string, len(servers))
+		for _, server := range servers {
+			domains[server.Name] = server.Domain
+		}
 		users, err := repo.ListUsers(ctx, 10000)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -2473,7 +2518,7 @@ func NewNodeURIsHandler(repo *storage.TrafficRepository) http.Handler {
 				if strings.TrimSpace(n.ClashConfig) == "" {
 					continue
 				}
-				item, perr := makeNodeURIItem(u.Username, n, prod)
+				item, perr := makeNodeURIItem(u.Username, n, prod, domains[n.OriginalServer])
 				if perr != nil {
 					continue
 				}
@@ -2519,6 +2564,18 @@ func convertNode(node storage.Node) nodeDTO {
 
 func convertAdminNodes(ctx context.Context, repo *storage.TrafficRepository, nodes []storage.Node) []nodeDTO {
 	result := convertNodes(nodes)
+	if hosts, err := repo.ForwardNodeTargetHosts(ctx); err == nil {
+		for i, node := range nodes {
+			result[i].ForwardTargetHost = hosts[node.ID]
+		}
+	}
+	if targets, err := repo.ForwardNodeTargets(ctx); err == nil {
+		for i, node := range nodes {
+			if target, ok := targets[node.ID]; ok {
+				result[i].ForwardNodeID = &target
+			}
+		}
+	}
 	servers, err := repo.ListRemoteServers(ctx)
 	if err != nil {
 		return result
