@@ -77,6 +77,7 @@ func TestChooseClashServerHostFallsBackToIPv6(t *testing.T) {
 }
 
 func TestCreateRemoteServerAcceptsDomainForDDNS(t *testing.T) {
+	t.Setenv("ARCWAY_PANEL_IPS", "203.0.113.10")
 	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
 	if err != nil {
 		t.Fatal(err)
