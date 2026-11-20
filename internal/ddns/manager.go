@@ -37,7 +37,14 @@ func NewManager(repo *storage.TrafficRepository) *Manager {
 // 不阻塞调用方 — 用法是 `go manager.Trigger(ctx, server)`。
 // 失败只 log,不返 error;靠 DDNSLastError 字段 + reconciler 重试。
 func (m *Manager) Trigger(ctx context.Context, server *storage.RemoteServer) {
-	if server == nil || !server.DDNSEnabled || strings.TrimSpace(server.PullAddress) == "" {
+	if server == nil || !server.DDNSEnabled {
+		return
+	}
+	fqdn := strings.TrimSpace(server.Domain)
+	if fqdn == "" {
+		fqdn = strings.TrimSpace(server.PullAddress)
+	}
+	if fqdn == "" {
 		return
 	}
 	lock := m.lockFor(server.ID)
@@ -52,7 +59,7 @@ func (m *Manager) Trigger(ctx context.Context, server *storage.RemoteServer) {
 		return
 	}
 	_ = m.repo.UpdateRemoteServerDDNSStatus(ctx, server.ID, "")
-	log.Printf("[DDNS] sync ok for server %s (id=%d) → %s", server.Name, server.ID, server.PullAddress)
+	log.Printf("[DDNS] sync ok for server %s (id=%d) → %s", server.Name, server.ID, fqdn)
 }
 
 // TriggerByID 给 reconciler / 手动测试 API 用 — 自己加载 server。
@@ -73,9 +80,12 @@ func (m *Manager) lockFor(id int64) *sync.Mutex {
 // doSync 真正执行同步,返回业务级 error。任何步骤失败都不写 record — 例如 v4 失败就放弃 v6,
 // 因为通常用户是同一份凭据 → 一处失败两处都会失败,继续只是雪上加霜。
 func (m *Manager) doSync(ctx context.Context, server *storage.RemoteServer) error {
-	fqdn := strings.TrimSpace(server.PullAddress)
+	fqdn := strings.TrimSpace(server.Domain)
+	if fqdn == "" {
+		fqdn = strings.TrimSpace(server.PullAddress)
+	}
 	if ip := net.ParseIP(fqdn); ip != nil {
-		return fmt.Errorf("pull_address is an IP %q, DDNS requires a domain name", fqdn)
+		return fmt.Errorf("ddns target is an IP %q, DDNS requires a domain name", fqdn)
 	}
 
 	providerID, err := m.resolveProviderID(ctx, server, fqdn)

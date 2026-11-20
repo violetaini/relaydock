@@ -67,11 +67,17 @@ func (h *DDNSAdminHandler) handleStatus(w http.ResponseWriter, r *http.Request, 
 	}
 	// 拼一个 DNS provider 名(若已配置 + 有匹配)给 Tooltip 显示用
 	providerName := ""
+	matchedDomain := ""
 	providerID := server.DDNSProviderID
 	if providerID == 0 && server.DDNSEnabled {
-		// 自动模式 — 查匹配证书
-		if cert, cerr := h.repo.FindCertificateForDomain(r.Context(), server.PullAddress); cerr == nil {
+		// 查匹配证书域名
+		targetDomain := strings.TrimSpace(server.Domain)
+		if targetDomain == "" {
+			targetDomain = strings.TrimSpace(server.PullAddress)
+		}
+		if cert, cerr := h.repo.FindCertificateForDomain(r.Context(), targetDomain); cerr == nil {
 			providerID = cert.DNSProviderID
+			matchedDomain = cert.Domain
 		}
 	}
 	if providerID > 0 {
@@ -79,13 +85,19 @@ func (h *DDNSAdminHandler) handleStatus(w http.ResponseWriter, r *http.Request, 
 			providerName = dp.Name + " (" + dp.ProviderType + ")"
 		}
 	}
+	targetFQDN := strings.TrimSpace(server.Domain)
+	if targetFQDN == "" {
+		targetFQDN = server.PullAddress
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":             true,
 		"id":                  server.ID,
 		"name":                server.Name,
+		"domain":              targetFQDN,
 		"ddns_enabled":        server.DDNSEnabled,
 		"ddns_provider_id":    server.DDNSProviderID,
 		"ddns_provider_name":  providerName,
+		"matched_domain":      matchedDomain,
 		"ddns_last_synced_at": server.DDNSLastSyncedAt,
 		"ddns_last_error":     server.DDNSLastError,
 		"ddns_pending":        server.DDNSPending,

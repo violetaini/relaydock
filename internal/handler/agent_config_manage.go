@@ -926,12 +926,19 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 
 	// DDNS 开启时必须用域名 — agent 上报 IP 漂移后,DDNS 把这个域名的 A/AAAA 指到新 IP
 	if req.DDNSEnabled {
-		pa := strings.TrimSpace(req.PullAddress)
+		pa := strings.TrimSpace(req.Domain)
+		if pa == "" {
+			pa = strings.TrimSpace(req.PullAddress)
+		}
 		if pa == "" || net.ParseIP(pa) != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(stdhttp.StatusBadRequest)
-			json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "DDNS 开启时,服务器地址必须填域名"})
+			json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "DDNS 开启时,服务器必须填写域名"})
 			return
+		}
+		req.PullAddress = pa
+		if strings.TrimSpace(req.Domain) == "" {
+			req.Domain = pa
 		}
 		// 显式 provider_id 必须存在
 		if req.DDNSProviderID > 0 {
@@ -947,7 +954,7 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			if _, cerr := h.repo.FindCertificateForDomain(ctx, pa); cerr != nil {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(stdhttp.StatusBadRequest)
-				json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("DDNS 自动模式:找不到匹配 %s 的通配符证书,请先签发证书或显式选择 DNS 服务商", pa)})
+				json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("找不到匹配域名 %s 的证书，请在「DDNS 提供商」下拉菜单中直接选择具体的 DNS 服务商", pa)})
 				return
 			}
 		}
@@ -2016,15 +2023,25 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	// Validate DDNS before changing any other server fields. A failed provider or
 	// domain check must not leave the main server update half-applied.
 	if req.DDNSEnabled {
-		effectivePull := strings.TrimSpace(req.PullAddress)
+		effectivePull := strings.TrimSpace(req.Domain)
+		if effectivePull == "" {
+			effectivePull = strings.TrimSpace(req.PullAddress)
+		}
+		if effectivePull == "" {
+			effectivePull = strings.TrimSpace(oldServer.Domain)
+		}
 		if effectivePull == "" {
 			effectivePull = strings.TrimSpace(oldServer.PullAddress)
 		}
 		if effectivePull == "" || net.ParseIP(effectivePull) != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(stdhttp.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "DDNS 开启时,服务器地址必须填域名"})
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "DDNS 开启时,服务器必须填写域名"})
 			return
+		}
+		req.PullAddress = effectivePull
+		if strings.TrimSpace(req.Domain) == "" {
+			req.Domain = effectivePull
 		}
 		if req.DDNSProviderID > 0 {
 			if _, perr := h.repo.GetDNSProvider(ctx, req.DDNSProviderID); perr != nil {
@@ -2036,7 +2053,7 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		} else if _, cerr := h.repo.FindCertificateForDomain(ctx, effectivePull); cerr != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(stdhttp.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("DDNS 自动模式:找不到匹配 %s 的通配符证书,请先签发证书或显式选择 DNS 服务商", effectivePull)})
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("找不到匹配域名 %s 的证书，请在「DDNS 提供商」下拉菜单中直接选择具体的 DNS 服务商", effectivePull)})
 			return
 		}
 	}
@@ -2275,6 +2292,9 @@ func normalizeRemoteServerAddressUpdate(oldServer *storage.RemoteServer, req *Re
 	if newPull != oldPull && oldDomain != "" && oldDomain == oldPull && (newDomain == "" || newDomain == oldDomain) {
 		newDomain = newPull
 		req.Domain = newDomain
+	} else if newDomain != oldDomain && newDomain != "" && (newPull == "" || newPull == oldPull) {
+		newPull = newDomain
+		req.PullAddress = newPull
 	}
 
 	next := *oldServer

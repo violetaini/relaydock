@@ -1,6 +1,12 @@
 package handler
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/violetaini/relaydock/internal/storage"
@@ -39,6 +45,14 @@ func TestNormalizeRemoteServerAddressUpdateFollowsOnlyLinkedDomain(t *testing.T)
 			wantNew:    "new.example",
 			wantDomain: "",
 		},
+		{
+			name:       "updating domain synchronizes pull address when omitted",
+			server:     storage.RemoteServer{Domain: "old.example", PullAddress: "old.example", IPAddress: "192.0.2.10"},
+			request:    RemoteServerUpdateRequest{Domain: "unified.example", PullPort: 23889},
+			wantOld:    "old.example",
+			wantNew:    "unified.example",
+			wantDomain: "unified.example",
+		},
 	}
 
 	for _, tc := range tests {
@@ -59,5 +73,41 @@ func TestChooseClashServerHostFallsBackToIPv6(t *testing.T) {
 	server.IPv6Enabled = false
 	if got := chooseClashServerHost(server); got != "" {
 		t.Fatalf("chooseClashServerHost=%q with IPv6 disabled, want empty", got)
+	}
+}
+
+func TestCreateRemoteServerAcceptsDomainForDDNS(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	dp := &storage.DNSProvider{
+		Name: "Test DNS", ProviderType: "cloudflare", Credentials: `{"CF_DNS_API_TOKEN":"token"}`,
+	}
+	if err := repo.CreateDNSProvider(context.Background(), dp); err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(RemoteServerCreateRequest{
+		Name: "Unified DDNS", Domain: "unified.example.com",
+		DDNSEnabled: true, DDNSProviderID: dp.ID,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/remote-servers/create", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	NewXrayServerHandler(repo, nil, nil).CreateRemoteServer(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	servers, err := repo.ListRemoteServers(context.Background())
+	if err != nil || len(servers) != 1 {
+		t.Fatalf("expected 1 server, got %v (err=%v)", len(servers), err)
+	}
+	if servers[0].Domain != "unified.example.com" || servers[0].PullAddress != "unified.example.com" {
+		t.Fatalf("expected unified domain, got Domain=%q PullAddress=%q", servers[0].Domain, servers[0].PullAddress)
+	}
+	if !servers[0].DDNSEnabled || servers[0].DDNSProviderID != dp.ID {
+		t.Fatalf("DDNS settings not saved: enabled=%v provider=%d", servers[0].DDNSEnabled, servers[0].DDNSProviderID)
 	}
 }
