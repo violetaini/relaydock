@@ -239,11 +239,13 @@ func TestForwardingStorageOwnershipPortsAndIdentity(t *testing.T) {
 		if hop.ListenPort == second.Hops[i].ListenPort {
 			t.Fatalf("server %d reused port %d", hop.ServerID, hop.ListenPort)
 		}
-		if hop.ListenPort != first.AllocatedEntryPort || second.Hops[i].ListenPort != second.AllocatedEntryPort {
-			t.Fatalf("route does not use one common port: first=%+v second=%+v", first.Hops, second.Hops)
+		if i == 0 {
+			if hop.ListenPort != first.AllocatedEntryPort || second.Hops[0].ListenPort != second.AllocatedEntryPort {
+				t.Fatalf("hop 0 does not match allocated entry port: first=%+v second=%+v", first.Hops, second.Hops)
+			}
 		}
-		if i < len(first.Hops)-1 && hop.NextPort != first.AllocatedEntryPort {
-			t.Fatalf("hop %d next port=%d want common port %d", i, hop.NextPort, first.AllocatedEntryPort)
+		if i < len(first.Hops)-1 && hop.NextPort != first.Hops[i+1].ListenPort {
+			t.Fatalf("hop %d next port=%d want hop %d listen port %d", i, hop.NextPort, i+1, first.Hops[i+1].ListenPort)
 		}
 	}
 	if _, err := fixture.repo.GetUserForward(fixture.ctx, first.PublicID, "bob"); !errors.Is(err, ErrUserForwardNotFound) {
@@ -389,7 +391,7 @@ func TestForwardingTCPUDPExplicitCommonPortAndAtomicConflict(t *testing.T) {
 	}
 	for i, conflictNetwork := range []string{ForwardNetworkTCP, ForwardNetworkUDP} {
 		port := 2033 + i
-		if _, err := fixture.repo.db.ExecContext(fixture.ctx, `INSERT INTO server_port_allocations(server_id,network,port,owner_type,owner_id) VALUES(?,?,?,'test',?)`, fixture.servers[1].ID, conflictNetwork, port, 900+i); err != nil {
+		if _, err := fixture.repo.db.ExecContext(fixture.ctx, `INSERT INTO server_port_allocations(server_id,network,port,owner_type,owner_id) VALUES(?,?,?,'test',?)`, fixture.servers[0].ID, conflictNetwork, port, 900+i); err != nil {
 			t.Fatalf("seed %s conflict: %v", conflictNetwork, err)
 		}
 		if _, err := create("conflict-"+conflictNetwork, port); !errors.Is(err, ErrForwardingConflict) {
@@ -414,13 +416,16 @@ func TestForwardingTCPUDPExplicitCommonPortAndAtomicConflict(t *testing.T) {
 	if forward.Network != ForwardNetworkTCPUDP || forward.RequestedEntryPort != 2033 || forward.AllocatedEntryPort != 2033 || len(forward.Hops) != 3 {
 		t.Fatalf("unexpected explicit forward: %+v", forward)
 	}
+	if forward.Hops[0].ListenPort != 2033 {
+		t.Fatalf("hop 0 listen port=%d want 2033", forward.Hops[0].ListenPort)
+	}
 	for i, hop := range forward.Hops {
-		if hop.ListenPort != 2033 {
-			t.Fatalf("hop %d listen port=%d want 2033", i, hop.ListenPort)
+		if i < len(forward.Hops)-1 && hop.NextPort != forward.Hops[i+1].ListenPort {
+			t.Fatalf("hop %d next port=%d want hop %d listen port %d", i, hop.NextPort, i+1, forward.Hops[i+1].ListenPort)
 		}
-		if i < len(forward.Hops)-1 && hop.NextPort != 2033 {
-			t.Fatalf("hop %d next port=%d want 2033", i, hop.NextPort)
-		}
+	}
+	if forward.Hops[len(forward.Hops)-1].NextPort != 8443 {
+		t.Fatalf("last hop next port=%d want 8443", forward.Hops[len(forward.Hops)-1].NextPort)
 	}
 	protocolCounts := map[string]int{}
 	rows, err := fixture.repo.db.QueryContext(fixture.ctx, `SELECT network,COUNT(*) FROM server_port_allocations WHERE owner_type='forward_hop' AND owner_id IN (SELECT id FROM user_forward_hops WHERE forward_id=?) GROUP BY network`, forward.ID)
@@ -1150,5 +1155,83 @@ func TestForwardingDeleteArchivesUsageAndRecreateCannotResetQuota(t *testing.T) 
 	})
 	if !errors.Is(err, ErrForwardingForbidden) {
 		t.Fatalf("create after exhausted archived quota error=%v, want forbidden", err)
+	}
+}
+
+func TestBidirectionalForwardingSameEntryPort(t *testing.T) {
+	fixture := newForwardingStorageFixture(t)
+	tunnelForward, err := fixture.repo.CreateTunnelTemplate(fixture.ctx, TunnelTemplate{
+		Name: "A to B", State: TunnelStateActive, BillingMode: ManagedBillingBoth,
+		PortRangeStart: 2000, PortRangeEnd: 3000,
+		CreatedBy: "admin", Hops: []TunnelTemplateHop{{ServerID: fixture.servers[0].ID}, {ServerID: fixture.servers[1].ID}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunnelReverse, err := fixture.repo.CreateTunnelTemplate(fixture.ctx, TunnelTemplate{
+		Name: "B to A", State: TunnelStateActive, BillingMode: ManagedBillingBoth,
+		PortRangeStart: 2000, PortRangeEnd: 3000,
+		CreatedBy: "admin", Hops: []TunnelTemplateHop{{ServerID: fixture.servers[1].ID}, {ServerID: fixture.servers[0].ID}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(24 * time.Hour)
+	grantFwd, err := fixture.repo.CreateUserTunnelGrant(fixture.ctx, UserTunnelGrant{
+		Username: "alice", TunnelID: tunnelForward.ID, Enabled: true, StartsAt: time.Now().UTC().Add(-time.Hour),
+		ExpiresAt: &expires, MaxActiveForwards: 10, BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth),
+		AllowManagedTarget: true, CreatedBy: "admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grantRev, err := fixture.repo.CreateUserTunnelGrant(fixture.ctx, UserTunnelGrant{
+		Username: "alice", TunnelID: tunnelReverse.ID, Enabled: true, StartsAt: time.Now().UTC().Add(-time.Hour),
+		ExpiresAt: &expires, MaxActiveForwards: 10, BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth),
+		AllowManagedTarget: true, CreatedBy: "admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create forward from A to B with entry port 2022
+	fwd, err := fixture.repo.CreateUserForward(fixture.ctx, CreateUserForwardInput{
+		Username: "alice", Name: "fwd-a-b", GrantPublicID: grantFwd.PublicID,
+		TargetNodeID: 1, TargetHost: "198.51.100.1", TargetPort: 443,
+		RequestedEntryPort: 2022, EffectiveExpiresAt: &expires, Actor: "alice",
+	})
+	if err != nil {
+		t.Fatalf("create forward A->B with port 2022: %v", err)
+	}
+	if fwd.AllocatedEntryPort != 2022 || fwd.Hops[0].ListenPort != 2022 {
+		t.Fatalf("fwd entry port=%d hop0=%d want 2022", fwd.AllocatedEntryPort, fwd.Hops[0].ListenPort)
+	}
+
+	// Create reverse forward from B to A ALSO with entry port 2022
+	rev, err := fixture.repo.CreateUserForward(fixture.ctx, CreateUserForwardInput{
+		Username: "alice", Name: "rev-b-a", GrantPublicID: grantRev.PublicID,
+		TargetNodeID: 2, TargetHost: "198.51.100.2", TargetPort: 443,
+		RequestedEntryPort: 2022, EffectiveExpiresAt: &expires, Actor: "alice",
+	})
+	if err != nil {
+		t.Fatalf("create reverse B->A with port 2022 (should succeed): %v", err)
+	}
+	if rev.AllocatedEntryPort != 2022 || rev.Hops[0].ListenPort != 2022 {
+		t.Fatalf("rev entry port=%d hop0=%d want 2022", rev.AllocatedEntryPort, rev.Hops[0].ListenPort)
+	}
+
+	// Verify both tunnels are valid and non-conflicting
+	if fwd.Hops[0].NextPort != fwd.Hops[1].ListenPort {
+		t.Fatalf("fwd broken chain: hop0.next=%d hop1.listen=%d", fwd.Hops[0].NextPort, fwd.Hops[1].ListenPort)
+	}
+	if rev.Hops[0].NextPort != rev.Hops[1].ListenPort {
+		t.Fatalf("rev broken chain: hop0.next=%d hop1.listen=%d", rev.Hops[0].NextPort, rev.Hops[1].ListenPort)
+	}
+	// Verify neither intermediate hop squatted on 2022 on the opposite server
+	if fwd.Hops[1].ListenPort == 2022 {
+		t.Fatalf("fwd hop 1 squatted on 2022")
+	}
+	if rev.Hops[1].ListenPort == 2022 {
+		t.Fatalf("rev hop 1 squatted on 2022")
 	}
 }

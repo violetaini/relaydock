@@ -719,7 +719,7 @@ func (h *ForwardingHandler) userForwardDTO(ctx context.Context, f storage.UserFo
 }
 
 func (h *ForwardingHandler) resolveManagedForwardTarget(ctx context.Context, username string, nodeID int64) (storage.Node, string, int, *time.Time, error) {
-	hasNodeAccess := hasEffectiveManagedNodeAccess(ctx, h.repo, username, nodeID)
+	hasNodeAccess := userIsAdmin(ctx, h.repo, username) || hasEffectiveManagedNodeAccess(ctx, h.repo, username, nodeID)
 	if !hasNodeAccess {
 		directNodeIDs, err := h.repo.ListEffectiveDirectNodeIDs(ctx, username, time.Now().UTC())
 		if err != nil {
@@ -740,11 +740,14 @@ func (h *ForwardingHandler) resolveManagedForwardTarget(ctx context.Context, use
 		strings.TrimSpace(raw.OriginalServer) == "" || strings.TrimSpace(raw.InboundTag) == "" {
 		return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
 	}
-	userNodes := substituteNodesForUser(ctx, h.repo, username, []storage.Node{raw})
-	if len(userNodes) != 1 || userNodes[0].ID != nodeID {
-		return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
+	node := raw
+	if !userIsAdmin(ctx, h.repo, username) {
+		userNodes := substituteNodesForUser(ctx, h.repo, username, []storage.Node{raw})
+		if len(userNodes) != 1 || userNodes[0].ID != nodeID {
+			return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
+		}
+		node = userNodes[0]
 	}
-	node := userNodes[0]
 	if node.NodeType != "" && node.NodeType != "physical" {
 		return storage.Node{}, "", 0, nil, storage.ErrForwardingInvalid
 	}
@@ -774,17 +777,20 @@ func (h *ForwardingHandler) resolveManagedForwardTarget(ctx context.Context, use
 	if _, err := netip.ParseAddr(host); err != nil {
 		return storage.Node{}, "", 0, nil, storage.ErrForwardingInvalid
 	}
-	hasAccess, expiry, err := h.repo.HasEffectiveUserInboundAccess(ctx, username, server.ID, node.InboundTag, 0, time.Now().UTC())
-	if err != nil {
-		return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
-	}
-	hasDirectAccess, directExpiry, err := h.repo.HasEffectiveDirectUserInboundAccess(ctx, username, server.ID, node.InboundTag, 0, time.Now().UTC())
-	if err != nil {
-		return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
-	}
-	hasAccess, expiry = laterOptionalExpiry(hasAccess, expiry, hasDirectAccess, directExpiry)
-	if !hasAccess {
-		return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
+	var expiry *time.Time
+	if !userIsAdmin(ctx, h.repo, username) {
+		hasAccess, userExpiry, err := h.repo.HasEffectiveUserInboundAccess(ctx, username, server.ID, node.InboundTag, 0, time.Now().UTC())
+		if err != nil {
+			return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
+		}
+		hasDirectAccess, directExpiry, err := h.repo.HasEffectiveDirectUserInboundAccess(ctx, username, server.ID, node.InboundTag, 0, time.Now().UTC())
+		if err != nil {
+			return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
+		}
+		hasAccess, expiry = laterOptionalExpiry(hasAccess, userExpiry, hasDirectAccess, directExpiry)
+		if !hasAccess {
+			return storage.Node{}, "", 0, nil, storage.ErrForwardingForbidden
+		}
 	}
 	return node, host, port, expiry, nil
 }
@@ -1307,13 +1313,21 @@ func forwardNeedsPortConvergence(f *storage.UserForwardRule) bool {
 	if f == nil || len(f.Hops) == 0 {
 		return false
 	}
-	commonPort := f.Hops[0].ListenPort
-	for i, hop := range f.Hops {
-		if hop.ListenPort != commonPort {
+	if f.AllocatedEntryPort <= 0 || f.Hops[0].ListenPort != f.AllocatedEntryPort {
+		return true
+	}
+	for i := 0; i < len(f.Hops); i++ {
+		if f.Hops[i].ListenPort <= 0 {
 			return true
 		}
-		if i+1 < len(f.Hops) && hop.NextPort != commonPort {
-			return true
+		if i+1 < len(f.Hops) {
+			if f.Hops[i].NextPort <= 0 || f.Hops[i].NextPort != f.Hops[i+1].ListenPort {
+				return true
+			}
+		} else {
+			if f.TargetPort > 0 && f.Hops[i].NextPort != f.TargetPort {
+				return true
+			}
 		}
 	}
 	return false

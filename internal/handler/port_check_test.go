@@ -28,14 +28,14 @@ func TestPortCheckAdminUserAndForwardingFlows(t *testing.T) {
 		agent1Calls++
 		port, _ := strconv.Atoi(r.URL.Query().Get("port"))
 		w.Header().Set("Content-Type", "application/json")
-		if port == 30222 {
+		if port == 30222 || port == 24001 {
 			_ = json.NewEncoder(w).Encode(PortCheckResult{
 				Success:    true,
 				Port:       port,
 				Available:  false,
 				OccupiedBy: "system_listener",
 				Network:    "tcp",
-				Reason:     "端口 30222 已被本机 TCP 进程占用 (0.0.0.0:30222)",
+				Reason:     fmt.Sprintf("端口 %d 已被本机 TCP 进程占用 (0.0.0.0:%d)", port, port),
 			})
 			return
 		}
@@ -253,25 +253,36 @@ func TestPortCheckAdminUserAndForwardingFlows(t *testing.T) {
 		t.Fatalf("expected tunnel_range failure for 2033, got code=%d out=%+v", rec.Code, out)
 	}
 
-	// Hop 2 UDP conflict on 24002
+	// Entry hop (srv1) conflict on 24001
+	fwdReq = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/user/forwards/port-check?grant_id=%s&port=24001", grant.PublicID), nil)
+	fwdReq = fwdReq.WithContext(auth.ContextWithUsername(fwdReq.Context(), "alice"))
+	rec = httptest.NewRecorder()
+	forwarding.HandleUserForwardPortCheck(rec, fwdReq)
+	out = PortCheckResult{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if rec.Code != http.StatusOK || out.Available || out.OccupiedBy != "system_listener" || out.ServerID != srv1.ID {
+		t.Fatalf("expected entry hop system_listener conflict on 24001, got code=%d out=%+v", rec.Code, out)
+	}
+
+	// Preflight also rejects requested_entry_port=24001 with 409 Conflict
+	preflightBody := []byte(fmt.Sprintf(`{"grant_id":%q,"name":"conflict-test","requested_entry_port":24001,"target":{"type":"managed_node","node_id":%d}}`, grant.PublicID, node.ID))
+	preReq := httptest.NewRequest(http.MethodPost, "/api/user/forwards/preflight", bytes.NewReader(preflightBody))
+	preReq = preReq.WithContext(auth.ContextWithUsername(preReq.Context(), "alice"))
+	rec = httptest.NewRecorder()
+	forwarding.HandleUserForwardPreflight(rec, preReq)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 conflict from preflight on occupied port 24001, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Hop 2 occupation on 24002 does NOT block entry hop (srv1) from using 24002
 	fwdReq = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/user/forwards/port-check?grant_id=%s&port=24002", grant.PublicID), nil)
 	fwdReq = fwdReq.WithContext(auth.ContextWithUsername(fwdReq.Context(), "alice"))
 	rec = httptest.NewRecorder()
 	forwarding.HandleUserForwardPortCheck(rec, fwdReq)
 	out = PortCheckResult{}
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
-	if rec.Code != http.StatusOK || out.Available || out.OccupiedBy != "xray_inbound" || out.ServerID != srv2.ID {
-		t.Fatalf("expected hop 2 xray_inbound conflict on 24002, got code=%d out=%+v", rec.Code, out)
-	}
-
-	// Preflight also rejects requested_entry_port=24002 with 409 Conflict
-	preflightBody := []byte(fmt.Sprintf(`{"grant_id":%q,"name":"conflict-test","requested_entry_port":24002,"target":{"type":"managed_node","node_id":%d}}`, grant.PublicID, node.ID))
-	preReq := httptest.NewRequest(http.MethodPost, "/api/user/forwards/preflight", bytes.NewReader(preflightBody))
-	preReq = preReq.WithContext(auth.ContextWithUsername(preReq.Context(), "alice"))
-	rec = httptest.NewRecorder()
-	forwarding.HandleUserForwardPreflight(rec, preReq)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("expected 409 conflict from preflight on occupied port 24002, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK || !out.Available {
+		t.Fatalf("expected entry hop to allow 24002 even if hop 2 has it occupied, got code=%d out=%+v", rec.Code, out)
 	}
 
 	// Free port 25000 succeeds across both hops

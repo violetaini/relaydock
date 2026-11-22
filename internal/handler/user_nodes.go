@@ -46,10 +46,23 @@ func (h *UserNodesHandler) HandleListNodes(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	nodeIDs, err := ResolveEffectiveUserNodeIDs(ctx, h.repo, username, time.Now().UTC())
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "获取有效节点失败")
-		return
+	var nodeIDs []int64
+	if userIsAdmin(ctx, h.repo, username) {
+		adminNodes, err := h.repo.ListNodes(ctx, username)
+		if err == nil {
+			for _, n := range adminNodes {
+				if n.Enabled && (n.NodeType == "" || n.NodeType == "physical") {
+					nodeIDs = append(nodeIDs, n.ID)
+				}
+			}
+		}
+	} else {
+		resolvedIDs, err := ResolveEffectiveUserNodeIDs(ctx, h.repo, username, time.Now().UTC())
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "获取有效节点失败")
+			return
+		}
+		nodeIDs = resolvedIDs
 	}
 
 	var nodes []userNodeInfo
@@ -535,10 +548,23 @@ func (h *UserNodesHandler) HandlePublicNodes(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	nodeIDs, err := ResolveEffectiveUserNodeIDs(ctx, h.repo, username, time.Now().UTC())
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "获取有效节点失败")
-		return
+	var nodeIDs []int64
+	if userIsAdmin(ctx, h.repo, username) {
+		adminNodes, err := h.repo.ListNodes(ctx, username)
+		if err == nil {
+			for _, n := range adminNodes {
+				if n.Enabled && (n.NodeType == "" || n.NodeType == "physical") {
+					nodeIDs = append(nodeIDs, n.ID)
+				}
+			}
+		}
+	} else {
+		resolvedIDs, err := ResolveEffectiveUserNodeIDs(ctx, h.repo, username, time.Now().UTC())
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "获取有效节点失败")
+			return
+		}
+		nodeIDs = resolvedIDs
 	}
 
 	servers, _ := h.repo.ListRemoteServers(ctx)

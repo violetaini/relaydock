@@ -330,46 +330,49 @@ func (h *ForwardingHandler) checkForwardPortAcrossHops(
 			Reason:     fmt.Sprintf("端口 %d 不在模板允许范围 %d-%d 内", port, tunnel.PortRangeStart, tunnel.PortRangeEnd),
 		}, nil
 	}
+	if len(tunnel.Hops) == 0 {
+		return PortCheckResult{
+			Success:   true,
+			Port:      port,
+			Available: true,
+			Network:   "tcp,udp",
+			Reason:    fmt.Sprintf("端口 %d 可用", port),
+		}, nil
+	}
+	entryHop := tunnel.Hops[0]
 	rm := h.resolveRemoteManager()
-	seenServers := make(map[int64]bool, len(tunnel.Hops))
-	for _, hop := range tunnel.Hops {
-		if seenServers[hop.ServerID] {
-			continue
-		}
-		seenServers[hop.ServerID] = true
-		if rm != nil {
-			res, err := rm.checkServerPortAvailability(ctx, hop.ServerID, port, "dokodemo-door", "tcp,udp", "")
-			if err != nil {
-				return PortCheckResult{}, err
-			}
-			if !res.Available {
-				label := res.ServerName
-				if label == "" {
-					label = fmt.Sprintf("节点 #%d", hop.ServerID)
-				}
-				res.Reason = fmt.Sprintf("中转节点 %s：%s", label, res.Reason)
-				return res, nil
-			}
-		} else if ownerType, allocNet, found, err := h.repo.FindOccupiedForwardPortAllocation(ctx, hop.ServerID, []string{"tcp", "udp"}, port); err != nil {
+	if rm != nil {
+		res, err := rm.checkServerPortAvailability(ctx, entryHop.ServerID, port, "dokodemo-door", "tcp,udp", "")
+		if err != nil {
 			return PortCheckResult{}, err
-		} else if found {
-			return PortCheckResult{
-				Success:    true,
-				Port:       port,
-				Available:  false,
-				OccupiedBy: "forward_allocation",
-				Network:    allocNet,
-				ServerID:   hop.ServerID,
-				Reason:     fmt.Sprintf("节点 #%d 端口 %d 已被转发规则端口池占用 (%s)", hop.ServerID, port, ownerType),
-			}, nil
 		}
+		if !res.Available {
+			label := res.ServerName
+			if label == "" {
+				label = fmt.Sprintf("入口节点 #%d", entryHop.ServerID)
+			}
+			res.Reason = fmt.Sprintf("入口节点 %s：%s", label, res.Reason)
+			return res, nil
+		}
+	} else if ownerType, allocNet, found, err := h.repo.FindOccupiedForwardPortAllocation(ctx, entryHop.ServerID, []string{"tcp", "udp"}, port); err != nil {
+		return PortCheckResult{}, err
+	} else if found {
+		return PortCheckResult{
+			Success:    true,
+			Port:       port,
+			Available:  false,
+			OccupiedBy: "forward_allocation",
+			Network:    allocNet,
+			ServerID:   entryHop.ServerID,
+			Reason:     fmt.Sprintf("入口节点 #%d 端口 %d 已被转发规则端口池占用 (%s)", entryHop.ServerID, port, ownerType),
+		}, nil
 	}
 	return PortCheckResult{
 		Success:   true,
 		Port:      port,
 		Available: true,
 		Network:   "tcp,udp",
-		Reason:    fmt.Sprintf("全链路共 %d 台节点均未占用端口 %d", len(seenServers), port),
+		Reason:    fmt.Sprintf("入口节点端口 %d 可用", port),
 	}, nil
 }
 

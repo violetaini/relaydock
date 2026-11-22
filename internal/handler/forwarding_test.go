@@ -422,13 +422,18 @@ func TestForwardNeedsPortConvergence(t *testing.T) {
 		hops []storage.UserForwardHop
 		want bool
 	}{
-		{name: "common route", hops: base},
-		{name: "different listen port", hops: []storage.UserForwardHop{{ListenPort: 2033, NextPort: 2034}, {ListenPort: 2034, NextPort: 443}}, want: true},
+		{name: "common route", hops: base, want: false},
+		{name: "decoupled connected route", hops: []storage.UserForwardHop{{ListenPort: 2033, NextPort: 2034}, {ListenPort: 2034, NextPort: 443}}, want: false},
 		{name: "different intermediate next port", hops: []storage.UserForwardHop{{ListenPort: 2033, NextPort: 2040}, {ListenPort: 2033, NextPort: 443}}, want: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := forwardNeedsPortConvergence(&storage.UserForwardRule{Hops: test.hops}); got != test.want {
+			rule := &storage.UserForwardRule{
+				AllocatedEntryPort: test.hops[0].ListenPort,
+				TargetPort:         443,
+				Hops:               test.hops,
+			}
+			if got := forwardNeedsPortConvergence(rule); got != test.want {
 				t.Fatalf("forwardNeedsPortConvergence()=%t want=%t", got, test.want)
 			}
 		})
@@ -443,11 +448,15 @@ func TestForwardingLegacyRouteConvergesBeforeDeploymentAndCleansOldIdentities(t 
 	if legacyPort > 65535 {
 		legacyPort = oldPort - 1
 	}
+	disjointPort := legacyPort + 1
+	if disjointPort > 65535 {
+		disjointPort = legacyPort - 2
+	}
 	db, err := sql.Open("sqlite", fixture.dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `UPDATE user_forward_hops SET next_port=? WHERE id=?`, legacyPort, fixture.forward.Hops[0].ID); err != nil {
+	if _, err := db.ExecContext(ctx, `UPDATE user_forward_hops SET next_port=? WHERE id=?`, disjointPort, fixture.forward.Hops[0].ID); err != nil {
 		_ = db.Close()
 		t.Fatal(err)
 	}
@@ -486,9 +495,9 @@ func TestForwardingLegacyRouteConvergesBeforeDeploymentAndCleansOldIdentities(t 
 	if forwardNeedsPortConvergence(updated) {
 		t.Fatalf("route did not converge: %+v", updated.Hops)
 	}
-	commonPort := updated.Hops[0].ListenPort
-	if updated.AllocatedEntryPort != commonPort || commonPort == oldPort || commonPort == legacyPort {
-		t.Fatalf("converged entry port=%d allocated=%d old=%d legacy=%d", commonPort, updated.AllocatedEntryPort, oldPort, legacyPort)
+	entryPort := updated.Hops[0].ListenPort
+	if updated.AllocatedEntryPort != entryPort || entryPort == oldPort || entryPort == legacyPort {
+		t.Fatalf("converged entry port=%d allocated=%d old=%d legacy=%d", entryPort, updated.AllocatedEntryPort, oldPort, legacyPort)
 	}
 	for i, hop := range updated.Hops {
 		if oldResourceIDs[hop.ResourceID] {
@@ -520,8 +529,8 @@ func TestForwardingLegacyRouteConvergesBeforeDeploymentAndCleansOldIdentities(t 
 		}
 	}
 	for _, spec := range fixture.deployer.specs {
-		if spec.ListenPort != commonPort || fixture.deployer.state[spec.ResourceID] != "active" {
-			t.Fatalf("new deployment was not converged and active: %+v state=%q", spec, fixture.deployer.state[spec.ResourceID])
+		if fixture.deployer.state[spec.ResourceID] != "active" {
+			t.Fatalf("new deployment was not active: %+v state=%q", spec, fixture.deployer.state[spec.ResourceID])
 		}
 	}
 }
@@ -759,18 +768,18 @@ func TestTunnelSpecNormalizesPreviousHopHostCIDRs(t *testing.T) {
 	}
 }
 
-func TestForwardingAllHopsShareOneTCPUDPPort(t *testing.T) {
+func TestForwardingHopRouteChainAndTCPUDPNetwork(t *testing.T) {
 	fixture := newForwardingHandlerFixture(t)
 	if len(fixture.forward.Hops) < 2 {
 		t.Fatalf("hops=%d", len(fixture.forward.Hops))
 	}
-	port := fixture.forward.Hops[0].ListenPort
+	entryPort := fixture.forward.Hops[0].ListenPort
+	if fixture.forward.AllocatedEntryPort != entryPort {
+		t.Fatalf("allocated entry port=%d want=%d", fixture.forward.AllocatedEntryPort, entryPort)
+	}
 	for i, hop := range fixture.forward.Hops {
-		if hop.ListenPort != port {
-			t.Fatalf("hop %d listen port=%d want=%d", i, hop.ListenPort, port)
-		}
-		if i+1 < len(fixture.forward.Hops) && hop.NextPort != port {
-			t.Fatalf("hop %d next port=%d want=%d", i, hop.NextPort, port)
+		if i+1 < len(fixture.forward.Hops) && hop.NextPort != fixture.forward.Hops[i+1].ListenPort {
+			t.Fatalf("hop %d next port=%d want hop %d listen port %d", i, hop.NextPort, i+1, fixture.forward.Hops[i+1].ListenPort)
 		}
 	}
 	fixture.deployer.mu.Lock()

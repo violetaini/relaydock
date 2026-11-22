@@ -1572,17 +1572,29 @@ COALESCE((SELECT SUM(`+forwardBilledUsageExpression+`) FROM user_forward_usage u
 		return nil, err
 	}
 	forwardID, _ := res.LastInsertId()
-	serverIDs := make([]int64, len(seeds))
-	for i := range seeds {
-		serverIDs[i] = seeds[i].sid
-	}
-	port, err := findCommonForwardPortTx(ctx, tx, serverIDs, forwardNetwork, t.PortRangeStart, t.PortRangeEnd, in.RequestedEntryPort, nil)
+	entryPort, err := findCommonForwardPortTx(ctx, tx, []int64{seeds[0].sid}, forwardNetwork, t.PortRangeStart, t.PortRangeEnd, in.RequestedEntryPort, nil)
 	if err != nil {
 		return nil, err
+	}
+	hopPorts := make([]int, len(seeds))
+	hopPorts[0] = entryPort
+	for i := 1; i < len(seeds); i++ {
+		// Intermediate and egress hops (Hop 1..N-1) allocate internal transit ports.
+		// Exclude entryPort when possible so the transit server's entryPort remains available for reverse tunnels.
+		excluded := map[int]bool{entryPort: true}
+		transitPort, err := findCommonForwardPortTx(ctx, tx, []int64{seeds[i].sid}, forwardNetwork, t.PortRangeStart, t.PortRangeEnd, 0, excluded)
+		if err != nil && errors.Is(err, ErrForwardingLimit) {
+			transitPort, err = findCommonForwardPortTx(ctx, tx, []int64{seeds[i].sid}, forwardNetwork, t.PortRangeStart, t.PortRangeEnd, 0, nil)
+		}
+		if err != nil {
+			return nil, err
+		}
+		hopPorts[i] = transitPort
 	}
 	hopIDs := make([]int64, len(seeds))
 	resourceTags := make([]string, len(seeds))
 	for i, s := range seeds {
+		port := hopPorts[i]
 		allocationIDs, err := reserveForwardPortTx(ctx, tx, s.sid, forwardNetwork, port)
 		if err != nil {
 			return nil, err
@@ -1603,13 +1615,14 @@ COALESCE((SELECT SUM(`+forwardBilledUsageExpression+`) FROM user_forward_usage u
 	for i := range seeds {
 		nextHost, nextPort := in.TargetHost, in.TargetPort
 		if i < len(seeds)-1 {
-			nextHost, nextPort = seeds[i+1].host, port
+			nextHost = seeds[i+1].host
+			nextPort = hopPorts[i+1]
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE user_forward_hops SET next_host=?,next_port=? WHERE id=?`, nextHost, nextPort, hopIDs[i]); err != nil {
 			return nil, err
 		}
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE user_forward_rules SET allocated_entry_port=? WHERE id=?`, port, forwardID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE user_forward_rules SET allocated_entry_port=? WHERE id=?`, entryPort, forwardID); err != nil {
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO user_forward_usage(forward_id,cycle_started_at) VALUES(?,?)`, forwardID, time.Now().UTC()); err != nil {
@@ -1824,18 +1837,33 @@ JOIN tunnel_templates t ON t.id=g.tunnel_id
 			return nil, err
 		}
 	}
-	serverIDs := make([]int64, len(forward.Hops))
-	excluded := make(map[int]bool, len(forward.Hops))
-	for i, hop := range forward.Hops {
-		serverIDs[i] = hop.ServerID
-		excluded[hop.ListenPort] = true
-	}
-	port, err := findCommonForwardPortTx(ctx, tx, serverIDs, ForwardNetworkTCPUDP, portStart, portEnd, 0, excluded)
+	hop0Excluded := map[int]bool{forward.Hops[0].ListenPort: true}
+	entryPort, err := findCommonForwardPortTx(ctx, tx, []int64{forward.Hops[0].ServerID}, ForwardNetworkTCPUDP, portStart, portEnd, 0, hop0Excluded)
 	if err != nil {
 		return nil, err
 	}
+	hopPorts := make([]int, len(forward.Hops))
+	hopPorts[0] = entryPort
+	for i := 1; i < len(forward.Hops); i++ {
+		excluded := map[int]bool{
+			entryPort:                  true,
+			forward.Hops[i].ListenPort: true,
+		}
+		transitPort, err := findCommonForwardPortTx(ctx, tx, []int64{forward.Hops[i].ServerID}, ForwardNetworkTCPUDP, portStart, portEnd, 0, excluded)
+		if err != nil && errors.Is(err, ErrForwardingLimit) {
+			transitPort, err = findCommonForwardPortTx(ctx, tx, []int64{forward.Hops[i].ServerID}, ForwardNetworkTCPUDP, portStart, portEnd, 0, map[int]bool{forward.Hops[i].ListenPort: true})
+		}
+		if err != nil && errors.Is(err, ErrForwardingLimit) {
+			transitPort, err = findCommonForwardPortTx(ctx, tx, []int64{forward.Hops[i].ServerID}, ForwardNetworkTCPUDP, portStart, portEnd, 0, nil)
+		}
+		if err != nil {
+			return nil, err
+		}
+		hopPorts[i] = transitPort
+	}
 	resourceTags := make([]string, len(forward.Hops))
 	for i, hop := range forward.Hops {
+		port := hopPorts[i]
 		allocationIDs, err := reserveForwardPortTx(ctx, tx, hop.ServerID, ForwardNetworkTCPUDP, port)
 		if err != nil {
 			return nil, err
@@ -1852,11 +1880,11 @@ JOIN tunnel_templates t ON t.id=g.tunnel_id
 		}
 	}
 	for i := 0; i < len(forward.Hops)-1; i++ {
-		if _, err := tx.ExecContext(ctx, `UPDATE user_forward_hops SET next_port=? WHERE id=?`, port, forward.Hops[i].ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE user_forward_hops SET next_port=? WHERE id=?`, hopPorts[i+1], forward.Hops[i].ID); err != nil {
 			return nil, err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE user_forward_rules SET network=?,allocated_entry_port=?,observed_state='pending',generation=generation+1,applied_generation=0,last_error_code='',last_error_detail='',updated_at=CURRENT_TIMESTAMP WHERE id=?`, ForwardNetworkTCPUDP, port, forward.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE user_forward_rules SET network=?,allocated_entry_port=?,observed_state='pending',generation=generation+1,applied_generation=0,last_error_code='',last_error_detail='',updated_at=CURRENT_TIMESTAMP WHERE id=?`, ForwardNetworkTCPUDP, entryPort, forward.ID); err != nil {
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE user_forward_usage SET last_raw_uplink=0,last_raw_downlink=0,updated_at=CURRENT_TIMESTAMP WHERE forward_id=?`, forward.ID); err != nil {
