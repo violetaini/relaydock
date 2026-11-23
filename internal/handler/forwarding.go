@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"net/netip"
 	"sort"
@@ -1324,6 +1325,10 @@ func (h *ForwardingHandler) handleForwardItem(w http.ResponseWriter, r *http.Req
 		h.writeForwardClientConfig(w, r, f, username)
 		return
 	}
+	if (action == "probe" || action == "health") && (r.Method == http.MethodGet || r.Method == http.MethodPost) {
+		h.handleForwardProbe(w, r, f)
+		return
+	}
 	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -1495,6 +1500,83 @@ func (h *ForwardingHandler) writeForwardClientConfig(w http.ResponseWriter, r *h
 		out = cfg
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "config": out})
+}
+
+type ForwardProbeResponse struct {
+	Success   bool    `json:"success"`
+	LatencyMs float64 `json:"latency_ms"`
+	Status    string  `json:"status"` // "healthy", "degraded", "error"
+	Message   string  `json:"message,omitempty"`
+	EntryHost string  `json:"entry_host,omitempty"`
+	EntryPort int     `json:"entry_port,omitempty"`
+	ProbeType string  `json:"probe_type"`
+	CheckedAt int64   `json:"checked_at"`
+}
+
+func (h *ForwardingHandler) handleForwardProbe(w http.ResponseWriter, r *http.Request, f *storage.UserForwardRule) {
+	var entryHost string
+	var entryPort int
+	if len(f.Hops) > 0 {
+		if s, err := h.repo.GetRemoteServer(r.Context(), f.Hops[0].ServerID); err == nil && s != nil {
+			entryHost = serverEntryHost(s)
+		}
+		entryPort = f.Hops[0].ListenPort
+	}
+	if entryPort <= 0 {
+		entryPort = f.AllocatedEntryPort
+	}
+
+	if strings.TrimSpace(entryHost) == "" || entryPort <= 0 {
+		writeJSON(w, http.StatusOK, ForwardProbeResponse{
+			Success:   false,
+			Status:    "error",
+			Message:   "转发入口尚未生成或未激活",
+			CheckedAt: time.Now().Unix(),
+		})
+		return
+	}
+
+	timeout := 4 * time.Second
+	addr := net.JoinHostPort(entryHost, strconv.Itoa(entryPort))
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	latency := float64(time.Since(start).Milliseconds())
+
+	if err != nil {
+		writeJSON(w, http.StatusOK, ForwardProbeResponse{
+			Success:   false,
+			LatencyMs: 0,
+			Status:    "error",
+			Message:   fmt.Sprintf("入口连接失败: %v", err),
+			EntryHost: entryHost,
+			EntryPort: entryPort,
+			ProbeType: "tcp_handshake",
+			CheckedAt: time.Now().Unix(),
+		})
+		return
+	}
+	_ = conn.Close()
+
+	status := "healthy"
+	if latency > 300 {
+		status = "degraded"
+	}
+
+	msg := "入口通信正常，链路就绪"
+	if f.ObservedState != storage.ForwardObservedActive {
+		msg = fmt.Sprintf("入口通信正常，但当前状态为 %s", f.ObservedState)
+	}
+
+	writeJSON(w, http.StatusOK, ForwardProbeResponse{
+		Success:   true,
+		LatencyMs: latency,
+		Status:    status,
+		Message:   msg,
+		EntryHost: entryHost,
+		EntryPort: entryPort,
+		ProbeType: "tcp_handshake",
+		CheckedAt: time.Now().Unix(),
+	})
 }
 
 func (h *ForwardingHandler) acquireForwardLeases(ctx context.Context, hops []storage.UserForwardHop) (context.Context, func(), error) {

@@ -859,6 +859,8 @@ func main() {
 	// 通过 Agent 确认入站运行状态并测量管理链路 RTT。
 	mux.Handle("/api/admin/tcping", auth.RequireToken(tokenStore, userRepo, handler.NewTCPingHandler(repo, remoteManageHandler)))
 	mux.Handle("/api/admin/tcping/batch", auth.RequireToken(tokenStore, userRepo, handler.NewTCPingBatchHandler(repo, remoteManageHandler)))
+	mux.Handle("/api/user/tcping", auth.RequireToken(tokenStore, userRepo, handler.NewTCPingHandler(repo, remoteManageHandler)))
+	mux.Handle("/api/user/tcping/batch", auth.RequireToken(tokenStore, userRepo, handler.NewTCPingBatchHandler(repo, remoteManageHandler)))
 
 	// 子服务器模式配置
 	// 确定我们是否处于儿童/远程模式：

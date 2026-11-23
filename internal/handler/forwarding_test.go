@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -1150,6 +1151,72 @@ func TestForwardingCustomPublicTarget(t *testing.T) {
 	fixture.handler.HandleUserForward(cfgRec, cfgReq)
 	if cfgRec.Code != http.StatusOK {
 		t.Fatalf("client-config status=%d body=%s", cfgRec.Code, cfgRec.Body.String())
+	}
+}
+
+func TestForwardProbeHealthCheck(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+
+	// Create a local TCP listener to simulate the forward entry port
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	tcpPort := ln.Addr().(*net.TCPAddr).Port
+
+	db, err := sql.Open("sqlite", fixture.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Update entry server IP to 127.0.0.1 and entry hop listen port to tcpPort
+	entryServerID := fixture.forward.Hops[0].ServerID
+	if _, err := db.Exec(`UPDATE remote_servers SET ip_address='127.0.0.1' WHERE id=?`, entryServerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE user_forward_rules SET allocated_entry_port=? WHERE id=?`, tcpPort, fixture.forward.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE user_forward_hops SET listen_port=? WHERE forward_id=? AND position=0`, tcpPort, fixture.forward.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Probe active responding port -> returns healthy
+	probeReq := httptest.NewRequest(http.MethodPost, "/api/user/forwards/"+fixture.forward.PublicID+"/probe", nil)
+	probeReq.SetPathValue("id", fixture.forward.PublicID)
+	probeReq.SetPathValue("action", "probe")
+	probeReq = probeReq.WithContext(auth.ContextWithUsername(probeReq.Context(), "alice"))
+	probeRec := httptest.NewRecorder()
+	fixture.handler.HandleUserForward(probeRec, probeReq)
+
+	if probeRec.Code != http.StatusOK {
+		t.Fatalf("probe status=%d body=%s", probeRec.Code, probeRec.Body.String())
+	}
+
+	var res ForwardProbeResponse
+	if err := json.Unmarshal(probeRec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if !res.Success || res.Status != "healthy" || res.EntryPort != tcpPort {
+		t.Fatalf("unexpected probe response: %+v", res)
+	}
+
+	// 2. Close listener -> probe returns error
+	ln.Close()
+	probeRec2 := httptest.NewRecorder()
+	fixture.handler.HandleUserForward(probeRec2, probeReq)
+	if probeRec2.Code != http.StatusOK {
+		t.Fatalf("probe status=%d body=%s", probeRec2.Code, probeRec2.Body.String())
+	}
+	var res2 ForwardProbeResponse
+	if err := json.Unmarshal(probeRec2.Body.Bytes(), &res2); err != nil {
+		t.Fatal(err)
+	}
+	if res2.Success || res2.Status != "error" {
+		t.Fatalf("expected closed port to fail probe, got: %+v", res2)
 	}
 }
 
