@@ -1060,3 +1060,18 @@ func TestPublicProbeAddressGuard(t *testing.T) {
 		t.Fatal("expected public resolver addresses to be allowed")
 	}
 }
+
+func TestTCPingOverrideServerAndPort(t *testing.T) {
+	config := `{"name":"test","type":"shadowsocks","server":"origin.example.com","port":52143,"cipher":"aes-128-gcm","password":"secret"}`
+	overridden := overrideMihomoConfigServer(config, "188.253.6.193", 2056)
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(overridden), &parsed); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if parsed["server"] != "188.253.6.193" {
+		t.Fatalf("server = %v, want 188.253.6.193", parsed["server"])
+	}
+	if parsed["port"] != float64(2056) {
+		t.Fatalf("port = %v, want 2056", parsed["port"])
+	}
+}

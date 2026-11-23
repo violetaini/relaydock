@@ -29,11 +29,13 @@ var errManagedWireGuardInboundUnowned = errors.New("managed WireGuard inbound ha
 // node_id. Host/port cannot describe the credentials needed for a real Mihomo
 // protocol test and are therefore no longer accepted as an alternate target.
 type TCPingRequest struct {
-	NodeID   int64  `json:"node_id,omitempty"`
-	Host     string `json:"host,omitempty"`
-	Port     int    `json:"port,omitempty"`
-	Timeout  int    `json:"timeout"`
-	Protocol string `json:"protocol,omitempty"`
+	NodeID         int64  `json:"node_id,omitempty"`
+	Host           string `json:"host,omitempty"`
+	Port           int    `json:"port,omitempty"`
+	Timeout        int    `json:"timeout"`
+	Protocol       string `json:"protocol,omitempty"`
+	OverrideServer string `json:"override_server,omitempty"`
+	OverridePort   int    `json:"override_port,omitempty"`
 }
 
 type TCPingResponse struct {
@@ -201,6 +203,10 @@ func (h *tcpingHandler) resolveRequests(ctx context.Context, requests []TCPingRe
 			resolved[index] = resolvedTCPingRequest{resolveStatus: http.StatusUnprocessableEntity, resolveError: fmt.Sprintf("节点 %d 缺少有效的服务器地址", node.ID)}
 			continue
 		}
+		if strings.TrimSpace(request.OverrideServer) != "" && request.OverridePort > 0 {
+			request.Host = strings.TrimSpace(request.OverrideServer)
+			request.Port = request.OverridePort
+		}
 		resolved[index] = resolvedTCPingRequest{
 			request: request, node: node, dialerChain: chain, publicOnly: !isAdmin,
 		}
@@ -314,10 +320,13 @@ func (h *tcpingHandler) prepareMihomoLatencyTarget(ctx context.Context, resolved
 	configs := make([]string, 0, len(nodes))
 	wireGuardRelayBypass := make([]bool, 0, len(nodes))
 	hosts := make(map[string]string)
-	for _, node := range nodes {
+	for i, node := range nodes {
 		config, relayBypass, err := h.mihomoProbeConfigForNode(ctx, node, wireGuardCache, timeout)
 		if err != nil {
 			return speedtest.ProtocolLatencyTarget{}, err
+		}
+		if i == 0 && strings.TrimSpace(resolved.request.OverrideServer) != "" && resolved.request.OverridePort > 0 {
+			config = overrideMihomoConfigServer(config, resolved.request.OverrideServer, resolved.request.OverridePort)
 		}
 		if resolved.publicOnly {
 			if err := validatePublicMihomoProbeOverrides(config); err != nil {
@@ -344,6 +353,24 @@ func (h *tcpingHandler) prepareMihomoLatencyTarget(ctx context.Context, resolved
 		ClashConfig: configs[0], DialerChain: configs[1:], Hosts: hosts,
 		WireGuardRelayBypass: wireGuardRelayBypass, Timeout: timeout,
 	}, nil
+}
+
+func overrideMihomoConfigServer(rawConfig, overrideServer string, overridePort int) string {
+	var proxy map[string]interface{}
+	if err := json.Unmarshal([]byte(rawConfig), &proxy); err != nil || proxy == nil {
+		return rawConfig
+	}
+	if strings.TrimSpace(overrideServer) != "" {
+		proxy["server"] = strings.TrimSpace(overrideServer)
+	}
+	if overridePort > 0 {
+		proxy["port"] = overridePort
+	}
+	encoded, err := json.Marshal(proxy)
+	if err != nil {
+		return rawConfig
+	}
+	return string(encoded)
 }
 
 func (h *tcpingHandler) mihomoProbeConfigForNode(ctx context.Context, node storage.Node, cache map[string]cachedWireGuardProbePeer, timeout time.Duration) (string, bool, error) {
