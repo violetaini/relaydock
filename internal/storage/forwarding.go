@@ -1265,6 +1265,48 @@ func forwardingBoolInt(v bool) int {
 	return 0
 }
 
+func (r *TrafficRepository) EnsureAdminTunnelGrant(ctx context.Context, username string, tunnelID int64) (*UserTunnelGrant, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		username = "admin"
+	}
+	existing, err := scanTunnelGrant(r.db.QueryRowContext(ctx, selectTunnelGrant+` WHERE username=? AND tunnel_id=?`, username, tunnelID))
+	if err == nil {
+		if !existing.Enabled {
+			_, _ = r.db.ExecContext(ctx, `UPDATE user_tunnel_grants SET enabled=1, updated_at=CURRENT_TIMESTAMP WHERE id=?`, existing.ID)
+			existing.Enabled = true
+		}
+		return &existing, nil
+	}
+	// Verify tunnel template exists
+	if _, err := r.GetTunnelTemplateByID(ctx, tunnelID); err != nil {
+		return nil, err
+	}
+	billing := "both"
+	pubID := forwardingID("grt_")
+	now := time.Now().UTC()
+	res, err := r.db.ExecContext(ctx, `INSERT INTO user_tunnel_grants(
+public_id,username,tunnel_id,enabled,starts_at,expires_at,max_active_forwards,
+per_forward_speed_mbps,per_forward_connection_limit,traffic_limit_bytes,billing_mode_override,
+allow_managed_target,allow_custom_public_target,source_type,source_package_id,created_by)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		pubID, username, tunnelID, 1, now, nil, 1000, 0, 0, 0, billing, 1, 0, GrantSourceManual, nil, username)
+	if err != nil {
+		row := r.db.QueryRowContext(ctx, selectTunnelGrant+` WHERE username=? AND tunnel_id=?`, username, tunnelID)
+		g, scanErr := scanTunnelGrant(row)
+		if scanErr == nil {
+			return &g, nil
+		}
+		return nil, err
+	}
+	gID, _ := res.LastInsertId()
+	created, err := r.GetUserTunnelGrantByID(ctx, gID)
+	if err != nil {
+		return r.GetUserTunnelGrant(ctx, pubID, username)
+	}
+	return created, nil
+}
+
 func (r *TrafficRepository) GetUserTunnelGrant(ctx context.Context, publicID, username string) (*UserTunnelGrant, error) {
 	q := selectTunnelGrant + ` WHERE public_id=?`
 	args := []any{strings.TrimSpace(publicID)}
@@ -2284,3 +2326,110 @@ func (r *TrafficRepository) ListForwardAudit(ctx context.Context, username, enti
 	}
 	return items, rows.Err()
 }
+
+type UpdateUserForwardInput struct {
+	Name               string
+	TargetNodeID       int64
+	TargetHost         string
+	TargetPort         int
+	RequestedEntryPort int
+	SourceCIDRs        []string
+	Actor              string
+}
+
+func (r *TrafficRepository) UpdateUserForward(ctx context.Context, publicID, username string, in UpdateUserForwardInput) (*UserForwardRule, error) {
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" {
+		return nil, ErrForwardingInvalid
+	}
+	username = strings.TrimSpace(username)
+	leasedCtx, releaseAuthorization, err := r.AcquireUserAuthorizationLease(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuthorization()
+	ctx = leasedCtx
+	r.managedNodeMu.Lock()
+	defer r.managedNodeMu.Unlock()
+	f, err := r.GetUserForward(ctx, publicID, username)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if in.SourceCIDRs == nil {
+		in.SourceCIDRs = []string{}
+	}
+	sourceCIDRsJSON, err := json.Marshal(in.SourceCIDRs)
+	if err != nil {
+		return nil, ErrForwardingInvalid
+	}
+
+	targetChanged := false
+	targetHost := f.TargetHost
+	targetPort := f.TargetPort
+	targetNodeID := f.TargetNodeID
+	if in.TargetNodeID > 0 && (in.TargetNodeID != f.TargetNodeID || (in.TargetHost != "" && in.TargetHost != f.TargetHost) || (in.TargetPort > 0 && in.TargetPort != f.TargetPort)) {
+		targetChanged = true
+		targetNodeID = in.TargetNodeID
+		if in.TargetHost != "" {
+			targetHost = in.TargetHost
+		}
+		if in.TargetPort > 0 {
+			targetPort = in.TargetPort
+		}
+	}
+
+	allocatedEntryPort := f.AllocatedEntryPort
+	requestedEntryPort := f.RequestedEntryPort
+	if in.RequestedEntryPort > 0 && in.RequestedEntryPort != f.AllocatedEntryPort {
+		var portStart, portEnd int
+		if err := tx.QueryRowContext(ctx, `SELECT t.port_range_start, t.port_range_end FROM user_forward_rules f JOIN user_tunnel_grants g ON g.id=f.grant_id JOIN tunnel_templates t ON t.id=g.tunnel_id WHERE f.id=?`, f.ID).Scan(&portStart, &portEnd); err != nil {
+			return nil, err
+		}
+		if in.RequestedEntryPort < portStart || in.RequestedEntryPort > portEnd {
+			return nil, ErrForwardingInvalid
+		}
+		if len(f.Hops) == 0 {
+			return nil, ErrForwardingConflict
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM server_port_allocations WHERE owner_type='forward_hop' AND owner_id=?`, f.Hops[0].ID); err != nil {
+			return nil, err
+		}
+		allocIDs, err := reserveForwardPortTx(ctx, tx, f.Hops[0].ServerID, f.Network, in.RequestedEntryPort)
+		if err != nil {
+			return nil, err
+		}
+		for _, aid := range allocIDs {
+			if _, err = tx.ExecContext(ctx, `UPDATE server_port_allocations SET owner_id=? WHERE id=?`, f.Hops[0].ID, aid); err != nil {
+				return nil, err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE user_forward_hops SET listen_port=?, generation=generation+1, updated_at=CURRENT_TIMESTAMP WHERE id=?`, in.RequestedEntryPort, f.Hops[0].ID); err != nil {
+			return nil, err
+		}
+		allocatedEntryPort = in.RequestedEntryPort
+		requestedEntryPort = in.RequestedEntryPort
+	}
+
+	if _, err = tx.ExecContext(ctx, `UPDATE user_forward_rules SET name=?, target_node_id=?, target_host=?, target_port=?, source_cidrs=?, requested_entry_port=?, allocated_entry_port=?, generation=generation+1, updated_at=CURRENT_TIMESTAMP WHERE id=?`, in.Name, targetNodeID, targetHost, targetPort, string(sourceCIDRsJSON), requestedEntryPort, allocatedEntryPort, f.ID); err != nil {
+		return nil, err
+	}
+
+	if targetChanged {
+		if _, err = tx.ExecContext(ctx, `UPDATE user_forward_hops SET next_host=?, next_port=?, generation=generation+1, updated_at=CURRENT_TIMESTAMP WHERE forward_id=? AND position=(SELECT MAX(position) FROM user_forward_hops WHERE forward_id=?)`, targetHost, targetPort, f.ID, f.ID); err != nil {
+			return nil, err
+		}
+	}
+
+	_ = insertForwardAudit(ctx, tx, in.Actor, "update", "user_forward", f.ID, f.Username, fmt.Sprintf("target_node_id=%d port=%d", targetNodeID, allocatedEntryPort))
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return r.GetUserForward(ctx, publicID, username)
+}
+

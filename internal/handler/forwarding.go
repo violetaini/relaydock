@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -465,7 +466,7 @@ func (h *ForwardingHandler) HandleAdminUserTunnelGrant(w http.ResponseWriter, r 
 		return
 	}
 	if current.SourceType == storage.GrantSourcePackage {
-		writeForwardingError(w, storage.ErrForwardingForbidden)
+		writeJSONError(w, http.StatusForbidden, "套餐授权的隧道禁止在此修改，请在套餐管理中调整")
 		return
 	}
 	switch r.Method {
@@ -514,7 +515,7 @@ func (h *ForwardingHandler) HandleAdminUserTunnelGrantAction(w http.ResponseWrit
 		return
 	}
 	if current.SourceType == storage.GrantSourcePackage {
-		writeForwardingError(w, storage.ErrForwardingForbidden)
+		writeJSONError(w, http.StatusForbidden, "套餐授权的隧道禁止在此修改，请在套餐管理中调整")
 		return
 	}
 	var body struct {
@@ -646,6 +647,46 @@ func (h *ForwardingHandler) HandleUserTunnelGrants(w http.ResponseWriter, r *htt
 	for _, item := range items {
 		out = append(out, userGrantResponse(item))
 	}
+	if userIsAdmin(r.Context(), h.repo, username) {
+		templates, tErr := h.repo.ListTunnelTemplates(r.Context())
+		if tErr == nil {
+			coveredTunnels := make(map[int64]bool)
+			for _, item := range items {
+				coveredTunnels[item.TunnelID] = true
+			}
+			for _, tpl := range templates {
+				if tpl.State != "active" {
+					continue
+				}
+				if !coveredTunnels[tpl.ID] {
+					billing := tpl.BillingMode
+					var route []string
+					for _, hop := range tpl.Hops {
+						route = append(route, hop.ServerName)
+					}
+					out = append(out, userTunnelGrantResponse{
+						ID:                     "admin_auto_" + strconv.FormatInt(tpl.ID, 10),
+						TunnelID:               strconv.FormatInt(tpl.ID, 10),
+						Name:                   tpl.Name,
+						TunnelName:             tpl.Name,
+						Description:            tpl.Description,
+						State:                  "active",
+						Route:                  route,
+						StartsAt:               time.Now().UTC(),
+						ExpiresAt:              nil,
+						MaxActiveForwards:      1000,
+						ActiveForwardCount:     0,
+						PerForwardSpeedMbps:    0,
+						PerForwardConnectionLimit: 0,
+						TrafficLimitBytes:      0,
+						UsedBytes:              0,
+						BillingMode:            billing,
+						TrafficMultiplierMilli: tpl.TrafficMultiplierMilli,
+					})
+				}
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "grants": out})
 }
 
@@ -662,32 +703,63 @@ type createForwardRequest struct {
 }
 
 type userForwardResponse struct {
-	ID                 string     `json:"id"`
-	Name               string     `json:"name"`
-	GrantID            string     `json:"grant_id"`
-	TargetNodeID       int64      `json:"target_node_id"`
-	TargetName         string     `json:"target_name,omitempty"`
-	Network            string     `json:"network"`
-	EntryHost          string     `json:"entry_host,omitempty"`
-	EntryPort          int        `json:"entry_port"`
-	RequestedEntryPort int        `json:"requested_entry_port"`
-	DesiredState       string     `json:"desired_state"`
-	ObservedState      string     `json:"observed_state"`
-	SuspendReason      string     `json:"suspend_reason"`
-	EffectiveExpiresAt *time.Time `json:"effective_expires_at,omitempty"`
-	LastErrorCode      string     `json:"last_error_code,omitempty"`
-	Route              []string   `json:"route"`
-	SourceCIDRs        []string   `json:"source_cidrs"`
-	UplinkBytes        int64      `json:"uplink_bytes"`
-	DownlinkBytes      int64      `json:"downlink_bytes"`
-	BilledBytes        int64      `json:"billed_bytes"`
-	CreatedAt          time.Time  `json:"created_at"`
+	ID                 string                   `json:"id"`
+	Name               string                   `json:"name"`
+	GrantID            string                   `json:"grant_id"`
+	Username           string                   `json:"username,omitempty"`
+	TargetType         string                   `json:"target_type"`
+	TargetNodeID       int64                    `json:"target_node_id,omitempty"`
+	TargetName         string                   `json:"target_name,omitempty"`
+	TargetHost         string                   `json:"target_host,omitempty"`
+	TargetPort         int                      `json:"target_port,omitempty"`
+	Network            string                   `json:"network"`
+	EntryHost          string                   `json:"entry_host,omitempty"`
+	EntryPort          int                      `json:"entry_port"`
+	AllocatedEntryPort int                      `json:"allocated_entry_port,omitempty"`
+	RequestedEntryPort int                      `json:"requested_entry_port"`
+	DesiredState       string                   `json:"desired_state"`
+	ObservedState      string                   `json:"observed_state"`
+	SuspendReason      string                   `json:"suspend_reason"`
+	EffectiveExpiresAt *time.Time               `json:"effective_expires_at,omitempty"`
+	LastErrorCode      string                   `json:"last_error_code,omitempty"`
+	Route              []string                 `json:"route"`
+	SourceCIDRs        []string                 `json:"source_cidrs"`
+	SpeedLimitMbps     float64                  `json:"speed_limit_mbps,omitempty"`
+	ConnectionLimit    int                      `json:"connection_limit,omitempty"`
+	UplinkBytes        int64                    `json:"uplink_bytes"`
+	DownlinkBytes      int64                    `json:"downlink_bytes"`
+	BilledBytes        int64                    `json:"billed_bytes"`
+	TrafficUsedBytes   int64                    `json:"traffic_used_bytes,omitempty"`
+	CreatedAt          time.Time                `json:"created_at"`
+	Hops               []storage.UserForwardHop `json:"hops,omitempty"`
 }
 
 func (h *ForwardingHandler) userForwardDTO(ctx context.Context, f storage.UserForwardRule) userForwardResponse {
-	out := userForwardResponse{ID: f.PublicID, Name: f.Name, TargetNodeID: f.TargetNodeID, Network: f.Network, SourceCIDRs: f.SourceCIDRs, EntryPort: f.AllocatedEntryPort, RequestedEntryPort: f.RequestedEntryPort, DesiredState: f.DesiredState, ObservedState: f.ObservedState, SuspendReason: f.SuspendReason, EffectiveExpiresAt: f.EffectiveExpiresAt, LastErrorCode: f.LastErrorCode, CreatedAt: f.CreatedAt}
+	out := userForwardResponse{
+		ID:                 f.PublicID,
+		Name:               f.Name,
+		Username:           f.Username,
+		TargetType:         f.TargetType,
+		TargetNodeID:       f.TargetNodeID,
+		TargetHost:         f.TargetHost,
+		TargetPort:         f.TargetPort,
+		Network:            f.Network,
+		SourceCIDRs:        f.SourceCIDRs,
+		EntryPort:          f.AllocatedEntryPort,
+		AllocatedEntryPort: f.AllocatedEntryPort,
+		RequestedEntryPort: f.RequestedEntryPort,
+		DesiredState:       f.DesiredState,
+		ObservedState:      f.ObservedState,
+		SuspendReason:      f.SuspendReason,
+		EffectiveExpiresAt: f.EffectiveExpiresAt,
+		LastErrorCode:      f.LastErrorCode,
+		CreatedAt:          f.CreatedAt,
+		Hops:               f.Hops,
+	}
 	if g, err := h.repo.GetUserTunnelGrantByID(ctx, f.GrantID); err == nil {
 		out.GrantID = g.PublicID
+		out.SpeedLimitMbps = g.PerForwardSpeedMbps
+		out.ConnectionLimit = g.PerForwardConnectionLimit
 	}
 	if n, err := h.repo.GetNodeByID(ctx, f.TargetNodeID); err == nil {
 		out.TargetName = n.NodeName
@@ -697,6 +769,7 @@ func (h *ForwardingHandler) userForwardDTO(ctx context.Context, f storage.UserFo
 	}
 	if usage, err := h.repo.GetUserForwardUsage(ctx, f.ID); err == nil {
 		out.UplinkBytes, out.DownlinkBytes = usage.UplinkBytes, usage.DownlinkBytes
+		out.TrafficUsedBytes = usage.UplinkBytes + usage.DownlinkBytes
 		switch f.BillingModeSnapshot {
 		case storage.ManagedBillingBoth:
 			out.BilledBytes = usage.UplinkBytes + usage.DownlinkBytes
@@ -905,25 +978,49 @@ func (h *ForwardingHandler) HandleUserForwardPreflight(w http.ResponseWriter, r 
 		return
 	}
 	username := auth.UsernameFromContext(r.Context())
-	g, err := h.repo.GetUserTunnelGrant(r.Context(), req.GrantID, username)
-	if err != nil {
-		writeForwardingError(w, err)
-		return
-	}
-	grants, err := h.repo.ListUserTunnelGrants(r.Context(), username)
-	if err != nil {
-		writeForwardingError(w, err)
-		return
-	}
-	state := ""
-	for _, item := range grants {
-		if item.ID == g.ID {
-			state = item.State
+	isAdmin := userIsAdmin(r.Context(), h.repo, username)
+	var g *storage.UserTunnelGrant
+	if isAdmin {
+		if strings.HasPrefix(req.GrantID, "admin_auto_") || strings.HasPrefix(req.GrantID, "admin_") || (!strings.HasPrefix(req.GrantID, "grt_") && !strings.Contains(req.GrantID, "-")) {
+			tidStr := strings.TrimPrefix(req.GrantID, "admin_auto_")
+			tidStr = strings.TrimPrefix(tidStr, "admin_")
+			if tid, parseErr := strconv.ParseInt(tidStr, 10, 64); parseErr == nil && tid > 0 {
+				g, _ = h.repo.EnsureAdminTunnelGrant(r.Context(), username, tid)
+			}
 		}
 	}
-	if state != "active" {
-		writeForwardingError(w, storage.ErrForwardingForbidden)
-		return
+	if g == nil {
+		var err error
+		g, err = h.repo.GetUserTunnelGrant(r.Context(), req.GrantID, username)
+		if err != nil && isAdmin {
+			if tid, parseErr := strconv.ParseInt(req.GrantID, 10, 64); parseErr == nil && tid > 0 {
+				g, _ = h.repo.EnsureAdminTunnelGrant(r.Context(), username, tid)
+			}
+		}
+		if g == nil {
+			writeForwardingError(w, err)
+			return
+		}
+	}
+	state := "active"
+	var grants []storage.UserTunnelGrant
+	if !isAdmin {
+		var err error
+		grants, err = h.repo.ListUserTunnelGrants(r.Context(), username)
+		if err != nil {
+			writeForwardingError(w, err)
+			return
+		}
+		state = ""
+		for _, item := range grants {
+			if item.ID == g.ID {
+				state = item.State
+			}
+		}
+		if state != "active" {
+			writeForwardingError(w, storage.ErrForwardingForbidden)
+			return
+		}
 	}
 	tunnel, err := h.repo.GetTunnelTemplateByID(r.Context(), g.TunnelID)
 	if err != nil {
@@ -991,11 +1088,31 @@ func (h *ForwardingHandler) HandleUserForwards(w http.ResponseWriter, r *http.Re
 			writeForwardingError(w, err)
 			return
 		}
-		g, err := h.repo.GetUserTunnelGrant(r.Context(), req.GrantID, username)
-		if err != nil {
-			writeForwardingError(w, err)
-			return
+		isAdmin := userIsAdmin(r.Context(), h.repo, username)
+		var g *storage.UserTunnelGrant
+		if isAdmin {
+			if strings.HasPrefix(req.GrantID, "admin_auto_") || strings.HasPrefix(req.GrantID, "admin_") || (!strings.HasPrefix(req.GrantID, "grt_") && !strings.Contains(req.GrantID, "-")) {
+				tidStr := strings.TrimPrefix(req.GrantID, "admin_auto_")
+				tidStr = strings.TrimPrefix(tidStr, "admin_")
+				if tid, parseErr := strconv.ParseInt(tidStr, 10, 64); parseErr == nil && tid > 0 {
+					g, _ = h.repo.EnsureAdminTunnelGrant(r.Context(), username, tid)
+				}
+			}
 		}
+		if g == nil {
+			var err error
+			g, err = h.repo.GetUserTunnelGrant(r.Context(), req.GrantID, username)
+			if err != nil && isAdmin {
+				if tid, parseErr := strconv.ParseInt(req.GrantID, 10, 64); parseErr == nil && tid > 0 {
+					g, _ = h.repo.EnsureAdminTunnelGrant(r.Context(), username, tid)
+				}
+			}
+			if g == nil {
+				writeForwardingError(w, err)
+				return
+			}
+		}
+		req.GrantID = g.PublicID
 		tunnel, err := h.repo.GetTunnelTemplateByID(r.Context(), g.TunnelID)
 		if err != nil {
 			writeForwardingError(w, err)
@@ -1064,7 +1181,11 @@ func (h *ForwardingHandler) HandleAdminForwards(w http.ResponseWriter, r *http.R
 		writeForwardingError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "forwards": items})
+	out := make([]userForwardResponse, 0, len(items))
+	for _, item := range items {
+		out = append(out, h.userForwardDTO(r.Context(), item))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "forwards": out})
 }
 
 // HandleUserForward and HandleAdminForward dispatch item actions by the final path segment.
@@ -1089,11 +1210,11 @@ func (h *ForwardingHandler) handleForwardItem(w http.ResponseWriter, r *http.Req
 	}
 	action := strings.TrimSpace(r.PathValue("action"))
 	if action == "" && r.Method == http.MethodGet {
-		if admin {
-			writeJSON(w, http.StatusOK, map[string]any{"success": true, "forward": f})
-		} else {
-			writeJSON(w, http.StatusOK, map[string]any{"success": true, "forward": h.userForwardDTO(r.Context(), *f)})
-		}
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "forward": h.userForwardDTO(r.Context(), *f)})
+		return
+	}
+	if action == "" && (r.Method == http.MethodPut || r.Method == http.MethodPatch) {
+		h.handleUpdateForward(w, r, f, username, admin)
 		return
 	}
 	if r.Method == http.MethodDelete {
@@ -1131,11 +1252,77 @@ func (h *ForwardingHandler) handleForwardItem(w http.ResponseWriter, r *http.Req
 		writeForwardingError(w, err)
 		return
 	}
-	if admin {
-		writeJSON(w, http.StatusOK, map[string]any{"success": true, "forward": latest})
-	} else {
-		writeJSON(w, http.StatusOK, map[string]any{"success": true, "forward": h.userForwardDTO(r.Context(), *latest)})
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "forward": h.userForwardDTO(r.Context(), *latest)})
+}
+
+type updateForwardRequest struct {
+	Name               string   `json:"name"`
+	TargetNodeID       int64    `json:"target_node_id"`
+	RequestedEntryPort int      `json:"requested_entry_port"`
+	SourceCIDRs        []string `json:"source_cidrs"`
+}
+
+func (h *ForwardingHandler) handleUpdateForward(w http.ResponseWriter, r *http.Request, f *storage.UserForwardRule, username string, admin bool) {
+	var req updateForwardRequest
+	if !decodeForwardingJSON(w, r, &req) {
+		return
 	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeForwardingError(w, storage.ErrForwardingInvalid)
+		return
+	}
+	sourceCIDRs, err := normalizeForwardSourceCIDRs(req.SourceCIDRs)
+	if err != nil {
+		writeForwardingError(w, err)
+		return
+	}
+	targetUser := username
+	if targetUser == "" {
+		targetUser = f.Username
+	}
+	targetNodeID := f.TargetNodeID
+	targetHost := f.TargetHost
+	targetPort := f.TargetPort
+	if req.TargetNodeID > 0 && req.TargetNodeID != f.TargetNodeID {
+		node, host, port, _, err := h.resolveManagedForwardTarget(r.Context(), targetUser, req.TargetNodeID)
+		if err != nil {
+			writeForwardingError(w, err)
+			return
+		}
+		targetNodeID = node.ID
+		targetHost = host
+		targetPort = port
+	}
+
+	actor := username
+	if admin {
+		actor = managedActor(r)
+	}
+
+	updated, err := h.repo.UpdateUserForward(r.Context(), f.PublicID, username, storage.UpdateUserForwardInput{
+		Name:               req.Name,
+		TargetNodeID:       targetNodeID,
+		TargetHost:         targetHost,
+		TargetPort:         targetPort,
+		RequestedEntryPort: req.RequestedEntryPort,
+		SourceCIDRs:        sourceCIDRs,
+		Actor:              actor,
+	})
+	if err != nil {
+		writeForwardingError(w, err)
+		return
+	}
+
+	if updated.DesiredState == storage.ForwardDesiredActive {
+		_ = h.deployForward(r.Context(), updated)
+	}
+
+	latest, err := h.repo.GetUserForward(r.Context(), f.PublicID, username)
+	if err != nil || latest == nil {
+		latest = updated
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "forward": h.userForwardDTO(r.Context(), *latest)})
 }
 
 func (h *ForwardingHandler) writeForwardClientConfig(w http.ResponseWriter, r *http.Request, f *storage.UserForwardRule, username string) {

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -914,3 +915,155 @@ func TestTunnelTemplateWritesHoldServerMutationLeasesAcrossProbeAndCommit(t *tes
 		})
 	}
 }
+
+func TestForwardingUpdateNameAndTargetNode(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	// Create a forward first
+	createReq := httptest.NewRequest(http.MethodPost, "/api/user/forwards", strings.NewReader(fmt.Sprintf(`{"name":"original-fwd","grant_id":"%s","target":{"type":"managed_node","node_id":%d},"network":"tcp_udp"}`, fixture.grant.PublicID, fixture.nodeID)))
+	createReq = createReq.WithContext(auth.ContextWithUsername(createReq.Context(), "alice"))
+	createRec := httptest.NewRecorder()
+	fixture.handler.HandleUserForwards(createRec, createReq)
+	if createRec.Code != http.StatusCreated && createRec.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var created struct {
+		Forward userForwardResponse `json:"forward"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	// Update name and entry port
+	updateReq := httptest.NewRequest(http.MethodPut, "/api/user/forwards/"+created.Forward.ID, strings.NewReader(`{"name":"updated-fwd","requested_entry_port":2099,"target_node_id":`+fmt.Sprint(fixture.nodeID)+`,"source_cidrs":["10.0.0.1/32"]}`))
+	updateReq.SetPathValue("id", created.Forward.ID)
+	updateReq = updateReq.WithContext(auth.ContextWithUsername(updateReq.Context(), "alice"))
+	updateRec := httptest.NewRecorder()
+	fixture.handler.HandleUserForward(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", updateRec.Code, updateRec.Body.String())
+	}
+	var updated struct {
+		Forward userForwardResponse `json:"forward"`
+	}
+	if err := json.Unmarshal(updateRec.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Forward.Name != "updated-fwd" {
+		t.Fatalf("expected updated-fwd, got %s", updated.Forward.Name)
+	}
+	if updated.Forward.AllocatedEntryPort != 2099 || updated.Forward.EntryPort != 2099 {
+		t.Fatalf("expected entry port 2099, got allocated=%d entry=%d", updated.Forward.AllocatedEntryPort, updated.Forward.EntryPort)
+	}
+	if len(updated.Forward.SourceCIDRs) != 1 || updated.Forward.SourceCIDRs[0] != "10.0.0.1/32" {
+		t.Fatalf("expected source cidr, got %v", updated.Forward.SourceCIDRs)
+	}
+}
+
+func TestForwardingPackageGrantRejectEdit(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	db, err := sql.Open("sqlite", fixture.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	// Mark existing grant as source_type = 'package'
+	_, err = db.ExecContext(ctx, `UPDATE user_tunnel_grants SET source_type = ? WHERE public_id = ?`,
+		storage.GrantSourcePackage, fixture.grant.PublicID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Admin attempts to edit the package grant -> must return 403 Forbidden
+	putReq := httptest.NewRequest(http.MethodPut, "/api/admin/users/alice/tunnel-grants/"+fixture.grant.PublicID, strings.NewReader(`{"max_active_forwards":10}`))
+	putReq.SetPathValue("username", "alice")
+	putReq.SetPathValue("id", fixture.grant.PublicID)
+	putReq = putReq.WithContext(auth.ContextWithUsername(putReq.Context(), "admin"))
+	putRec := httptest.NewRecorder()
+	fixture.handler.HandleAdminUserTunnelGrant(putRec, putReq)
+
+	if putRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for package grant edit, got %d: %s", putRec.Code, putRec.Body.String())
+	}
+	if !strings.Contains(putRec.Body.String(), "套餐授权的隧道禁止在此修改") {
+		t.Fatalf("expected package forbidden message, got %s", putRec.Body.String())
+	}
+
+	// Admin attempts to suspend the package grant -> must return 403 Forbidden
+	actReq := httptest.NewRequest(http.MethodPost, "/api/admin/users/alice/tunnel-grants/"+fixture.grant.PublicID+"/actions/suspend", nil)
+	actReq.SetPathValue("username", "alice")
+	actReq.SetPathValue("id", fixture.grant.PublicID)
+	actReq.SetPathValue("action", "suspend")
+	actReq = actReq.WithContext(auth.ContextWithUsername(actReq.Context(), "admin"))
+	actRec := httptest.NewRecorder()
+	fixture.handler.HandleAdminUserTunnelGrantAction(actRec, actReq)
+
+	if actRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for package grant action, got %d: %s", actRec.Code, actRec.Body.String())
+	}
+
+	// Admin attempts to delete the package grant -> must return 403 Forbidden
+	delReq := httptest.NewRequest(http.MethodDelete, "/api/admin/users/alice/tunnel-grants/"+fixture.grant.PublicID, nil)
+	delReq.SetPathValue("username", "alice")
+	delReq.SetPathValue("id", fixture.grant.PublicID)
+	delReq = delReq.WithContext(auth.ContextWithUsername(delReq.Context(), "admin"))
+	delRec := httptest.NewRecorder()
+	fixture.handler.HandleAdminUserTunnelGrant(delRec, delReq)
+
+	if delRec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for package grant delete, got %d: %s", delRec.Code, delRec.Body.String())
+	}
+}
+
+func TestForwardingAdminAutoTunnelGrant(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+
+	// Admin lists grants via GET /api/user/tunnel-grants -> should include synthetic grant for active template
+	getReq := httptest.NewRequest(http.MethodGet, "/api/user/tunnel-grants", nil)
+	getReq = getReq.WithContext(auth.ContextWithUsername(getReq.Context(), "admin"))
+	getRec := httptest.NewRecorder()
+	fixture.handler.HandleUserTunnelGrants(getRec, getReq)
+
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", getRec.Code, getRec.Body.String())
+	}
+	var resp struct {
+		Grants []userTunnelGrantResponse `json:"grants"`
+	}
+	if err := json.Unmarshal(getRec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, g := range resp.Grants {
+		if g.TunnelID == fmt.Sprint(fixture.grant.TunnelID) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected admin to have auto access to tunnel %d, grants=%+v", fixture.grant.TunnelID, resp.Grants)
+	}
+
+	// Admin preflights forward with synthetic grant ID
+	syntheticGrantID := fmt.Sprintf("admin_auto_%d", fixture.grant.TunnelID)
+	preReq := httptest.NewRequest(http.MethodPost, "/api/user/forwards/preflight", strings.NewReader(fmt.Sprintf(`{"name":"admin-fwd","grant_id":"%s","target":{"type":"managed_node","node_id":%d},"network":"tcp_udp"}`, syntheticGrantID, fixture.nodeID)))
+	preReq = preReq.WithContext(auth.ContextWithUsername(preReq.Context(), "admin"))
+	preRec := httptest.NewRecorder()
+	fixture.handler.HandleUserForwardPreflight(preRec, preReq)
+
+	if preRec.Code != http.StatusOK {
+		t.Fatalf("preflight status=%d body=%s", preRec.Code, preRec.Body.String())
+	}
+
+	// Admin creates forward with synthetic grant ID
+	createReq := httptest.NewRequest(http.MethodPost, "/api/user/forwards", strings.NewReader(fmt.Sprintf(`{"name":"admin-fwd","grant_id":"%s","target":{"type":"managed_node","node_id":%d},"network":"tcp_udp"}`, syntheticGrantID, fixture.nodeID)))
+	createReq = createReq.WithContext(auth.ContextWithUsername(createReq.Context(), "admin"))
+	createRec := httptest.NewRecorder()
+	fixture.handler.HandleUserForwards(createRec, createReq)
+
+	if createRec.Code != http.StatusCreated && createRec.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+}
+
