@@ -374,7 +374,7 @@ func (h *ForwardingHandler) grantModel(ctx context.Context, username string, req
 		tunnelID = t.ID
 	}
 	if math.IsNaN(req.PerForwardSpeedMbps) || math.IsInf(req.PerForwardSpeedMbps, 0) || req.PerForwardSpeedMbps < 0 ||
-		req.PerForwardConnectionLimit != 0 || req.AllowCustomPublicTarget {
+		req.PerForwardConnectionLimit != 0 {
 		return storage.UserTunnelGrant{}, storage.ErrForwardingInvalid
 	}
 	if err := requireForwardingSpeedCapability(ctx, h.repo, h.limiterPusher, tunnelID, req.PerForwardSpeedMbps); err != nil {
@@ -398,7 +398,7 @@ func (h *ForwardingHandler) grantModel(ctx context.Context, username string, req
 		PerForwardSpeedMbps:       req.PerForwardSpeedMbps,
 		PerForwardConnectionLimit: req.PerForwardConnectionLimit,
 		TrafficLimitBytes:         req.TrafficLimitBytes, BillingModeOverride: req.BillingModeOverride,
-		AllowManagedTarget: true, CreatedBy: actor,
+		AllowManagedTarget: true, AllowCustomPublicTarget: req.AllowCustomPublicTarget, CreatedBy: actor,
 		SourceType: func() string {
 			if existing != nil {
 				return existing.SourceType
@@ -698,7 +698,9 @@ type createForwardRequest struct {
 	SourceCIDRs        []string `json:"source_cidrs"`
 	Target             struct {
 		Type   string `json:"type"`
-		NodeID int64  `json:"node_id"`
+		NodeID int64  `json:"node_id,omitempty"`
+		Host   string `json:"host,omitempty"`
+		Port   int    `json:"port,omitempty"`
 	} `json:"target"`
 }
 
@@ -761,7 +763,9 @@ func (h *ForwardingHandler) userForwardDTO(ctx context.Context, f storage.UserFo
 		out.SpeedLimitMbps = g.PerForwardSpeedMbps
 		out.ConnectionLimit = g.PerForwardConnectionLimit
 	}
-	if n, err := h.repo.GetNodeByID(ctx, f.TargetNodeID); err == nil {
+	if f.TargetType == "custom" {
+		out.TargetName = fmt.Sprintf("%s:%d", f.TargetHost, f.TargetPort)
+	} else if n, err := h.repo.GetNodeByID(ctx, f.TargetNodeID); err == nil {
 		out.TargetName = n.NodeName
 	}
 	for _, hop := range f.Hops {
@@ -883,8 +887,33 @@ func earlierForwardExpiry(left, right *time.Time) *time.Time {
 	return &value
 }
 
+func isValidTargetHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" || len(host) > 255 {
+		return false
+	}
+	if addr, err := netip.ParseAddr(host); err == nil && addr.IsValid() {
+		return true
+	}
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, ch := range label {
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func validateCreateForwardRequest(req createForwardRequest) error {
-	if strings.TrimSpace(req.GrantID) == "" || strings.TrimSpace(req.Name) == "" || req.Target.NodeID <= 0 {
+	if strings.TrimSpace(req.GrantID) == "" || strings.TrimSpace(req.Name) == "" {
 		return storage.ErrForwardingInvalid
 	}
 	switch strings.ToLower(strings.TrimSpace(req.Network)) {
@@ -895,7 +924,16 @@ func validateCreateForwardRequest(req createForwardRequest) error {
 	if req.RequestedEntryPort != 0 && (req.RequestedEntryPort < 1024 || req.RequestedEntryPort > 65535) {
 		return storage.ErrForwardingInvalid
 	}
-	if req.Target.Type != "" && req.Target.Type != "managed_node" {
+	targetType := strings.TrimSpace(req.Target.Type)
+	if targetType == "" || targetType == "managed_node" {
+		if req.Target.NodeID <= 0 {
+			return storage.ErrForwardingInvalid
+		}
+	} else if targetType == "custom" {
+		if !isValidTargetHost(req.Target.Host) || req.Target.Port < 1 || req.Target.Port > 65535 {
+			return storage.ErrForwardingInvalid
+		}
+	} else {
 		return storage.ErrForwardingForbidden
 	}
 	return nil
@@ -1040,12 +1078,37 @@ func (h *ForwardingHandler) HandleUserForwardPreflight(w http.ResponseWriter, r 
 			return
 		}
 	}
-	node, host, port, _, err := h.resolveManagedForwardTarget(r.Context(), username, req.Target.NodeID)
-	if err != nil {
-		writeForwardingError(w, err)
-		return
+	targetType := strings.TrimSpace(req.Target.Type)
+	if targetType == "" {
+		targetType = "managed_node"
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "network": storage.ForwardNetworkTCPUDP, "requested_entry_port": req.RequestedEntryPort, "source_cidrs": sourceCIDRs, "target": map[string]any{"node_id": node.ID, "name": node.NodeName, "host": host, "port": port}, "tunnel": userGrantResponse(func() storage.UserTunnelGrant {
+	var targetPayload map[string]any
+	if targetType == "custom" {
+		if !isAdmin && !g.AllowCustomPublicTarget {
+			writeForwardingError(w, storage.ErrForwardingForbidden)
+			return
+		}
+		targetPayload = map[string]any{
+			"type": "custom",
+			"name": fmt.Sprintf("%s:%d", strings.TrimSpace(req.Target.Host), req.Target.Port),
+			"host": strings.TrimSpace(req.Target.Host),
+			"port": req.Target.Port,
+		}
+	} else {
+		node, host, port, _, err := h.resolveManagedForwardTarget(r.Context(), username, req.Target.NodeID)
+		if err != nil {
+			writeForwardingError(w, err)
+			return
+		}
+		targetPayload = map[string]any{
+			"type":    "managed_node",
+			"node_id": node.ID,
+			"name":    node.NodeName,
+			"host":    host,
+			"port":    port,
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "network": storage.ForwardNetworkTCPUDP, "requested_entry_port": req.RequestedEntryPort, "source_cidrs": sourceCIDRs, "target": targetPayload, "tunnel": userGrantResponse(func() storage.UserTunnelGrant {
 		for _, v := range grants {
 			if v.ID == g.ID {
 				return v
@@ -1132,13 +1195,50 @@ func (h *ForwardingHandler) HandleUserForwards(w http.ResponseWriter, r *http.Re
 			return
 		}
 		defer release()
-		node, host, port, expiry, err := h.resolveManagedForwardTarget(leasedContext, username, req.Target.NodeID)
-		if err != nil {
-			writeForwardingError(w, err)
-			return
+		targetType := strings.TrimSpace(req.Target.Type)
+		if targetType == "" {
+			targetType = "managed_node"
 		}
-		expiry = earlierForwardExpiry(expiry, g.ExpiresAt)
-		f, err := h.repo.CreateUserForward(leasedContext, storage.CreateUserForwardInput{Username: username, Name: req.Name, GrantPublicID: req.GrantID, TargetNodeID: node.ID, TargetHost: host, TargetPort: port, RequestedEntryPort: req.RequestedEntryPort, SourceCIDRs: sourceCIDRs, TunnelVersion: tunnel.Version, EffectiveExpiresAt: expiry, Actor: username})
+		var nodeID int64
+		var host string
+		var port int
+		var expiry *time.Time
+
+		if targetType == "custom" {
+			if !isAdmin && !g.AllowCustomPublicTarget {
+				writeForwardingError(w, storage.ErrForwardingForbidden)
+				return
+			}
+			host = strings.TrimSpace(req.Target.Host)
+			port = req.Target.Port
+			nodeID = 0
+			expiry = g.ExpiresAt
+		} else {
+			node, resolvedHost, resolvedPort, nodeExpiry, err := h.resolveManagedForwardTarget(leasedContext, username, req.Target.NodeID)
+			if err != nil {
+				writeForwardingError(w, err)
+				return
+			}
+			nodeID = node.ID
+			host = resolvedHost
+			port = resolvedPort
+			expiry = earlierForwardExpiry(nodeExpiry, g.ExpiresAt)
+		}
+
+		f, err := h.repo.CreateUserForward(leasedContext, storage.CreateUserForwardInput{
+			Username:           username,
+			Name:               req.Name,
+			GrantPublicID:      req.GrantID,
+			TargetType:         targetType,
+			TargetNodeID:       nodeID,
+			TargetHost:         host,
+			TargetPort:         port,
+			RequestedEntryPort: req.RequestedEntryPort,
+			SourceCIDRs:        sourceCIDRs,
+			TunnelVersion:      tunnel.Version,
+			EffectiveExpiresAt: expiry,
+			Actor:              username,
+		})
 		if err != nil {
 			writeForwardingError(w, err)
 			return
@@ -1257,7 +1357,10 @@ func (h *ForwardingHandler) handleForwardItem(w http.ResponseWriter, r *http.Req
 
 type updateForwardRequest struct {
 	Name               string   `json:"name"`
+	TargetType         string   `json:"target_type"`
 	TargetNodeID       int64    `json:"target_node_id"`
+	TargetHost         string   `json:"target_host"`
+	TargetPort         int      `json:"target_port"`
 	RequestedEntryPort int      `json:"requested_entry_port"`
 	SourceCIDRs        []string `json:"source_cidrs"`
 }
@@ -1281,10 +1384,37 @@ func (h *ForwardingHandler) handleUpdateForward(w http.ResponseWriter, r *http.R
 	if targetUser == "" {
 		targetUser = f.Username
 	}
+	targetType := f.TargetType
+	if req.TargetType != "" {
+		targetType = req.TargetType
+	}
 	targetNodeID := f.TargetNodeID
 	targetHost := f.TargetHost
 	targetPort := f.TargetPort
-	if req.TargetNodeID > 0 && req.TargetNodeID != f.TargetNodeID {
+
+	if targetType == "custom" {
+		if !admin && !userIsAdmin(r.Context(), h.repo, targetUser) {
+			if g, err := h.repo.GetUserTunnelGrantByID(r.Context(), f.GrantID); err != nil || !g.AllowCustomPublicTarget {
+				writeForwardingError(w, storage.ErrForwardingForbidden)
+				return
+			}
+		}
+		if req.TargetHost != "" {
+			if !isValidTargetHost(req.TargetHost) {
+				writeForwardingError(w, storage.ErrForwardingInvalid)
+				return
+			}
+			targetHost = strings.TrimSpace(req.TargetHost)
+		}
+		if req.TargetPort > 0 {
+			if req.TargetPort < 1 || req.TargetPort > 65535 {
+				writeForwardingError(w, storage.ErrForwardingInvalid)
+				return
+			}
+			targetPort = req.TargetPort
+		}
+		targetNodeID = 0
+	} else if req.TargetNodeID > 0 && req.TargetNodeID != f.TargetNodeID {
 		node, host, port, _, err := h.resolveManagedForwardTarget(r.Context(), targetUser, req.TargetNodeID)
 		if err != nil {
 			writeForwardingError(w, err)
@@ -1302,6 +1432,7 @@ func (h *ForwardingHandler) handleUpdateForward(w http.ResponseWriter, r *http.R
 
 	updated, err := h.repo.UpdateUserForward(r.Context(), f.PublicID, username, storage.UpdateUserForwardInput{
 		Name:               req.Name,
+		TargetType:         targetType,
 		TargetNodeID:       targetNodeID,
 		TargetHost:         targetHost,
 		TargetPort:         targetPort,
@@ -1328,6 +1459,20 @@ func (h *ForwardingHandler) handleUpdateForward(w http.ResponseWriter, r *http.R
 func (h *ForwardingHandler) writeForwardClientConfig(w http.ResponseWriter, r *http.Request, f *storage.UserForwardRule, username string) {
 	if f.ObservedState != storage.ForwardObservedActive {
 		writeForwardingError(w, storage.ErrForwardingForbidden)
+		return
+	}
+	if f.TargetType == "custom" {
+		entry := h.userForwardDTO(r.Context(), *f)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"config": map[string]any{
+				"type":        "custom",
+				"entry_host":  entry.EntryHost,
+				"entry_port":  entry.EntryPort,
+				"target_host": f.TargetHost,
+				"target_port": f.TargetPort,
+			},
+		})
 		return
 	}
 	targetUser := username
@@ -1535,8 +1680,10 @@ func (h *ForwardingHandler) deployForward(ctx context.Context, f *storage.UserFo
 		if !h.activeGrantForForward(leasedCtx, *current) {
 			return storage.ErrForwardingForbidden
 		}
-		if _, _, _, _, err := h.resolveManagedForwardTarget(leasedCtx, current.Username, current.TargetNodeID); err != nil {
-			return err
+		if current.TargetType == "managed_node" || current.TargetType == "" {
+			if _, _, _, _, err := h.resolveManagedForwardTarget(leasedCtx, current.Username, current.TargetNodeID); err != nil {
+				return err
+			}
 		}
 		return h.deployForwardLocked(leasedCtx, current)
 	})
@@ -1655,8 +1802,10 @@ func (h *ForwardingHandler) resumeForwardLocked(ctx context.Context, f *storage.
 	if state != "active" {
 		return storage.ErrForwardingForbidden
 	}
-	if _, _, _, _, err = h.resolveManagedForwardTarget(ctx, f.Username, f.TargetNodeID); err != nil {
-		return err
+	if f.TargetType == "managed_node" || f.TargetType == "" {
+		if _, _, _, _, err = h.resolveManagedForwardTarget(ctx, f.Username, f.TargetNodeID); err != nil {
+			return err
+		}
 	}
 	updated, err := h.repo.SetUserForwardDesired(ctx, f.PublicID, f.Username, storage.ForwardDesiredActive, storage.ForwardObservedPending, "none", actor)
 	if err != nil {
@@ -1793,6 +1942,9 @@ func (h *ForwardingHandler) systemSuspendForward(ctx context.Context, f *storage
 					return nil
 				}
 			case "target_inactive":
+				if current.TargetType == "custom" {
+					return nil
+				}
 				if _, _, _, _, targetErr := h.resolveManagedForwardTarget(leasedCtx, current.Username, current.TargetNodeID); targetErr == nil {
 					return nil
 				}
@@ -1900,12 +2052,14 @@ func (h *ForwardingHandler) reconcileForwards(ctx context.Context) {
 				_ = h.systemSuspendForward(ctx, forward, "grant_inactive")
 				continue
 			}
-			if _, _, _, _, err := h.resolveManagedForwardTarget(ctx, forward.Username, forward.TargetNodeID); err != nil {
-				if forward.ObservedState == storage.ForwardObservedSuspended && forward.SuspendReason == "target_inactive" {
+			if forward.TargetType == "managed_node" || forward.TargetType == "" {
+				if _, _, _, _, err := h.resolveManagedForwardTarget(ctx, forward.Username, forward.TargetNodeID); err != nil {
+					if forward.ObservedState == storage.ForwardObservedSuspended && forward.SuspendReason == "target_inactive" {
+						continue
+					}
+					_ = h.systemSuspendForward(ctx, forward, "target_inactive")
 					continue
 				}
-				_ = h.systemSuspendForward(ctx, forward, "target_inactive")
-				continue
 			}
 			candidate := forward
 			if forward.ObservedState != storage.ForwardObservedActive {

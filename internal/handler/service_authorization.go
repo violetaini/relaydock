@@ -382,7 +382,7 @@ func (h *ServiceAuthorizationHandler) validateCustomRequest(ctx context.Context,
 	for _, grant := range *request.ForwardingGrants {
 		if grant.TunnelID <= 0 || !grant.Enabled || grant.StartsAt.IsZero() || grant.MaxActiveForwards < 0 ||
 			grant.PerForwardSpeedMbps < 0 || math.IsNaN(grant.PerForwardSpeedMbps) || math.IsInf(grant.PerForwardSpeedMbps, 0) ||
-			grant.PerForwardConnectionLimit != 0 || grant.TrafficLimitBytes < 0 || grant.AllowCustomPublicTarget {
+			grant.PerForwardConnectionLimit != 0 || grant.TrafficLimitBytes < 0 {
 			return fmt.Errorf("%w: invalid forwarding grant", storage.ErrForwardingInvalid)
 		}
 		if _, duplicate := seenTunnels[grant.TunnelID]; duplicate {

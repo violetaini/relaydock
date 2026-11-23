@@ -1067,3 +1067,89 @@ func TestForwardingAdminAutoTunnelGrant(t *testing.T) {
 	}
 }
 
+func TestForwardingCustomPublicTarget(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	db, err := sql.Open("sqlite", fixture.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE user_tunnel_grants SET allow_custom_public_target=1 WHERE id=?`, fixture.grant.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Preflight custom target
+	preReq := httptest.NewRequest(http.MethodPost, "/api/user/forwards/preflight", strings.NewReader(fmt.Sprintf(`{"name":"custom-fwd","grant_id":"%s","target":{"type":"custom","host":"198.51.100.24","port":8443},"network":"tcp_udp"}`, fixture.grant.PublicID)))
+	preReq = preReq.WithContext(auth.ContextWithUsername(preReq.Context(), "alice"))
+	preRec := httptest.NewRecorder()
+	fixture.handler.HandleUserForwardPreflight(preRec, preReq)
+	if preRec.Code != http.StatusOK {
+		t.Fatalf("preflight status=%d body=%s", preRec.Code, preRec.Body.String())
+	}
+	var preResp struct {
+		Success bool `json:"success"`
+		Target  struct {
+			Type string `json:"type"`
+			Host string `json:"host"`
+			Port int    `json:"port"`
+		} `json:"target"`
+	}
+	if err := json.Unmarshal(preRec.Body.Bytes(), &preResp); err != nil {
+		t.Fatal(err)
+	}
+	if !preResp.Success || preResp.Target.Type != "custom" || preResp.Target.Host != "198.51.100.24" || preResp.Target.Port != 8443 {
+		t.Fatalf("unexpected preflight response: %+v", preResp)
+	}
+
+	// 2. Create custom forward
+	createReq := httptest.NewRequest(http.MethodPost, "/api/user/forwards", strings.NewReader(fmt.Sprintf(`{"name":"custom-fwd","grant_id":"%s","target":{"type":"custom","host":"198.51.100.24","port":8443},"network":"tcp_udp"}`, fixture.grant.PublicID)))
+	createReq = createReq.WithContext(auth.ContextWithUsername(createReq.Context(), "alice"))
+	createRec := httptest.NewRecorder()
+	fixture.handler.HandleUserForwards(createRec, createReq)
+	if createRec.Code != http.StatusCreated && createRec.Code != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var created struct {
+		Forward userForwardResponse `json:"forward"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Forward.TargetType != "custom" || created.Forward.TargetHost != "198.51.100.24" || created.Forward.TargetPort != 8443 {
+		t.Fatalf("unexpected forward: %+v", created.Forward)
+	}
+	if created.Forward.TargetName != "198.51.100.24:8443" {
+		t.Fatalf("expected target name 198.51.100.24:8443, got %s", created.Forward.TargetName)
+	}
+
+	// 3. Update custom forward target host and port
+	updateReq := httptest.NewRequest(http.MethodPut, "/api/user/forwards/"+created.Forward.ID, strings.NewReader(`{"name":"custom-fwd-renamed","target_type":"custom","target_host":"api.example.com","target_port":9000}`))
+	updateReq.SetPathValue("id", created.Forward.ID)
+	updateReq = updateReq.WithContext(auth.ContextWithUsername(updateReq.Context(), "alice"))
+	updateRec := httptest.NewRecorder()
+	fixture.handler.HandleUserForward(updateRec, updateReq)
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", updateRec.Code, updateRec.Body.String())
+	}
+	var updated struct {
+		Forward userForwardResponse `json:"forward"`
+	}
+	if err := json.Unmarshal(updateRec.Body.Bytes(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Forward.TargetHost != "api.example.com" || updated.Forward.TargetPort != 9000 {
+		t.Fatalf("unexpected updated forward: %+v", updated.Forward)
+	}
+
+	// 4. Client config for custom target returns custom config object
+	cfgReq := httptest.NewRequest(http.MethodGet, "/api/user/forwards/"+created.Forward.ID+"/client-config", nil)
+	cfgReq.SetPathValue("id", created.Forward.ID)
+	cfgReq.SetPathValue("action", "client-config")
+	cfgReq = cfgReq.WithContext(auth.ContextWithUsername(cfgReq.Context(), "alice"))
+	cfgRec := httptest.NewRecorder()
+	fixture.handler.HandleUserForward(cfgRec, cfgReq)
+	if cfgRec.Code != http.StatusOK {
+		t.Fatalf("client-config status=%d body=%s", cfgRec.Code, cfgRec.Body.String())
+	}
+}
+
