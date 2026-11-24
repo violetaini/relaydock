@@ -196,16 +196,24 @@ func (h *PortalSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		resp.Nodes.OnlineCount = onlineCount
 	}
 
-	if token, err := h.repo.GetOrCreateUserToken(ctx, username); err == nil {
-		resp.Subscription.Token = token
+	subAllowed := resp.User.IsAdmin
+	if !subAllowed {
+		if ent, err := ResolveUserServiceEntitlements(ctx, h.repo, username, now); err == nil && ent.Subscription {
+			subAllowed = true
+		}
 	}
-	if shortCode, err := h.repo.GetEffectiveUserShortCode(ctx, username); err == nil {
-		resp.Subscription.UserShortCode = shortCode
+	if subAllowed {
+		if token, err := h.repo.GetOrCreateUserToken(ctx, username); err == nil {
+			resp.Subscription.Token = token
+		}
+		if shortCode, err := h.repo.GetEffectiveUserShortCode(ctx, username); err == nil {
+			resp.Subscription.UserShortCode = shortCode
+		}
+		if customCode, err := h.repo.GetUserCustomShortCode(ctx, username); err == nil {
+			resp.Subscription.CustomShortCode = customCode
+		}
+		resp.Subscription.ShortLinkPrefix = "/x/"
 	}
-	if customCode, err := h.repo.GetUserCustomShortCode(ctx, username); err == nil {
-		resp.Subscription.CustomShortCode = customCode
-	}
-	resp.Subscription.ShortLinkPrefix = "/x/"
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)

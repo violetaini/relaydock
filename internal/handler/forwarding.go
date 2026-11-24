@@ -1434,6 +1434,12 @@ func (h *ForwardingHandler) handleUpdateForward(w http.ResponseWriter, r *http.R
 	if targetUser == "" {
 		targetUser = f.Username
 	}
+	if !admin && !userIsAdmin(r.Context(), h.repo, targetUser) {
+		if !h.activeGrantForForward(r.Context(), *f) {
+			writeForwardingError(w, storage.ErrForwardingForbidden)
+			return
+		}
+	}
 	targetType := f.TargetType
 	if req.TargetType != "" {
 		targetType = req.TargetType

@@ -268,11 +268,28 @@ func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Requ
 	}
 
 	username := auth.UsernameFromContext(r.Context())
+	isAdmin := userIsAdmin(r.Context(), h.repo, username)
+	if !isAdmin {
+		if req.TrafficLimit != nil {
+			writeError(w, http.StatusForbidden, errors.New("普通用户无权设置或修改流量限制"))
+			return
+		}
+		entitlements, err := ResolveUserServiceEntitlements(r.Context(), h.repo, username, time.Now().UTC())
+		if err != nil || !entitlements.Subscription {
+			writeError(w, http.StatusForbidden, errors.New("无有效订阅权限"))
+			return
+		}
+	}
 
 	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。
 	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
 		writeError(w, http.StatusForbidden, err)
 		return
+	}
+
+	var trafficLimit *float64
+	if isAdmin {
+		trafficLimit = req.TrafficLimit
 	}
 
 	file := storage.SubscribeFile{
@@ -287,7 +304,7 @@ func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Requ
 		SelectedCustomRuleIDs:     req.SelectedCustomRuleIDs,
 		SelectedOverrideScriptIDs: req.SelectedOverrideScriptIDs,
 		StatsServerIDs:            req.StatsServerIDs,
-		TrafficLimit:              req.TrafficLimit,
+		TrafficLimit:              trafficLimit,
 		CreatedBy:                 username,
 	}
 	if req.RawOutput != nil {
@@ -451,7 +468,16 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 
 	username := auth.UsernameFromContext(r.Context())
 
-	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。
+	// 配额与有效订阅权限校验:普通用户受全局配额与 active 订阅授权约束(admin 不限)。
+	isAdmin := userIsAdmin(r.Context(), h.repo, username)
+	if !isAdmin {
+		entitlements, err := ResolveUserServiceEntitlements(r.Context(), h.repo, username, time.Now().UTC())
+		if err != nil || !entitlements.Subscription {
+			_ = removeSubscriptionFileIfOwned(filePath, ownership)
+			writeError(w, http.StatusForbidden, errors.New("无有效订阅权限"))
+			return
+		}
+	}
 	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
 		_ = removeSubscriptionFileIfOwned(filePath, ownership)
 		writeError(w, http.StatusForbidden, err)
@@ -565,7 +591,16 @@ func (h *subscribeFilesHandler) handleUpload(w http.ResponseWriter, r *http.Requ
 
 	username := auth.UsernameFromContext(r.Context())
 
-	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。
+	// 配额与有效订阅权限校验:普通用户受全局配额与 active 订阅授权约束(admin 不限)。
+	isAdmin := userIsAdmin(r.Context(), h.repo, username)
+	if !isAdmin {
+		entitlements, err := ResolveUserServiceEntitlements(r.Context(), h.repo, username, time.Now().UTC())
+		if err != nil || !entitlements.Subscription {
+			_ = removeSubscriptionFileIfOwned(filePath, ownership)
+			writeError(w, http.StatusForbidden, errors.New("无有效订阅权限"))
+			return
+		}
+	}
 	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
 		_ = removeSubscriptionFileIfOwned(filePath, ownership)
 		writeError(w, http.StatusForbidden, err)
@@ -683,9 +718,18 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 		existing.SelectedOverrideScriptIDs = req.SelectedOverrideScriptIDs
 	}
 	existing.StatsServerIDs = req.StatsServerIDs
-	existing.TrafficLimit = req.TrafficLimit
+	if isAdmin {
+		existing.TrafficLimit = req.TrafficLimit
+	} else if req.TrafficLimit != nil && (existing.TrafficLimit == nil || *existing.TrafficLimit != *req.TrafficLimit) {
+		writeError(w, http.StatusForbidden, errors.New("普通用户无权设置或修改流量限制"))
+		return
+	}
 	// 仅当前端显式传了 custom_short_code 才覆盖(同上,nil = 内联更新场景,保留原值)
 	if req.CustomShortCode != nil {
+		if !isAdmin {
+			writeError(w, http.StatusForbidden, errors.New("只有管理员可以编辑短码"))
+			return
+		}
 		existing.CustomShortCode = *req.CustomShortCode
 	}
 	if req.RawOutput != nil {
@@ -1358,7 +1402,16 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 		return
 	}
 
-	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。
+	// 配额与有效订阅权限校验:普通用户受全局配额与 active 订阅授权约束(admin 不限)。
+	isAdmin := userIsAdmin(r.Context(), h.repo, username)
+	if !isAdmin {
+		entitlements, err := ResolveUserServiceEntitlements(r.Context(), h.repo, username, time.Now().UTC())
+		if err != nil || !entitlements.Subscription {
+			_ = removeSubscriptionFileIfOwned(filePath, ownership)
+			writeError(w, http.StatusForbidden, errors.New("无有效订阅权限"))
+			return
+		}
+	}
 	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
 		_ = removeSubscriptionFileIfOwned(filePath, ownership)
 		writeError(w, http.StatusForbidden, err)

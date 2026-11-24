@@ -427,3 +427,45 @@ func TestDefaultUserPermissionsIncludesCertificates(t *testing.T) {
 		t.Fatalf("default pages missing certificates: %v", body.Pages)
 	}
 }
+
+func TestUserPermissionsWithoutActiveEntitlementsFiltersControlledPages(t *testing.T) {
+	fixture := newEffectiveAuthorizationFixture(t)
+	// Alice is a plain user without any active packages, nodes, forwarding, or subscriptions
+	request := httptest.NewRequest(http.MethodGet, "/api/user/permissions", nil)
+	request = request.WithContext(auth.ContextWithUsername(request.Context(), "alice"))
+	response := httptest.NewRecorder()
+
+	NewUserPermissionsHandler(fixture.repo).UserGet(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("permissions status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Pages        []string                `json:"pages"`
+		Entitlements UserServiceEntitlements `json:"service_entitlements"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode permissions: %v", err)
+	}
+
+	for _, p := range body.Pages {
+		if p == "nodes" || p == "forwarding" || p == "subscription" || p == "generator" || p == "subscribe-files" {
+			t.Fatalf("unentitled user must not have access to controlled page %q, got pages=%v", p, body.Pages)
+		}
+	}
+	// Verify that basic utility pages remain available
+	hasCert, hasTpl, hasRule := false, false, false
+	for _, p := range body.Pages {
+		if p == "certificates" {
+			hasCert = true
+		}
+		if p == "templates" {
+			hasTpl = true
+		}
+		if p == "custom-rules" {
+			hasRule = true
+		}
+	}
+	if !hasCert || !hasTpl || !hasRule {
+		t.Fatalf("expected utility pages to be present, got %v", body.Pages)
+	}
+}

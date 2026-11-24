@@ -46,6 +46,7 @@ var validUserPages = map[string]bool{
 	"subscribe-files": true, // 订阅管理
 	"custom-rules":    true, // 覆写管理
 	"nodes":           true, // 节点管理(普通用户:只读自己导入的+套餐节点、可导入、用于出站)
+	"forwarding":      true, // 转发管理
 	"certificates":    true, // 证书管理
 }
 
@@ -54,6 +55,7 @@ var defaultUserPages = []string{
 	"subscription",
 	"generator",
 	"nodes",
+	"forwarding",
 	"certificates",
 	"templates",
 	"subscribe-files",
@@ -72,6 +74,63 @@ func stableUserPageUnion(configured, effective []string) []string {
 			pages = append(pages, page)
 		}
 	}
+	return pages
+}
+
+// resolveEffectiveUserPages 为普通用户根据实际 active 授权过滤可见页面。
+// 未获得 active 权限的功能（节点、转发、订阅管理）严禁展示。
+func resolveEffectiveUserPages(configuredPages []string, entitlements UserServiceEntitlements, isAdmin bool) []string {
+	if isAdmin {
+		pages := make([]string, 0, len(defaultUserPages))
+		seen := make(map[string]bool, len(defaultUserPages))
+		for _, p := range defaultUserPages {
+			if !seen[p] {
+				seen[p] = true
+				pages = append(pages, p)
+			}
+		}
+		return pages
+	}
+
+	base := configuredPages
+	if len(base) == 0 {
+		base = defaultUserPages
+	}
+
+	pages := make([]string, 0, len(base))
+	seen := make(map[string]bool, len(base))
+
+	for _, page := range base {
+		if !validUserPages[page] || seen[page] {
+			continue
+		}
+		// 严控服务页面与 active 权限挂钩
+		switch page {
+		case "nodes":
+			if !entitlements.Nodes && !entitlements.Servers {
+				continue
+			}
+		case "forwarding":
+			if !entitlements.Forwarding {
+				continue
+			}
+		case "subscription", "generator", "subscribe-files":
+			if !entitlements.Subscription {
+				continue
+			}
+		}
+		seen[page] = true
+		pages = append(pages, page)
+	}
+
+	// 动态授权补偿:如果用户实际具备 active 权限，但全局配置中未包含该页面，予以补充展示
+	for _, page := range entitlements.pages() {
+		if !seen[page] {
+			pages = append(pages, page)
+			seen[page] = true
+		}
+	}
+
 	return pages
 }
 
@@ -259,7 +318,7 @@ func (h *UserPermissionsHandler) UserGet(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	pages := stableUserPageUnion(cfg.Pages, entitlements.pages())
+	pages := resolveEffectiveUserPages(cfg.Pages, entitlements, isAdmin)
 
 	usedTpl, _ := h.repo.CountUserTemplates(ctx, username)
 	ovrScripts, _ := h.repo.CountUserOverrideScripts(ctx, username)
