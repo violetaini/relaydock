@@ -2599,11 +2599,41 @@ func (h *ForwardingHandler) reconcileForwards(ctx context.Context) {
 	}
 }
 
+func canonicalIPSet(addrs []net.IP) string {
+	strs := make([]string, len(addrs))
+	for i, ip := range addrs {
+		strs[i] = ip.String()
+	}
+	sort.Strings(strs)
+	return strings.Join(strs, ",")
+}
+
 func (h *ForwardingHandler) reconcileDomainDrift(ctx context.Context) {
 	candidates, err := h.repo.ListForwardReconcileCandidates(ctx)
 	if err != nil {
 		return
 	}
+	activeForwardIDs := make(map[int64]bool, len(candidates))
+	activeHopIDs := make(map[int64]bool)
+	for i := range candidates {
+		activeForwardIDs[candidates[i].ID] = true
+		for _, hop := range candidates[i].Hops {
+			activeHopIDs[hop.ID] = true
+		}
+	}
+	h.dnsCacheMu.Lock()
+	for fid := range h.dnsTargetCache {
+		if !activeForwardIDs[fid] {
+			delete(h.dnsTargetCache, fid)
+		}
+	}
+	for hid := range h.dnsHopCache {
+		if !activeHopIDs[hid] {
+			delete(h.dnsHopCache, hid)
+		}
+	}
+	h.dnsCacheMu.Unlock()
+
 	resolver := net.DefaultResolver
 	for i := range candidates {
 		if ctx.Err() != nil {
@@ -2622,7 +2652,7 @@ func (h *ForwardingHandler) reconcileDomainDrift(ctx context.Context) {
 			addrs, lErr := resolver.LookupIP(lookupCtx, "ip", targetHost)
 			cancel()
 			if lErr == nil && len(addrs) > 0 {
-				currentIP := addrs[0].String()
+				currentIP := canonicalIPSet(addrs)
 				h.dnsCacheMu.Lock()
 				prevIP, exists := h.dnsTargetCache[f.ID]
 				if exists && prevIP != currentIP {
@@ -2642,7 +2672,7 @@ func (h *ForwardingHandler) reconcileDomainDrift(ctx context.Context) {
 				addrs, lErr := resolver.LookupIP(lookupCtx, "ip", nextHost)
 				cancel()
 				if lErr == nil && len(addrs) > 0 {
-					currentIP := addrs[0].String()
+					currentIP := canonicalIPSet(addrs)
 					h.dnsCacheMu.Lock()
 					prevIP, exists := h.dnsHopCache[hop.ID]
 					if exists && prevIP != currentIP {
@@ -2684,6 +2714,38 @@ func (h *ForwardingHandler) ReconcileServerIPDrift(ctx context.Context, serverID
 		}
 		if f.DesiredState == storage.ForwardDesiredActive {
 			_ = h.deployForward(ctx, f)
+		}
+	}
+	return nil
+}
+
+// ReconcileUserForwards reconciles all active forwards owned by a user.
+// If the user's tunnel grants are inactive/disabled (e.g. user disabled or package expired),
+// forwards are immediately suspended and inbounds withdrawn from the remote nodes.
+// If the user's tunnel grants are active, suspended forwards are restored and redeployed.
+func (h *ForwardingHandler) ReconcileUserForwards(ctx context.Context, username string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return nil
+	}
+	forwards, err := h.repo.ListUserForwards(ctx, username)
+	if err != nil {
+		return err
+	}
+	for i := range forwards {
+		f := &forwards[i]
+		if f.DesiredState == storage.ForwardDesiredActive {
+			if !h.activeGrantForForward(ctx, *f) {
+				if f.ObservedState != storage.ForwardObservedSuspended || f.SuspendReason != "grant_inactive" {
+					_ = h.systemSuspendForward(ctx, f, "grant_inactive")
+				}
+			} else {
+				if f.ObservedState != storage.ForwardObservedActive {
+					if candidate, err := h.repo.PrepareUserForwardSystemApply(ctx, f.PublicID, f.Username); err == nil {
+						_ = h.deployForward(ctx, candidate)
+					}
+				}
+			}
 		}
 	}
 	return nil

@@ -185,7 +185,7 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 //
 // 跟 user delete 路径区别:本接口 **保留** user_inbound_configs 行 (credential 留着),
 // 启用时能精确还原原 uuid/password,客户端订阅无需重新生成。
-func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher, tokens *auth.TokenStore) http.Handler {
+func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher, tokens *auth.TokenStore, forwardingHandlers ...*ForwardingHandler) http.Handler {
 	if repo == nil {
 		panic("user status handler requires repository")
 	}
@@ -193,6 +193,10 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 		repo.SetSessionRevoker(tokens.RevokeAllForUser)
 	}
 	managedHandler := NewManagedNodesHandler(repo, remoteManage, pusher)
+	var forwardingHandler *ForwardingHandler
+	if len(forwardingHandlers) > 0 && forwardingHandlers[0] != nil {
+		forwardingHandler = forwardingHandlers[0]
+	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -325,6 +329,9 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 			if pusher != nil {
 				go pusher.PushToAllServersForUser(context.Background(), username)
 			}
+			if forwardingHandler != nil {
+				_ = forwardingHandler.ReconcileUserForwards(ctx, username)
+			}
 			writeJSON(w, http.StatusOK, map[string]interface{}{"status": "disabled"})
 			return
 		}
@@ -374,12 +381,18 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 			go pusher.PushToAllServersForUser(context.Background(), username)
 		}
 		if activationErr := errors.Join(activationErrs...); activationErr != nil {
+			if forwardingHandler != nil {
+				_ = forwardingHandler.ReconcileUserForwards(ctx, username)
+			}
 			writeJSON(w, http.StatusAccepted, map[string]interface{}{
 				"status": "enable_pending", "message": "remote access activation is pending",
 			})
 			return
 		}
 
+		if forwardingHandler != nil {
+			_ = forwardingHandler.ReconcileUserForwards(ctx, username)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 	})

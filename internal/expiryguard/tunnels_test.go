@@ -639,3 +639,58 @@ func TestTunnelApplyAcceptsDomainTarget(t *testing.T) {
 		t.Fatalf("inbound address = %v, want myddns.example.com", settings["address"])
 	}
 }
+
+func TestTunnelApplyAllowsNewerGenerationTargetAndCIDRUpdate(t *testing.T) {
+	agent := newFakeTunnelAgent()
+	runner := &fakeNFTRunner{available: true}
+	guard, _, _ := newTunnelGuard(t, agent, runner)
+
+	req := validTunnelRequest("forward_update_001", 24011)
+	req.TargetIP = "1.2.3.4"
+	req.TargetPort = 80
+	req.SourceCIDRs = []string{"10.0.0.1/32"}
+
+	// 1. Initial generation 1 applies successfully
+	res, changed, err := guard.ApplyTunnel(context.Background(), req)
+	if err != nil || !changed || res.State != TunnelStateActive {
+		t.Fatalf("gen 1 apply error: %v", err)
+	}
+
+	// 2. Same generation with different target must fail
+	conflictReq := req
+	conflictReq.TargetIP = "5.6.7.8"
+	if _, _, err := guard.ApplyTunnel(context.Background(), conflictReq); apiErrorCode(err) != "generation_conflict" {
+		t.Fatalf("expected generation_conflict, got %v", err)
+	}
+
+	// 3. Newer generation with updated domain target and new CIDR succeeds
+	gen2Req := req
+	gen2Req.Generation = 2
+	gen2Req.TargetIP = "new-target.ddns.net"
+	gen2Req.TargetPort = 443
+	gen2Req.SourceCIDRs = []string{"10.0.0.2/32"}
+
+	res2, changed2, err := guard.ApplyTunnel(context.Background(), gen2Req)
+	if err != nil || !changed2 || res2.State != TunnelStateActive {
+		t.Fatalf("gen 2 apply error: %v", err)
+	}
+	if res2.TargetIP != "new-target.ddns.net" || res2.TargetPort != 443 {
+		t.Fatalf("gen 2 target not updated: %s:%d", res2.TargetIP, res2.TargetPort)
+	}
+
+	// Verify Agent received updated inbound settings
+	agent.mu.Lock()
+	settings, _ := agent.lastAdd["settings"].(map[string]interface{})
+	if settings["address"] != "new-target.ddns.net" || settings["port"] != float64(443) {
+		t.Fatalf("agent settings not updated: %#v", settings)
+	}
+	agent.mu.Unlock()
+
+	// 4. Newer generation trying to change ListenPort must fail with resource_definition_conflict
+	gen3Req := gen2Req
+	gen3Req.Generation = 3
+	gen3Req.ListenPort = 24012
+	if _, _, err := guard.ApplyTunnel(context.Background(), gen3Req); apiErrorCode(err) != "resource_definition_conflict" {
+		t.Fatalf("expected resource_definition_conflict on listen port change, got %v", err)
+	}
+}

@@ -381,6 +381,11 @@ func sameTunnelDefinition(left, right TunnelResource) bool {
 		canUpgradeTunnelNetwork(left.Network, right.Network) && strings.Join(left.SourceCIDRs, "\x00") == strings.Join(right.SourceCIDRs, "\x00")
 }
 
+func sameTunnelIdentity(left, right TunnelResource) bool {
+	return left.ResourceID == right.ResourceID && left.Tag == right.Tag && left.ListenIP == right.ListenIP &&
+		left.ListenPort == right.ListenPort && canUpgradeTunnelNetwork(left.Network, right.Network)
+}
+
 func (g *Guard) SetCommandRunner(runner CommandRunner) {
 	if runner != nil {
 		g.commands = runner
@@ -801,8 +806,8 @@ func (g *Guard) ApplyTunnel(ctx context.Context, request TunnelApplyRequest) (Tu
 			g.notify()
 			return current, true, nil
 		}
-		if !sameTunnelDefinition(current, resource) {
-			return current, false, tunnelErr(http.StatusConflict, "resource_definition_conflict", "listen, target, network, and source CIDRs are immutable; create a new resource")
+		if !sameTunnelIdentity(current, resource) {
+			return current, false, tunnelErr(http.StatusConflict, "resource_definition_conflict", "listen port and identity are immutable; create a new resource")
 		}
 	}
 	if err := g.checkDurablePort(resource); err != nil {

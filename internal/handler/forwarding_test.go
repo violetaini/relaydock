@@ -1307,3 +1307,63 @@ func TestForwardingReconcileDomainDrift(t *testing.T) {
 	}
 }
 
+func TestForwardingReconcileUserForwardsOnStatusChange(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	ctx := context.Background()
+
+	// Initial state: forward is active
+	fwd, err := fixture.repo.GetUserForward(ctx, fixture.forward.PublicID, "alice")
+	if err != nil {
+		t.Fatalf("GetUserForward failed: %v", err)
+	}
+	if fwd.ObservedState != storage.ForwardObservedActive {
+		t.Fatalf("expected initial forward active, got %s", fwd.ObservedState)
+	}
+
+	// 1. Disable alice's tunnel grant (simulating user disable or grant suspend)
+	grant, err := fixture.repo.GetUserTunnelGrantByID(ctx, fwd.GrantID)
+	if err != nil {
+		t.Fatalf("GetUserTunnelGrantByID failed: %v", err)
+	}
+	grant.Enabled = false
+	if _, err := fixture.repo.UpdateUserTunnelGrant(ctx, grant.PublicID, "alice", *grant, grant.Version, "admin"); err != nil {
+		t.Fatalf("UpdateUserTunnelGrant failed: %v", err)
+	}
+
+	// Reconcile user forwards
+	if err := fixture.handler.ReconcileUserForwards(ctx, "alice"); err != nil {
+		t.Fatalf("ReconcileUserForwards failed: %v", err)
+	}
+
+	suspended, err := fixture.repo.GetUserForward(ctx, fwd.PublicID, "alice")
+	if err != nil {
+		t.Fatalf("GetUserForward failed: %v", err)
+	}
+	if suspended.ObservedState != storage.ForwardObservedSuspended || suspended.SuspendReason != "grant_inactive" {
+		t.Fatalf("expected forward suspended with grant_inactive, got %s (reason: %s)", suspended.ObservedState, suspended.SuspendReason)
+	}
+
+	// 2. Re-enable alice's tunnel grant
+	grant, err = fixture.repo.GetUserTunnelGrantByID(ctx, fwd.GrantID)
+	if err != nil {
+		t.Fatalf("GetUserTunnelGrantByID failed: %v", err)
+	}
+	grant.Enabled = true
+	if _, err := fixture.repo.UpdateUserTunnelGrant(ctx, grant.PublicID, "alice", *grant, grant.Version, "admin"); err != nil {
+		t.Fatalf("UpdateUserTunnelGrant failed: %v", err)
+	}
+
+	// Reconcile user forwards again
+	if err := fixture.handler.ReconcileUserForwards(ctx, "alice"); err != nil {
+		t.Fatalf("ReconcileUserForwards failed: %v", err)
+	}
+
+	restored, err := fixture.repo.GetUserForward(ctx, fwd.PublicID, "alice")
+	if err != nil {
+		t.Fatalf("GetUserForward failed: %v", err)
+	}
+	if restored.ObservedState != storage.ForwardObservedActive {
+		t.Fatalf("expected forward restored to active, got %s", restored.ObservedState)
+	}
+}
+
