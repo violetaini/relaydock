@@ -328,10 +328,10 @@ func (h *CertificateHandler) authenticateUser(w http.ResponseWriter, r *http.Req
 	if userIsAdmin(r.Context(), h.repo, username) {
 		return username, true
 	}
-	// 普通用户：检查页面权限与服务配额
+	// 普通用户：检查页面权限与服务配额（必须具有有效服务器授权）
 	cfg := loadUserPermConfig(r.Context(), h.repo)
 	entitlements, _ := ResolveUserServiceEntitlements(r.Context(), h.repo, username, time.Now().UTC())
-	pages := stableUserPageUnion(cfg.Pages, entitlements.pages())
+	pages := resolveEffectiveUserPages(cfg.Pages, entitlements, false)
 	for _, p := range pages {
 		if p == "certificates" {
 			return username, true

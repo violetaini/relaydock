@@ -37,6 +37,27 @@ func TestCertificatesMultiTenantIsolation(t *testing.T) {
 		t.Fatalf("CreateUser userB: %v", err)
 	}
 
+	// Create test server and grant server authorizations to userA and userB
+	srv := &storage.RemoteServer{
+		Name: "test-server", IPAddress: "1.1.1.1", Token: "test-token", PullPort: 1234, PullToken: "token",
+	}
+	if err := repo.CreateRemoteServer(ctx, srv); err != nil {
+		t.Fatalf("CreateRemoteServer: %v", err)
+	}
+	now := time.Now().UTC()
+	exp := now.Add(24 * time.Hour)
+	for _, u := range []string{"userA", "userB"} {
+		_, err := repo.CreateUserServerGrant(ctx, storage.UserServerGrant{
+			Username: u, ServerID: srv.ID, Enabled: true,
+			StartsAt: now.Add(-time.Hour), ExpiresAt: &exp, MaxActiveNodes: 1,
+			SpeedLimitMbps: 50, ConnectionLimit: 4, BillingMode: storage.ManagedBillingDownload,
+			ResetPolicy: storage.ManagedResetNone, ResetDay: 1, BillingTimezone: "Asia/Shanghai", CreatedBy: "admin",
+		})
+		if err != nil {
+			t.Fatalf("CreateUserServerGrant %s: %v", u, err)
+		}
+	}
+
 	h := NewCertificateHandler(repo, nil)
 
 	userReq := func(method, path, username string, body any) *http.Request {
@@ -83,7 +104,7 @@ func TestCertificatesMultiTenantIsolation(t *testing.T) {
 	}
 
 	// 2. Create Certificates for Admin, User A, and User B
-	now := time.Now().UTC()
+	now = time.Now().UTC()
 	expiry := now.Add(90 * 24 * time.Hour)
 
 	adminCert := &storage.Certificate{
@@ -351,4 +372,27 @@ func TestCertificatesMultiTenantIsolation(t *testing.T) {
 			t.Fatalf("admin could not bind admin cert: %v", err)
 		}
 	})
+}
+
+func TestCertificatesRequiresServerGrantForbidden(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "cert_forbidden_test.db"))
+	if err != nil {
+		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	ctx := context.Background()
+	if err := repo.CreateUser(ctx, "unentitled_user", "u@example.com", "Unentitled", "hash", storage.RoleUser, ""); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	h := NewCertificateHandler(repo, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/certificates", nil)
+	req = req.WithContext(auth.ContextWithUsername(req.Context(), "unentitled_user"))
+	rec := httptest.NewRecorder()
+
+	h.ListCertificates(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for user without server grant, got %d: %s", rec.Code, rec.Body.String())
+	}
 }

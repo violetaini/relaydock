@@ -365,7 +365,7 @@ func TestUserPermissionsMergeAuthorizationDerivedPages(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode permissions: %v", err)
 	}
-	wantPages := []string{"templates", "nodes", "subscription", "forwarding"}
+	wantPages := []string{"templates", "nodes", "subscription", "forwarding", "certificates"}
 	if !reflect.DeepEqual(body.Pages, wantPages) {
 		t.Fatalf("pages=%v want=%v", body.Pages, wantPages)
 	}
@@ -399,7 +399,7 @@ func TestUserPermissionsGlobalAPITokenDoesNotResolveSyntheticUser(t *testing.T) 
 	}
 }
 
-func TestDefaultUserPermissionsIncludesCertificates(t *testing.T) {
+func TestUserPermissionsCertificatesRequiresServerEntitlement(t *testing.T) {
 	fixture := newEffectiveAuthorizationFixture(t)
 	request := httptest.NewRequest(http.MethodGet, "/api/user/permissions", nil)
 	request = request.WithContext(auth.ContextWithUsername(request.Context(), "alice"))
@@ -416,21 +416,51 @@ func TestDefaultUserPermissionsIncludesCertificates(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode permissions: %v", err)
 	}
-	hasCert := false
 	for _, p := range body.Pages {
+		if p == "certificates" {
+			t.Fatalf("unentitled user should not have certificates in pages: %v", body.Pages)
+		}
+	}
+
+	// Grant alice an active server grant
+	now := time.Now().UTC()
+	exp := now.Add(24 * time.Hour)
+	_, err := fixture.repo.CreateUserServerGrant(context.Background(), storage.UserServerGrant{
+		Username: "alice", ServerID: fixture.server.ID, Enabled: true,
+		StartsAt: now.Add(-time.Hour), ExpiresAt: &exp, MaxActiveNodes: 1,
+		SpeedLimitMbps: 50, ConnectionLimit: 4, BillingMode: storage.ManagedBillingDownload,
+		ResetPolicy: storage.ManagedResetNone, ResetDay: 1, BillingTimezone: "Asia/Shanghai", CreatedBy: "admin",
+	})
+	if err != nil {
+		t.Fatalf("create server grant: %v", err)
+	}
+
+	response2 := httptest.NewRecorder()
+	NewUserPermissionsHandler(fixture.repo).UserGet(response2, request)
+	if response2.Code != http.StatusOK {
+		t.Fatalf("permissions status=%d body=%s", response2.Code, response2.Body.String())
+	}
+	var body2 struct {
+		Pages []string `json:"pages"`
+	}
+	if err := json.Unmarshal(response2.Body.Bytes(), &body2); err != nil {
+		t.Fatalf("decode permissions 2: %v", err)
+	}
+	hasCert := false
+	for _, p := range body2.Pages {
 		if p == "certificates" {
 			hasCert = true
 			break
 		}
 	}
 	if !hasCert {
-		t.Fatalf("default pages missing certificates: %v", body.Pages)
+		t.Fatalf("expected certificates in pages for user with server grant, got: %v", body2.Pages)
 	}
 }
 
 func TestUserPermissionsWithoutActiveEntitlementsFiltersControlledPages(t *testing.T) {
 	fixture := newEffectiveAuthorizationFixture(t)
-	// Alice is a plain user without any active packages, nodes, forwarding, or subscriptions
+	// Alice is a plain user without any active packages, nodes, forwarding, subscriptions, or server grants
 	request := httptest.NewRequest(http.MethodGet, "/api/user/permissions", nil)
 	request = request.WithContext(auth.ContextWithUsername(request.Context(), "alice"))
 	response := httptest.NewRecorder()
@@ -448,16 +478,13 @@ func TestUserPermissionsWithoutActiveEntitlementsFiltersControlledPages(t *testi
 	}
 
 	for _, p := range body.Pages {
-		if p == "nodes" || p == "forwarding" || p == "subscription" || p == "generator" || p == "subscribe-files" {
+		if p == "nodes" || p == "forwarding" || p == "subscription" || p == "generator" || p == "subscribe-files" || p == "certificates" {
 			t.Fatalf("unentitled user must not have access to controlled page %q, got pages=%v", p, body.Pages)
 		}
 	}
 	// Verify that basic utility pages remain available
-	hasCert, hasTpl, hasRule := false, false, false
+	hasTpl, hasRule := false, false
 	for _, p := range body.Pages {
-		if p == "certificates" {
-			hasCert = true
-		}
 		if p == "templates" {
 			hasTpl = true
 		}
@@ -465,7 +492,7 @@ func TestUserPermissionsWithoutActiveEntitlementsFiltersControlledPages(t *testi
 			hasRule = true
 		}
 	}
-	if !hasCert || !hasTpl || !hasRule {
-		t.Fatalf("expected utility pages to be present, got %v", body.Pages)
+	if !hasTpl || !hasRule {
+		t.Fatalf("expected utility pages (templates, custom-rules) to be present, got %v", body.Pages)
 	}
 }

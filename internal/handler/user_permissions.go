@@ -118,6 +118,10 @@ func resolveEffectiveUserPages(configuredPages []string, entitlements UserServic
 			if !entitlements.Subscription {
 				continue
 			}
+		case "certificates":
+			if !entitlements.Servers {
+				continue
+			}
 		}
 		seen[page] = true
 		pages = append(pages, page)

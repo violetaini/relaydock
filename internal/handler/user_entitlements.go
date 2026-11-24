@@ -20,7 +20,7 @@ type UserServiceEntitlements struct {
 }
 
 func (e UserServiceEntitlements) pages() []string {
-	pages := make([]string, 0, 3)
+	pages := make([]string, 0, 4)
 	if e.Subscription {
 		pages = append(pages, "subscription")
 	}
@@ -29,6 +29,9 @@ func (e UserServiceEntitlements) pages() []string {
 	}
 	if e.Forwarding {
 		pages = append(pages, "forwarding")
+	}
+	if e.Servers {
+		pages = append(pages, "certificates")
 	}
 	return pages
 }
