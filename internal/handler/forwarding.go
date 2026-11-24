@@ -32,10 +32,18 @@ type ForwardingHandler struct {
 	reconcileMu     sync.Mutex
 	reconcileCancel context.CancelFunc
 	reconcileWG     sync.WaitGroup
+	dnsTargetCache  map[int64]string
+	dnsHopCache     map[int64]string
+	dnsCacheMu      sync.RWMutex
 }
 
 func NewForwardingHandler(repo *storage.TrafficRepository, deployer ForwardTunnelDeployer) *ForwardingHandler {
-	return &ForwardingHandler{repo: repo, deployer: deployer}
+	return &ForwardingHandler{
+		repo:           repo,
+		deployer:       deployer,
+		dnsTargetCache: make(map[int64]string),
+		dnsHopCache:    make(map[int64]string),
+	}
 }
 
 func (h *ForwardingHandler) SetLimiterPusher(pusher *LimiterConfigPusher) {
@@ -848,11 +856,14 @@ func (h *ForwardingHandler) resolveManagedForwardTarget(ctx context.Context, use
 	if _, err := h.repo.GetFederatedServer(ctx, server.ID); err == nil || !errors.Is(err, storage.ErrFederatedServerNotFound) {
 		return storage.Node{}, "", 0, nil, storage.ErrForwardingInvalid
 	}
-	host := strings.TrimSpace(server.IPAddress)
-	if _, err := netip.ParseAddr(host); err != nil {
-		host = strings.TrimSpace(server.IPAddressV6)
+	host := chooseClashServerHost(server)
+	if host == "" {
+		host = strings.TrimSpace(server.IPAddress)
+		if host == "" {
+			host = strings.TrimSpace(server.IPAddressV6)
+		}
 	}
-	if _, err := netip.ParseAddr(host); err != nil {
+	if !isValidTargetHost(host) {
 		return storage.Node{}, "", 0, nil, storage.ErrForwardingInvalid
 	}
 	var expiry *time.Time
@@ -896,7 +907,41 @@ func isValidTargetHost(host string) bool {
 	if addr, err := netip.ParseAddr(host); err == nil && addr.IsValid() {
 		return true
 	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
 	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, ch := range label {
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isValidDomainName(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" || len(host) > 255 {
+		return false
+	}
+	if addr, err := netip.ParseAddr(host); err == nil && addr.IsValid() {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return false
+	}
 	for _, label := range labels {
 		if len(label) == 0 || len(label) > 63 {
 			return false
@@ -2507,6 +2552,7 @@ func (h *ForwardingHandler) reconcileForwards(ctx context.Context) {
 		return
 	}
 	_ = h.repo.SyncUserForwardUsage(ctx)
+	h.reconcileDomainDrift(ctx)
 	items, err := h.repo.ListForwardReconcileCandidates(ctx)
 	if err != nil {
 		return
@@ -2551,4 +2597,94 @@ func (h *ForwardingHandler) reconcileForwards(ctx context.Context) {
 			_ = h.deployForward(ctx, candidate)
 		}
 	}
+}
+
+func (h *ForwardingHandler) reconcileDomainDrift(ctx context.Context) {
+	candidates, err := h.repo.ListForwardReconcileCandidates(ctx)
+	if err != nil {
+		return
+	}
+	resolver := net.DefaultResolver
+	for i := range candidates {
+		if ctx.Err() != nil {
+			return
+		}
+		f := &candidates[i]
+		if f.DesiredState != storage.ForwardDesiredActive {
+			continue
+		}
+		drifted := false
+
+		// 1. Check custom target host domain
+		if f.TargetType == "custom" && isValidDomainName(f.TargetHost) {
+			targetHost := strings.TrimSpace(f.TargetHost)
+			lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			addrs, lErr := resolver.LookupIP(lookupCtx, "ip", targetHost)
+			cancel()
+			if lErr == nil && len(addrs) > 0 {
+				currentIP := addrs[0].String()
+				h.dnsCacheMu.Lock()
+				prevIP, exists := h.dnsTargetCache[f.ID]
+				if exists && prevIP != currentIP {
+					log.Printf("[Forwarding DNS Drift] Forward %d (%s) target domain %q IP drifted: %s -> %s", f.ID, f.PublicID, targetHost, prevIP, currentIP)
+					drifted = true
+				}
+				h.dnsTargetCache[f.ID] = currentIP
+				h.dnsCacheMu.Unlock()
+			}
+		}
+
+		// 2. Check hop next_host domains (e.g. from connect_host)
+		for _, hop := range f.Hops {
+			nextHost := strings.TrimSpace(hop.NextHost)
+			if nextHost != "" && isValidDomainName(nextHost) {
+				lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				addrs, lErr := resolver.LookupIP(lookupCtx, "ip", nextHost)
+				cancel()
+				if lErr == nil && len(addrs) > 0 {
+					currentIP := addrs[0].String()
+					h.dnsCacheMu.Lock()
+					prevIP, exists := h.dnsHopCache[hop.ID]
+					if exists && prevIP != currentIP {
+						log.Printf("[Forwarding DNS Drift] Forward hop %d next_host domain %q IP drifted: %s -> %s", hop.ID, nextHost, prevIP, currentIP)
+						drifted = true
+					}
+					h.dnsHopCache[hop.ID] = currentIP
+					h.dnsCacheMu.Unlock()
+				}
+			}
+		}
+
+		if drifted {
+			if err := h.repo.TouchUserForwardGeneration(ctx, f.ID); err == nil {
+				if candidate, err := h.repo.GetUserForwardByID(ctx, f.ID); err == nil && candidate != nil {
+					_ = h.deployForward(ctx, candidate)
+				}
+			}
+		}
+	}
+}
+
+// ReconcileServerIPDrift is invoked when a remote server's IP changes (e.g. heartbeat IPChanged).
+// It updates next_host for intermediate hops and managed_node exit hops pointing to this server,
+// and redeploys all affected forwards.
+func (h *ForwardingHandler) ReconcileServerIPDrift(ctx context.Context, serverID int64, newIP string) error {
+	affectedIDs, err := h.repo.SyncServerIPDriftForwards(ctx, serverID, newIP)
+	if err != nil {
+		return err
+	}
+	if len(affectedIDs) == 0 {
+		return nil
+	}
+	log.Printf("[Forwarding IP Drift] Reconciling %d forward(s) due to server %d IP drift -> %s", len(affectedIDs), serverID, newIP)
+	for _, fid := range affectedIDs {
+		f, err := h.repo.GetUserForwardByID(ctx, fid)
+		if err != nil || f == nil {
+			continue
+		}
+		if f.DesiredState == storage.ForwardDesiredActive {
+			_ = h.deployForward(ctx, f)
+		}
+	}
+	return nil
 }

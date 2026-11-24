@@ -1235,3 +1235,105 @@ func TestBidirectionalForwardingSameEntryPort(t *testing.T) {
 		t.Fatalf("rev hop 1 squatted on 2022")
 	}
 }
+
+func TestSyncServerIPDriftForwards(t *testing.T) {
+	fixture := newForwardingStorageFixture(t)
+	forward := fixture.createForward(t, "drift-test")
+
+	if len(forward.Hops) < 2 {
+		t.Fatalf("expected at least 2 hops, got %d", len(forward.Hops))
+	}
+	hop0 := forward.Hops[0]
+	hop1 := forward.Hops[1]
+
+	oldNextHost := hop0.NextHost
+	newIP := "198.51.100.99"
+
+	affectedIDs, err := fixture.repo.SyncServerIPDriftForwards(fixture.ctx, hop1.ServerID, newIP)
+	if err != nil {
+		t.Fatalf("SyncServerIPDriftForwards failed: %v", err)
+	}
+
+	found := false
+	for _, id := range affectedIDs {
+		if id == forward.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected forward ID %d in affectedIDs %v", forward.ID, affectedIDs)
+	}
+
+	updated, err := fixture.repo.GetUserForward(fixture.ctx, forward.PublicID, "alice")
+	if err != nil {
+		t.Fatalf("GetUserForward failed: %v", err)
+	}
+	if updated.Hops[0].NextHost != newIP {
+		t.Fatalf("hop0 NextHost = %q, want %q (old was %q)", updated.Hops[0].NextHost, newIP, oldNextHost)
+	}
+	if updated.Hops[0].Generation <= hop0.Generation {
+		t.Fatalf("hop0 generation did not increment: %d <= %d", updated.Hops[0].Generation, hop0.Generation)
+	}
+	if updated.Hops[0].AppliedGeneration != 0 {
+		t.Fatalf("hop0 applied_generation was not reset to 0: got %d", updated.Hops[0].AppliedGeneration)
+	}
+	if updated.Generation <= forward.Generation {
+		t.Fatalf("forward generation did not increment: %d <= %d", updated.Generation, forward.Generation)
+	}
+}
+
+func TestTunnelAcceptsDomainTargetAndConnectHost(t *testing.T) {
+	fixture := newForwardingStorageFixture(t)
+
+	// Verify CreateTunnelTemplate accepts domain in ConnectHost
+	tunTmpl, err := fixture.repo.CreateTunnelTemplate(fixture.ctx, TunnelTemplate{
+		Name: "domain-tun", CreatedBy: "admin", State: TunnelStateActive, Network: ForwardNetworkTCPUDP,
+		BillingMode: ManagedBillingBoth, TrafficMultiplierMilli: 1000, PortRangeStart: 1024, PortRangeEnd: 65535,
+		Hops: []TunnelTemplateHop{
+			{Position: 0, ServerID: fixture.servers[0].ID},
+			{Position: 1, ServerID: fixture.servers[1].ID, ConnectHost: "transit.ddns.example.com"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateTunnelTemplate with domain ConnectHost failed: %v", err)
+	}
+	if tunTmpl.Hops[1].ConnectHost != "transit.ddns.example.com" {
+		t.Fatalf("got connect_host=%q want transit.ddns.example.com", tunTmpl.Hops[1].ConnectHost)
+	}
+
+	// Grant access
+	now := time.Now().UTC()
+	expires := now.Add(24 * time.Hour)
+	grant, err := fixture.repo.CreateUserTunnelGrant(fixture.ctx, UserTunnelGrant{
+		PublicID: "grant-domain-test", Username: "alice", TunnelID: tunTmpl.ID, State: TunnelStateActive, Enabled: true,
+		StartsAt: now.Add(-time.Hour), ExpiresAt: &expires, MaxActiveForwards: 10,
+		BillingModeOverride: forwardingBillingModePtr(ManagedBillingBoth),
+		AllowCustomPublicTarget: true, CreatedBy: "admin",
+	})
+	if err != nil {
+		t.Fatalf("CreateUserTunnelGrant failed: %v", err)
+	}
+
+	// Create forward with custom target domain
+	fwd, err := fixture.repo.CreateUserForward(fixture.ctx, CreateUserForwardInput{
+		Username: "alice", Name: "domain-target-fwd", GrantPublicID: grant.PublicID,
+		TargetType: "custom", TargetHost: "target.ddns.example.com", TargetPort: 8443,
+		RequestedEntryPort: 0, EffectiveExpiresAt: &expires, Actor: "alice",
+	})
+	if err != nil {
+		t.Fatalf("CreateUserForward with domain target failed: %v", err)
+	}
+	if fwd.TargetHost != "target.ddns.example.com" {
+		t.Fatalf("got fwd.TargetHost=%q want target.ddns.example.com", fwd.TargetHost)
+	}
+	// Exit hop should have next_host = target.ddns.example.com
+	exitHop := fwd.Hops[len(fwd.Hops)-1]
+	if exitHop.NextHost != "target.ddns.example.com" {
+		t.Fatalf("exit hop next_host=%q want target.ddns.example.com", exitHop.NextHost)
+	}
+	// Hop 0 next_host should be transit.ddns.example.com (from connect_host)
+	if fwd.Hops[0].NextHost != "transit.ddns.example.com" {
+		t.Fatalf("hop 0 next_host=%q want transit.ddns.example.com", fwd.Hops[0].NextHost)
+	}
+}

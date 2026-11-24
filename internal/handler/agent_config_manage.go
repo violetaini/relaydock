@@ -52,6 +52,7 @@ type XrayServerHandler struct {
 	crypto                   *CryptoConfig
 	capabilityManager        *capabilities.Manager
 	ddnsManager              *ddns.Manager
+	ipDriftCallback          func(ctx context.Context, serverID int64, newIP string) error
 	managementProbeMu        sync.Mutex
 	managementProbes         map[int64]time.Time
 	agentUninstallMu         sync.Mutex
@@ -62,6 +63,10 @@ type XrayServerHandler struct {
 
 func (h *XrayServerHandler) SetWSHandler(ws *RemoteWSHandler) {
 	h.wsHandler = ws
+}
+
+func (h *XrayServerHandler) SetIPDriftCallback(cb func(ctx context.Context, serverID int64, newIP string) error) {
+	h.ipDriftCallback = cb
 }
 
 // SetProbeMetricsStore injects the volatile live host-health cache shared by

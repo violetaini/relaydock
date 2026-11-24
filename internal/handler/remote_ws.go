@@ -402,11 +402,16 @@ type RemoteWSHandler struct {
 	// ddnsManager 心跳检测到 IP 漂移时触发 DNS provider API 更新域名 A/AAAA 记录。
 	// 用 setter 注入避免循环依赖(ddns 包不能依赖 handler 包)。
 	ddnsManager *ddns.Manager
+	ipDriftCallback func(ctx context.Context, serverID int64, newIP string) error
 }
 
 // SetDDNSManager 注入 DDNS 管理器,main.go 启动时调一次。
 func (h *RemoteWSHandler) SetDDNSManager(m *ddns.Manager) {
 	h.ddnsManager = m
+}
+
+func (h *RemoteWSHandler) SetIPDriftCallback(cb func(ctx context.Context, serverID int64, newIP string) error) {
+	h.ipDriftCallback = cb
 }
 
 // tokenConflictRecord 单 token 复用冲突状态:winnerIP 是当前被允许连接的 agent IP,
@@ -1105,6 +1110,20 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 		if h.ddnsManager != nil && latest.DDNSEnabled {
 			go h.ddnsManager.Trigger(context.Background(), latest)
 		}
+		// 隧道转发: 同步更新以此服务器为跳点或目标的转发生效 IP
+		if h.ipDriftCallback != nil {
+			effectiveIP := strings.TrimSpace(latest.IPAddress)
+			if effectiveIP == "" {
+				effectiveIP = strings.TrimSpace(latest.IPAddressV6)
+			}
+			if effectiveIP != "" {
+				go func(sid int64, ip string) {
+					if err := h.ipDriftCallback(context.Background(), sid, ip); err != nil {
+						log.Printf("[Remote WS] auth: forward IP drift sync failed for server %d: %v", sid, err)
+					}
+				}(latest.ID, effectiveIP)
+			}
+		}
 	}
 	// 同步 WARP 安装状态 — 跟 IP 字段分开 update 是为了不破坏 UpdateRemoteServerHeartbeat 签名
 	if err := h.repo.UpdateRemoteServerWarpInstalled(updateCtx, authPayload.Token, authPayload.WarpInstalled); err != nil {
@@ -1339,6 +1358,20 @@ func (h *RemoteWSHandler) handleHeartbeat(wsConn *RemoteWSConnection, payload js
 		// DDNS:同步新 IP 到域名 A/AAAA 记录
 		if h.ddnsManager != nil && hbResult.Server.DDNSEnabled {
 			go h.ddnsManager.Trigger(context.Background(), hbResult.Server)
+		}
+		// 隧道转发: 同步更新以此服务器为跳点或目标的转发生效 IP
+		if h.ipDriftCallback != nil {
+			effectiveIP := strings.TrimSpace(hbResult.Server.IPAddress)
+			if effectiveIP == "" {
+				effectiveIP = strings.TrimSpace(hbResult.Server.IPAddressV6)
+			}
+			if effectiveIP != "" {
+				go func(sid int64, ip string) {
+					if err := h.ipDriftCallback(context.Background(), sid, ip); err != nil {
+						log.Printf("[Remote WS] heartbeat: forward IP drift sync failed for server %d: %v", sid, err)
+					}
+				}(hbResult.Server.ID, effectiveIP)
+			}
 		}
 	}
 	// 心跳里也带 warp_installed,跟踪 agent 主动 install/remove 后的状态变化

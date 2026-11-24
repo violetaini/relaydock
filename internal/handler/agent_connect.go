@@ -319,6 +319,20 @@ func (h *XrayServerHandler) RemoteHeartbeat(w http.ResponseWriter, r *http.Reque
 		if h.ddnsManager != nil && result.Server.DDNSEnabled {
 			go h.ddnsManager.Trigger(context.Background(), result.Server)
 		}
+		// 隧道转发: 同步更新以此服务器为跳点或目标的转发生效 IP
+		if h.ipDriftCallback != nil {
+			effectiveIP := strings.TrimSpace(result.Server.IPAddress)
+			if effectiveIP == "" {
+				effectiveIP = strings.TrimSpace(result.Server.IPAddressV6)
+			}
+			if effectiveIP != "" {
+				go func(sid int64, ip string) {
+					if err := h.ipDriftCallback(context.Background(), sid, ip); err != nil {
+						log.Printf("[RemoteHeartbeat] forward IP drift sync failed for server %d: %v", sid, err)
+					}
+				}(result.Server.ID, effectiveIP)
+			}
+		}
 	}
 
 	// 首次连接或 Xray 重启时推送限速配置（非 WebSocket 模式的补偿）

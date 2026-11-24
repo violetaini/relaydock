@@ -610,3 +610,32 @@ func TestLegacyStateVersionStillLoads(t *testing.T) {
 		t.Fatalf("migrated state version = %d, want %d", migrated.Version, stateVersion)
 	}
 }
+
+func TestTunnelApplyAcceptsDomainTarget(t *testing.T) {
+	agent := newFakeTunnelAgent()
+	runner := &fakeNFTRunner{available: true}
+	guard, _, _ := newTunnelGuard(t, agent, runner)
+	server := httptest.NewServer(guard.Handler())
+	defer server.Close()
+
+	req := validTunnelRequest("forward_domain_001", 24009)
+	req.TargetIP = "MYDDNS.EXAMPLE.COM"
+
+	apply := signedGuardRequest(t, server.Client(), http.MethodPut, server.URL, "/v1/tunnels/apply", req)
+	applyBody, _ := io.ReadAll(apply.Body)
+	apply.Body.Close()
+	if apply.StatusCode != http.StatusOK || !strings.Contains(string(applyBody), `"state":"active"`) {
+		t.Fatalf("apply status=%d body=%s", apply.StatusCode, applyBody)
+	}
+
+	// 验证 agent 接收到的 dokodemo-door 目标地址被规范化为小写域名
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	if agent.lastAdd == nil {
+		t.Fatal("agent lastAdd is nil")
+	}
+	settings, _ := agent.lastAdd["settings"].(map[string]interface{})
+	if settings["address"] != "myddns.example.com" {
+		t.Fatalf("inbound address = %v, want myddns.example.com", settings["address"])
+	}
+}

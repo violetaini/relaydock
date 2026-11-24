@@ -669,6 +669,8 @@ func main() {
 	forwardingHandler := handler.NewForwardingHandler(repo, handler.NewForwardingGuardDeployer(managedNodesHandler))
 	forwardingHandler.SetLimiterPusher(limiterPusher)
 	forwardingHandler.SetRemoteManage(remoteManageHandler)
+	remoteWSHandler.SetIPDriftCallback(forwardingHandler.ReconcileServerIPDrift)
+	xrayServerHandler.SetIPDriftCallback(forwardingHandler.ReconcileServerIPDrift)
 	forwardingReconcileCtx, stopForwardingReconciler := context.WithCancel(context.Background())
 	forwardingHandler.StartReconciler(forwardingReconcileCtx)
 	mux.Handle("/api/admin/tunnel-templates", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminTunnelTemplates)))

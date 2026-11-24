@@ -1233,3 +1233,77 @@ func TestForwardProbeHealthCheck(t *testing.T) {
 	}
 }
 
+func TestForwardingReconcileServerIPDrift(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	ctx := context.Background()
+
+	if err := fixture.handler.deployForward(ctx, fixture.forward); err != nil {
+		t.Fatalf("deployForward failed: %v", err)
+	}
+
+	targetServerID := fixture.forward.Hops[1].ServerID
+	newIP := "198.51.100.88"
+
+	if err := fixture.handler.ReconcileServerIPDrift(ctx, targetServerID, newIP); err != nil {
+		t.Fatalf("ReconcileServerIPDrift failed: %v", err)
+	}
+
+	updated, err := fixture.repo.GetUserForward(ctx, fixture.forward.PublicID, "alice")
+	if err != nil {
+		t.Fatalf("GetUserForward failed: %v", err)
+	}
+	if updated.Hops[0].NextHost != newIP {
+		t.Fatalf("hop0 NextHost = %q, want %q", updated.Hops[0].NextHost, newIP)
+	}
+	if updated.ObservedState != storage.ForwardObservedActive {
+		t.Fatalf("expected observed_state=active, got %s", updated.ObservedState)
+	}
+}
+
+func TestForwardingReconcileDomainDrift(t *testing.T) {
+	fixture := newForwardingHandlerFixture(t)
+	ctx := context.Background()
+
+	// Update forward target to custom with localhost
+	customFwd, err := fixture.repo.UpdateUserForward(ctx, fixture.forward.PublicID, "alice", storage.UpdateUserForwardInput{
+		Name: "custom-domain-fwd", TargetType: "custom", TargetHost: "localhost", TargetPort: 8080,
+		RequestedEntryPort: 0, Actor: "alice",
+	})
+	if err != nil {
+		t.Fatalf("UpdateUserForward failed: %v", err)
+	}
+	if err := fixture.handler.deployForward(ctx, customFwd); err != nil {
+		t.Fatalf("deployForward failed: %v", err)
+	}
+
+	// Mock stale DNS cache (e.g. was pointing to old IP 192.0.2.1)
+	fixture.handler.dnsCacheMu.Lock()
+	fixture.handler.dnsTargetCache[customFwd.ID] = "192.0.2.1"
+	fixture.handler.dnsCacheMu.Unlock()
+
+	oldGen := customFwd.Generation
+
+	// Run reconcileDomainDrift
+	fixture.handler.reconcileDomainDrift(ctx)
+
+	fixture.handler.dnsCacheMu.RLock()
+	cachedIP := fixture.handler.dnsTargetCache[customFwd.ID]
+	fixture.handler.dnsCacheMu.RUnlock()
+
+	// localhost should resolve to 127.0.0.1 or ::1, which differs from 192.0.2.1
+	if cachedIP == "192.0.2.1" {
+		t.Fatalf("expected cached IP to change from 192.0.2.1, got %q", cachedIP)
+	}
+
+	reconciled, err := fixture.repo.GetUserForward(ctx, customFwd.PublicID, "alice")
+	if err != nil {
+		t.Fatalf("GetUserForward failed: %v", err)
+	}
+	if reconciled.Generation <= oldGen {
+		t.Fatalf("expected forward generation to increment on drift: %d <= %d", reconciled.Generation, oldGen)
+	}
+	if reconciled.ObservedState != storage.ForwardObservedActive {
+		t.Fatalf("expected forward redeployed to active, got %s", reconciled.ObservedState)
+	}
+}
+

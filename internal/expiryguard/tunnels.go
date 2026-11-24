@@ -149,6 +149,53 @@ func normalizeIP(value, field string, defaultIP net.IP) (string, error) {
 	return ip.String(), nil
 }
 
+func isValidDomainName(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" || len(host) > 255 {
+		return false
+	}
+	if strings.ContainsAny(host, " /\\:?#@\r\n\t") {
+		return false
+	}
+	if !strings.Contains(host, ".") {
+		return false
+	}
+	for _, part := range strings.Split(host, ".") {
+		if part == "" || len(part) > 63 {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidTargetHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return !ip.IsUnspecified() && !ip.IsMulticast()
+	}
+	return isValidDomainName(host)
+}
+
+func normalizeTargetHost(value, field string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("%s cannot be empty", field)
+	}
+	if ip := net.ParseIP(value); ip != nil {
+		if ip.IsUnspecified() {
+			return "", fmt.Errorf("%s cannot be unspecified", field)
+		}
+		if ip.IsMulticast() {
+			return "", fmt.Errorf("%s cannot be multicast", field)
+		}
+		return ip.String(), nil
+	}
+	lower := strings.ToLower(value)
+	if !isValidDomainName(lower) {
+		return "", fmt.Errorf("%s must be a valid IP literal or domain name", field)
+	}
+	return lower, nil
+}
+
 func normalizeSourceCIDRs(values []string) ([]string, error) {
 	if len(values) > 64 {
 		return nil, errors.New("source_cidrs cannot contain more than 64 entries")
@@ -222,9 +269,9 @@ func normalizeTunnelApply(request TunnelApplyRequest, now time.Time) (TunnelReso
 	if err != nil {
 		return TunnelResource{}, tunnelErr(http.StatusUnprocessableEntity, "invalid_listen_ip", err.Error())
 	}
-	targetIP, err := normalizeIP(request.TargetIP, "target_ip", nil)
-	if err != nil || net.ParseIP(targetIP).IsUnspecified() {
-		return TunnelResource{}, tunnelErr(http.StatusUnprocessableEntity, "invalid_target_ip", "target_ip must be a non-unspecified IP literal")
+	targetIP, err := normalizeTargetHost(request.TargetIP, "target_ip")
+	if err != nil {
+		return TunnelResource{}, tunnelErr(http.StatusUnprocessableEntity, "invalid_target_ip", err.Error())
 	}
 	network, supported := normalizeTunnelApplyNetwork(request.Network)
 	if !supported {
@@ -282,7 +329,7 @@ func validatePersistedTunnelResource(resource TunnelResource) error {
 	if resource.ListenPort < 1024 || resource.ListenPort > 65535 || resource.TargetPort < 1 || resource.TargetPort > 65535 {
 		return errors.New("invalid port")
 	}
-	if net.ParseIP(resource.ListenIP) == nil || net.ParseIP(resource.TargetIP) == nil || !validPersistedTunnelNetwork(resource.Network) {
+	if net.ParseIP(resource.ListenIP) == nil || !isValidTargetHost(resource.TargetIP) || !validPersistedTunnelNetwork(resource.Network) {
 		return errors.New("invalid TCP/UDP endpoint")
 	}
 	if resource.HardNotAfter.IsZero() || resource.LeaseUntil.IsZero() || resource.UpdatedAt.IsZero() || !validTunnelState(resource.State) {

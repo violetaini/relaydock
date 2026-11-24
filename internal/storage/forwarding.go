@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -806,6 +807,37 @@ func normalizeForwardingBillingMode(mode *string) error {
 	return nil
 }
 
+func isValidTargetHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" || len(host) > 255 {
+		return false
+	}
+	if addr, err := netip.ParseAddr(host); err == nil && addr.IsValid() {
+		return true
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return false
+	}
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, ch := range label {
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func normalizeTemplate(t *TunnelTemplate) error {
 	t.Name = strings.TrimSpace(t.Name)
 	t.Description = strings.TrimSpace(t.Description)
@@ -844,7 +876,7 @@ func normalizeTemplate(t *TunnelTemplate) error {
 			return ErrForwardingInvalid
 		}
 		t.Hops[i].ConnectHost = strings.TrimSpace(t.Hops[i].ConnectHost)
-		if t.Hops[i].ConnectHost != "" && net.ParseIP(t.Hops[i].ConnectHost) == nil {
+		if t.Hops[i].ConnectHost != "" && !isValidTargetHost(t.Hops[i].ConnectHost) {
 			return ErrForwardingInvalid
 		}
 		seen[t.Hops[i].ServerID] = true
@@ -867,7 +899,7 @@ FROM remote_servers WHERE id = ?`, hop.ServerID).Scan(&status, &xrayRunning, &ho
 		if err != nil {
 			return fmt.Errorf("validate tunnel server: %w", err)
 		}
-		if (status != "online" && status != "connected") || xrayRunning == 0 || locallyOwned == 0 || net.ParseIP(strings.TrimSpace(host)) == nil {
+		if (status != "online" && status != "connected") || xrayRunning == 0 || locallyOwned == 0 || !isValidTargetHost(strings.TrimSpace(host)) {
 			return ErrForwardingInvalid
 		}
 	}
@@ -1607,7 +1639,7 @@ COALESCE((SELECT SUM(`+forwardBilledUsageExpression+`) FROM user_forward_usage u
 		if s.override != "" {
 			s.host = s.override
 		}
-		if net.ParseIP(s.host) == nil || (s.status != "online" && s.status != "connected") || s.xrayRunning == 0 || s.federated != 0 {
+		if !isValidTargetHost(s.host) || (s.status != "online" && s.status != "connected") || s.xrayRunning == 0 || s.federated != 0 {
 			rows.Close()
 			return nil, ErrForwardingInvalid
 		}
@@ -2007,6 +2039,21 @@ func (r *TrafficRepository) GetUserForward(ctx context.Context, publicID, userna
 		args = append(args, strings.TrimSpace(username))
 	}
 	f, err := scanUserForward(r.db.QueryRowContext(ctx, q, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUserForwardNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := r.loadForwardHops(ctx, &f); err != nil {
+		return nil, err
+	}
+	return &f, nil
+}
+
+func (r *TrafficRepository) GetUserForwardByID(ctx context.Context, id int64) (*UserForwardRule, error) {
+	q := selectUserForward + ` WHERE id=?`
+	f, err := scanUserForward(r.db.QueryRowContext(ctx, q, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrUserForwardNotFound
 	}
@@ -2468,4 +2515,166 @@ func (r *TrafficRepository) UpdateUserForward(ctx context.Context, publicID, use
 	}
 	return r.GetUserForward(ctx, publicID, username)
 }
+
+func (r *TrafficRepository) TouchUserForwardGeneration(ctx context.Context, forwardID int64) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `UPDATE user_forward_hops SET generation=generation+1, applied_generation=0, observed_state='pending', updated_at=CURRENT_TIMESTAMP WHERE forward_id=?`, forwardID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE user_forward_rules SET generation=generation+1, applied_generation=0, observed_state='pending', updated_at=CURRENT_TIMESTAMP WHERE id=?`, forwardID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *TrafficRepository) SyncServerIPDriftForwards(ctx context.Context, serverID int64, newIP string) ([]int64, error) {
+	if err := forwardingInitialized(r); err != nil {
+		return nil, err
+	}
+	newIP = strings.TrimSpace(newIP)
+	if newIP == "" || net.ParseIP(newIP) == nil {
+		return nil, ErrForwardingInvalid
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	affectedForwardMap := make(map[int64]bool)
+
+	// 1. Find intermediate hops pointing to this server as their next hop
+	rows1, err := tx.QueryContext(ctx, `
+		SELECT h.id, h.forward_id
+		FROM user_forward_hops h
+		JOIN user_forward_hops next_h ON next_h.forward_id = h.forward_id AND next_h.position = h.position + 1
+		LEFT JOIN tunnel_template_hops tth ON tth.id = next_h.template_hop_id
+		WHERE next_h.server_id = ?
+		  AND h.next_host != ?
+		  AND (tth.connect_host IS NULL OR tth.connect_host = '')
+	`, serverID, newIP)
+	if err != nil {
+		return nil, err
+	}
+	var hopIDsToUpdate []int64
+	for rows1.Next() {
+		var hid, fid int64
+		if err := rows1.Scan(&hid, &fid); err == nil {
+			hopIDsToUpdate = append(hopIDsToUpdate, hid)
+			affectedForwardMap[fid] = true
+		}
+	}
+	rows1.Close()
+
+	for _, hid := range hopIDsToUpdate {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE user_forward_hops
+			SET next_host = ?, generation = generation + 1, applied_generation = 0, observed_state = 'pending', updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+		`, newIP, hid); err != nil {
+			return nil, err
+		}
+	}
+
+	// 2. Find exit hops pointing to a managed_node located on this server
+	rows2, err := tx.QueryContext(ctx, `
+		SELECT h.id, f.id
+		FROM user_forward_hops h
+		JOIN user_forward_rules f ON f.id = h.forward_id
+		JOIN nodes n ON n.id = f.target_node_id
+		JOIN remote_servers rs ON rs.name = n.original_server
+		WHERE rs.id = ?
+		  AND f.target_type = 'managed_node'
+		  AND (h.next_host != ? OR f.target_host != ?)
+		  AND h.position = (SELECT MAX(position) FROM user_forward_hops WHERE forward_id = f.id)
+	`, serverID, newIP, newIP)
+	if err != nil {
+		return nil, err
+	}
+	var exitHopIDs []int64
+	var exitFwdIDs []int64
+	for rows2.Next() {
+		var hid, fid int64
+		if err := rows2.Scan(&hid, &fid); err == nil {
+			exitHopIDs = append(exitHopIDs, hid)
+			exitFwdIDs = append(exitFwdIDs, fid)
+			affectedForwardMap[fid] = true
+		}
+	}
+	rows2.Close()
+
+	for i, hid := range exitHopIDs {
+		fid := exitFwdIDs[i]
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE user_forward_hops
+			SET next_host = ?, generation = generation + 1, applied_generation = 0, observed_state = 'pending', updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+		`, newIP, hid); err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE user_forward_rules
+			SET target_host = ?, generation = generation + 1, applied_generation = 0, observed_state = 'pending', updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+		`, newIP, fid); err != nil {
+			return nil, err
+		}
+	}
+
+	// 3. For any active forward where serverID is hop k, hop k+1 needs its SourceCIDRs updated with serverID's new IP
+	rows3, err := tx.QueryContext(ctx, `
+		SELECT next_h.id, h.forward_id
+		FROM user_forward_hops h
+		JOIN user_forward_hops next_h ON next_h.forward_id = h.forward_id AND next_h.position = h.position + 1
+		JOIN user_forward_rules f ON f.id = h.forward_id
+		WHERE h.server_id = ? AND f.desired_state = 'active'
+	`, serverID)
+	if err != nil {
+		return nil, err
+	}
+	var nextHopIDsToBump []int64
+	for rows3.Next() {
+		var nextHID, fid int64
+		if err := rows3.Scan(&nextHID, &fid); err == nil {
+			nextHopIDsToBump = append(nextHopIDsToBump, nextHID)
+			affectedForwardMap[fid] = true
+		}
+	}
+	rows3.Close()
+
+	for _, nextHID := range nextHopIDsToBump {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE user_forward_hops
+			SET generation = generation + 1, applied_generation = 0, observed_state = 'pending', updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+		`, nextHID); err != nil {
+			return nil, err
+		}
+	}
+
+	// Bump generation for all affected forward rules
+	var affectedIDs []int64
+	for fid := range affectedForwardMap {
+		affectedIDs = append(affectedIDs, fid)
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE user_forward_rules
+			SET generation = generation + 1, applied_generation = 0, observed_state = 'pending', updated_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+		`, fid); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return affectedIDs, nil
+}
+
 
