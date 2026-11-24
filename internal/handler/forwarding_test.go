@@ -1203,6 +1203,19 @@ func TestForwardProbeHealthCheck(t *testing.T) {
 	if !res.Success || res.Status != "healthy" || res.EntryPort != tcpPort {
 		t.Fatalf("unexpected probe response: %+v", res)
 	}
+	if len(res.Segments) == 0 {
+		t.Fatalf("expected probe segments to be populated, got: %+v", res)
+	}
+	hasEntry := false
+	for _, seg := range res.Segments {
+		if seg.Type == "entry" && seg.Success {
+			hasEntry = true
+			break
+		}
+	}
+	if !hasEntry {
+		t.Fatalf("expected healthy entry segment in: %+v", res.Segments)
+	}
 
 	// 2. Close listener -> probe returns error
 	ln.Close()

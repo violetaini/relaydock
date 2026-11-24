@@ -1995,6 +1995,10 @@ func loadForwardHopsFrom(ctx context.Context, queryer forwardingRowsQueryer, f *
 func (r *TrafficRepository) loadForwardHops(ctx context.Context, f *UserForwardRule) error {
 	return loadForwardHopsFrom(ctx, r.db, f)
 }
+
+func (r *TrafficRepository) LoadForwardHops(ctx context.Context, f *UserForwardRule) error {
+	return loadForwardHopsFrom(ctx, r.db, f)
+}
 func (r *TrafficRepository) GetUserForward(ctx context.Context, publicID, username string) (*UserForwardRule, error) {
 	q := selectUserForward + ` WHERE public_id=?`
 	args := []any{strings.TrimSpace(publicID)}

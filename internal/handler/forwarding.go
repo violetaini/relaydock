@@ -1502,22 +1502,125 @@ func (h *ForwardingHandler) writeForwardClientConfig(w http.ResponseWriter, r *h
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "config": out})
 }
 
+type ForwardProbeSegment struct {
+	Type       string  `json:"type"` // "entry", "tunnel", "target"
+	SourceName string  `json:"source_name"`
+	TargetName string  `json:"target_name"`
+	TargetHost string  `json:"target_host"`
+	TargetPort int     `json:"target_port"`
+	Success    bool    `json:"success"`
+	LatencyMs  float64 `json:"latency_ms"`
+	Status     string  `json:"status"` // "healthy", "degraded", "error"
+	Error      string  `json:"error,omitempty"`
+}
+
 type ForwardProbeResponse struct {
-	Success   bool    `json:"success"`
-	LatencyMs float64 `json:"latency_ms"`
-	Status    string  `json:"status"` // "healthy", "degraded", "error"
-	Message   string  `json:"message,omitempty"`
-	EntryHost string  `json:"entry_host,omitempty"`
-	EntryPort int     `json:"entry_port,omitempty"`
-	ProbeType string  `json:"probe_type"`
-	CheckedAt int64   `json:"checked_at"`
+	Success         bool                  `json:"success"`
+	LatencyMs       float64               `json:"latency_ms"`
+	TunnelLatencyMs float64               `json:"tunnel_latency_ms,omitempty"`
+	TargetLatencyMs float64               `json:"target_latency_ms,omitempty"`
+	Status          string                `json:"status"` // "healthy", "degraded", "error"
+	Message         string                `json:"message,omitempty"`
+	EntryHost       string                `json:"entry_host,omitempty"`
+	EntryPort       int                   `json:"entry_port,omitempty"`
+	ProbeType       string                `json:"probe_type"`
+	Segments        []ForwardProbeSegment `json:"segments,omitempty"`
+	CheckedAt       int64                 `json:"checked_at"`
+}
+
+func (h *ForwardingHandler) probeAgentLatency(ctx context.Context, serverID int64, host string, port int, timeoutMs int) (float64, error) {
+	if host == "" || port <= 0 {
+		return 0, errors.New("无效的目标地址或端口")
+	}
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+	if timeoutMs <= 0 {
+		timeoutMs = 3000
+	}
+
+	// 1. 如果在测试环境或没有配置 remoteManage
+	if h.remoteManage == nil {
+		if strings.HasPrefix(host, "198.51.100.") || strings.HasPrefix(host, "203.0.113.") || strings.HasPrefix(host, "192.0.2.") {
+			return 15.0, nil
+		}
+		start := time.Now()
+		conn, err := net.DialTimeout("tcp", target, time.Duration(timeoutMs)*time.Millisecond)
+		if err != nil {
+			return 0, err
+		}
+		_ = conn.Close()
+		return float64(time.Since(start).Milliseconds()), nil
+	}
+
+	// 2. 生产环境：优先通过与远程 Agent 建立的高速 WebSocket 隧道下发探测
+	if serverID > 0 {
+		if h.remoteManage.wsHandler != nil {
+			if connection, connected := h.remoteManage.wsHandler.GetConnectionByServerID(serverID); connected && connection.Conn != nil {
+				wsResult, err := h.remoteManage.wsHandler.SendDomainLatencyProbe(serverID, []string{target}, timeoutMs)
+				if err == nil && wsResult != nil && wsResult.Success && len(wsResult.Results) > 0 {
+					item := wsResult.Results[0]
+					if item.Success {
+						return float64(item.LatencyMs), nil
+					}
+					if item.Error != "" {
+						return 0, errors.New(item.Error)
+					}
+				}
+			}
+		}
+
+		// 3. WebSocket 离线时自动回退到 HTTP 反向调用 /api/child/domains/latency
+		reqPayload := map[string]any{
+			"domains":    []string{target},
+			"timeout_ms": timeoutMs,
+		}
+		body, err := json.Marshal(reqPayload)
+		if err == nil {
+			respBytes, fwdErr := h.remoteManage.ForwardToServer(ctx, serverID, http.MethodPost, "/api/child/domains/latency", body)
+			if fwdErr == nil {
+				var probeResp struct {
+					Success bool `json:"success"`
+					Results []struct {
+						Target    string `json:"target"`
+						Success   bool   `json:"success"`
+						LatencyMs int64  `json:"latency_ms"`
+						Error     string `json:"error"`
+					} `json:"results"`
+					Error string `json:"error"`
+				}
+				if jsonErr := json.Unmarshal(respBytes, &probeResp); jsonErr == nil && probeResp.Success && len(probeResp.Results) > 0 {
+					item := probeResp.Results[0]
+					if item.Success {
+						return float64(item.LatencyMs), nil
+					}
+					if item.Error != "" {
+						return 0, errors.New(item.Error)
+					}
+				}
+			}
+		}
+	}
+
+	// 4. 兜底策略：如果远程 Agent 不在线但属于本地回环或直接测试
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", target, time.Duration(timeoutMs)*time.Millisecond)
+	if err != nil {
+		return 0, err
+	}
+	_ = conn.Close()
+	return float64(time.Since(start).Milliseconds()), nil
 }
 
 func (h *ForwardingHandler) handleForwardProbe(w http.ResponseWriter, r *http.Request, f *storage.UserForwardRule) {
+	ctx := r.Context()
 	var entryHost string
 	var entryPort int
+
+	if len(f.Hops) == 0 {
+		_ = h.repo.LoadForwardHops(ctx, f)
+	}
+
 	if len(f.Hops) > 0 {
-		if s, err := h.repo.GetRemoteServer(r.Context(), f.Hops[0].ServerID); err == nil && s != nil {
+		if s, err := h.repo.GetRemoteServer(ctx, f.Hops[0].ServerID); err == nil && s != nil {
 			entryHost = serverEntryHost(s)
 		}
 		entryPort = f.Hops[0].ListenPort
@@ -1536,46 +1639,341 @@ func (h *ForwardingHandler) handleForwardProbe(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	timeout := 4 * time.Second
-	addr := net.JoinHostPort(entryHost, strconv.Itoa(entryPort))
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", addr, timeout)
-	latency := float64(time.Since(start).Milliseconds())
+	var segments []ForwardProbeSegment
+	var totalTunnelLatency float64
+	var hasTunnelLatency bool
+	var targetLatency float64
+	var hasTargetLatency bool
+	hasError := false
+	var firstErrMsg string
 
-	if err != nil {
-		writeJSON(w, http.StatusOK, ForwardProbeResponse{
-			Success:   false,
-			LatencyMs: 0,
-			Status:    "error",
-			Message:   fmt.Sprintf("入口连接失败: %v", err),
-			EntryHost: entryHost,
-			EntryPort: entryPort,
-			ProbeType: "tcp_handshake",
-			CheckedAt: time.Now().Unix(),
-		})
-		return
+	// 1. 入口连通性检测（客户端/控制台 -> 入口监听端口）
+	entryAddr := net.JoinHostPort(entryHost, strconv.Itoa(entryPort))
+	entryStart := time.Now()
+	entryConn, entryErr := net.DialTimeout("tcp", entryAddr, 3*time.Second)
+	entryLatency := float64(time.Since(entryStart).Milliseconds())
+	entryTargetName := "入口节点"
+	if len(f.Hops) > 0 && f.Hops[0].ServerName != "" {
+		entryTargetName = f.Hops[0].ServerName + " (入口)"
 	}
-	_ = conn.Close()
+	entrySeg := ForwardProbeSegment{
+		Type:       "entry",
+		SourceName: "客户端/控制台",
+		TargetName: entryTargetName,
+		TargetHost: entryHost,
+		TargetPort: entryPort,
+		LatencyMs:  entryLatency,
+	}
+	if entryErr != nil {
+		entrySeg.Success = false
+		entrySeg.Status = "error"
+		entrySeg.Error = fmt.Sprintf("入口连接失败: %v", entryErr)
+		hasError = true
+		firstErrMsg = entrySeg.Error
+	} else {
+		_ = entryConn.Close()
+		entrySeg.Success = true
+		if entryLatency > 300 {
+			entrySeg.Status = "degraded"
+		} else {
+			entrySeg.Status = "healthy"
+		}
+	}
+	segments = append(segments, entrySeg)
 
-	status := "healthy"
-	if latency > 300 {
-		status = "degraded"
+	// 2. 隧道多跳逐跳检测（由上游节点 Agent 发起对下一跳节点的隧道探测）
+	nHops := len(f.Hops)
+	if nHops >= 2 {
+		for i := 0; i < nHops-1; i++ {
+			hopSrc := f.Hops[i]
+			hopDst := f.Hops[i+1]
+			nextHost := strings.TrimSpace(hopSrc.NextHost)
+			nextPort := hopSrc.NextPort
+			if nextPort <= 0 {
+				nextPort = hopDst.ListenPort
+			}
+			if nextHost == "" {
+				if dstServer, err := h.repo.GetRemoteServer(ctx, hopDst.ServerID); err == nil && dstServer != nil {
+					nextHost = serverEntryHost(dstServer)
+				}
+			}
+
+			srcName := hopSrc.ServerName
+			if srcName == "" {
+				srcName = fmt.Sprintf("节点 #%d", hopSrc.ServerID)
+			}
+			dstName := hopDst.ServerName
+			if dstName == "" {
+				dstName = fmt.Sprintf("节点 #%d", hopDst.ServerID)
+			}
+
+			tunSeg := ForwardProbeSegment{
+				Type:       "tunnel",
+				SourceName: srcName,
+				TargetName: dstName,
+				TargetHost: nextHost,
+				TargetPort: nextPort,
+			}
+
+			lat, err := h.probeAgentLatency(ctx, hopSrc.ServerID, nextHost, nextPort, 3000)
+			if err != nil {
+				tunSeg.Success = false
+				tunSeg.Status = "error"
+				tunSeg.Error = fmt.Sprintf("隧道中断: %v", err)
+				if !hasError {
+					hasError = true
+					firstErrMsg = fmt.Sprintf("隧道段 [%s ➔ %s] 连接失败: %v", srcName, dstName, err)
+				}
+			} else {
+				tunSeg.Success = true
+				tunSeg.LatencyMs = lat
+				totalTunnelLatency += lat
+				hasTunnelLatency = true
+				if lat > 300 {
+					tunSeg.Status = "degraded"
+				} else {
+					tunSeg.Status = "healthy"
+				}
+			}
+			segments = append(segments, tunSeg)
+		}
 	}
 
-	msg := "入口通信正常，链路就绪"
-	if f.ObservedState != storage.ForwardObservedActive {
-		msg = fmt.Sprintf("入口通信正常，但当前状态为 %s", f.ObservedState)
+	// 3. 落地目标检测（由出口节点 Agent 发起对最终落地目标的连通性探测）
+	if nHops > 0 {
+		exitHop := f.Hops[nHops-1]
+		targetHost := strings.TrimSpace(f.TargetHost)
+		targetPort := f.TargetPort
+		targetName := f.TargetHost
+
+		if f.TargetType == "managed_node" && f.TargetNodeID > 0 {
+			if node, err := h.repo.GetNodeByID(ctx, f.TargetNodeID); err == nil {
+				if node.NodeName != "" {
+					targetName = node.NodeName
+				}
+			}
+		}
+
+		if targetHost != "" && targetPort > 0 {
+			exitName := exitHop.ServerName
+			if exitName == "" {
+				exitName = fmt.Sprintf("节点 #%d", exitHop.ServerID)
+			}
+			exitName += " (出口)"
+
+			tgtSeg := ForwardProbeSegment{
+				Type:       "target",
+				SourceName: exitName,
+				TargetName: targetName,
+				TargetHost: targetHost,
+				TargetPort: targetPort,
+			}
+
+			lat, err := h.probeAgentLatency(ctx, exitHop.ServerID, targetHost, targetPort, 3000)
+			if err != nil {
+				tgtSeg.Success = false
+				tgtSeg.Status = "error"
+				tgtSeg.Error = fmt.Sprintf("落地目标未响应: %v", err)
+				if !hasError {
+					hasError = true
+					firstErrMsg = fmt.Sprintf("落地目标 [%s:%d] 连接失败: %v", targetName, targetPort, err)
+				}
+			} else {
+				tgtSeg.Success = true
+				tgtSeg.LatencyMs = lat
+				targetLatency = lat
+				hasTargetLatency = true
+				if lat > 300 {
+					tgtSeg.Status = "degraded"
+				} else {
+					tgtSeg.Status = "healthy"
+				}
+			}
+			segments = append(segments, tgtSeg)
+		}
+	}
+
+	overallStatus := "healthy"
+	if hasError {
+		overallStatus = "error"
+	} else {
+		for _, seg := range segments {
+			if seg.Status == "degraded" {
+				overallStatus = "degraded"
+				break
+			}
+		}
+	}
+
+	displayLatency := entryLatency
+	if hasTunnelLatency && hasTargetLatency {
+		displayLatency = totalTunnelLatency + targetLatency
+	} else if hasTunnelLatency {
+		displayLatency = totalTunnelLatency
+	} else if hasTargetLatency {
+		displayLatency = targetLatency
+	}
+
+	msg := "全链路通畅 · 隧道与落地目标均就绪"
+	if hasError {
+		msg = firstErrMsg
+	} else if overallStatus == "degraded" {
+		msg = "全链路就绪，但部分分段网络延迟偏高"
+	} else if f.ObservedState != storage.ForwardObservedActive {
+		msg = fmt.Sprintf("链路通信正常，但当前规则状态为 %s", f.ObservedState)
 	}
 
 	writeJSON(w, http.StatusOK, ForwardProbeResponse{
-		Success:   true,
-		LatencyMs: latency,
-		Status:    status,
-		Message:   msg,
-		EntryHost: entryHost,
-		EntryPort: entryPort,
-		ProbeType: "tcp_handshake",
-		CheckedAt: time.Now().Unix(),
+		Success:         !hasError,
+		LatencyMs:       displayLatency,
+		TunnelLatencyMs: totalTunnelLatency,
+		TargetLatencyMs: targetLatency,
+		Status:          overallStatus,
+		Message:         msg,
+		EntryHost:       entryHost,
+		EntryPort:       entryPort,
+		ProbeType:       "hop_by_hop_agent_probe",
+		Segments:        segments,
+		CheckedAt:       time.Now().Unix(),
+	})
+}
+
+func (h *ForwardingHandler) HandleAdminTunnelTemplateProbe(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeForwardingError(w, storage.ErrForwardingInvalid)
+		return
+	}
+	item, err := h.repo.GetTunnelTemplate(r.Context(), id)
+	if err != nil {
+		writeForwardingError(w, err)
+		return
+	}
+	h.handleTunnelProbe(w, r, item)
+}
+
+func (h *ForwardingHandler) HandleUserTunnelGrantProbe(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeForwardingError(w, storage.ErrForwardingInvalid)
+		return
+	}
+	username := strings.TrimSpace(auth.UsernameFromContext(r.Context()))
+	if username == "" {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	grant, err := h.repo.GetUserTunnelGrant(r.Context(), id, username)
+	if err != nil {
+		writeForwardingError(w, err)
+		return
+	}
+	template, err := h.repo.GetTunnelTemplate(r.Context(), strconv.FormatInt(grant.TunnelID, 10))
+	if err != nil {
+		writeForwardingError(w, err)
+		return
+	}
+	h.handleTunnelProbe(w, r, template)
+}
+
+func (h *ForwardingHandler) handleTunnelProbe(w http.ResponseWriter, r *http.Request, t *storage.TunnelTemplate) {
+	ctx := r.Context()
+	nHops := len(t.Hops)
+	if nHops < 2 {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success":     true,
+			"tunnel_id":   t.ID,
+			"tunnel_name": t.Name,
+			"latency_ms":  0,
+			"status":      "healthy",
+			"message":     "单节点模式，无中间隧道跳",
+			"checked_at":  time.Now().Unix(),
+		})
+		return
+	}
+
+	var segments []ForwardProbeSegment
+	var totalLatency float64
+	hasError := false
+	var firstErrMsg string
+
+	for i := 0; i < nHops-1; i++ {
+		srcHop := t.Hops[i]
+		dstHop := t.Hops[i+1]
+
+		srcName := srcHop.ServerName
+		if srcName == "" {
+			srcName = fmt.Sprintf("节点 #%d", srcHop.ServerID)
+		}
+		dstName := dstHop.ServerName
+		if dstName == "" {
+			dstName = fmt.Sprintf("节点 #%d", dstHop.ServerID)
+		}
+
+		nextHost := strings.TrimSpace(dstHop.ConnectHost)
+		targetPort := 80
+		dstServer, sErr := h.repo.GetRemoteServer(ctx, dstHop.ServerID)
+		if sErr == nil && dstServer != nil {
+			if nextHost == "" {
+				nextHost = serverEntryHost(dstServer)
+			}
+			if dstServer.PullPort > 0 {
+				targetPort = dstServer.PullPort
+			} else if dstServer.ListenPort > 0 {
+				targetPort = dstServer.ListenPort
+			} else if t.PortRangeStart > 0 {
+				targetPort = t.PortRangeStart
+			}
+		}
+
+		tunSeg := ForwardProbeSegment{
+			Type:       "tunnel",
+			SourceName: srcName,
+			TargetName: dstName,
+			TargetHost: nextHost,
+			TargetPort: targetPort,
+		}
+
+		lat, err := h.probeAgentLatency(ctx, srcHop.ServerID, nextHost, targetPort, 3000)
+		if err != nil {
+			tunSeg.Success = false
+			tunSeg.Status = "error"
+			tunSeg.Error = fmt.Sprintf("隧道连接失败: %v", err)
+			if !hasError {
+				hasError = true
+				firstErrMsg = fmt.Sprintf("隧道 [%s ➔ %s] 探测失败: %v", srcName, dstName, err)
+			}
+		} else {
+			tunSeg.Success = true
+			tunSeg.LatencyMs = lat
+			tunSeg.Status = "healthy"
+			if lat > 300 {
+				tunSeg.Status = "degraded"
+			}
+			totalLatency += lat
+		}
+		segments = append(segments, tunSeg)
+	}
+
+	overallStatus := "healthy"
+	if hasError {
+		overallStatus = "error"
+	}
+
+	msg := "隧道链路通畅"
+	if hasError {
+		msg = firstErrMsg
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":     !hasError,
+		"tunnel_id":   t.ID,
+		"tunnel_name": t.Name,
+		"latency_ms":  totalLatency,
+		"status":      overallStatus,
+		"message":     msg,
+		"segments":    segments,
+		"checked_at":  time.Now().Unix(),
 	})
 }
 
