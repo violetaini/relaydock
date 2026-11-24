@@ -1457,6 +1457,8 @@ func main() {
 	remoteWSHandler.StartCleanupLoop(collectorCtx, 1*time.Minute)
 	// 启动通知调度器
 	go handler.StartNotifyScheduler(collectorCtx, repo)
+	// 启动外部订阅文件的后台自动更新任务（每 1 分钟检查到期外部订阅并自动拉取更新）
+	go handler.StartSubscribeFilesAutoUpdater(collectorCtx, repo)
 
 	// 外部测速组件由当前后端的内置目录明确指定版本。启动时立即对比，
 	// 之后定期重试下载失败项；只更新已由 Arcway 管理的副本。

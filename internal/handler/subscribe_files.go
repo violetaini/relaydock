@@ -177,6 +177,10 @@ func (h *subscribeFilesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		// PUT /api/admin/subscribe-files/{文件名}/内容
 		filename := strings.TrimSuffix(path, "/content")
 		h.handleUpdateContent(w, r, filename)
+	case strings.HasSuffix(path, "/sync") && r.Method == http.MethodPost:
+		// POST /api/admin/subscribe-files/{id}/sync — 手动同步该外部订阅
+		idStr := strings.TrimSuffix(path, "/sync")
+		h.handleSync(w, r, idStr)
 	case path != "" && path != "import" && path != "upload" && path != "create-from-config" && (r.Method == http.MethodPut || r.Method == http.MethodPatch):
 		h.handleUpdate(w, r, path)
 	case path != "" && path != "import" && path != "upload" && path != "create-from-config" && r.Method == http.MethodDelete:
@@ -352,10 +356,11 @@ func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Requ
 
 func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
-		URL         string `json:"url"`
-		Filename    string `json:"filename"`
+		Name               string `json:"name"`
+		Description        string `json:"description"`
+		URL                string `json:"url"`
+		Filename           string `json:"filename"`
+		AutoUpdateInterval *int   `json:"auto_update_interval,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -484,14 +489,22 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	autoInterval := 0
+	if req.AutoUpdateInterval != nil && *req.AutoUpdateInterval >= 0 {
+		autoInterval = *req.AutoUpdateInterval
+	}
+	now := time.Now().UTC()
+
 	// 保存到数据库
 	file := storage.SubscribeFile{
-		Name:        req.Name,
-		Description: req.Description,
-		URL:         req.URL,
-		Type:        storage.SubscribeTypeImport,
-		Filename:    filename,
-		CreatedBy:   username,
+		Name:               req.Name,
+		Description:        req.Description,
+		URL:                req.URL,
+		Type:               storage.SubscribeTypeImport,
+		Filename:           filename,
+		CreatedBy:          username,
+		AutoUpdateInterval: autoInterval,
+		LastSyncAt:         &now,
 	}
 
 	created, err := h.repo.CreateSubscribeFile(r.Context(), file)
@@ -737,6 +750,9 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 	}
 	if req.SortOrder != nil {
 		existing.SortOrder = *req.SortOrder
+	}
+	if req.AutoUpdateInterval != nil && *req.AutoUpdateInterval >= 0 {
+		existing.AutoUpdateInterval = *req.AutoUpdateInterval
 	}
 
 	// 处理文件名更新
@@ -1152,33 +1168,37 @@ type subscribeFileRequest struct {
 	// 必须用指针以区分"前端没传"vs"前端想清空":
 	// 内联更新(只发 template_filename)时 CustomShortCode 字段缺省,
 	// 旧 string 零值会被误判为"想把短码清空"→ 触发"只有管理员可以编辑短码"。
-	CustomShortCode *string `json:"custom_short_code,omitempty"`
-	RawOutput       *bool   `json:"raw_output,omitempty"`
-	SortOrder       *int    `json:"sort_order,omitempty"`
+	CustomShortCode    *string `json:"custom_short_code,omitempty"`
+	RawOutput          *bool   `json:"raw_output,omitempty"`
+	SortOrder          *int    `json:"sort_order,omitempty"`
+	AutoUpdateInterval *int    `json:"auto_update_interval,omitempty"`
 }
 
 type subscribeFileDTO struct {
-	ID                        int64     `json:"id"`
-	Name                      string    `json:"name"`
-	Description               string    `json:"description"`
-	Type                      string    `json:"type"`
-	Filename                  string    `json:"filename"`
-	FileShortCode             string    `json:"file_short_code"`
-	CustomShortCode           string    `json:"custom_short_code"`
-	AutoSyncCustomRules       bool      `json:"auto_sync_custom_rules"`
-	TemplateFilename          string    `json:"template_filename"`
-	SelectedTags              []string  `json:"selected_tags"`
-	SelectedNodeIDs           []int64   `json:"selected_node_ids"`
-	SelectedCustomRuleIDs     []int64   `json:"selected_custom_rule_ids"`
-	SelectedOverrideScriptIDs []int64   `json:"selected_override_script_ids"`
-	StatsServerIDs            string    `json:"stats_server_ids"`
-	TrafficLimit              *float64  `json:"traffic_limit"`
-	SortOrder                 int       `json:"sort_order"`
-	RawOutput                 bool      `json:"raw_output"`
-	CreatedBy                 string    `json:"created_by"`
-	CreatedAt                 time.Time `json:"created_at"`
-	UpdatedAt                 time.Time `json:"updated_at"`
-	LatestVersion             int64     `json:"latest_version,omitempty"`
+	ID                        int64      `json:"id"`
+	Name                      string     `json:"name"`
+	Description               string     `json:"description"`
+	URL                       string     `json:"url,omitempty"`
+	Type                      string     `json:"type"`
+	Filename                  string     `json:"filename"`
+	FileShortCode             string     `json:"file_short_code"`
+	CustomShortCode           string     `json:"custom_short_code"`
+	AutoSyncCustomRules       bool       `json:"auto_sync_custom_rules"`
+	TemplateFilename          string     `json:"template_filename"`
+	SelectedTags              []string   `json:"selected_tags"`
+	SelectedNodeIDs           []int64    `json:"selected_node_ids"`
+	SelectedCustomRuleIDs     []int64    `json:"selected_custom_rule_ids"`
+	SelectedOverrideScriptIDs []int64    `json:"selected_override_script_ids"`
+	StatsServerIDs            string     `json:"stats_server_ids"`
+	TrafficLimit              *float64   `json:"traffic_limit"`
+	SortOrder                 int        `json:"sort_order"`
+	RawOutput                 bool       `json:"raw_output"`
+	CreatedBy                 string     `json:"created_by"`
+	AutoUpdateInterval        int        `json:"auto_update_interval"`
+	LastSyncAt                *time.Time `json:"last_sync_at,omitempty"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
+	LatestVersion             int64      `json:"latest_version,omitempty"`
 }
 
 func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
@@ -1218,6 +1238,9 @@ func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
 		SortOrder:                 file.SortOrder,
 		RawOutput:                 file.RawOutput,
 		CreatedBy:                 file.CreatedBy,
+		URL:                       file.URL,
+		AutoUpdateInterval:        file.AutoUpdateInterval,
+		LastSyncAt:                file.LastSyncAt,
 		CreatedAt:                 file.CreatedAt,
 		UpdatedAt:                 file.UpdatedAt,
 	}
@@ -1806,4 +1829,152 @@ func filterAdminVisibleSubscribeFiles(ctx context.Context, repo *storage.Traffic
 		}
 	}
 	return out
+}
+
+// syncSingleSubscribeFile 从外部 URL 同步单个订阅文件内容并更新版本与上次同步时间。
+func (h *subscribeFilesHandler) syncSingleSubscribeFile(ctx context.Context, sf storage.SubscribeFile, author string) error {
+	if sf.URL == "" {
+		return errors.New("订阅没有外部 URL 地址，无法同步")
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, sf.URL, nil)
+	if err != nil {
+		return fmt.Errorf("创建请求失败: %w", err)
+	}
+	httpReq.Header.Set("User-Agent", "clash-meta/2.4.0")
+
+	resp, err := h.fetchClient.Do(httpReq)
+	if err != nil {
+		logger.Info("[订阅文件] 获取外部订阅失败", "url", sf.URL, "error", sanitizeSubscriptionRequestError(err))
+		return fmt.Errorf("无法获取外部订阅内容: %w", sanitizeSubscriptionRequestError(err))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("订阅服务器返回 HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("读取外部订阅内容失败: %w", err)
+	}
+
+	var yamlCheck map[string]any
+	if err := yaml.Unmarshal(body, &yamlCheck); err != nil {
+		return errors.New("外部订阅内容不是有效的 YAML 格式")
+	}
+
+	unlock, err := lockSubscriptionFilenames(sf.Filename)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	protectedContent, err := protectWireGuardSubscriptionContent(ctx, h.repo, sf.Filename, string(body), false)
+	if err != nil {
+		return err
+	}
+
+	filePath := filepath.Join("subscribes", sf.Filename)
+	if err := writePrivateSubscriptionFileUnlocked(filePath, []byte(protectedContent)); err != nil {
+		return fmt.Errorf("保存订阅文件失败: %w", err)
+	}
+
+	if author == "" {
+		author = sf.CreatedBy
+	}
+	if author == "" {
+		author = "system"
+	}
+
+	_, _ = h.repo.SaveRuleVersionForSubscribe(ctx, sf.ID, sf.Filename, protectedContent, author)
+
+	now := time.Now().UTC()
+	sf.LastSyncAt = &now
+	sf.UpdatedAt = now
+	_, err = h.repo.UpdateSubscribeFile(ctx, sf)
+	return err
+}
+
+func (h *subscribeFilesHandler) handleSync(w http.ResponseWriter, r *http.Request, idStr string) {
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		writeBadRequest(w, "无效的订阅 ID")
+		return
+	}
+
+	sf, err := h.repo.GetSubscribeFileByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, storage.ErrSubscribeFileNotFound) {
+			writeError(w, http.StatusNotFound, errors.New("订阅文件不存在"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	// 权限校验：普通用户只能同步自己创建的订阅
+	uname := auth.UsernameFromContext(r.Context())
+	if !userIsAdmin(r.Context(), h.repo, uname) && sf.CreatedBy != uname {
+		writeError(w, http.StatusNotFound, errors.New("订阅文件不存在"))
+		return
+	}
+
+	if err := h.syncSingleSubscribeFile(r.Context(), sf, uname); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	updated, _ := h.repo.GetSubscribeFileByID(r.Context(), id)
+	respondJSON(w, http.StatusOK, map[string]any{
+		"file": convertSubscribeFile(updated),
+	})
+}
+
+// StartSubscribeFilesAutoUpdater 启动外部订阅文件的后台自动更新定时器。
+func StartSubscribeFilesAutoUpdater(ctx context.Context, repo *storage.TrafficRepository) {
+	if repo == nil {
+		return
+	}
+	h := &subscribeFilesHandler{
+		repo:        repo,
+		fetchClient: safefetch.NewClient(30*time.Second, maxSubscriptionBytes),
+	}
+
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			files, err := repo.ListSubscribeFiles(ctx)
+			if err != nil {
+				continue
+			}
+			now := time.Now().UTC()
+			for _, sf := range files {
+				if sf.URL == "" || sf.AutoUpdateInterval <= 0 {
+					continue
+				}
+				last := sf.LastSyncAt
+				var lastTime time.Time
+				if last != nil {
+					lastTime = *last
+				} else {
+					lastTime = sf.UpdatedAt
+				}
+				if now.Sub(lastTime) >= time.Duration(sf.AutoUpdateInterval)*time.Second {
+					logger.Info("[订阅自动更新] 触发外部订阅自动同步", "id", sf.ID, "name", sf.Name, "filename", sf.Filename)
+					syncCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+					if err := h.syncSingleSubscribeFile(syncCtx, sf, "auto-updater"); err != nil {
+						logger.Warn("[订阅自动更新] 外部订阅自动同步失败", "id", sf.ID, "name", sf.Name, "error", err)
+					} else {
+						logger.Info("[订阅自动更新] 外部订阅自动同步成功", "id", sf.ID, "name", sf.Name)
+					}
+					cancel()
+				}
+			}
+		}
+	}
 }

@@ -645,6 +645,8 @@ type SubscribeFile struct {
 	SortOrder                 int
 	RawOutput                 bool
 	CreatedBy                 string // 创建者用户名
+	AutoUpdateInterval        int    // 自动更新间隔(秒), 0=不自动更新
+	LastSyncAt                *time.Time
 	CreatedAt                 time.Time
 	UpdatedAt                 time.Time
 }
@@ -1994,6 +1996,12 @@ CREATE INDEX IF NOT EXISTS idx_custom_rules_enabled ON custom_rules(enabled);
 		return err
 	}
 	if err := r.ensureSubscribeFileColumn("created_by", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := r.ensureSubscribeFileColumn("auto_update_interval", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureSubscribeFileColumn("last_sync_at", "DATETIME"); err != nil {
 		return err
 	}
 
