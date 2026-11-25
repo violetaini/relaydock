@@ -120,6 +120,38 @@ func applyCustomRulesToYaml(ctx context.Context, repo *storage.TrafficRepository
 		return yamlData, nil, nil
 	}
 
+	return applyCustomRuleListToYaml(yamlData, rules)
+}
+
+func applyCustomRulesToYamlForFile(ctx context.Context, repo *storage.TrafficRepository, yamlData []byte, sf storage.SubscribeFile) ([]byte, []string, error) {
+	if len(sf.SelectedCustomRuleIDs) == 0 || repo == nil {
+		return yamlData, nil, nil
+	}
+	allRules, err := repo.ListEnabledCustomRules(ctx, "")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get custom rules: %w", err)
+	}
+	var rules []storage.CustomRule
+	for _, rule := range allRules {
+		allowed, err := customRuleAllowedForSubscribeFile(ctx, repo, sf, rule)
+		if err != nil {
+			return nil, nil, err
+		}
+		if allowed {
+			rules = append(rules, rule)
+		}
+	}
+	if len(rules) == 0 {
+		return yamlData, nil, nil
+	}
+	return applyCustomRuleListToYaml(yamlData, rules)
+}
+
+func applyCustomRuleListToYaml(yamlData []byte, rules []storage.CustomRule) ([]byte, []string, error) {
+	if len(rules) == 0 {
+		return yamlData, nil, nil
+	}
+
 	// 将 YAML 数据解析为 Node 以保留结构和顺序
 	var rootNode yaml.Node
 	if err := yaml.Unmarshal(yamlData, &rootNode); err != nil {

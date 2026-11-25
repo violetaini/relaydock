@@ -789,6 +789,15 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	logger.Info("[⏱️ 耗时监测] 链式代理注入完成", "step", "chain_proxy", "duration_ms", time.Since(stepStart).Milliseconds())
 
+	// 动态生成订阅在下载时实时应用选中的覆写规则
+	if subscribeFile.Generation != nil && len(subscribeFile.SelectedCustomRuleIDs) > 0 && h.repo != nil {
+		if applied, _, err := applyCustomRulesToYamlForFile(r.Context(), h.repo, data, subscribeFile); err == nil {
+			data = applied
+		} else {
+			logger.Info("[Subscription] 动态应用覆写规则失败", "error", err)
+		}
+	}
+
 	// 执行覆写脚本（post_fetch 钩子）
 	stepStart = time.Now()
 	if username != "" && h.repo != nil {

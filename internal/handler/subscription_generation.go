@@ -24,13 +24,15 @@ import (
 )
 
 type generationRequest struct {
-	ID              int64                           `json:"id,omitempty"`
-	Name            string                          `json:"name"`
-	Description     string                          `json:"description"`
-	Filename        string                          `json:"filename"`
-	SelectedNodeIDs []int64                         `json:"selected_node_ids"`
-	Generation      *storage.SubscriptionGeneration `json:"generation"`
-	TrafficLimit    json.RawMessage                 `json:"traffic_limit,omitempty"`
+	ID                        int64                           `json:"id,omitempty"`
+	Name                      string                          `json:"name"`
+	Description               string                          `json:"description"`
+	Filename                  string                          `json:"filename"`
+	SelectedNodeIDs           []int64                         `json:"selected_node_ids"`
+	SelectedCustomRuleIDs     []int64                         `json:"selected_custom_rule_ids"`
+	SelectedOverrideScriptIDs []int64                         `json:"selected_override_script_ids"`
+	Generation                *storage.SubscriptionGeneration `json:"generation"`
+	TrafficLimit              json.RawMessage                 `json:"traffic_limit,omitempty"`
 }
 type previewNodeSummary struct {
 	Key         string `json:"key"`
@@ -797,7 +799,19 @@ func (h *subscribeFilesHandler) handleGeneration(w http.ResponseWriter, r *http.
 			return
 		}
 	}
-	file := storage.SubscribeFile{ID: req.ID, Name: strings.TrimSpace(req.Name), Description: strings.TrimSpace(req.Description), Filename: strings.TrimSpace(req.Filename), Type: storage.SubscribeTypeCreate, CreatedBy: username, SelectedNodeIDs: req.SelectedNodeIDs, Generation: req.Generation}
+	file := storage.SubscribeFile{
+		ID:                        req.ID,
+		Name:                      strings.TrimSpace(req.Name),
+		Description:               strings.TrimSpace(req.Description),
+		Filename:                  strings.TrimSpace(req.Filename),
+		Type:                      storage.SubscribeTypeCreate,
+		CreatedBy:                 username,
+		SelectedNodeIDs:           req.SelectedNodeIDs,
+		SelectedCustomRuleIDs:     req.SelectedCustomRuleIDs,
+		SelectedOverrideScriptIDs: req.SelectedOverrideScriptIDs,
+		AutoSyncCustomRules:       len(req.SelectedCustomRuleIDs) > 0,
+		Generation:                req.Generation,
+	}
 	if file.ID > 0 {
 		existing, err := h.repo.GetSubscribeFileByID(r.Context(), file.ID)
 		if err != nil || (!admin && existing.CreatedBy != username) {
@@ -812,6 +826,15 @@ func (h *subscribeFilesHandler) handleGeneration(w http.ResponseWriter, r *http.
 		file.Generation = req.Generation
 		if req.SelectedNodeIDs != nil {
 			file.SelectedNodeIDs = req.SelectedNodeIDs
+		}
+		if req.SelectedCustomRuleIDs != nil {
+			file.SelectedCustomRuleIDs = req.SelectedCustomRuleIDs
+			if len(req.SelectedCustomRuleIDs) > 0 {
+				file.AutoSyncCustomRules = true
+			}
+		}
+		if req.SelectedOverrideScriptIDs != nil {
+			file.SelectedOverrideScriptIDs = req.SelectedOverrideScriptIDs
 		}
 		if req.Name != "" {
 			file.Name = strings.TrimSpace(req.Name)
@@ -850,6 +873,11 @@ func (h *subscribeFilesHandler) handleGeneration(w http.ResponseWriter, r *http.
 		if convErr != nil {
 			writeError(w, 422, fmt.Errorf("%s: %w", out.Client, convErr))
 			return
+		}
+		if (out.Client == "" || out.Client == "clashmeta") && len(file.SelectedCustomRuleIDs) > 0 {
+			if applied, _, applyErr := applyCustomRulesToYamlForFile(r.Context(), h.repo, converted, file); applyErr == nil {
+				converted = applied
+			}
 		}
 		targetResult.Content = string(converted)
 		result.Outputs = append(result.Outputs, targetResult)
