@@ -55,6 +55,27 @@ func validateSubscriptionNodeSelectionEdit(ctx context.Context, repo *storage.Tr
 				retained[id] = true
 			}
 		}
+	} else if f.Generation != nil && f.Generation.Kind == "strategy" {
+		isAdmin := userIsAdmin(ctx, repo, f.CreatedBy)
+		for _, srcID := range f.Generation.SourceIDs {
+			if srcID <= 0 || srcID == f.ID {
+				continue
+			}
+			source, err := repo.GetSubscribeFileByID(ctx, srcID)
+			if err != nil || subscriptionKind(source) != "custom" {
+				continue
+			}
+			if source.CreatedBy != f.CreatedBy && !(isAdmin && source.CreatedBy == "") {
+				continue
+			}
+			ids, _, err := subscriptionBoundNodeIDs(ctx, repo, source)
+			if err != nil {
+				return err
+			}
+			for _, id := range ids {
+				retained[id] = true
+			}
+		}
 	}
 	return validateSubscriptionNodeSelectionWithRetained(ctx, repo, f, retained)
 }

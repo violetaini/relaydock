@@ -182,6 +182,13 @@ func TestSubscriptionRuleEditRetainsLegacyNodesWithoutAllowingNewSharedNodes(t *
 	if err := validateSubscriptionNodeSelectionEdit(ctx, repo, saved); err == nil {
 		t.Fatal("retained node exemption crossed ownership")
 	}
+
+	// Owner's legacy custom subscription can be previewed/used as a strategy source without exposing it to other users.
+	strategyGen := generationRecipe(f.ID)
+	strategyPreview := generationCall(repo, "/api/admin/subscribe-files/generation/preview", generationRequest{Generation: strategyGen})
+	if strategyPreview.Code != 200 || !strings.Contains(strategyPreview.Body.String(), "legacy") {
+		t.Fatalf("legacy custom source rejected in strategy preview: %d %s", strategyPreview.Code, strategyPreview.Body.String())
+	}
 }
 
 func TestAssignedExternalSourceDoesNotExposeOwnerCredentials(t *testing.T) {
