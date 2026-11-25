@@ -332,6 +332,49 @@ func cachedOrQueueGeoIPCountryCode(ipAddress string) string {
 	return ""
 }
 
+func resolveServerCountryCode(ctx context.Context, repo *storage.TrafficRepository, server storage.RemoteServer) string {
+	if code := publicCountryCode(server.CountryCode); code != "" {
+		return code
+	}
+	for _, rawIP := range []string{server.IPAddress, func() string {
+		if server.IPv6Enabled {
+			return server.IPAddressV6
+		}
+		return ""
+	}()} {
+		ip := net.ParseIP(strings.TrimSpace(rawIP))
+		if ip == nil {
+			continue
+		}
+		key := ip.String()
+		if cached, ok := geoIPCache.Load(key); ok {
+			if code, ok := cached.(string); ok {
+				if valid := publicCountryCode(code); valid != "" {
+					if repo != nil && server.ID > 0 {
+						_ = repo.SetRemoteServerCountryCodeIfEmpty(ctx, server.ID, valid)
+					}
+					return valid
+				}
+			}
+			continue
+		}
+		if !isGeoIPLookupPublicIP(ip) {
+			continue
+		}
+		if _, loaded := geoIPLookupPending.LoadOrStore(key, struct{}{}); !loaded {
+			serverID := server.ID
+			go func() {
+				defer geoIPLookupPending.Delete(key)
+				if code := publicCountryCode(getGeoIPCountryCode(key)); code != "" && repo != nil && serverID > 0 {
+					_ = repo.SetRemoteServerCountryCodeIfEmpty(context.Background(), serverID, code)
+				}
+			}()
+		}
+		break
+	}
+	return ""
+}
+
 func publicCountryCode(value string) string {
 	value = strings.ToUpper(strings.TrimSpace(value))
 	if len(value) != 2 {

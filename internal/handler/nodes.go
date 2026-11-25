@@ -2413,6 +2413,7 @@ type nodeDTO struct {
 	// 这两个字段是被中转替换掉的原服务器地址/端口,前端在「服务器地址」下方显示 + 用于编辑/取消中转。
 	RelayOrigServer string    `json:"relay_orig_server,omitempty"`
 	RelayOrigPort   int       `json:"relay_orig_port,omitempty"`
+	CountryCode     string    `json:"country_code,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -2597,6 +2598,18 @@ func convertAdminNodes(ctx context.Context, repo *storage.TrafficRepository, nod
 			eligible = provenanceErr == nil && provisionable
 		}
 		result[i].DirectGrantEligible = eligible
+		if ok {
+			if cc := resolveServerCountryCode(ctx, repo, server); cc != "" {
+				result[i].CountryCode = cc
+			}
+		}
+		if result[i].CountryCode == "" {
+			if inferred := inferCountryCodeFromName(node.NodeName); inferred != "" && inferred != "UN" {
+				result[i].CountryCode = inferred
+			} else if tagCC := publicCountryCode(node.Tag); tagCC != "" {
+				result[i].CountryCode = tagCC
+			}
+		}
 	}
 	return result
 }

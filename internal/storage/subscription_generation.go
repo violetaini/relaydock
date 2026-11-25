@@ -24,6 +24,7 @@ type SubscriptionProcessing struct {
 	Sort          string   `json:"sort,omitempty"`
 	SortDirection string   `json:"sort_direction,omitempty"`
 	TypeOrder     []string `json:"type_order,omitempty"`
+	RegionOrder   []string `json:"region_order,omitempty"`
 	CustomOrder   []string `json:"custom_order,omitempty"`
 }
 

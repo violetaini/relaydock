@@ -415,3 +415,68 @@ func TestGenerationSortByTypeCustomOrderAndDirection(t *testing.T) {
 		t.Fatalf("custom desc order wrong: %+v", stats.Nodes)
 	}
 }
+
+func TestGenerationSortByRegionAndServerCountryCode(t *testing.T) {
+	repo, source := generationFixture(t)
+	ctx := context.Background()
+
+	// Server bound by domain, initial region set to SG and must stay SG even if IP changes.
+	srv := &storage.RemoteServer{Name: "sg-edge", Token: "tok-sg", Domain: "sg.example.net", IPAddress: "203.0.113.50", XrayMode: "embedded"}
+	if err := repo.CreateRemoteServer(ctx, srv); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetRemoteServerCountryCodeIfEmpty(ctx, srv.ID, "SG"); err != nil {
+		t.Fatal(err)
+	}
+	// Attempting to overwrite when already set (simulating dynamic IP change) must be a no-op.
+	if err := repo.SetRemoteServerCountryCodeIfEmpty(ctx, srv.ID, "US"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := repo.GetRemoteServer(ctx, srv.ID)
+	if err != nil || loaded.CountryCode != "SG" {
+		t.Fatalf("expected initial server country_code SG to persist across dynamic IP updates, got %q err=%v", loaded.CountryCode, err)
+	}
+
+	// Admin updates server region explicitly to JP via UpdateRemoteServerCountryCode.
+	if err := repo.UpdateRemoteServerCountryCode(ctx, srv.ID, "JP"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _ = repo.GetRemoteServer(ctx, srv.ID)
+	if loaded.CountryCode != "JP" {
+		t.Fatalf("expected admin-updated country_code JP, got %q", loaded.CountryCode)
+	}
+
+	raw := `proxies:
+  - {name: Alpha Node, type: ss, server: sg.example.net, port: 443, cipher: aes-128-gcm, password: a}
+  - {name: 香港 HKT 01, type: vmess, server: hk.example.net, port: 443, uuid: 11111111-1111-1111-1111-111111111111}
+  - {name: 🇺🇸 US West, type: trojan, server: us.example.net, port: 443, password: b}
+`
+	if err := os.WriteFile("subscribes/airport.yaml", []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h := NewSubscriptionHandlerConcrete(repo, "subscribes")
+	g := generationRecipe(source.ID)
+	g.Processing.Sort = "region"
+	g.Processing.SortDirection = "asc"
+	g.Processing.RegionOrder = []string{"US", "HK", "JP"}
+
+	_, stats, err := h.generateSubscription(ctx, storage.SubscribeFile{CreatedBy: "admin", Generation: g}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.Nodes) != 3 ||
+		stats.Nodes[0].CountryCode != "US" ||
+		stats.Nodes[1].CountryCode != "HK" ||
+		stats.Nodes[2].CountryCode != "JP" {
+		t.Fatalf("region asc sort wrong: %+v", stats.Nodes)
+	}
+
+	g.Processing.SortDirection = "desc"
+	_, stats, err = h.generateSubscription(ctx, storage.SubscribeFile{CreatedBy: "admin", Generation: g}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Nodes[0].CountryCode != "JP" || stats.Nodes[1].CountryCode != "HK" || stats.Nodes[2].CountryCode != "US" {
+		t.Fatalf("region desc sort wrong: %+v", stats.Nodes)
+	}
+}

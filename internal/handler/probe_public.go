@@ -164,10 +164,7 @@ func (h *ProbePublicHandler) buildPayloadUncached(ctx context.Context) (map[stri
 		}
 		// Country code is safe to expose while addresses are not. The resolver
 		// only returns a cached two-letter value and queues any slow lookup.
-		probe.CountryCode = cachedOrQueueGeoIPCountryCode(server.IPAddress)
-		if probe.CountryCode == "" && server.IPv6Enabled {
-			probe.CountryCode = cachedOrQueueGeoIPCountryCode(server.IPAddressV6)
-		}
+		probe.CountryCode = resolveServerCountryCode(ctx, h.repo, *server)
 		if showName {
 			probe.Name = server.Name
 		}

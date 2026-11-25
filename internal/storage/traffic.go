@@ -933,6 +933,7 @@ type RemoteServer struct {
 	// 或 "system"(用 agent 上报的 /proc/net/dev 累计 RX/TX,跟 VPS 服务商网卡计费口径一致)。
 	// 节点视图 / 用户视图 / 套餐 enforcement 不受此字段影响,它们恒为 xray 维度。
 	TrafficSource string `json:"traffic_source"`
+	CountryCode   string `json:"country_code,omitempty"`
 	// SystemRxCycle / SystemTxCycle 当前 cycle(reset_day 之间)内累加的系统网卡 RX/TX 字节,
 	// 用于 traffic_source='system' 时算 server.traffic_used = SystemRxCycle + SystemTxCycle + offset(按 stats_mode)。
 	SystemRxCycle int64 `json:"system_rx_cycle"`
@@ -2452,6 +2453,9 @@ CREATE INDEX IF NOT EXISTS idx_remote_server_install_tickets_server
 		return err
 	}
 	if err := r.ensureRemoteServerColumn("traffic_stats_mode", "TEXT NOT NULL DEFAULT 'both'"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("country_code", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	// traffic_source 决定 server.traffic_used 的数据源:
@@ -12765,6 +12769,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 		COALESCE(traffic_used_offset, 0),
 		COALESCE(traffic_stats_mode, 'both'),
 		COALESCE(traffic_source, 'xray'),
+		COALESCE(country_code, ''),
 		COALESCE(warp_installed, 0),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
 		last_traffic_reset_at,
@@ -12805,6 +12810,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 			&server.TrafficUsedOffset,
 			&server.TrafficStatsMode,
 			&server.TrafficSource,
+			&server.CountryCode,
 			&warpInstalledInt,
 			&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
 			&lastTrafficResetAt,
@@ -12894,6 +12900,7 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		COALESCE(traffic_used_offset, 0),
 		COALESCE(traffic_stats_mode, 'both'),
 		COALESCE(traffic_source, 'xray'),
+		COALESCE(country_code, ''),
 		COALESCE(warp_installed, 0),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
 		last_traffic_reset_at,
@@ -12923,6 +12930,7 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		&server.TrafficUsedOffset,
 		&server.TrafficStatsMode,
 		&server.TrafficSource,
+		&server.CountryCode,
 		&warpInstalledInt,
 		&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
 		&lastTrafficResetAt,
@@ -12987,6 +12995,7 @@ func (r *TrafficRepository) GetRemoteServerByToken(ctx context.Context, token st
 		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'), COALESCE(nginx_mode, 'managed'),
 		COALESCE(site_type, ''), COALESCE(site_value, ''),
 		COALESCE(xray_mode, 'external'),
+		COALESCE(country_code, ''),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
 		created_at, updated_at
 		FROM remote_servers WHERE token = ?`
@@ -13006,6 +13015,7 @@ func (r *TrafficRepository) GetRemoteServerByToken(ctx context.Context, token st
 		&server.Use443, &server.StealSelf, &server.StealMode, &server.NginxMode,
 		&server.SiteType, &server.SiteValue,
 		&server.XrayMode,
+		&server.CountryCode,
 		&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
 		&server.CreatedAt, &server.UpdatedAt)
 	if err != nil {
@@ -13063,6 +13073,7 @@ func (r *TrafficRepository) GetRemoteServerByName(ctx context.Context, name stri
 		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'), COALESCE(nginx_mode, 'managed'),
 		COALESCE(site_type, ''), COALESCE(site_value, ''),
 		COALESCE(xray_mode, 'external'),
+		COALESCE(country_code, ''),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
 		created_at, updated_at
 		FROM remote_servers WHERE name = ?`
@@ -13082,6 +13093,7 @@ func (r *TrafficRepository) GetRemoteServerByName(ctx context.Context, name stri
 		&server.Use443, &server.StealSelf, &server.StealMode, &server.NginxMode,
 		&server.SiteType, &server.SiteValue,
 		&server.XrayMode,
+		&server.CountryCode,
 		&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
 		&server.CreatedAt, &server.UpdatedAt)
 	if err != nil {
@@ -14190,6 +14202,43 @@ func (r *TrafficRepository) UpdateRemoteServerDomain(ctx context.Context, id int
 		return fmt.Errorf("update domain: %w", err)
 	}
 	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return ErrRemoteServerNotFound
+	}
+	return nil
+}
+
+// SetRemoteServerCountryCodeIfEmpty persists the first auto-detected region for a server
+// without overwriting an already-set region (so dynamic IP changes keep the initial region).
+func (r *TrafficRepository) SetRemoteServerCountryCodeIfEmpty(ctx context.Context, id int64, countryCode string) error {
+	if r == nil || r.db == nil || id <= 0 {
+		return nil
+	}
+	code := strings.ToUpper(strings.TrimSpace(countryCode))
+	if code == "" {
+		return nil
+	}
+	_, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET country_code = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND COALESCE(country_code, '') = ''`, code, id)
+	return err
+}
+
+// UpdateRemoteServerCountryCode explicitly sets or clears a server's region code from Server Management.
+func (r *TrafficRepository) UpdateRemoteServerCountryCode(ctx context.Context, id int64, countryCode string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if id <= 0 {
+		return errors.New("remote server id is required")
+	}
+	code := strings.ToUpper(strings.TrimSpace(countryCode))
+	result, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET country_code = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, code, id)
+	if err != nil {
+		return fmt.Errorf("update remote server country_code: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("get rows affected: %w", err)
+	}
 	if affected == 0 {
 		return ErrRemoteServerNotFound
 	}

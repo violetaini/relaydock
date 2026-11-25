@@ -511,24 +511,38 @@ type PublicNodeResponseItem struct {
 func inferCountryCodeFromName(name string) string {
 	nameUpper := strings.ToUpper(name)
 	switch {
-	case strings.Contains(name, "香港") || strings.Contains(nameUpper, "HK"):
+	case strings.Contains(name, "🇭🇰") || strings.Contains(name, "香港") || strings.Contains(nameUpper, "HK"):
 		return "HK"
-	case strings.Contains(name, "日本") || strings.Contains(name, "东京") || strings.Contains(name, "大阪") || strings.Contains(nameUpper, "JP"):
+	case strings.Contains(name, "🇯🇵") || strings.Contains(name, "日本") || strings.Contains(name, "东京") || strings.Contains(name, "大阪") || strings.Contains(nameUpper, "JP"):
 		return "JP"
-	case strings.Contains(name, "台湾") || strings.Contains(name, "台北") || strings.Contains(nameUpper, "TW"):
+	case strings.Contains(name, "🇹🇼") || strings.Contains(name, "台湾") || strings.Contains(name, "台北") || strings.Contains(nameUpper, "TW"):
 		return "TW"
-	case strings.Contains(name, "美国") || strings.Contains(name, "洛杉矶") || strings.Contains(name, "圣何塞") || strings.Contains(name, "硅谷") || strings.Contains(nameUpper, "US"):
+	case strings.Contains(name, "🇺🇸") || strings.Contains(name, "美国") || strings.Contains(name, "洛杉矶") || strings.Contains(name, "圣何塞") || strings.Contains(name, "硅谷") || strings.Contains(nameUpper, "US"):
 		return "US"
-	case strings.Contains(name, "俄罗斯") || strings.Contains(name, "莫斯科") || strings.Contains(nameUpper, "RU"):
+	case strings.Contains(name, "🇷🇺") || strings.Contains(name, "俄罗斯") || strings.Contains(name, "莫斯科") || strings.Contains(nameUpper, "RU"):
 		return "RU"
-	case strings.Contains(name, "新加坡") || strings.Contains(name, "狮城") || strings.Contains(nameUpper, "SG"):
+	case strings.Contains(name, "🇸🇬") || strings.Contains(name, "新加坡") || strings.Contains(name, "狮城") || strings.Contains(nameUpper, "SG"):
 		return "SG"
-	case strings.Contains(name, "韩国") || strings.Contains(name, "首尔") || strings.Contains(nameUpper, "KR"):
+	case strings.Contains(name, "🇰🇷") || strings.Contains(name, "韩国") || strings.Contains(name, "首尔") || strings.Contains(nameUpper, "KR"):
 		return "KR"
-	case strings.Contains(name, "英国") || strings.Contains(name, "伦敦") || strings.Contains(nameUpper, "UK") || strings.Contains(nameUpper, "GB"):
+	case strings.Contains(name, "🇬🇧") || strings.Contains(name, "英国") || strings.Contains(name, "伦敦") || strings.Contains(nameUpper, "UK") || strings.Contains(nameUpper, "GB"):
 		return "GB"
-	case strings.Contains(name, "德国") || strings.Contains(name, "法兰克福") || strings.Contains(nameUpper, "DE"):
+	case strings.Contains(name, "🇩🇪") || strings.Contains(name, "德国") || strings.Contains(name, "法兰克福") || strings.Contains(nameUpper, "DE"):
 		return "DE"
+	case strings.Contains(name, "🇫🇷") || strings.Contains(name, "法国") || strings.Contains(name, "巴黎"):
+		return "FR"
+	case strings.Contains(name, "🇳🇱") || strings.Contains(name, "荷兰") || strings.Contains(name, "阿姆斯特丹"):
+		return "NL"
+	case strings.Contains(name, "🇨🇦") || strings.Contains(name, "加拿大") || strings.Contains(name, "多伦多"):
+		return "CA"
+	case strings.Contains(name, "🇦🇺") || strings.Contains(name, "澳大利亚") || strings.Contains(name, "澳洲") || strings.Contains(name, "悉尼"):
+		return "AU"
+	case strings.Contains(name, "🇹🇷") || strings.Contains(name, "土耳其"):
+		return "TR"
+	case strings.Contains(name, "🇮🇳") || strings.Contains(name, "印度"):
+		return "IN"
+	case strings.Contains(name, "🇲🇴") || strings.Contains(name, "澳门"):
+		return "MO"
 	default:
 		return "UN"
 	}
@@ -586,10 +600,8 @@ func (h *UserNodesHandler) HandlePublicNodes(w http.ResponseWriter, r *http.Requ
 		}
 		isOnline := node.Enabled
 		if s, ok := serverMap[node.OriginalServer]; ok {
-			if s.IPAddress != "" {
-				if geo := cachedOrQueueGeoIPCountryCode(s.IPAddress); geo != "" {
-					cc = geo
-				}
+			if geo := resolveServerCountryCode(ctx, h.repo, s); geo != "" {
+				cc = geo
 			}
 			isOnline = node.Enabled && (s.Status == "online" || s.Status == "connected")
 		}

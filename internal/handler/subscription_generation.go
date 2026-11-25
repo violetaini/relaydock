@@ -33,9 +33,10 @@ type generationRequest struct {
 	TrafficLimit    json.RawMessage                 `json:"traffic_limit,omitempty"`
 }
 type previewNodeSummary struct {
-	Key  string `json:"key"`
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Key         string `json:"key"`
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	CountryCode string `json:"country_code,omitempty"`
 }
 
 type generationPreview struct {
@@ -123,14 +124,14 @@ func (h *SubscriptionHandler) validateGeneration(ctx context.Context, f storage.
 			}
 		}
 	}
-	if g.Processing.Sort != "" && g.Processing.Sort != "source" && g.Processing.Sort != "name" && g.Processing.Sort != "type" && g.Processing.Sort != "custom" {
+	if g.Processing.Sort != "" && g.Processing.Sort != "source" && g.Processing.Sort != "name" && g.Processing.Sort != "type" && g.Processing.Sort != "region" && g.Processing.Sort != "custom" {
 		return errors.New("无效的排序方式")
 	}
 	if g.Processing.SortDirection != "" && g.Processing.SortDirection != "asc" && g.Processing.SortDirection != "desc" {
 		return errors.New("无效的排序方向")
 	}
-	if len(g.Processing.TypeOrder) > 100 {
-		return errors.New("节点类型排序列表过长")
+	if len(g.Processing.TypeOrder) > 100 || len(g.Processing.RegionOrder) > 100 {
+		return errors.New("节点类型或地区排序列表过长")
 	}
 	if len(g.Processing.CustomOrder) > 5000 {
 		return errors.New("自定义节点排序列表过长")
@@ -367,13 +368,19 @@ func (h *SubscriptionHandler) processGenerationNodes(ctx context.Context, f stor
 			p["name"] = name
 		}
 	}
-	sortGenerationNodes(live, cfg)
+	hostCountryMap := h.buildProxyHostCountryMap(ctx)
+	sortGenerationNodes(live, cfg, hostCountryMap)
 	nodesMeta := make([]previewNodeSummary, 0, len(live))
 	for _, p := range live {
+		cc := resolveProxyCountryCode(p, hostCountryMap)
+		if cc == "UN" {
+			cc = ""
+		}
 		nodesMeta = append(nodesMeta, previewNodeSummary{
-			Key:  generationFingerprint(p),
-			Name: fmt.Sprint(p["name"]),
-			Type: strings.ToLower(fmt.Sprint(p["type"])),
+			Key:         generationFingerprint(p),
+			Name:        fmt.Sprint(p["name"]),
+			Type:        strings.ToLower(fmt.Sprint(p["type"])),
+			CountryCode: cc,
 		})
 	}
 	stats.Nodes = nodesMeta
@@ -381,7 +388,46 @@ func (h *SubscriptionHandler) processGenerationNodes(ctx context.Context, f stor
 	return live, stats, nil
 }
 
-func sortGenerationNodes(live []map[string]any, cfg storage.SubscriptionProcessing) {
+func (h *SubscriptionHandler) buildProxyHostCountryMap(ctx context.Context) map[string]string {
+	out := make(map[string]string)
+	if h == nil || h.repo == nil {
+		return out
+	}
+	servers, err := h.repo.ListRemoteServers(ctx)
+	if err != nil {
+		return out
+	}
+	for _, srv := range servers {
+		cc := resolveServerCountryCode(ctx, h.repo, srv)
+		if cc == "" {
+			continue
+		}
+		for _, host := range []string{srv.IPAddress, srv.IPAddressV6, srv.Domain} {
+			hKey := strings.ToLower(strings.TrimSpace(host))
+			if hKey != "" {
+				out[hKey] = cc
+			}
+		}
+	}
+	return out
+}
+
+func resolveProxyCountryCode(p map[string]any, hostCountryMap map[string]string) string {
+	if len(hostCountryMap) > 0 {
+		host := strings.ToLower(strings.TrimSpace(fmt.Sprint(p["server"])))
+		if host != "" && host != "<nil>" {
+			if cc := hostCountryMap[host]; cc != "" {
+				return cc
+			}
+		}
+	}
+	if cc := inferCountryCodeFromName(fmt.Sprint(p["name"])); cc != "" {
+		return cc
+	}
+	return "UN"
+}
+
+func sortGenerationNodes(live []map[string]any, cfg storage.SubscriptionProcessing, hostCountryMap map[string]string) {
 	desc := cfg.SortDirection == "desc"
 	switch cfg.Sort {
 	case "name":
@@ -428,6 +474,48 @@ func sortGenerationNodes(live []map[string]any, cfg storage.SubscriptionProcessi
 			}
 			if ti != tj {
 				return ti < tj
+			}
+			ni := strings.ToLower(fmt.Sprint(live[i]["name"]))
+			nj := strings.ToLower(fmt.Sprint(live[j]["name"]))
+			return ni < nj
+		})
+		if desc {
+			reverseProxySlice(live)
+		}
+	case "region":
+		regionRank := make(map[string]int, len(cfg.RegionOrder))
+		for idx, code := range cfg.RegionOrder {
+			norm := strings.ToUpper(strings.TrimSpace(code))
+			if norm == "" {
+				continue
+			}
+			if _, exists := regionRank[norm]; !exists {
+				regionRank[norm] = idx
+			}
+		}
+		unknownRank := len(cfg.RegionOrder)
+		sort.SliceStable(live, func(i, j int) bool {
+			ci := resolveProxyCountryCode(live[i], hostCountryMap)
+			cj := resolveProxyCountryCode(live[j], hostCountryMap)
+			ri, oki := regionRank[ci]
+			if !oki {
+				ri = unknownRank
+			}
+			rj, okj := regionRank[cj]
+			if !okj {
+				rj = unknownRank
+			}
+			if ri != rj {
+				return ri < rj
+			}
+			if ci != cj {
+				if ci == "UN" {
+					return false
+				}
+				if cj == "UN" {
+					return true
+				}
+				return ci < cj
 			}
 			ni := strings.ToLower(fmt.Sprint(live[i]["name"]))
 			nj := strings.ToLower(fmt.Sprint(live[j]["name"]))

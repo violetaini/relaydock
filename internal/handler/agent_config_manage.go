@@ -225,8 +225,9 @@ type RemoteServerUpdateRequest struct {
 	TrafficSource    string `json:"traffic_source"`     // xray | system
 	IPv6Enabled      *bool  `json:"ipv6_enabled"`       // 指针:nil=不改;false=关闭(服务管理不显示 v6、加节点不可选 v6)
 	// DDNS 同 Create
-	DDNSEnabled    bool  `json:"ddns_enabled"`
-	DDNSProviderID int64 `json:"ddns_provider_id"`
+	DDNSEnabled    bool    `json:"ddns_enabled"`
+	DDNSProviderID int64   `json:"ddns_provider_id"`
+	CountryCode    *string `json:"country_code"`
 }
 
 // 生成加密安全令牌
@@ -286,10 +287,7 @@ func (h *XrayServerHandler) BuildRemoteServersList(ctx context.Context) RemoteSe
 				extended.AgentUninstallV2 = &capable
 			}
 		}
-		extended.CountryCode = cachedOrQueueGeoIPCountryCode(server.IPAddress)
-		if extended.CountryCode == "" && server.IPv6Enabled {
-			extended.CountryCode = cachedOrQueueGeoIPCountryCode(server.IPAddressV6)
-		}
+		extended.CountryCode = resolveServerCountryCode(ctx, h.repo, server)
 		if ((h.wsHandler != nil && h.wsHandler.IsConnected(server.Token)) || server.Status == storage.RemoteServerStatusConnected) && h.probeStore != nil {
 			if snapshot, ok := h.probeStore.Snapshot(server.ID); ok {
 				fillRemoteServerSystemMetrics(&extended, snapshot)
@@ -2090,6 +2088,16 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		}
 	}
 
+	if req.CountryCode != nil {
+		trimmedCountry := strings.TrimSpace(*req.CountryCode)
+		if trimmedCountry != "" && publicCountryCode(trimmedCountry) == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "无效的地区代码（请使用两位国家/地区代码，如 HK、JP、US）"})
+			return
+		}
+	}
+
 	if err := h.repo.UpdateRemoteServer(ctx, req.ID, req.Name, req.Domain, req.TrafficLimit, req.TrafficResetDay, req.ConnectionMode, req.XrayMode, req.TrafficStatsMode, req.TrafficSource, req.IPv6Enabled); err != nil {
 		msg := "更新服务器失败"
 		if errors.Is(err, storage.ErrRemoteServerNotFound) {
@@ -2116,6 +2124,12 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		})
 		return
 	}
+	if req.CountryCode != nil {
+		if err := h.repo.UpdateRemoteServerCountryCode(ctx, req.ID, publicCountryCode(*req.CountryCode)); err != nil {
+			log.Printf("[Remote Server] Failed to update country_code for server %d: %v", req.ID, err)
+		}
+	}
+
 	if nginxModeChanged {
 		if err := h.repo.UpdateRemoteServerNginxMode(ctx, req.ID, newNginxMode); err != nil {
 			rollbackErr := h.rollbackRemoteNginxMode(ctx, req.ID, oldNginxMode)
