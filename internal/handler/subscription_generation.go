@@ -37,6 +37,7 @@ type previewNodeSummary struct {
 	Name        string `json:"name"`
 	Type        string `json:"type"`
 	CountryCode string `json:"country_code,omitempty"`
+	SourceIndex int    `json:"source_index,omitempty"`
 }
 
 type generationPreview struct {
@@ -290,6 +291,7 @@ func (h *SubscriptionHandler) generationSources(ctx context.Context, f storage.S
 			if replacement := renames[fmt.Sprint(p["dialer-proxy"])]; replacement != "" {
 				p["dialer-proxy"] = replacement
 			}
+			p["_rd_source_index"] = i
 		}
 		proxies = append(proxies, batch...)
 	}
@@ -372,6 +374,8 @@ func (h *SubscriptionHandler) processGenerationNodes(ctx context.Context, f stor
 	sortGenerationNodes(live, cfg, hostCountryMap)
 	nodesMeta := make([]previewNodeSummary, 0, len(live))
 	for _, p := range live {
+		srcIdx, _ := p["_rd_source_index"].(int)
+		delete(p, "_rd_source_index")
 		cc := resolveProxyCountryCode(p, hostCountryMap)
 		if cc == "UN" {
 			cc = ""
@@ -381,6 +385,7 @@ func (h *SubscriptionHandler) processGenerationNodes(ctx context.Context, f stor
 			Name:        fmt.Sprint(p["name"]),
 			Type:        strings.ToLower(fmt.Sprint(p["type"])),
 			CountryCode: cc,
+			SourceIndex: srcIdx,
 		})
 	}
 	stats.Nodes = nodesMeta
@@ -427,8 +432,49 @@ func resolveProxyCountryCode(p map[string]any, hostCountryMap map[string]string)
 	return "UN"
 }
 
+func generationCustomOrderRank(customOrder []string) map[string]int {
+	if len(customOrder) == 0 {
+		return nil
+	}
+	rank := make(map[string]int, len(customOrder))
+	for idx, key := range customOrder {
+		trimmed := strings.TrimSpace(key)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := rank[trimmed]; !exists {
+			rank[trimmed] = idx
+		}
+	}
+	return rank
+}
+
+func proxyCustomRank(p map[string]any, rank map[string]int, fallback int) int {
+	if len(rank) == 0 {
+		return fallback
+	}
+	// Fingerprint ignores temporary internal metadata.
+	clean := make(map[string]any, len(p))
+	for k, v := range p {
+		if k != "name" && k != "_rd_source_index" {
+			clean[k] = v
+		}
+	}
+	b, _ := json.Marshal(clean)
+	sum := sha256.Sum256(b)
+	fp := hex.EncodeToString(sum[:])
+	if pos, ok := rank[fp]; ok {
+		return pos
+	}
+	if pos, ok := rank[fmt.Sprint(p["name"])]; ok {
+		return pos
+	}
+	return len(rank) + fallback
+}
+
 func sortGenerationNodes(live []map[string]any, cfg storage.SubscriptionProcessing, hostCountryMap map[string]string) {
 	desc := cfg.SortDirection == "desc"
+	customRank := generationCustomOrderRank(cfg.CustomOrder)
 	switch cfg.Sort {
 	case "name":
 		sort.SliceStable(live, func(i, j int) bool {
@@ -458,27 +504,36 @@ func sortGenerationNodes(live []map[string]any, cfg storage.SubscriptionProcessi
 			}
 		}
 		unknownRank := len(cfg.TypeOrder)
-		sort.SliceStable(live, func(i, j int) bool {
-			ti := strings.ToLower(strings.TrimSpace(fmt.Sprint(live[i]["type"])))
-			tj := strings.ToLower(strings.TrimSpace(fmt.Sprint(live[j]["type"])))
-			ri, oki := typeRank[ti]
-			if !oki {
-				ri = unknownRank
+		type item struct {
+			proxy  map[string]any
+			tRank  int
+			typ    string
+			cRank  int
+		}
+		items := make([]item, len(live))
+		for i, p := range live {
+			typ := strings.ToLower(strings.TrimSpace(fmt.Sprint(p["type"])))
+			tr, ok := typeRank[typ]
+			if !ok {
+				tr = unknownRank
 			}
-			rj, okj := typeRank[tj]
-			if !okj {
-				rj = unknownRank
+			items[i] = item{proxy: p, tRank: tr, typ: typ, cRank: proxyCustomRank(p, customRank, i)}
+		}
+		sort.SliceStable(items, func(i, j int) bool {
+			if items[i].tRank != items[j].tRank {
+				return items[i].tRank < items[j].tRank
 			}
-			if ri != rj {
-				return ri < rj
+			if items[i].typ != items[j].typ {
+				return items[i].typ < items[j].typ
 			}
-			if ti != tj {
-				return ti < tj
+			if len(customRank) > 0 && items[i].cRank != items[j].cRank {
+				return items[i].cRank < items[j].cRank
 			}
-			ni := strings.ToLower(fmt.Sprint(live[i]["name"]))
-			nj := strings.ToLower(fmt.Sprint(live[j]["name"]))
-			return ni < nj
+			return strings.ToLower(fmt.Sprint(items[i].proxy["name"])) < strings.ToLower(fmt.Sprint(items[j].proxy["name"]))
 		})
+		for i, it := range items {
+			live[i] = it.proxy
+		}
 		if desc {
 			reverseProxySlice(live)
 		}
@@ -494,65 +549,54 @@ func sortGenerationNodes(live []map[string]any, cfg storage.SubscriptionProcessi
 			}
 		}
 		unknownRank := len(cfg.RegionOrder)
-		sort.SliceStable(live, func(i, j int) bool {
-			ci := resolveProxyCountryCode(live[i], hostCountryMap)
-			cj := resolveProxyCountryCode(live[j], hostCountryMap)
-			ri, oki := regionRank[ci]
-			if !oki {
-				ri = unknownRank
+		type item struct {
+			proxy map[string]any
+			rRank int
+			code  string
+			cRank int
+		}
+		items := make([]item, len(live))
+		for i, p := range live {
+			cc := resolveProxyCountryCode(p, hostCountryMap)
+			rr, ok := regionRank[cc]
+			if !ok {
+				rr = unknownRank
 			}
-			rj, okj := regionRank[cj]
-			if !okj {
-				rj = unknownRank
+			items[i] = item{proxy: p, rRank: rr, code: cc, cRank: proxyCustomRank(p, customRank, i)}
+		}
+		sort.SliceStable(items, func(i, j int) bool {
+			if items[i].rRank != items[j].rRank {
+				return items[i].rRank < items[j].rRank
 			}
-			if ri != rj {
-				return ri < rj
-			}
-			if ci != cj {
-				if ci == "UN" {
+			if items[i].code != items[j].code {
+				if items[i].code == "UN" {
 					return false
 				}
-				if cj == "UN" {
+				if items[j].code == "UN" {
 					return true
 				}
-				return ci < cj
+				return items[i].code < items[j].code
 			}
-			ni := strings.ToLower(fmt.Sprint(live[i]["name"]))
-			nj := strings.ToLower(fmt.Sprint(live[j]["name"]))
-			return ni < nj
+			if len(customRank) > 0 && items[i].cRank != items[j].cRank {
+				return items[i].cRank < items[j].cRank
+			}
+			return strings.ToLower(fmt.Sprint(items[i].proxy["name"])) < strings.ToLower(fmt.Sprint(items[j].proxy["name"]))
 		})
+		for i, it := range items {
+			live[i] = it.proxy
+		}
 		if desc {
 			reverseProxySlice(live)
 		}
 	case "custom":
-		if len(cfg.CustomOrder) > 0 {
-			rank := make(map[string]int, len(cfg.CustomOrder))
-			for idx, key := range cfg.CustomOrder {
-				trimmed := strings.TrimSpace(key)
-				if trimmed == "" {
-					continue
-				}
-				if _, exists := rank[trimmed]; !exists {
-					rank[trimmed] = idx
-				}
-			}
-			base := len(cfg.CustomOrder)
-			orderOf := func(p map[string]any, fallbackIdx int) int {
-				if pos, ok := rank[generationFingerprint(p)]; ok {
-					return pos
-				}
-				if pos, ok := rank[fmt.Sprint(p["name"])]; ok {
-					return pos
-				}
-				return base + fallbackIdx
-			}
+		if len(customRank) > 0 {
 			type indexedNode struct {
 				proxy map[string]any
 				rank  int
 			}
 			items := make([]indexedNode, len(live))
 			for i, p := range live {
-				items[i] = indexedNode{proxy: p, rank: orderOf(p, i)}
+				items[i] = indexedNode{proxy: p, rank: proxyCustomRank(p, customRank, i)}
 			}
 			sort.SliceStable(items, func(i, j int) bool {
 				return items[i].rank < items[j].rank
@@ -565,6 +609,27 @@ func sortGenerationNodes(live []map[string]any, cfg storage.SubscriptionProcessi
 			reverseProxySlice(live)
 		}
 	default:
+		if len(customRank) > 0 {
+			type indexedNode struct {
+				proxy     map[string]any
+				srcIndex  int
+				cRank     int
+			}
+			items := make([]indexedNode, len(live))
+			for i, p := range live {
+				srcIdx, _ := p["_rd_source_index"].(int)
+				items[i] = indexedNode{proxy: p, srcIndex: srcIdx, cRank: proxyCustomRank(p, customRank, i)}
+			}
+			sort.SliceStable(items, func(i, j int) bool {
+				if items[i].srcIndex != items[j].srcIndex {
+					return items[i].srcIndex < items[j].srcIndex
+				}
+				return items[i].cRank < items[j].cRank
+			})
+			for i, item := range items {
+				live[i] = item.proxy
+			}
+		}
 		if desc {
 			reverseProxySlice(live)
 		}

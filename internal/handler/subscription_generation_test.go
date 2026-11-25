@@ -479,4 +479,26 @@ func TestGenerationSortByRegionAndServerCountryCode(t *testing.T) {
 	if stats.Nodes[0].CountryCode != "JP" || stats.Nodes[1].CountryCode != "HK" || stats.Nodes[2].CountryCode != "US" {
 		t.Fatalf("region desc sort wrong: %+v", stats.Nodes)
 	}
+
+	// Dual-level hierarchical sort: region_order > custom_order.
+	// Moving a JP node ahead of HK in custom_order must NOT cross region boundaries,
+	// while custom_order DOES reorder nodes within the same region (e.g. HK-B before HK-A).
+	rawDual := `proxies:
+  - {name: HK-A, type: vmess, server: hk1.example.net, port: 443, uuid: 11111111-1111-1111-1111-111111111111}
+  - {name: HK-B, type: vmess, server: hk2.example.net, port: 443, uuid: 22222222-2222-2222-2222-222222222222}
+  - {name: JP-A, type: trojan, server: jp.example.net, port: 443, password: b}
+`
+	if err := os.WriteFile("subscribes/airport.yaml", []byte(rawDual), 0600); err != nil {
+		t.Fatal(err)
+	}
+	g.Processing.SortDirection = "asc"
+	g.Processing.RegionOrder = []string{"HK", "JP"}
+	g.Processing.CustomOrder = []string{"JP-A", "HK-B", "HK-A"}
+	_, stats, err = h.generateSubscription(ctx, storage.SubscribeFile{CreatedBy: "admin", Generation: g}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.Nodes) != 3 || stats.Nodes[0].Name != "HK-B" || stats.Nodes[1].Name != "HK-A" || stats.Nodes[2].Name != "JP-A" {
+		t.Fatalf("dual region>custom sort violated hierarchy: %+v", stats.Nodes)
+	}
 }
