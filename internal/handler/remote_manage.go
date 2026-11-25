@@ -2571,6 +2571,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 				inboundReq["mutation_id"] = "managed-inbound:" + uuid.NewString()
 			}
 			applyManagedInboundSniffing(inboundReq)
+			normalizeShadowsocksInboundDefaults(inboundReq)
 		} else if action == "remove" {
 			tag := strings.TrimSpace(wireGuardStringValue(inboundReq["tag"]))
 			if tag == "" {
@@ -3100,6 +3101,58 @@ func (h *RemoteManageHandler) validateDatabaseManagedForwardNode(ctx context.Con
 
 // applyManagedInboundSniffing enforces the server-side product default for
 // every newly managed proxy inbound. Frontend presets are not a security or
+// normalizeShadowsocksInboundDefaults ensures newly created classic AES-GCM
+// Shadowsocks inbounds default to multi-user clients[] mode instead of legacy
+// single-password top-level settings, so all supported SS nodes support per-user
+// credentials and traffic accounting by default.
+func normalizeShadowsocksInboundDefaults(request map[string]interface{}) {
+	if request == nil {
+		return
+	}
+	inbound, _ := request["inbound"].(map[string]interface{})
+	if inbound == nil {
+		return
+	}
+	if canonicalManagedProtocol(wireGuardStringValue(inbound["protocol"])) != "shadowsocks" {
+		return
+	}
+	settings, _ := inbound["settings"].(map[string]interface{})
+	if settings == nil {
+		return
+	}
+	method := strings.ToLower(strings.TrimSpace(wireGuardStringValue(settings["method"])))
+	if method != "aes-128-gcm" && method != "aes-256-gcm" {
+		return
+	}
+	topPassword := strings.TrimSpace(wireGuardStringValue(settings["password"]))
+	clients, _ := settings["clients"].([]interface{})
+	if len(clients) == 0 {
+		if topPassword != "" {
+			settings["clients"] = []interface{}{
+				map[string]interface{}{
+					"email":    "admin",
+					"method":   method,
+					"password": topPassword,
+				},
+			}
+		}
+	} else {
+		for _, item := range clients {
+			if clientMap, ok := item.(map[string]interface{}); ok {
+				if strings.TrimSpace(wireGuardStringValue(clientMap["method"])) == "" {
+					clientMap["method"] = method
+				}
+			}
+		}
+	}
+	delete(settings, "method")
+	delete(settings, "password")
+	if strings.TrimSpace(wireGuardStringValue(settings["network"])) == "" {
+		settings["network"] = "tcp,udp"
+	}
+}
+
+// applyManagedInboundSniffing enforces protocol-aware sniffing defaults as a backend
 // correctness boundary: advanced JSON and direct API callers pass here too.
 // WireGuard must not be sniffed, while forwarding tunnel inbounds are not proxy
 // sessions and keep their own configuration untouched.
