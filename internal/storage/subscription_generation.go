@@ -16,12 +16,14 @@ type SubscriptionGeneration struct {
 }
 
 type SubscriptionProcessing struct {
-	Deduplicate  bool     `json:"deduplicate"`
-	RemoveDead   bool     `json:"remove_dead"`
-	Include      string   `json:"include,omitempty"`
-	Exclude      string   `json:"exclude,omitempty"`
-	ExcludeTypes []string `json:"exclude_types,omitempty"`
-	Sort         string   `json:"sort,omitempty"`
+	Deduplicate   bool     `json:"deduplicate"`
+	RemoveDead    bool     `json:"remove_dead"`
+	Include       string   `json:"include,omitempty"`
+	Exclude       string   `json:"exclude,omitempty"`
+	ExcludeTypes  []string `json:"exclude_types,omitempty"`
+	Sort          string   `json:"sort,omitempty"`
+	SortDirection string   `json:"sort_direction,omitempty"`
+	CustomOrder   []string `json:"custom_order,omitempty"`
 }
 
 type SubscriptionOutput struct {

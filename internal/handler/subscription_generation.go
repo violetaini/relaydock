@@ -32,17 +32,24 @@ type generationRequest struct {
 	Generation      *storage.SubscriptionGeneration `json:"generation"`
 	TrafficLimit    json.RawMessage                 `json:"traffic_limit,omitempty"`
 }
+type previewNodeSummary struct {
+	Key  string `json:"key"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
 type generationPreview struct {
-	Input     int                 `json:"input"`
-	Duplicate int                 `json:"duplicate"`
-	Filtered  int                 `json:"filtered"`
-	Dead      int                 `json:"dead"`
-	Unknown   int                 `json:"unknown"`
-	Output    int                 `json:"output"`
-	Warnings  []string            `json:"warnings"`
-	Content   string              `json:"content"`
-	Client    string              `json:"client"`
-	Outputs   []generationPreview `json:"outputs,omitempty"`
+	Input     int                  `json:"input"`
+	Duplicate int                  `json:"duplicate"`
+	Filtered  int                  `json:"filtered"`
+	Dead      int                  `json:"dead"`
+	Unknown   int                  `json:"unknown"`
+	Output    int                  `json:"output"`
+	Warnings  []string             `json:"warnings"`
+	Content   string               `json:"content"`
+	Client    string               `json:"client"`
+	Nodes     []previewNodeSummary `json:"nodes,omitempty"`
+	Outputs   []generationPreview  `json:"outputs,omitempty"`
 }
 
 const builtInSubscriptionTemplate = "__relaydock_balanced__"
@@ -116,8 +123,14 @@ func (h *SubscriptionHandler) validateGeneration(ctx context.Context, f storage.
 			}
 		}
 	}
-	if g.Processing.Sort != "" && g.Processing.Sort != "source" && g.Processing.Sort != "name" {
+	if g.Processing.Sort != "" && g.Processing.Sort != "source" && g.Processing.Sort != "name" && g.Processing.Sort != "type" && g.Processing.Sort != "custom" {
 		return errors.New("无效的排序方式")
+	}
+	if g.Processing.SortDirection != "" && g.Processing.SortDirection != "asc" && g.Processing.SortDirection != "desc" {
+		return errors.New("无效的排序方向")
+	}
+	if len(g.Processing.CustomOrder) > 5000 {
+		return errors.New("自定义节点排序列表过长")
 	}
 	seen := map[string]bool{}
 	for _, out := range g.Outputs {
@@ -351,11 +364,107 @@ func (h *SubscriptionHandler) processGenerationNodes(ctx context.Context, f stor
 			p["name"] = name
 		}
 	}
-	if cfg.Sort == "name" {
-		sort.SliceStable(live, func(i, j int) bool { return fmt.Sprint(live[i]["name"]) < fmt.Sprint(live[j]["name"]) })
+	sortGenerationNodes(live, cfg)
+	nodesMeta := make([]previewNodeSummary, 0, len(live))
+	for _, p := range live {
+		nodesMeta = append(nodesMeta, previewNodeSummary{
+			Key:  generationFingerprint(p),
+			Name: fmt.Sprint(p["name"]),
+			Type: strings.ToLower(fmt.Sprint(p["type"])),
+		})
 	}
+	stats.Nodes = nodesMeta
 	stats.Output = len(live)
 	return live, stats, nil
+}
+
+func sortGenerationNodes(live []map[string]any, cfg storage.SubscriptionProcessing) {
+	desc := cfg.SortDirection == "desc"
+	switch cfg.Sort {
+	case "name":
+		sort.SliceStable(live, func(i, j int) bool {
+			ni := strings.ToLower(fmt.Sprint(live[i]["name"]))
+			nj := strings.ToLower(fmt.Sprint(live[j]["name"]))
+			if ni == nj {
+				ri, rj := fmt.Sprint(live[i]["name"]), fmt.Sprint(live[j]["name"])
+				if desc {
+					return ri > rj
+				}
+				return ri < rj
+			}
+			if desc {
+				return ni > nj
+			}
+			return ni < nj
+		})
+	case "type":
+		sort.SliceStable(live, func(i, j int) bool {
+			ti := strings.ToLower(fmt.Sprint(live[i]["type"]))
+			tj := strings.ToLower(fmt.Sprint(live[j]["type"]))
+			if ti != tj {
+				if desc {
+					return ti > tj
+				}
+				return ti < tj
+			}
+			ni := strings.ToLower(fmt.Sprint(live[i]["name"]))
+			nj := strings.ToLower(fmt.Sprint(live[j]["name"]))
+			if desc {
+				return ni > nj
+			}
+			return ni < nj
+		})
+	case "custom":
+		if len(cfg.CustomOrder) > 0 {
+			rank := make(map[string]int, len(cfg.CustomOrder))
+			for idx, key := range cfg.CustomOrder {
+				trimmed := strings.TrimSpace(key)
+				if trimmed == "" {
+					continue
+				}
+				if _, exists := rank[trimmed]; !exists {
+					rank[trimmed] = idx
+				}
+			}
+			base := len(cfg.CustomOrder)
+			orderOf := func(p map[string]any, fallbackIdx int) int {
+				if pos, ok := rank[generationFingerprint(p)]; ok {
+					return pos
+				}
+				if pos, ok := rank[fmt.Sprint(p["name"])]; ok {
+					return pos
+				}
+				return base + fallbackIdx
+			}
+			type indexedNode struct {
+				proxy map[string]any
+				rank  int
+			}
+			items := make([]indexedNode, len(live))
+			for i, p := range live {
+				items[i] = indexedNode{proxy: p, rank: orderOf(p, i)}
+			}
+			sort.SliceStable(items, func(i, j int) bool {
+				return items[i].rank < items[j].rank
+			})
+			for i, item := range items {
+				live[i] = item.proxy
+			}
+		}
+		if desc {
+			reverseProxySlice(live)
+		}
+	default:
+		if desc {
+			reverseProxySlice(live)
+		}
+	}
+}
+
+func reverseProxySlice(items []map[string]any) {
+	for l, r := 0, len(items)-1; l < r; l, r = l+1, r-1 {
+		items[l], items[r] = items[r], items[l]
+	}
 }
 
 func generationOutput(g *storage.SubscriptionGeneration, client string) storage.SubscriptionOutput {

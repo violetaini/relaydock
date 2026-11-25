@@ -342,3 +342,63 @@ func TestGenerationGlobalAPIUsesDurableAdminOwner(t *testing.T) {
 		t.Fatalf("background regeneration lost its owner: %v", err)
 	}
 }
+
+func TestGenerationSortByTypeCustomOrderAndDirection(t *testing.T) {
+	repo, source := generationFixture(t)
+	raw := `proxies:
+ - {name: Z-VMess, type: vmess, server: vmess.example.net, port: 443, uuid: 11111111-1111-1111-1111-111111111111}
+ - {name: A-SS, type: ss, server: ss.example.net, port: 443, cipher: aes-128-gcm, password: secret}
+ - {name: M-Trojan, type: trojan, server: trojan.example.net, port: 443, password: secret}
+`
+	if err := os.WriteFile("subscribes/airport.yaml", []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewSubscriptionHandlerConcrete(repo, "subscribes")
+	g := generationRecipe(source.ID)
+	g.Outputs = []storage.SubscriptionOutput{{Client: "clashmeta", Mode: "nodes"}}
+
+	// 1. Sort by type ascending: ss -> trojan -> vmess
+	g.Processing.Sort = "type"
+	g.Processing.SortDirection = "asc"
+	_, stats, err := h.generateSubscription(context.Background(), storage.SubscribeFile{CreatedBy: "admin", Generation: g}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.Nodes) != 3 || stats.Nodes[0].Type != "ss" || stats.Nodes[1].Type != "trojan" || stats.Nodes[2].Type != "vmess" {
+		t.Fatalf("type asc order wrong: %+v", stats.Nodes)
+	}
+
+	// 2. Sort by type descending: vmess -> trojan -> ss
+	g.Processing.SortDirection = "desc"
+	_, stats, err = h.generateSubscription(context.Background(), storage.SubscribeFile{CreatedBy: "admin", Generation: g}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Nodes[0].Type != "vmess" || stats.Nodes[1].Type != "trojan" || stats.Nodes[2].Type != "ss" {
+		t.Fatalf("type desc order wrong: %+v", stats.Nodes)
+	}
+
+	// 3. Custom order by key (M-Trojan -> Z-VMess -> A-SS) + reverse toggle
+	trojanKey := stats.Nodes[1].Key
+	vmessKey := stats.Nodes[0].Key
+	g.Processing.Sort = "custom"
+	g.Processing.SortDirection = "asc"
+	g.Processing.CustomOrder = []string{trojanKey, vmessKey}
+	_, stats, err = h.generateSubscription(context.Background(), storage.SubscribeFile{CreatedBy: "admin", Generation: g}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Nodes[0].Name != "M-Trojan" || stats.Nodes[1].Name != "Z-VMess" || stats.Nodes[2].Name != "A-SS" {
+		t.Fatalf("custom asc order wrong: %+v", stats.Nodes)
+	}
+
+	g.Processing.SortDirection = "desc"
+	_, stats, err = h.generateSubscription(context.Background(), storage.SubscribeFile{CreatedBy: "admin", Generation: g}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Nodes[0].Name != "A-SS" || stats.Nodes[1].Name != "Z-VMess" || stats.Nodes[2].Name != "M-Trojan" {
+		t.Fatalf("custom desc order wrong: %+v", stats.Nodes)
+	}
+}
