@@ -9,10 +9,11 @@ import (
 // SubscriptionGeneration stores the recipe, not a one-time copy of its nodes.
 // Existing subscriptions with nil Generation retain their historical behavior.
 type SubscriptionGeneration struct {
-	Kind       string                 `json:"kind"`
-	SourceIDs  []int64                `json:"source_ids,omitempty"`
-	Processing SubscriptionProcessing `json:"processing"`
-	Outputs    []SubscriptionOutput   `json:"outputs"`
+	Kind          string                 `json:"kind"`
+	SourceIDs     []int64                `json:"source_ids,omitempty"`
+	Processing    SubscriptionProcessing `json:"processing"`
+	Outputs       []SubscriptionOutput   `json:"outputs"`
+	LastSyncError string                 `json:"last_sync_error,omitempty"`
 }
 
 type SubscriptionProcessing struct {

@@ -1136,6 +1136,7 @@ type subscribeFileDTO struct {
 	CreatedBy                 string                          `json:"created_by"`
 	AutoUpdateInterval        int                             `json:"auto_update_interval"`
 	LastSyncAt                *time.Time                      `json:"last_sync_at,omitempty"`
+	LastSyncError             string                          `json:"last_sync_error,omitempty"`
 	CreatedAt                 time.Time                       `json:"created_at"`
 	UpdatedAt                 time.Time                       `json:"updated_at"`
 	LatestVersion             int64                           `json:"latest_version,omitempty"`
@@ -1158,6 +1159,10 @@ func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
 	scriptIDs := file.SelectedOverrideScriptIDs
 	if scriptIDs == nil {
 		scriptIDs = []int64{}
+	}
+	var syncError string
+	if file.Generation != nil {
+		syncError = file.Generation.LastSyncError
 	}
 	return subscribeFileDTO{
 		Kind:                      subscriptionKind(file),
@@ -1183,6 +1188,7 @@ func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
 		URL:                       file.URL,
 		AutoUpdateInterval:        file.AutoUpdateInterval,
 		LastSyncAt:                file.LastSyncAt,
+		LastSyncError:             syncError,
 		CreatedAt:                 file.CreatedAt,
 		UpdatedAt:                 file.UpdatedAt,
 	}
@@ -1535,6 +1541,14 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 		return
 	}
 
+	// 支持传入 YAML、Base64 或节点链接 (URI)
+	normalizedBytes, err := normalizeImportedSubscription([]byte(req.Content))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("订阅内容格式不正确，需为有效 YAML、Base64 或节点链接: "+err.Error()))
+		return
+	}
+	req.Content = string(normalizedBytes)
+
 	// 验证YAML格式，使用 Node API 保持顺序
 	var rootNode yaml.Node
 	if err := yaml.Unmarshal([]byte(req.Content), &rootNode); err != nil {
@@ -1566,6 +1580,33 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 		}
 		writeError(w, http.StatusBadRequest, errors.New("配置校验失败: "+strings.Join(errorMessages, "; ")))
 		return
+	}
+
+	// 当配置包含代理节点时，自动更新节点地区映射并修剪不存在的旧节点
+	if rawProxies, ok := yamlCheck["proxies"].([]any); ok {
+		if subscribeFile.Generation == nil {
+			subscribeFile.Generation = &storage.SubscriptionGeneration{Kind: "external"}
+		}
+		oldRegions := subscribeFile.Generation.Processing.NodeRegions
+		if oldRegions == nil {
+			oldRegions = make(map[string]string)
+		}
+		newRegions := make(map[string]string, len(rawProxies))
+		hostCountryMap := buildServerHostCountryMap(r.Context(), h.repo)
+		for _, item := range rawProxies {
+			if p, ok := item.(map[string]any); ok {
+				fp := generationFingerprint(p)
+				name := fmt.Sprint(p["name"])
+				if oldCC, ok := oldRegions[fp]; ok && oldCC != "" {
+					newRegions[fp] = oldCC
+				} else if oldCC, ok := oldRegions[name]; ok && oldCC != "" {
+					newRegions[fp] = oldCC
+				} else {
+					newRegions[fp] = resolveProxyCountryCodeWithLandingProbe(p, hostCountryMap)
+				}
+			}
+		}
+		subscribeFile.Generation.Processing.NodeRegions = newRegions
 	}
 
 	// 直接保存前端发送的内容（已经过前端修复，保持字段顺序）
@@ -1602,8 +1643,11 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// 更新数据库中的updated_at字段
+	// 更新数据库中的updated_at字段与地区映射
 	subscribeFile.UpdatedAt = time.Now()
+	if subscribeFile.Generation != nil {
+		subscribeFile.Generation.LastSyncError = ""
+	}
 	_, err = h.repo.UpdateSubscribeFile(r.Context(), subscribeFile)
 	if err != nil {
 		// 更新时间戳失败不影响文件保存，只记录错误
@@ -1614,6 +1658,7 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 	respondJSON(w, http.StatusOK, map[string]any{
 		"status":  "updated",
 		"version": version,
+		"file":    convertSubscribeFile(subscribeFile),
 	})
 }
 
@@ -1773,84 +1818,127 @@ func filterAdminVisibleSubscribeFiles(ctx context.Context, repo *storage.Traffic
 	return out
 }
 
+func (h *subscribeFilesHandler) recordSyncFailure(ctx context.Context, sf storage.SubscribeFile, errMsg string) {
+	if sf.Generation == nil {
+		sf.Generation = &storage.SubscriptionGeneration{Kind: "external"}
+	}
+	sf.Generation.LastSyncError = errMsg
+	sf.UpdatedAt = time.Now().UTC()
+	_, _ = h.repo.UpdateSubscribeFile(ctx, sf)
+}
+
 // syncSingleSubscribeFile 从外部 URL 同步单个订阅文件内容并更新版本与上次同步时间。
 func (h *subscribeFilesHandler) syncSingleSubscribeFile(ctx context.Context, sf storage.SubscribeFile, author string) error {
 	if sf.URL == "" {
-		return errors.New("订阅没有外部 URL 地址，无法同步")
+		err := errors.New("订阅没有外部 URL 地址，无法同步")
+		h.recordSyncFailure(ctx, sf, err.Error())
+		return err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, sf.URL, nil)
 	if err != nil {
-		return fmt.Errorf("创建请求失败: %w", err)
+		errMsg := fmt.Sprintf("拉取失败: 创建请求失败（%v）", err)
+		h.recordSyncFailure(ctx, sf, errMsg)
+		return errors.New(errMsg)
 	}
 	httpReq.Header.Set("User-Agent", "clash-meta/2.4.0")
 
 	resp, err := h.fetchClient.Do(httpReq)
 	if err != nil {
-		logger.Info("[订阅文件] 获取外部订阅失败", "url", sf.URL, "error", sanitizeSubscriptionRequestError(err))
-		return fmt.Errorf("无法获取外部订阅内容: %w", sanitizeSubscriptionRequestError(err))
+		sanitized := sanitizeSubscriptionRequestError(err)
+		logger.Info("[订阅文件] 获取外部订阅失败", "url", sf.URL, "error", sanitized)
+		errMsg := fmt.Sprintf("拉取失败: 无法连接订阅服务器（%v）", sanitized)
+		h.recordSyncFailure(ctx, sf, errMsg)
+		return errors.New(errMsg)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("订阅服务器返回 HTTP %d", resp.StatusCode)
+		errMsg := fmt.Sprintf("拉取失败: 订阅服务器返回 HTTP %d", resp.StatusCode)
+		h.recordSyncFailure(ctx, sf, errMsg)
+		return errors.New(errMsg)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("读取外部订阅内容失败: %w", err)
+		errMsg := fmt.Sprintf("拉取失败: 读取响应内容失败（%v）", err)
+		h.recordSyncFailure(ctx, sf, errMsg)
+		return errors.New(errMsg)
+	}
+
+	if len(strings.TrimSpace(string(body))) == 0 {
+		errMsg := "拉取失败: 订阅服务器返回内容为空"
+		h.recordSyncFailure(ctx, sf, errMsg)
+		return errors.New(errMsg)
 	}
 
 	body, err = normalizeImportedSubscription(body)
 	if err != nil {
-		return errors.New("外部订阅内容不是有效的 YAML 格式")
+		errMsg := fmt.Sprintf("识别节点失败: 内容不是有效的 Clash 配置或 Base64 / 节点链接（%v）", err)
+		h.recordSyncFailure(ctx, sf, errMsg)
+		return errors.New(errMsg)
 	}
 
 	// 增设节点变更与地区重新映射逻辑：新节点自动映射地区，旧的不存在节点映射自动剔除
 	var doc map[string]any
-	if yaml.Unmarshal(body, &doc) == nil {
-		if rawProxies, ok := doc["proxies"].([]any); ok {
-			if sf.Generation == nil {
-				sf.Generation = &storage.SubscriptionGeneration{Kind: "external"}
+	if err := yaml.Unmarshal(body, &doc); err != nil {
+		errMsg := fmt.Sprintf("识别节点失败: YAML 解析错误（%v）", err)
+		h.recordSyncFailure(ctx, sf, errMsg)
+		return errors.New(errMsg)
+	}
+
+	rawProxies, ok := doc["proxies"].([]any)
+	if !ok || len(rawProxies) == 0 {
+		errMsg := "识别节点失败: 未在订阅内容中找到任何有效代理节点（proxies 为空）"
+		h.recordSyncFailure(ctx, sf, errMsg)
+		return errors.New(errMsg)
+	}
+
+	if sf.Generation == nil {
+		sf.Generation = &storage.SubscriptionGeneration{Kind: "external"}
+	}
+	oldRegions := sf.Generation.Processing.NodeRegions
+	if oldRegions == nil {
+		oldRegions = make(map[string]string)
+	}
+	newRegions := make(map[string]string, len(rawProxies))
+	hostCountryMap := buildServerHostCountryMap(ctx, h.repo)
+	for _, item := range rawProxies {
+		if p, ok := item.(map[string]any); ok {
+			fp := generationFingerprint(p)
+			name := fmt.Sprint(p["name"])
+			if oldCC, ok := oldRegions[fp]; ok && oldCC != "" {
+				newRegions[fp] = oldCC
+			} else if oldCC, ok := oldRegions[name]; ok && oldCC != "" {
+				newRegions[fp] = oldCC
+			} else {
+				// 节点发生变化（新增节点）：重新映射地区
+				newRegions[fp] = resolveProxyCountryCodeWithLandingProbe(p, hostCountryMap)
 			}
-			oldRegions := sf.Generation.Processing.NodeRegions
-			if oldRegions == nil {
-				oldRegions = make(map[string]string)
-			}
-			newRegions := make(map[string]string, len(rawProxies))
-			hostCountryMap := buildServerHostCountryMap(ctx, h.repo)
-			for _, item := range rawProxies {
-				if p, ok := item.(map[string]any); ok {
-					fp := generationFingerprint(p)
-					name := fmt.Sprint(p["name"])
-					if oldCC, ok := oldRegions[fp]; ok && oldCC != "" {
-						newRegions[fp] = oldCC
-					} else if oldCC, ok := oldRegions[name]; ok && oldCC != "" {
-						newRegions[fp] = oldCC
-					} else {
-						// 节点发生变化（新增节点）：重新映射地区
-						newRegions[fp] = resolveProxyCountryCodeWithLandingProbe(p, hostCountryMap)
-					}
-				}
-			}
-			// 旧的未匹配映射自动被剔除（prune stale mappings）
-			sf.Generation.Processing.NodeRegions = newRegions
 		}
 	}
+	// 旧的未匹配映射自动被剔除（prune stale mappings）
+	sf.Generation.Processing.NodeRegions = newRegions
 
 	unlock, err := lockSubscriptionFilenames(sf.Filename)
 	if err != nil {
-		return err
+		errMsg := fmt.Sprintf("同步失败: 获取文件并发锁超时（%v）", err)
+		h.recordSyncFailure(ctx, sf, errMsg)
+		return errors.New(errMsg)
 	}
 	defer unlock()
 
 	protectedContent, err := protectWireGuardSubscriptionContent(ctx, h.repo, sf.Filename, string(body), false)
 	if err != nil {
-		return err
+		errMsg := fmt.Sprintf("同步失败: 加密保护 WireGuard 配置失败（%v）", err)
+		h.recordSyncFailure(ctx, sf, errMsg)
+		return errors.New(errMsg)
 	}
 
 	filePath := filepath.Join("subscribes", sf.Filename)
 	if err := writePrivateSubscriptionFileUnlocked(filePath, []byte(protectedContent)); err != nil {
-		return fmt.Errorf("保存订阅文件失败: %w", err)
+		errMsg := fmt.Sprintf("保存订阅文件失败: %v", err)
+		h.recordSyncFailure(ctx, sf, errMsg)
+		return errors.New(errMsg)
 	}
 
 	if author == "" {
@@ -1865,6 +1953,7 @@ func (h *subscribeFilesHandler) syncSingleSubscribeFile(ctx context.Context, sf 
 	now := time.Now().UTC()
 	sf.LastSyncAt = &now
 	sf.UpdatedAt = now
+	sf.Generation.LastSyncError = "" // 成功时清除之前的同步错误
 	_, err = h.repo.UpdateSubscribeFile(ctx, sf)
 	return err
 }

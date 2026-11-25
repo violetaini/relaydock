@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/violetaini/relaydock/internal/auth"
@@ -86,8 +87,10 @@ proxies:
     password: pass
 `
 
+	upstreamStatus := http.StatusOK
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/yaml")
+		w.WriteHeader(upstreamStatus)
 		_, _ = w.Write([]byte(upstreamContent))
 	}))
 	defer server.Close()
@@ -211,5 +214,60 @@ proxies:
 	}
 	if !foundSG {
 		t.Errorf("expected new Singapore node to be mapped to SG in node_regions")
+	}
+
+	// 4. 测试同步失败时记录 LastSyncError 且不破坏已有配置
+	upstreamStatus = http.StatusInternalServerError
+	upstreamContent = "upstream error 500"
+	failSyncReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/admin/subscribe-files/%d/sync", importedFile.ID), nil)
+	failSyncReq = failSyncReq.WithContext(auth.ContextWithUsername(context.Background(), "admin"))
+	failSyncRec := httptest.NewRecorder()
+	handler.ServeHTTP(failSyncRec, failSyncReq)
+
+	if failSyncRec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request on sync failure, got %d", failSyncRec.Code)
+	}
+	reloadedAfterFail, err := repo.GetSubscribeFileByID(context.Background(), importedFile.ID)
+	if err != nil {
+		t.Fatalf("failed to reload file after fail: %v", err)
+	}
+	if reloadedAfterFail.Generation == nil || !strings.Contains(reloadedAfterFail.Generation.LastSyncError, "500") {
+		t.Errorf("expected LastSyncError to record 500 error, got %q", reloadedAfterFail.Generation.LastSyncError)
+	}
+
+	// 5. 测试本地修改配置内容：PUT /api/admin/subscribe-files/{filename}/content
+	newLocalContent := `proxies:
+  - name: "🇯🇵 Tokyo-Local-01"
+    type: ss
+    server: 5.5.5.5
+    port: 8388
+    cipher: aes-128-gcm
+    password: test
+`
+	updateReqBody, _ := json.Marshal(map[string]string{"content": newLocalContent})
+	updateReq := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/admin/subscribe-files/%s/content", importedFile.Filename), bytes.NewReader(updateReqBody))
+	updateReq = updateReq.WithContext(auth.ContextWithUsername(context.Background(), "admin"))
+	updateRec := httptest.NewRecorder()
+	handler.ServeHTTP(updateRec, updateReq)
+
+	if updateRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from update content, got %d: %s", updateRec.Code, updateRec.Body.String())
+	}
+	reloadedAfterUpdate, err := repo.GetSubscribeFileByID(context.Background(), importedFile.ID)
+	if err != nil {
+		t.Fatalf("failed to reload file after update: %v", err)
+	}
+	if reloadedAfterUpdate.Generation.LastSyncError != "" {
+		t.Errorf("expected LastSyncError to be cleared after content update, got %q", reloadedAfterUpdate.Generation.LastSyncError)
+	}
+	foundJP := false
+	for _, cc := range reloadedAfterUpdate.Generation.Processing.NodeRegions {
+		if cc == "JP" {
+			foundJP = true
+			break
+		}
+	}
+	if !foundJP {
+		t.Errorf("expected updated proxy to have JP in node_regions")
 	}
 }
