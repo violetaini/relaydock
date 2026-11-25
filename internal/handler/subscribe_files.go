@@ -165,6 +165,8 @@ func (h *subscribeFilesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		h.handleTraffic(w, r)
 	case path == "import" && r.Method == http.MethodPost:
 		h.handleImport(w, r)
+	case path == "parse-preview" && r.Method == http.MethodPost:
+		h.handleParsePreview(w, r)
 	case path == "upload" && r.Method == http.MethodPost:
 		h.handleUpload(w, r)
 	case path == "create-from-config" && r.Method == http.MethodPost:
@@ -362,11 +364,12 @@ func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Requ
 
 func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name               string `json:"name"`
-		Description        string `json:"description"`
-		URL                string `json:"url"`
-		Filename           string `json:"filename"`
-		AutoUpdateInterval *int   `json:"auto_update_interval,omitempty"`
+		Name               string            `json:"name"`
+		Description        string            `json:"description"`
+		URL                string            `json:"url"`
+		Filename           string            `json:"filename"`
+		AutoUpdateInterval *int              `json:"auto_update_interval,omitempty"`
+		NodeRegions        map[string]string `json:"node_regions,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -501,6 +504,27 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 	}
 	now := time.Now().UTC()
 
+	var doc map[string]any
+	nodeRegions := make(map[string]string)
+	if yaml.Unmarshal(body, &doc) == nil {
+		if rawProxies, ok := doc["proxies"].([]any); ok {
+			hostCountryMap := buildServerHostCountryMap(r.Context(), h.repo)
+			for _, item := range rawProxies {
+				if p, ok := item.(map[string]any); ok {
+					fp := generationFingerprint(p)
+					name := fmt.Sprint(p["name"])
+					if req.NodeRegions != nil && req.NodeRegions[fp] != "" {
+						nodeRegions[fp] = req.NodeRegions[fp]
+					} else if req.NodeRegions != nil && req.NodeRegions[name] != "" {
+						nodeRegions[fp] = req.NodeRegions[name]
+					} else {
+						nodeRegions[fp] = resolveProxyCountryCodeWithLandingProbe(p, hostCountryMap)
+					}
+				}
+			}
+		}
+	}
+
 	// 保存到数据库
 	file := storage.SubscribeFile{
 		Name:               req.Name,
@@ -511,6 +535,12 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 		CreatedBy:          username,
 		AutoUpdateInterval: autoInterval,
 		LastSyncAt:         &now,
+		Generation: &storage.SubscriptionGeneration{
+			Kind: "external",
+			Processing: storage.SubscriptionProcessing{
+				NodeRegions: nodeRegions,
+			},
+		},
 	}
 
 	created, err := h.repo.CreateSubscribeFile(r.Context(), file)
@@ -1775,6 +1805,38 @@ func (h *subscribeFilesHandler) syncSingleSubscribeFile(ctx context.Context, sf 
 		return errors.New("外部订阅内容不是有效的 YAML 格式")
 	}
 
+	// 增设节点变更与地区重新映射逻辑：新节点自动映射地区，旧的不存在节点映射自动剔除
+	var doc map[string]any
+	if yaml.Unmarshal(body, &doc) == nil {
+		if rawProxies, ok := doc["proxies"].([]any); ok {
+			if sf.Generation == nil {
+				sf.Generation = &storage.SubscriptionGeneration{Kind: "external"}
+			}
+			oldRegions := sf.Generation.Processing.NodeRegions
+			if oldRegions == nil {
+				oldRegions = make(map[string]string)
+			}
+			newRegions := make(map[string]string, len(rawProxies))
+			hostCountryMap := buildServerHostCountryMap(ctx, h.repo)
+			for _, item := range rawProxies {
+				if p, ok := item.(map[string]any); ok {
+					fp := generationFingerprint(p)
+					name := fmt.Sprint(p["name"])
+					if oldCC, ok := oldRegions[fp]; ok && oldCC != "" {
+						newRegions[fp] = oldCC
+					} else if oldCC, ok := oldRegions[name]; ok && oldCC != "" {
+						newRegions[fp] = oldCC
+					} else {
+						// 节点发生变化（新增节点）：重新映射地区
+						newRegions[fp] = resolveProxyCountryCodeWithLandingProbe(p, hostCountryMap)
+					}
+				}
+			}
+			// 旧的未匹配映射自动被剔除（prune stale mappings）
+			sf.Generation.Processing.NodeRegions = newRegions
+		}
+	}
+
 	unlock, err := lockSubscriptionFilenames(sf.Filename)
 	if err != nil {
 		return err
@@ -1889,4 +1951,92 @@ func StartSubscribeFilesAutoUpdater(ctx context.Context, repo *storage.TrafficRe
 			}
 		}
 	}
+}
+
+func (h *subscribeFilesHandler) handleParsePreview(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URL     string `json:"url"`
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeBadRequest(w, "请求格式不正确")
+		return
+	}
+	var raw []byte
+	if strings.TrimSpace(req.URL) != "" {
+		httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, req.URL, nil)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("无效的订阅URL"))
+			return
+		}
+		httpReq.Header.Set("User-Agent", "clash-meta/2.4.0")
+		resp, err := h.fetchClient.Do(httpReq)
+		if err != nil {
+			logger.Info("[订阅文件] 预览获取外部订阅失败", "error", sanitizeSubscriptionRequestError(err))
+			writeError(w, http.StatusBadRequest, errors.New("无法获取订阅内容"))
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			writeError(w, http.StatusBadRequest, errors.New("订阅服务器返回错误状态"))
+			return
+		}
+		var readErr error
+		raw, readErr = io.ReadAll(resp.Body)
+		if readErr != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("读取订阅内容失败"))
+			return
+		}
+	} else if strings.TrimSpace(req.Content) != "" {
+		raw = []byte(req.Content)
+	} else {
+		writeBadRequest(w, "订阅URL或订阅内容是必填项")
+		return
+	}
+
+	normalized, err := normalizeImportedSubscription(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("订阅内容不是有效的YAML格式"))
+		return
+	}
+
+	var doc map[string]any
+	if err := yaml.Unmarshal(normalized, &doc); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("解析订阅YAML失败"))
+		return
+	}
+
+	rawProxies, _ := doc["proxies"].([]any)
+	hostCountryMap := buildServerHostCountryMap(r.Context(), h.repo)
+
+	type nodePreviewItem struct {
+		Key         string `json:"key"`
+		Name        string `json:"name"`
+		Type        string `json:"type"`
+		CountryCode string `json:"country_code"`
+	}
+
+	nodes := make([]nodePreviewItem, 0, len(rawProxies))
+	for _, item := range rawProxies {
+		p, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		fp := generationFingerprint(p)
+		cc := resolveProxyCountryCodeWithLandingProbe(p, hostCountryMap)
+		if cc == "UN" {
+			cc = ""
+		}
+		nodes = append(nodes, nodePreviewItem{
+			Key:         fp,
+			Name:        fmt.Sprint(p["name"]),
+			Type:        strings.ToLower(fmt.Sprint(p["type"])),
+			CountryCode: cc,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"nodes": nodes,
+		"count": len(nodes),
+	})
 }

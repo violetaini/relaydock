@@ -233,6 +233,16 @@ func (h *SubscriptionHandler) readGenerationSource(ctx context.Context, f storag
 	if len(proxies) == 0 {
 		return nil, nil, fmt.Errorf("来源 %s 没有可用节点（仅含 Provider 的配置需先展开节点）", f.Name)
 	}
+	if f.Generation != nil && len(f.Generation.Processing.NodeRegions) > 0 {
+		for _, p := range proxies {
+			fp := generationFingerprint(p)
+			if cc, ok := f.Generation.Processing.NodeRegions[fp]; ok && cc != "" {
+				p["_rd_country_code"] = cc
+			} else if cc, ok := f.Generation.Processing.NodeRegions[fmt.Sprint(p["name"])]; ok && cc != "" {
+				p["_rd_country_code"] = cc
+			}
+		}
+	}
 	return proxies, doc, nil
 }
 
@@ -393,17 +403,17 @@ func (h *SubscriptionHandler) processGenerationNodes(ctx context.Context, f stor
 	return live, stats, nil
 }
 
-func (h *SubscriptionHandler) buildProxyHostCountryMap(ctx context.Context) map[string]string {
+func buildServerHostCountryMap(ctx context.Context, repo *storage.TrafficRepository) map[string]string {
 	out := make(map[string]string)
-	if h == nil || h.repo == nil {
+	if repo == nil {
 		return out
 	}
-	servers, err := h.repo.ListRemoteServers(ctx)
+	servers, err := repo.ListRemoteServers(ctx)
 	if err != nil {
 		return out
 	}
 	for _, srv := range servers {
-		cc := resolveServerCountryCode(ctx, h.repo, srv)
+		cc := resolveServerCountryCode(ctx, repo, srv)
 		if cc == "" {
 			continue
 		}
@@ -417,19 +427,15 @@ func (h *SubscriptionHandler) buildProxyHostCountryMap(ctx context.Context) map[
 	return out
 }
 
+func (h *SubscriptionHandler) buildProxyHostCountryMap(ctx context.Context) map[string]string {
+	if h == nil {
+		return make(map[string]string)
+	}
+	return buildServerHostCountryMap(ctx, h.repo)
+}
+
 func resolveProxyCountryCode(p map[string]any, hostCountryMap map[string]string) string {
-	if len(hostCountryMap) > 0 {
-		host := strings.ToLower(strings.TrimSpace(fmt.Sprint(p["server"])))
-		if host != "" && host != "<nil>" {
-			if cc := hostCountryMap[host]; cc != "" {
-				return cc
-			}
-		}
-	}
-	if cc := inferCountryCodeFromName(fmt.Sprint(p["name"])); cc != "" {
-		return cc
-	}
-	return "UN"
+	return resolveProxyCountryCodeWithLandingProbe(p, hostCountryMap)
 }
 
 func generationCustomOrderRank(customOrder []string) map[string]int {
