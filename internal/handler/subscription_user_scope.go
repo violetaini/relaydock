@@ -26,6 +26,9 @@ func subscriptionNodeAccountingEligibility(node storage.Node) (bool, string) {
 	if node.NodeType != "routed" && !supportsPerUserInboundCredential(node.Protocol) {
 		return false, fmt.Sprintf("协议 %s 尚不支持独立用户凭据与流量统计", node.Protocol)
 	}
+	if node.NodeType != "routed" && canonicalManagedProtocol(node.Protocol) == "chitanda" && !hasTrustedManagedChitandaCapability(node) {
+		return false, "Chitanda 节点未启用 users[] 多用户模式"
+	}
 	if !isDatabaseManagedNode(&node) {
 		return false, "未绑定受管服务器和入站，无法按用户统计"
 	}

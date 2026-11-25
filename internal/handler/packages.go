@@ -4422,6 +4422,13 @@ func generateCredential(protocol string, user storage.User, method, inboundTag s
 		cred["psk"] = uuid.New().String()
 		cred["email"] = email
 		cred["level"] = 0
+	case "chitanda":
+		// Chitanda 多用户使用 settings.users[], 每用户需要独立 email, psk (>= 32 bytes), level。
+		key := make([]byte, 32)
+		rand.Read(key)
+		cred["psk"] = base64.StdEncoding.EncodeToString(key)
+		cred["email"] = email
+		cred["level"] = 0
 	case "hysteria":
 		// HY2 客户端凭据:auth(密码) + email(用于 per-user 流量统计,接入套餐限额)。
 		cred["auth"] = uuid.New().String()
@@ -4457,7 +4464,7 @@ func generateCredential(protocol string, user storage.User, method, inboundTag s
 // managed server/inbound coordinates.
 func supportsPerUserInboundCredential(protocol string) bool {
 	switch canonicalManagedProtocol(protocol) {
-	case "vless", "vmess", "trojan", "anytls", "snell", "hysteria", "shadowsocks", "socks", "http", "wireguard":
+	case "vless", "vmess", "trojan", "anytls", "snell", "chitanda", "hysteria", "shadowsocks", "socks", "http", "wireguard":
 		return true
 	default:
 		return false
@@ -4487,7 +4494,7 @@ func matchCredential(a, b map[string]interface{}, protocol string) bool {
 		return fmt.Sprint(a["id"]) == fmt.Sprint(b["id"])
 	case "trojan", "anytls":
 		return fmt.Sprint(a["password"]) == fmt.Sprint(b["password"])
-	case "snell":
+	case "snell", "chitanda":
 		return fmt.Sprint(a["psk"]) == fmt.Sprint(b["psk"])
 	case "hysteria":
 		return fmt.Sprint(a["auth"]) == fmt.Sprint(b["auth"])

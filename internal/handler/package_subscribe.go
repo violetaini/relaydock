@@ -724,8 +724,9 @@ func applyCredToProxy(proxy map[string]any, protocol string, cred map[string]any
 			proxy["password"] = password
 			return true
 		}
-	case "snell":
-		// Snell v4/v5:每用户 psk → clash snell 节点的 psk 字段(逐用户独立密钥)。
+	case "snell", "chitanda":
+		delete(proxy, storage.ManagedShadowsocksMultiUserMarker)
+		// Snell v4/v5 & Chitanda: 每用户 psk → clash 节点的 psk 字段(逐用户独立密钥)。
 		if psk, ok := cred["psk"].(string); ok && psk != "" {
 			proxy["psk"] = psk
 			return true

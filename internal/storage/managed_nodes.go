@@ -960,10 +960,14 @@ func SelfServiceNodeProtocolEligible(protocolName, clashConfig string) bool {
 	switch protocolName {
 	case "vless", "vmess", "trojan", "snell", "socks", "socks5", "http", "hysteria", "hysteria2", "hy2", "wireguard":
 		return true
-	case "ss", "shadowsocks":
+	case "ss", "shadowsocks", "chitanda":
 		var config map[string]interface{}
 		if json.Unmarshal([]byte(clashConfig), &config) != nil {
 			return false
+		}
+		if protocolName == "chitanda" {
+			multiUser, ok := config[ManagedShadowsocksMultiUserMarker].(bool)
+			return ok && multiUser
 		}
 		profile, ok := managedShadowsocksProtocolProfile(config)
 		if !ok {

@@ -1757,7 +1757,7 @@ func inboundClientListKey(protocol string, settings map[string]interface{}) (str
 	switch protocol {
 	case "vless", "vmess", "trojan", "shadowsocks", "ss", "hysteria", "hysteria2", "hy2":
 		preferred = "clients"
-	case "anytls", "snell":
+	case "anytls", "snell", "chitanda":
 		preferred = "users"
 	case "socks", "http":
 		preferred = "accounts"
@@ -1786,7 +1786,7 @@ func inboundCredentialPrimaryKey(protocol string) string {
 		return "id"
 	case "trojan", "anytls", "shadowsocks", "ss":
 		return "password"
-	case "snell":
+	case "snell", "chitanda":
 		return "psk"
 	case "hysteria", "hysteria2", "hy2":
 		return "auth"

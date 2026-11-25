@@ -505,19 +505,32 @@ func hasTrustedManagedShadowsocksCapability(node storage.Node) bool {
 		nodeType == "physical" && isDatabaseManagedNode(&node)
 }
 
+func hasTrustedManagedChitandaCapability(node storage.Node) bool {
+	_, marker, _, valid := sanitizeManagedShadowsocksConfig(node.ClashConfig)
+	nodeType := strings.ToLower(strings.TrimSpace(node.NodeType))
+	if nodeType == "" {
+		nodeType = "physical"
+	}
+	return valid && marker &&
+		canonicalManagedProtocol(node.Protocol) == "chitanda" &&
+		nodeType == "physical" && isDatabaseManagedNode(&node)
+}
+
 // prepareManagedNodeConfigUpdate strips any client-supplied marker. A trusted
-// marker survives only when a server-bound physical classic-AES node keeps the
-// same cipher.
+// marker survives only when a server-bound physical classic-AES or Chitanda node keeps the
+// same multi-user capability.
 func prepareManagedNodeConfigUpdate(existing storage.Node, incomingClash, incomingParsed string) (string, string) {
 	_, _, oldCipher, oldValid := sanitizeManagedShadowsocksConfig(existing.ClashConfig)
 	cleanClash, _, newCipher, newValid := sanitizeManagedShadowsocksConfig(incomingClash)
 	cleanParsed, _, parsedCipher, parsedValid := sanitizeManagedShadowsocksConfig(incomingParsed)
 
-	preserve := hasTrustedManagedShadowsocksCapability(existing) && oldValid && newValid &&
+	preserveSS := hasTrustedManagedShadowsocksCapability(existing) && oldValid && newValid &&
 		isClassicManagedShadowsocksCipher(oldCipher) && oldCipher == newCipher
-	if preserve {
+	preserveChitanda := hasTrustedManagedChitandaCapability(existing) && oldValid && newValid &&
+		canonicalManagedProtocol(existing.Protocol) == "chitanda"
+	if preserveSS || preserveChitanda {
 		cleanClash = setManagedShadowsocksMarker(cleanClash)
-		if parsedValid && parsedCipher == oldCipher {
+		if parsedValid && (preserveChitanda || parsedCipher == oldCipher) {
 			cleanParsed = setManagedShadowsocksMarker(cleanParsed)
 		}
 	}
@@ -2535,7 +2548,7 @@ func NewNodeURIsHandler(repo *storage.TrafficRepository) http.Handler {
 func convertNode(node storage.Node) nodeDTO {
 	clashConfig, _, _, _ := sanitizeManagedShadowsocksConfig(node.ClashConfig)
 	parsedConfig, _, _, _ := sanitizeManagedShadowsocksConfig(node.ParsedConfig)
-	managedMultiUser := hasTrustedManagedShadowsocksCapability(node)
+	managedMultiUser := hasTrustedManagedShadowsocksCapability(node) || hasTrustedManagedChitandaCapability(node)
 	packageEligible, _ := isPackageNodeMultiUserEligible(node)
 	subscriptionEligible, subscriptionReason := subscriptionNodeAccountingEligibility(node)
 	return nodeDTO{

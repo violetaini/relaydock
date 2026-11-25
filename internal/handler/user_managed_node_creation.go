@@ -532,14 +532,15 @@ func validateUserManagedInboundShape(request map[string]interface{}) (map[string
 			credential, err = validateUserManagedCredentialPlaceholder(settings, "accounts", "user", "pass")
 		}
 	case "chitanda":
-		if err = validateUserManagedObjectKeys(settings, "settings", "psk", "path", "transport", "fallback", "server_id", "strict_sni", "replay_file"); err == nil {
-			psk := wireGuardStringValue(settings["psk"])
-			if len(psk) < 8 {
-				err = fmt.Errorf("%w: chitanda psk too short", storage.ErrManagedInvalidArgument)
+		if err = validateUserManagedObjectKeys(settings, "settings", "users", "psk", "path", "transport", "fallback", "server_id", "strict_sni", "replay_file"); err == nil {
+			if _, hasUsers := settings["users"]; hasUsers {
+				credential, err = validateUserManagedCredentialPlaceholder(settings, "users", "psk", "email", "level")
+				if err == nil && len(wireGuardStringValue(credential["psk"])) < 32 {
+					err = fmt.Errorf("%w: chitanda psk must contain at least 32 bytes", storage.ErrManagedInvalidArgument)
+				}
+			} else if psk := wireGuardStringValue(settings["psk"]); len(psk) < 32 {
+				err = fmt.Errorf("%w: chitanda psk must contain at least 32 bytes", storage.ErrManagedInvalidArgument)
 			}
-		}
-		if transparent, valid := settings["allowTransparent"].(bool); err == nil && (!valid || transparent) {
-			err = fmt.Errorf("%w: transparent HTTP proxy is not allowed", storage.ErrManagedInvalidArgument)
 		}
 	}
 	if err != nil {
@@ -647,7 +648,7 @@ func replaceInboundCredential(settings map[string]interface{}, protocol string, 
 	}
 	key := "clients"
 	switch canonicalManagedProtocol(protocol) {
-	case "snell", "anytls":
+	case "snell", "anytls", "chitanda":
 		key = "users"
 	case "socks", "http":
 		key = "accounts"

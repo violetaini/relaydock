@@ -266,6 +266,9 @@ func (h *RemoteManageHandler) rebuildDatabaseAuthorizedInboundClients(
 		// back only after current authorization succeeds.
 		clients = filterCredentials(clients, credential, protocol)
 		settings[listKey] = clients
+		if protocol == "chitanda" && len(clients) > 0 {
+			delete(settings, "psk")
+		}
 		if protocol == "wireguard" {
 			provisionable, provenanceErr := h.repo.ManagedWireGuardInboundAuthorityProvisionable(ctx, serverID, config.InboundTag)
 			if provenanceErr != nil {

@@ -2572,6 +2572,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 			}
 			applyManagedInboundSniffing(inboundReq)
 			normalizeShadowsocksInboundDefaults(inboundReq)
+			normalizeChitandaInboundDefaults(inboundReq)
 		} else if action == "remove" {
 			tag := strings.TrimSpace(wireGuardStringValue(inboundReq["tag"]))
 			if tag == "" {
@@ -3149,6 +3150,42 @@ func normalizeShadowsocksInboundDefaults(request map[string]interface{}) {
 	delete(settings, "password")
 	if strings.TrimSpace(wireGuardStringValue(settings["network"])) == "" {
 		settings["network"] = "tcp,udp"
+	}
+}
+
+// normalizeChitandaInboundDefaults ensures newly created Chitanda inbounds default
+// to multi-user settings.users[] mode (and never send both top-level psk and users,
+// which Chitanda core rejects).
+func normalizeChitandaInboundDefaults(request map[string]interface{}) {
+	if request == nil {
+		return
+	}
+	inbound, _ := request["inbound"].(map[string]interface{})
+	if inbound == nil {
+		return
+	}
+	if canonicalManagedProtocol(wireGuardStringValue(inbound["protocol"])) != "chitanda" {
+		return
+	}
+	settings, _ := inbound["settings"].(map[string]interface{})
+	if settings == nil {
+		return
+	}
+	topPSK := strings.TrimSpace(wireGuardStringValue(settings["psk"]))
+	users, _ := settings["users"].([]interface{})
+	if len(users) == 0 {
+		if topPSK != "" {
+			settings["users"] = []interface{}{
+				map[string]interface{}{
+					"email": "admin",
+					"psk":   topPSK,
+					"level": 0,
+				},
+			}
+		}
+	}
+	if usersAfter, _ := settings["users"].([]interface{}); len(usersAfter) > 0 {
+		delete(settings, "psk")
 	}
 }
 
@@ -5653,8 +5690,13 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 
 	case "chitanda":
 		proxy["type"] = "chitanda"
-		if psk, ok := settings["psk"].(string); ok {
+		if psk, ok := settings["psk"].(string); ok && psk != "" {
 			proxy["psk"] = psk
+		} else if client != nil {
+			if psk, ok := client["psk"].(string); ok && psk != "" {
+				proxy["psk"] = psk
+			}
+			proxy[storage.ManagedShadowsocksMultiUserMarker] = true
 		}
 		transport := "h2"
 		if t, ok := settings["transport"].(string); ok && t != "" {
