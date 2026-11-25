@@ -650,6 +650,9 @@ func replaceInboundCredential(settings map[string]interface{}, protocol string, 
 	switch canonicalManagedProtocol(protocol) {
 	case "snell", "anytls", "chitanda":
 		key = "users"
+		if canonicalManagedProtocol(protocol) == "chitanda" {
+			delete(settings, "psk")
+		}
 	case "socks", "http":
 		key = "accounts"
 	case "vless", "vmess", "trojan", "hysteria", "shadowsocks":
