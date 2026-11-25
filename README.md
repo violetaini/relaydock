@@ -71,7 +71,7 @@ curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/quick-ins
 curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh | sudo bash
 ```
 
-### ⚡ 终端快捷运维命令（像 Nezha / Komari 一样便捷）
+### ⚡ 终端快捷运维命令
 
 安装完成后，脚本会自动注册系统快捷命令，您可以在 SSH 终端**随时随地**输入：
 
