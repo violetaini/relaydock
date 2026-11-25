@@ -116,7 +116,8 @@ func TestSubscriptionRejectsNodesWithoutPerUserAccounting(t *testing.T) {
 	for index, node := range []storage.Node{
 		{NodeName: "shared Chitanda", Protocol: "chitanda", OriginalServer: "edge", InboundTag: "chitanda-in", ClashConfig: `{"type":"chitanda","psk":"shared"}`},
 		{NodeName: "shared SS", Protocol: "ss", OriginalServer: "edge", InboundTag: "ss", ClashConfig: `{"type":"ss","cipher":"chacha20-ietf-poly1305","password":"shared"}`},
-		{NodeName: "Tunnel", Protocol: "ss", OriginalServer: "edge", InboundTag: "anydoor-node-1", ClashConfig: `{"type":"ss","cipher":"2022-blake3-aes-128-gcm"}`},
+		{NodeName: "Tunnel", Protocol: "ss", OriginalServer: "edge", InboundTag: "anydoor-node-1", NodeType: "forwarded", ClashConfig: `{"type":"ss","cipher":"2022-blake3-aes-128-gcm"}`},
+		{NodeName: "AnyDoor", Protocol: "dokodemo-door", OriginalServer: "edge", InboundTag: "inbound-2133", ClashConfig: `{"type":"dokodemo-door"}`},
 		{NodeName: "unmanaged", Protocol: "vless", ClashConfig: `{"type":"vless","uuid":"shared"}`},
 	} {
 		node.Username = "admin"
@@ -131,6 +132,47 @@ func TestSubscriptionRejectsNodesWithoutPerUserAccounting(t *testing.T) {
 		if response.Code != 422 || !strings.Contains(response.Body.String(), "不能加入订阅") {
 			t.Fatalf("unsupported node accepted: status=%d body=%s", response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestSubscriptionAllowsRoutedForwardingNodes(t *testing.T) {
+	repo, _ := generationFixture(t)
+	ctx := context.Background()
+	server := &storage.RemoteServer{Name: "routed-edge", Token: "tok", IPAddress: "203.0.113.88", XrayMode: "embedded"}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "HK Classic SS", Protocol: "shadowsocks", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "inbound-568",
+		ClashConfig: `{"name":"HK Classic SS","type":"ss","server":"203.0.113.88","port":568,"cipher":"aes-128-gcm","password":"admin"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID := parent.ID
+	routed, err := repo.CreateRoutedNode(ctx, storage.RoutedNodeDetail{
+		Node: storage.Node{
+			Username: "admin", NodeName: "HK Routed Tunnel", Protocol: "shadowsocks", Enabled: true,
+			OriginalServer: server.Name, InboundTag: parent.InboundTag, ParentNodeID: &parentID,
+			ClashConfig: `{"name":"HK Routed Tunnel","type":"ss","server":"203.0.113.88","port":568,"cipher":"aes-128-gcm","password":"admin"}`,
+		},
+		RoutedOutboundTag: "routed:p1:tw", RoutedRuleMarktag: "routed:p1:tw",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := generationRecipe()
+	g.Kind = "custom"
+	response := generationCall(repo, "/api/admin/subscribe-files/generation", generationRequest{
+		Name: "Routed Sub", Filename: "routed-sub.yaml", SelectedNodeIDs: []int64{routed.ID}, Generation: g,
+	})
+	if response.Code != 201 {
+		t.Fatalf("routed forwarding node rejected from subscription: status=%d body=%s", response.Code, response.Body.String())
+	}
+	dto := convertNode(routed.Node)
+	if !dto.PackageEligible || !dto.SubscriptionEligible {
+		t.Fatalf("routed classic-SS forwarding node eligibility = pkg:%v sub:%v reason:%q", dto.PackageEligible, dto.SubscriptionEligible, dto.SubscriptionIneligibleReason)
 	}
 }
 

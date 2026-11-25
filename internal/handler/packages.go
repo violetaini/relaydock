@@ -219,7 +219,9 @@ func isPackageNodeMultiUserEligible(node storage.Node) (bool, string) {
 		}
 		if profile == "shadowsocks-classic" {
 			multiUser, ok := config[storage.ManagedShadowsocksMultiUserMarker].(bool)
-			if !ok || !multiUser {
+			routedClassic := strings.EqualFold(strings.TrimSpace(node.NodeType), "routed") &&
+				node.ParentNodeID != nil && *node.ParentNodeID > 0 && isDatabaseManagedNode(&node)
+			if (!ok || !multiUser) && !routedClassic {
 				return false, "经典 Shadowsocks 节点未启用多用户模式"
 			}
 		}

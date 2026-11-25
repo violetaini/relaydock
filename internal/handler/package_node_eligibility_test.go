@@ -37,6 +37,34 @@ func TestIsPackageNodeMultiUserEligible(t *testing.T) {
 			expected: false,
 		},
 		{
+			name: "forwarded anydoor entry clone",
+			node: storage.Node{
+				NodeName:       "friend | Tunnel",
+				Protocol:       "shadowsocks",
+				NodeType:       "forwarded",
+				OriginalServer: "edge-1",
+				InboundTag:     "anydoor-node-41",
+				ClashConfig:    `{"name":"friend | Tunnel","type":"ss","server":"1.2.3.4","port":2033,"cipher":"2022-blake3-aes-128-gcm","password":"test"}`,
+			},
+			expected: false,
+		},
+		{
+			name: "routed forwarding node on classic managed shadowsocks",
+			node: func() storage.Node {
+				parentID := int64(21)
+				return storage.Node{
+					NodeName:       "HK Routed Forward",
+					Protocol:       "shadowsocks",
+					NodeType:       "routed",
+					ParentNodeID:   &parentID,
+					OriginalServer: "edge-1",
+					InboundTag:     "inbound-568",
+					ClashConfig:    `{"name":"HK Routed Forward","type":"ss","server":"1.2.3.4","port":568,"cipher":"aes-128-gcm","password":"admin"}`,
+				}
+			}(),
+			expected: true,
+		},
+		{
 			name: "shadowsocks chacha20 single-password",
 			node: storage.Node{
 				NodeName:    "SS ChaCha20",
