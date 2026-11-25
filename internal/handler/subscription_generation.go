@@ -129,6 +129,9 @@ func (h *SubscriptionHandler) validateGeneration(ctx context.Context, f storage.
 	if g.Processing.SortDirection != "" && g.Processing.SortDirection != "asc" && g.Processing.SortDirection != "desc" {
 		return errors.New("无效的排序方向")
 	}
+	if len(g.Processing.TypeOrder) > 100 {
+		return errors.New("节点类型排序列表过长")
+	}
 	if len(g.Processing.CustomOrder) > 5000 {
 		return errors.New("自定义节点排序列表过长")
 	}
@@ -398,22 +401,41 @@ func sortGenerationNodes(live []map[string]any, cfg storage.SubscriptionProcessi
 			return ni < nj
 		})
 	case "type":
+		typeRank := make(map[string]int, len(cfg.TypeOrder))
+		for idx, typ := range cfg.TypeOrder {
+			norm := strings.ToLower(strings.TrimSpace(typ))
+			if norm == "" {
+				continue
+			}
+			if _, exists := typeRank[norm]; !exists {
+				typeRank[norm] = idx
+			}
+		}
+		unknownRank := len(cfg.TypeOrder)
 		sort.SliceStable(live, func(i, j int) bool {
-			ti := strings.ToLower(fmt.Sprint(live[i]["type"]))
-			tj := strings.ToLower(fmt.Sprint(live[j]["type"]))
+			ti := strings.ToLower(strings.TrimSpace(fmt.Sprint(live[i]["type"])))
+			tj := strings.ToLower(strings.TrimSpace(fmt.Sprint(live[j]["type"])))
+			ri, oki := typeRank[ti]
+			if !oki {
+				ri = unknownRank
+			}
+			rj, okj := typeRank[tj]
+			if !okj {
+				rj = unknownRank
+			}
+			if ri != rj {
+				return ri < rj
+			}
 			if ti != tj {
-				if desc {
-					return ti > tj
-				}
 				return ti < tj
 			}
 			ni := strings.ToLower(fmt.Sprint(live[i]["name"]))
 			nj := strings.ToLower(fmt.Sprint(live[j]["name"]))
-			if desc {
-				return ni > nj
-			}
 			return ni < nj
 		})
+		if desc {
+			reverseProxySlice(live)
+		}
 	case "custom":
 		if len(cfg.CustomOrder) > 0 {
 			rank := make(map[string]int, len(cfg.CustomOrder))

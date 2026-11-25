@@ -23,6 +23,7 @@ type SubscriptionProcessing struct {
 	ExcludeTypes  []string `json:"exclude_types,omitempty"`
 	Sort          string   `json:"sort,omitempty"`
 	SortDirection string   `json:"sort_direction,omitempty"`
+	TypeOrder     []string `json:"type_order,omitempty"`
 	CustomOrder   []string `json:"custom_order,omitempty"`
 }
 

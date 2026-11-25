@@ -379,7 +379,20 @@ func TestGenerationSortByTypeCustomOrderAndDirection(t *testing.T) {
 		t.Fatalf("type desc order wrong: %+v", stats.Nodes)
 	}
 
+	// 2b. Sort by custom type_order: vmess -> trojan -> ss (and reverse)
+	g.Processing.Sort = "type"
+	g.Processing.SortDirection = "asc"
+	g.Processing.TypeOrder = []string{"vmess", "trojan", "ss"}
+	_, stats, err = h.generateSubscription(context.Background(), storage.SubscribeFile{CreatedBy: "admin", Generation: g}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Nodes[0].Type != "vmess" || stats.Nodes[1].Type != "trojan" || stats.Nodes[2].Type != "ss" {
+		t.Fatalf("custom type_order asc wrong: %+v", stats.Nodes)
+	}
+
 	// 3. Custom order by key (M-Trojan -> Z-VMess -> A-SS) + reverse toggle
+	g.Processing.TypeOrder = nil
 	trojanKey := stats.Nodes[1].Key
 	vmessKey := stats.Nodes[0].Key
 	g.Processing.Sort = "custom"
