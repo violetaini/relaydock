@@ -91,7 +91,9 @@ func TestRevealDNSProviderCredentialsRejectsUnauthenticatedAndNonAdmin(t *testin
 		wantCode int
 	}{
 		{name: "unauthenticated", request: httptest.NewRequest(http.MethodGet, path, nil), wantCode: http.StatusForbidden},
-		{name: "non-admin", request: httptest.NewRequest(http.MethodGet, path, nil), wantCode: http.StatusNotFound},
+		// This viewer has no active server entitlement. The certificate gate
+		// rejects access before ownership lookup and must not reveal the secret.
+		{name: "non-admin", request: httptest.NewRequest(http.MethodGet, path, nil), wantCode: http.StatusForbidden},
 	}
 	tests[1].request = tests[1].request.WithContext(auth.ContextWithUsername(tests[1].request.Context(), "viewer"))
 

@@ -116,6 +116,7 @@ func subscribeFileSelectClause(alias string) string {
 		"COALESCE(" + pfx + "created_by, '')",
 		"COALESCE(" + pfx + "auto_update_interval, 0)",
 		pfx + "last_sync_at",
+		"COALESCE(" + pfx + "generation_config, '')",
 		pfx + "created_at", pfx + "updated_at",
 	}
 	return strings.Join(cols, ", ")
@@ -139,7 +140,7 @@ func marshalIDArray(ids []int64) string {
 func scanSubscribeFile(scanner interface{ Scan(dest ...any) error }) (SubscribeFile, error) {
 	var file SubscribeFile
 	var autoSync, rawOutput, autoUpdateInterval int
-	var tagsJSON, nodeIDsJSON, customRuleIDsJSON, overrideScriptIDsJSON string
+	var tagsJSON, nodeIDsJSON, customRuleIDsJSON, overrideScriptIDsJSON, generationJSON string
 	var trafficLimit sql.NullFloat64
 	var lastSyncAt sql.NullTime
 	if err := scanner.Scan(
@@ -150,13 +151,18 @@ func scanSubscribeFile(scanner interface{ Scan(dest ...any) error }) (SubscribeF
 		&customRuleIDsJSON, &overrideScriptIDsJSON,
 		&file.StatsServerIDs, &trafficLimit,
 		&file.SortOrder, &rawOutput, &file.CreatedBy,
-		&autoUpdateInterval, &lastSyncAt,
+		&autoUpdateInterval, &lastSyncAt, &generationJSON,
 		&file.CreatedAt, &file.UpdatedAt,
 	); err != nil {
 		return file, err
 	}
 	if err := ValidateSubscribeFilename(file.Filename); err != nil {
 		return file, fmt.Errorf("invalid stored subscribe filename for id %d: %w", file.ID, err)
+	}
+	if generationJSON != "" {
+		if err := json.Unmarshal([]byte(generationJSON), &file.Generation); err != nil {
+			return file, fmt.Errorf("decode subscription generation: %w", err)
+		}
 	}
 	file.AutoSyncCustomRules = autoSync != 0
 	file.RawOutput = rawOutput != 0
@@ -362,13 +368,13 @@ func (r *TrafficRepository) CreateSubscribeFile(ctx context.Context, file Subscr
 			(name, description, url, type, filename, file_short_code, custom_short_code,
 			auto_sync_custom_rules, template_filename, selected_tags, selected_node_ids,
 			selected_custom_rule_ids, selected_override_script_ids, stats_server_ids,
-			traffic_limit, sort_order, raw_output, created_by, auto_update_interval, last_sync_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			traffic_limit, sort_order, raw_output, created_by, auto_update_interval, last_sync_at, generation_config)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			file.Name, file.Description, file.URL, file.Type, file.Filename, newFileShortCode, file.CustomShortCode,
 			file.TemplateFilename, string(tagsJSON), nodeIDsJSON,
 			customRuleIDsJSON, overrideScriptIDsJSON, file.StatsServerIDs,
 			file.TrafficLimit, file.SortOrder, boolToInt(file.RawOutput), file.CreatedBy,
-			file.AutoUpdateInterval, file.LastSyncAt)
+			file.AutoUpdateInterval, file.LastSyncAt, marshalSubscriptionGeneration(file.Generation))
 		if err != nil {
 			_ = tx.Rollback()
 			if strings.Contains(strings.ToLower(err.Error()), "unique") && strings.Contains(strings.ToLower(err.Error()), "file_short_code") {
@@ -440,14 +446,14 @@ func (r *TrafficRepository) UpdateSubscribeFile(ctx context.Context, file Subscr
 		template_filename = ?, selected_tags = ?, selected_node_ids = ?,
 		selected_custom_rule_ids = ?, selected_override_script_ids = ?, stats_server_ids = ?,
 		traffic_limit = ?, sort_order = ?, raw_output = ?,
-		auto_update_interval = ?, last_sync_at = ?,
+		auto_update_interval = ?, last_sync_at = ?, generation_config = ?,
 		updated_at = CURRENT_TIMESTAMP WHERE id = ? AND filename = ?`,
 		file.Name, file.Description, file.URL, file.Type, file.Filename,
 		file.CustomShortCode, boolToInt(file.AutoSyncCustomRules),
 		file.TemplateFilename, string(tagsJSON), nodeIDsJSON,
 		customRuleIDsJSON, overrideScriptIDsJSON, file.StatsServerIDs,
 		file.TrafficLimit, file.SortOrder, boolToInt(file.RawOutput),
-		file.AutoUpdateInterval, file.LastSyncAt,
+		file.AutoUpdateInterval, file.LastSyncAt, marshalSubscriptionGeneration(file.Generation),
 		file.ID, file.Filename)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") && strings.Contains(strings.ToLower(err.Error()), "custom_short_code") {
@@ -578,13 +584,13 @@ func (r *TrafficRepository) RenameSubscribeFileAndRuleVersions(ctx context.Conte
 		custom_short_code = ?, auto_sync_custom_rules = ?,
 		template_filename = ?, selected_tags = ?, selected_node_ids = ?,
 		selected_custom_rule_ids = ?, selected_override_script_ids = ?, stats_server_ids = ?,
-		traffic_limit = ?, sort_order = ?, raw_output = ?,
+		traffic_limit = ?, sort_order = ?, raw_output = ?, generation_config = ?,
 		updated_at = CURRENT_TIMESTAMP WHERE id = ? AND filename = ?`,
 		file.Name, file.Description, file.URL, file.Type, file.Filename,
 		file.CustomShortCode, boolToInt(file.AutoSyncCustomRules),
 		file.TemplateFilename, string(tagsJSON), nodeIDsJSON,
 		customRuleIDsJSON, overrideScriptIDsJSON, file.StatsServerIDs,
-		file.TrafficLimit, file.SortOrder, boolToInt(file.RawOutput),
+		file.TrafficLimit, file.SortOrder, boolToInt(file.RawOutput), marshalSubscriptionGeneration(file.Generation),
 		file.ID, oldFilename)
 	if err != nil {
 		lowerMessage := strings.ToLower(err.Error())

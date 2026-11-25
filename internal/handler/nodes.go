@@ -2377,17 +2377,19 @@ func (r *nodeRequest) parseChainProxyNodeID() {
 }
 
 type nodeDTO struct {
-	ID                  int64  `json:"id"`
-	RawURL              string `json:"raw_url"`
-	NodeName            string `json:"node_name"`
-	Protocol            string `json:"protocol"`
-	ParsedConfig        string `json:"parsed_config"`
-	ClashConfig         string `json:"clash_config"`
-	ManagedMultiUser    bool   `json:"managed_multi_user"`
-	DirectGrantEligible bool   `json:"direct_grant_eligible"`
-	PackageEligible     bool   `json:"package_eligible"`
-	CredentialState     string `json:"credential_state,omitempty"`
-	Enabled             bool   `json:"enabled"`
+	ID                           int64  `json:"id"`
+	RawURL                       string `json:"raw_url"`
+	NodeName                     string `json:"node_name"`
+	Protocol                     string `json:"protocol"`
+	ParsedConfig                 string `json:"parsed_config"`
+	ClashConfig                  string `json:"clash_config"`
+	ManagedMultiUser             bool   `json:"managed_multi_user"`
+	DirectGrantEligible          bool   `json:"direct_grant_eligible"`
+	PackageEligible              bool   `json:"package_eligible"`
+	SubscriptionEligible         bool   `json:"subscription_eligible"`
+	SubscriptionIneligibleReason string `json:"subscription_ineligible_reason,omitempty"`
+	CredentialState              string `json:"credential_state,omitempty"`
+	Enabled                      bool   `json:"enabled"`
 	// Tag 是用户自定义分类标签(VIP / Asia / 测试),前端节点页用它做过滤、分组显示、批量更新。
 	// 必须下发,否则前端改了 tag 拉回来缺字段,显示永远是原状态,等同"修改不起作用"。
 	Tag string `json:"tag"`
@@ -2534,31 +2536,34 @@ func convertNode(node storage.Node) nodeDTO {
 	parsedConfig, _, _, _ := sanitizeManagedShadowsocksConfig(node.ParsedConfig)
 	managedMultiUser := hasTrustedManagedShadowsocksCapability(node)
 	packageEligible, _ := isPackageNodeMultiUserEligible(node)
+	subscriptionEligible, subscriptionReason := subscriptionNodeAccountingEligibility(node)
 	return nodeDTO{
-		ID:                node.ID,
-		RawURL:            node.RawURL,
-		NodeName:          node.NodeName,
-		Protocol:          node.Protocol,
-		ParsedConfig:      parsedConfig,
-		ClashConfig:       clashConfig,
-		ManagedMultiUser:  managedMultiUser,
-		PackageEligible:   packageEligible,
-		Enabled:           node.Enabled,
-		Tag:               node.Tag,
-		Tags:              node.Tags,
-		OriginalServer:    node.OriginalServer,
-		OriginalDomain:    node.OriginalDomain,
-		InboundTag:        node.InboundTag,
-		ChainProxyNodeID:  node.ChainProxyNodeID,
-		NodeType:          node.NodeType,
-		ParentNodeID:      node.ParentNodeID,
-		RoutedOutboundTag: node.RoutedOutboundTag,
-		RoutedOwner:       node.RoutedOwner,
-		CreatedBy:         node.Username, // nodes 表里 username = 创建/拥有者
-		RelayOrigServer:   node.RelayOrigServer,
-		RelayOrigPort:     node.RelayOrigPort,
-		CreatedAt:         node.CreatedAt,
-		UpdatedAt:         node.UpdatedAt,
+		ID:                           node.ID,
+		RawURL:                       node.RawURL,
+		NodeName:                     node.NodeName,
+		Protocol:                     node.Protocol,
+		ParsedConfig:                 parsedConfig,
+		ClashConfig:                  clashConfig,
+		ManagedMultiUser:             managedMultiUser,
+		PackageEligible:              packageEligible,
+		SubscriptionEligible:         subscriptionEligible,
+		SubscriptionIneligibleReason: subscriptionReason,
+		Enabled:                      node.Enabled,
+		Tag:                          node.Tag,
+		Tags:                         node.Tags,
+		OriginalServer:               node.OriginalServer,
+		OriginalDomain:               node.OriginalDomain,
+		InboundTag:                   node.InboundTag,
+		ChainProxyNodeID:             node.ChainProxyNodeID,
+		NodeType:                     node.NodeType,
+		ParentNodeID:                 node.ParentNodeID,
+		RoutedOutboundTag:            node.RoutedOutboundTag,
+		RoutedOwner:                  node.RoutedOwner,
+		CreatedBy:                    node.Username, // nodes 表里 username = 创建/拥有者
+		RelayOrigServer:              node.RelayOrigServer,
+		RelayOrigPort:                node.RelayOrigPort,
+		CreatedAt:                    node.CreatedAt,
+		UpdatedAt:                    node.UpdatedAt,
 	}
 }
 

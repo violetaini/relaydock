@@ -231,9 +231,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		if clientType == "" {
 			w.Header().Set("Content-Disposition", "attachment; filename=\""+renderPackage.Name+".yaml\"")
 		}
-		if pkg != nil {
-			h.writeTrafficHeader(r.Context(), w, user, pkg)
-		}
+		h.writeNodeTrafficHeader(r.Context(), w, user, orderedNodeIDs)
 		w.Write([]byte(result))
 		return
 	}
@@ -245,9 +243,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	}
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	if pkg != nil {
-		h.writeTrafficHeader(r.Context(), w, user, pkg)
-	}
+	h.writeNodeTrafficHeader(r.Context(), w, user, orderedNodeIDs)
 	w.Write(converted)
 }
 
@@ -395,15 +391,20 @@ func (h *PackageSubscribeHandler) serveAllNodes(w http.ResponseWriter, r *http.R
 }
 
 func (h *PackageSubscribeHandler) writeTrafficHeader(ctx context.Context, w http.ResponseWriter, user storage.User, pkg *storage.Package) {
-	limitBytes := resolveTrafficLimitBytes(&user, pkg)
-	if limitBytes <= 0 {
+	if pkg != nil {
+		h.writeNodeTrafficHeader(ctx, w, user, pkg.Nodes)
+	}
+}
+
+func (h *PackageSubscribeHandler) writeNodeTrafficHeader(ctx context.Context, w http.ResponseWriter, user storage.User, ids []int64) {
+	if len(ids) == 0 {
 		return
 	}
-	// 已用流量在采集时按当时的套餐模式和节点倍率固化，确保客户端
-	// 显示与限额判定一致，且套餐变更不会重算历史流量。
-	// 之前这里硬编码 download=0,导致客户端永远显示已用 0。
-	used, _ := h.repo.GetUserBillableTraffic(ctx, user.Username)
-	info := fmt.Sprintf("upload=0; download=%d; total=%d", used, limitBytes)
+	stats, err := resolveSubscriptionUserTraffic(ctx, h.repo, user.Username, ids)
+	if err != nil {
+		return
+	}
+	info := buildSubscriptionHeader(stats.Limit, stats.Used)
 	if user.PackageEndDate != nil {
 		info += fmt.Sprintf("; expire=%d", user.PackageEndDate.Unix())
 	}

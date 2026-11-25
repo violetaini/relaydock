@@ -128,6 +128,24 @@ func (h *PortalSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		totalUsedBytes = billed
 	}
 
+	if user.Role != storage.RoleAdmin {
+		nodes, scopeErr := collectUserVisibleNodes(ctx, h.repo, username)
+		if scopeErr != nil {
+			writeError(w, http.StatusServiceUnavailable, scopeErr)
+			return
+		}
+		ids := make([]int64, 0, len(nodes))
+		for _, node := range nodes {
+			ids = append(ids, node.ID)
+		}
+		stats, scopeErr := resolveSubscriptionUserTraffic(ctx, h.repo, username, ids)
+		if scopeErr != nil {
+			writeError(w, http.StatusServiceUnavailable, scopeErr)
+			return
+		}
+		totalLimitBytes, totalUsedBytes = stats.Limit, stats.Used
+	}
+
 	remainingBytes := totalLimitBytes - totalUsedBytes
 	if remainingBytes < 0 || totalLimitBytes == 0 {
 		if totalLimitBytes == 0 {

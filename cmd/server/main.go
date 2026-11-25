@@ -1088,6 +1088,7 @@ func main() {
 		}
 	})))
 	mux.HandleFunc("/api/public/branding", systemSettingsHandler.GetBrandingPublic)
+	mux.Handle("/api/public/subscription-rule-sets/", handler.NewSubscriptionRuleSetsHandler())
 
 	// 公开端点:伪装探针的只读服务器状态 + 共享 WebSocket 广播。两条路径复用
 	// 同一个严格白名单 DTO；伪装关闭时 HTTP 返回 {enabled:false}，WS 返回 404。
@@ -1459,6 +1460,7 @@ func main() {
 	go handler.StartNotifyScheduler(collectorCtx, repo)
 	// 启动外部订阅文件的后台自动更新任务（每 1 分钟检查到期外部订阅并自动拉取更新）
 	go handler.StartSubscribeFilesAutoUpdater(collectorCtx, repo)
+	go handler.StartSubscriptionHealthUpdater(collectorCtx, repo)
 
 	// 外部测速组件由当前后端的内置目录明确指定版本。启动时立即对比，
 	// 之后定期重试下载失败项；只更新已由 Arcway 管理的副本。

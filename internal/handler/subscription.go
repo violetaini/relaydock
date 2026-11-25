@@ -469,7 +469,15 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	var templateFile storage.SubscribeFile
 	templateForceServerProviders := false
 	crossOwnerAccess := hasSubscribeFile && subscriptionProviderRequiresServerMaterialization(username, subscribeFile.CreatedBy)
-	if hasSubscribeFile {
+	if hasSubscribeFile && subscribeFile.Generation != nil {
+		generated, _, genErr := h.generateSubscription(context.WithValue(r.Context(), subscriptionViewerKey{}, username), subscribeFile, r.URL.Query().Get("t"))
+		if genErr != nil {
+			writeError(w, http.StatusServiceUnavailable, genErr)
+			return
+		}
+		data = generated
+	}
+	if hasSubscribeFile && subscribeFile.Generation == nil {
 		effectiveTemplate := subscribeFile.TemplateFilename
 		if effectiveTemplate == "" && h.repo != nil {
 			creator := strings.TrimSpace(subscribeFile.CreatedBy)
@@ -826,6 +834,9 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	stepStart = time.Now()
 	// 根据参数t的类型调用substore的转换代码
 	clientType := strings.TrimSpace(r.URL.Query().Get("t"))
+	if clientType == "" && hasSubscribeFile && subscribeFile.Generation != nil && len(subscribeFile.Generation.Outputs) > 0 {
+		clientType = subscribeFile.Generation.Outputs[0].Client
+	}
 	// 默认浏览器打开时直接输入文本, 不再下载问卷
 	contentType := "text/yaml; charset=utf-8; charset=UTF-8"
 	ext := filepath.Ext(filename)
@@ -836,7 +847,13 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	// clash 和 clashmeta 类型直接输出源文件, 不需要转换
 	if clientType != "" && clientType != "clash" && clientType != "clashmeta" {
 		// 使用子商店生产者转换订阅
-		convertedData, err := h.convertSubscription(r.Context(), data, clientType)
+		var convertedData []byte
+		var err error
+		if hasSubscribeFile && subscribeFile.Generation != nil {
+			convertedData, err = h.convertGenerationOutput(r.Context(), data, generationOutput(subscribeFile.Generation, clientType))
+		} else {
+			convertedData, err = h.convertSubscription(r.Context(), data, clientType)
+		}
 		if err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("failed to convert subscription for client %s: %w", clientType, err))
 			return
@@ -967,56 +984,78 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", contentType)
 
-	// 远程服务器流量统计:
-	//   - 订阅创建者是普通用户且绑了套餐 → 用套餐限额与采集时固化的计费用量,
-	//     跟"流量信息"页一致,避免把全平台所有服务器流量塞进 subscription-userinfo。
-	//   - admin / 无套餐 / 找不到用户 → 沿用 stats_server_ids 那套老逻辑。
-	remoteTrafficLimit, remoteTrafficUsed := int64(0), int64(0)
-	if hasSubscribeFile && h.repo != nil {
-		creator := strings.TrimSpace(subscribeFile.CreatedBy)
-		usedPackageScope := false
-		if creator != "" {
-			if user, uerr := h.repo.GetUser(r.Context(), creator); uerr == nil && user.Role != storage.RoleAdmin && user.PackageID > 0 {
-				if pkg, perr := h.repo.GetPackage(r.Context(), user.PackageID); perr == nil && pkg != nil {
-					remoteTrafficLimit = resolveTrafficLimitBytes(&user, pkg)
-					if billed, terr := h.repo.GetUserBillableTraffic(r.Context(), creator); terr == nil {
-						remoteTrafficUsed = billed
-					}
-					usedPackageScope = true
-				}
-			}
+	if hasSubscribeFile && subscribeFile.Generation != nil {
+		ids, external, scopeErr := subscriptionBoundNodeIDs(r.Context(), h.repo, subscribeFile)
+		if scopeErr != nil {
+			writeError(w, http.StatusServiceUnavailable, scopeErr)
+			return
 		}
-		if !usedPackageScope {
-			var serverIDs []int64
-			if subscribeFile.StatsServerIDs != "" {
-				for _, idStr := range strings.Split(subscribeFile.StatsServerIDs, ",") {
-					idStr = strings.TrimSpace(idStr)
-					if id, err := strconv.ParseInt(idStr, 10, 64); err == nil && id > 0 {
-						serverIDs = append(serverIDs, id)
+		stats, scopeErr := resolveSubscriptionUserTraffic(r.Context(), h.repo, username, ids)
+		if scopeErr != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("用户订阅流量暂不可用"))
+			return
+		}
+		if len(ids) > 0 {
+			info := buildSubscriptionHeader(stats.Limit, stats.Used)
+			if user, err := h.repo.GetUser(r.Context(), username); err == nil && user.PackageEndDate != nil {
+				info += fmt.Sprintf("; expire=%d", user.PackageEndDate.Unix())
+			}
+			w.Header().Set("subscription-userinfo", info)
+		} else if external && externalTrafficLimit > 0 {
+			w.Header().Set("subscription-userinfo", buildSubscriptionHeader(externalTrafficLimit, externalTrafficUsed))
+		}
+	} else {
+		// 远程服务器流量统计:
+		//   - 订阅创建者是普通用户且绑了套餐 → 用套餐限额与采集时固化的计费用量,
+		//     跟"流量信息"页一致,避免把全平台所有服务器流量塞进 subscription-userinfo。
+		//   - admin / 无套餐 / 找不到用户 → 沿用 stats_server_ids 那套老逻辑。
+		remoteTrafficLimit, remoteTrafficUsed := int64(0), int64(0)
+		if hasSubscribeFile && h.repo != nil {
+			creator := strings.TrimSpace(subscribeFile.CreatedBy)
+			usedPackageScope := false
+			if creator != "" {
+				if user, uerr := h.repo.GetUser(r.Context(), creator); uerr == nil && user.Role != storage.RoleAdmin && user.PackageID > 0 {
+					if pkg, perr := h.repo.GetPackage(r.Context(), user.PackageID); perr == nil && pkg != nil {
+						remoteTrafficLimit = resolveTrafficLimitBytes(&user, pkg)
+						if billed, terr := h.repo.GetUserBillableTraffic(r.Context(), creator); terr == nil {
+							remoteTrafficUsed = billed
+						}
+						usedPackageScope = true
 					}
 				}
 			}
-			if len(serverIDs) > 0 {
-				remoteTrafficLimit, remoteTrafficUsed, _ = h.repo.GetRemoteServerTrafficTotals(r.Context(), serverIDs)
-			} else {
-				remoteTrafficLimit, remoteTrafficUsed, _ = h.repo.GetAllRemoteServersTrafficTotals(r.Context())
-			}
-			// 同流量列表口径:仅当订阅自带 traffic_limit > 0 才作"显式覆盖",
-			// nil / 0 都视作"跟随服务器"。
-			if subscribeFile.TrafficLimit != nil && *subscribeFile.TrafficLimit > 0 {
+			if !usedPackageScope {
+				var serverIDs []int64
+				if subscribeFile.StatsServerIDs != "" {
+					for _, idStr := range strings.Split(subscribeFile.StatsServerIDs, ",") {
+						idStr = strings.TrimSpace(idStr)
+						if id, err := strconv.ParseInt(idStr, 10, 64); err == nil && id > 0 {
+							serverIDs = append(serverIDs, id)
+						}
+					}
+				}
+				if len(serverIDs) > 0 {
+					remoteTrafficLimit, remoteTrafficUsed, _ = h.repo.GetRemoteServerTrafficTotals(r.Context(), serverIDs)
+				} else {
+					remoteTrafficLimit, remoteTrafficUsed, _ = h.repo.GetAllRemoteServersTrafficTotals(r.Context())
+				}
+				// 同流量列表口径:仅当订阅自带 traffic_limit > 0 才作"显式覆盖",
+				// nil / 0 都视作"跟随服务器"。
+				if subscribeFile.TrafficLimit != nil && *subscribeFile.TrafficLimit > 0 {
+					remoteTrafficLimit = int64(*subscribeFile.TrafficLimit * 1024 * 1024 * 1024)
+				}
+			} else if subscribeFile.TrafficLimit != nil && *subscribeFile.TrafficLimit > 0 {
+				// 套餐口径下,如果订阅自带 traffic_limit 覆盖,以覆盖为准
 				remoteTrafficLimit = int64(*subscribeFile.TrafficLimit * 1024 * 1024 * 1024)
 			}
-		} else if subscribeFile.TrafficLimit != nil && *subscribeFile.TrafficLimit > 0 {
-			// 套餐口径下,如果订阅自带 traffic_limit 覆盖,以覆盖为准
-			remoteTrafficLimit = int64(*subscribeFile.TrafficLimit * 1024 * 1024 * 1024)
 		}
-	}
 
-	totalTrafficLimit := externalTrafficLimit + remoteTrafficLimit
-	totalTrafficUsed := externalTrafficUsed + remoteTrafficUsed
-	if totalTrafficLimit > 0 {
-		headerValue := buildSubscriptionHeader(totalTrafficLimit, totalTrafficUsed)
-		w.Header().Set("subscription-userinfo", headerValue)
+		totalTrafficLimit := externalTrafficLimit + remoteTrafficLimit
+		totalTrafficUsed := externalTrafficUsed + remoteTrafficUsed
+		if totalTrafficLimit > 0 {
+			headerValue := buildSubscriptionHeader(totalTrafficLimit, totalTrafficUsed)
+			w.Header().Set("subscription-userinfo", headerValue)
+		}
 	}
 	w.Header().Set("profile-update-interval", "24")
 	// 只有非浏览器访问时才添加 content-disposition 头（避免浏览器直接下载）
@@ -1132,6 +1171,36 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 		return nil, fmt.Errorf("读取模板文件失败: %w", err)
 	}
 
+	proxies, err := h.subscriptionNodeProxies(ctx, subscribeFile)
+	if err != nil {
+		return nil, err
+	}
+	creator := strings.TrimSpace(subscribeFile.CreatedBy)
+
+	result, err := renderTemplateWithProxyProviders(
+		ctx,
+		h.repo,
+		string(templateContent),
+		proxies,
+		creator,
+		forceServerProviders,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("处理模板失败: %w", err)
+	}
+
+	// 孤儿节点裁剪:顶层 proxies: 只保留被 proxy-groups 实际引用的节点,删掉没被引用的
+	if pruned, perr := pruneUnreferencedProxies([]byte(result)); perr == nil {
+		result = string(pruned)
+	} else {
+		logger.Info("[模板生成] 孤儿裁剪跳过", "error", perr.Error())
+	}
+
+	logger.Info("[模板生成] 完成", "subscribe", subscribeFile.Name, "template", subscribeFile.TemplateFilename, "bytes", len(result))
+	return []byte(result), nil
+}
+
+func (h *SubscriptionHandler) subscriptionNodeProxies(ctx context.Context, subscribeFile storage.SubscribeFile) ([]map[string]any, error) {
 	// 节点池选择:
 	//   - 普通用户有套餐 → 仅套餐节点
 	//   - 普通用户无套餐 → 仅自己导入的外部节点
@@ -1148,27 +1217,11 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 		}
 		if user.Role != storage.RoleAdmin {
 			userScoped = true
-			if user.PackageID > 0 {
-				pkg, perr := h.repo.GetPackage(ctx, user.PackageID)
-				if perr != nil || pkg == nil {
-					if perr == nil {
-						perr = errors.New("套餐不存在")
-					}
-					return nil, fmt.Errorf("获取用户套餐失败: %w", perr)
-				}
-				restrictToPackage = true
-				nodes = make([]storage.Node, 0, len(pkg.Nodes))
-				for _, nid := range pkg.Nodes {
-					if pn, nerr := h.repo.GetNodeByID(ctx, nid); nerr == nil {
-						nodes = append(nodes, pn)
-					}
-				}
-			} else {
-				var lerr error
-				nodes, lerr = h.repo.ListNodes(ctx, creator)
-				if lerr != nil {
-					return nil, fmt.Errorf("获取用户节点列表失败: %w", lerr)
-				}
+			restrictToPackage = user.AuthorizationMode == storage.AuthorizationModePackage && user.PackageID > 0
+			var listErr error
+			nodes, listErr = collectUserVisibleNodes(ctx, h.repo, creator)
+			if listErr != nil {
+				return nil, fmt.Errorf("获取用户授权节点失败: %w", listErr)
 			}
 		}
 	}
@@ -1217,6 +1270,11 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 
 	var proxies []map[string]any
 	for _, node := range nodes {
+		if viewer, _ := ctx.Value(subscriptionViewerKey{}).(string); viewer != "" && !userIsAdmin(ctx, h.repo, viewer) {
+			if eligible, _ := subscriptionNodeAccountingEligibility(node); !eligible {
+				continue
+			}
+		}
 		if !node.Enabled {
 			continue
 		}
@@ -1261,27 +1319,7 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 		return nil, errors.New("无可用节点")
 	}
 
-	result, err := renderTemplateWithProxyProviders(
-		ctx,
-		h.repo,
-		string(templateContent),
-		proxies,
-		creator,
-		forceServerProviders,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("处理模板失败: %w", err)
-	}
-
-	// 孤儿节点裁剪:顶层 proxies: 只保留被 proxy-groups 实际引用的节点,删掉没被引用的
-	if pruned, perr := pruneUnreferencedProxies([]byte(result)); perr == nil {
-		result = string(pruned)
-	} else {
-		logger.Info("[模板生成] 孤儿裁剪跳过", "error", perr.Error())
-	}
-
-	logger.Info("[模板生成] 完成", "subscribe", subscribeFile.Name, "template", subscribeFile.TemplateFilename, "bytes", len(result))
-	return []byte(result), nil
+	return proxies, nil
 }
 
 func buildSubscriptionHeader(totalLimit, totalUsed int64) string {

@@ -210,8 +210,7 @@ func (p *ShadowrocketTemplateProducer) formatProxyLine(proxy Proxy) string {
 
 	// 构建参数列表
 	var params []string
-	params = append(params, name)
-	params = append(params, proxyType)
+	params = append(params, name+"="+proxyType)
 	params = append(params, server)
 	params = append(params, fmt.Sprintf("%d", port))
 

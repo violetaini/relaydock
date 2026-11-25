@@ -112,15 +112,21 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 			totalUsed += extUsed
 		}
 	} else if haveUser {
-		// 普通用户:套餐流量。已用值在采集时按当时的套餐模式和节点倍率固化。
-		if user.PackageID > 0 {
-			if pkg, perr := h.repo.GetPackage(ctx, user.PackageID); perr == nil {
-				totalLimit += resolveTrafficLimitBytes(&user, pkg)
-				if billed, terr := h.repo.GetUserBillableTraffic(ctx, username); terr == nil {
-					totalUsed += billed
-				}
-			}
+		nodes, scopeErr := collectUserVisibleNodes(ctx, h.repo, username)
+		if scopeErr != nil {
+			writeError(w, http.StatusServiceUnavailable, scopeErr)
+			return
 		}
+		ids := make([]int64, 0, len(nodes))
+		for _, node := range nodes {
+			ids = append(ids, node.ID)
+		}
+		stats, scopeErr := resolveSubscriptionUserTraffic(ctx, h.repo, username, ids)
+		if scopeErr != nil {
+			writeError(w, http.StatusServiceUnavailable, scopeErr)
+			return
+		}
+		totalLimit, totalUsed = stats.Limit, stats.Used
 		// 外部订阅(该用户开启 sync_traffic 时)叠加。
 		extLimit, extUsed := h.fetchExternalSubscriptionTraffic(ctx, username)
 		totalLimit += extLimit

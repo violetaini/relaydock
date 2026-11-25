@@ -1,0 +1,240 @@
+[
+  {
+    "key": "ads",
+    "emoji": "🔴",
+    "label": "广告拦截",
+    "default": true,
+    "rules": [
+      "GEOSITE,category-ads-all,REJECT"
+    ]
+  },
+  {
+    "key": "ai",
+    "emoji": "🤖",
+    "label": "AI 服务",
+    "default": true,
+    "rules": [
+      "GEOSITE,category-ai-!cn,PROXY"
+    ]
+  },
+  {
+    "key": "bilibili",
+    "emoji": "📺",
+    "label": "哔哩哔哩",
+    "default": false,
+    "rules": [
+      "GEOSITE,bilibili,DIRECT"
+    ]
+  },
+  {
+    "key": "youtube",
+    "emoji": "📺",
+    "label": "油管视频",
+    "default": true,
+    "rules": [
+      "GEOSITE,youtube,PROXY"
+    ]
+  },
+  {
+    "key": "google",
+    "emoji": "🔍",
+    "label": "谷歌服务",
+    "default": true,
+    "rules": [
+      "GEOSITE,google,PROXY",
+      "GEOIP,google,PROXY,no-resolve"
+    ]
+  },
+  {
+    "key": "private",
+    "emoji": "🏠",
+    "label": "私有网络",
+    "default": true,
+    "rules": [
+      "GEOSITE,private,DIRECT",
+      "GEOIP,private,DIRECT,no-resolve"
+    ]
+  },
+  {
+    "key": "cn",
+    "emoji": "🔒",
+    "label": "国内服务",
+    "default": true,
+    "rules": [
+      "GEOSITE,cn,DIRECT",
+      "GEOIP,cn,DIRECT,no-resolve"
+    ]
+  },
+  {
+    "key": "telegram",
+    "emoji": "📱",
+    "label": "电报消息",
+    "default": true,
+    "rules": [
+      "GEOSITE,telegram,PROXY",
+      "GEOIP,telegram,PROXY,no-resolve"
+    ]
+  },
+  {
+    "key": "github",
+    "emoji": "🐱",
+    "label": "Github",
+    "default": false,
+    "rules": [
+      "GEOSITE,github,PROXY"
+    ]
+  },
+  {
+    "key": "microsoft",
+    "emoji": "🪟",
+    "label": "微软服务",
+    "default": false,
+    "rules": [
+      "GEOSITE,microsoft,PROXY"
+    ]
+  },
+  {
+    "key": "apple",
+    "emoji": "🍎",
+    "label": "苹果服务",
+    "default": false,
+    "rules": [
+      "GEOSITE,apple,DIRECT"
+    ]
+  },
+  {
+    "key": "social",
+    "emoji": "🌐",
+    "label": "社交媒体",
+    "default": false,
+    "rules": [
+      "GEOSITE,category-social-media-!cn,PROXY"
+    ]
+  },
+  {
+    "key": "stream",
+    "emoji": "📺",
+    "label": "流媒体",
+    "default": false,
+    "rules": [
+      "GEOSITE,category-entertainment,PROXY"
+    ]
+  },
+  {
+    "key": "games",
+    "emoji": "🎮",
+    "label": "游戏平台",
+    "default": false,
+    "rules": [
+      "GEOSITE,category-games,PROXY"
+    ]
+  },
+  {
+    "key": "education",
+    "emoji": "📚",
+    "label": "教育资源",
+    "default": false,
+    "rules": [
+      "GEOSITE,category-scholar-!cn,PROXY"
+    ]
+  },
+  {
+    "key": "finance",
+    "emoji": "💰",
+    "label": "金融服务",
+    "default": false,
+    "rules": [
+      "GEOSITE,category-finance,PROXY"
+    ]
+  },
+  {
+    "key": "cloud",
+    "emoji": "☁️",
+    "label": "云服务",
+    "default": false,
+    "rules": [
+      "GEOSITE,category-dev,PROXY"
+    ]
+  },
+  {
+    "key": "spotify",
+    "emoji": "🎵",
+    "label": "Spotify",
+    "default": false,
+    "rules": [
+      "GEOSITE,spotify,PROXY"
+    ]
+  },
+  {
+    "key": "pixiv",
+    "emoji": "🎨",
+    "label": "Pixiv",
+    "default": false,
+    "rules": [
+      "GEOSITE,pixiv,PROXY"
+    ]
+  },
+  {
+    "key": "abema",
+    "emoji": "📡",
+    "label": "Abema",
+    "default": false,
+    "rules": [
+      "GEOSITE,abema,PROXY"
+    ]
+  },
+  {
+    "key": "proxy",
+    "emoji": "🔀",
+    "label": "代理服务",
+    "default": false,
+    "rules": [
+      "GEOSITE,gfw,PROXY"
+    ]
+  },
+  {
+    "key": "proxy-media",
+    "emoji": "🎭",
+    "label": "代理媒体",
+    "default": false,
+    "rules": [
+      "GEOSITE,geolocation-!cn,PROXY"
+    ]
+  },
+  {
+    "key": "ehentai",
+    "emoji": "🔞",
+    "label": "E-Hentai",
+    "default": false,
+    "rules": [
+      "GEOSITE,ehentai,PROXY"
+    ]
+  },
+  {
+    "key": "non-cn",
+    "emoji": "🌍",
+    "label": "非中国",
+    "default": false,
+    "rules": [
+      "GEOSITE,geolocation-!cn,PROXY"
+    ]
+  },
+  {
+    "key": "tracker",
+    "emoji": "🔗",
+    "label": "PT Tracker",
+    "default": false,
+    "rules": [
+      "GEOSITE,category-public-tracker,DIRECT"
+    ]
+  },
+  {
+    "key": "pt",
+    "emoji": "🎞️",
+    "label": "PT 站点",
+    "default": false,
+    "rules": [
+      "GEOSITE,category-pt,DIRECT"
+    ]
+  }
+]

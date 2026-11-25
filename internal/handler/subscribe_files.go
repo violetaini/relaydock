@@ -151,6 +151,10 @@ func (h *subscribeFilesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	path = strings.Trim(path, "/")
 
 	switch {
+	case path == "generation/preview" && r.Method == http.MethodPost:
+		h.handleGeneration(w, r, true)
+	case path == "generation" && r.Method == http.MethodPost:
+		h.handleGeneration(w, r, false)
 	case path == "" && r.Method == http.MethodGet:
 		h.handleList(w, r)
 	case path == "" && r.Method == http.MethodPost:
@@ -165,6 +169,8 @@ func (h *subscribeFilesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		h.handleUpload(w, r)
 	case path == "create-from-config" && r.Method == http.MethodPost:
 		h.handleCreateFromConfig(w, r)
+	case strings.HasSuffix(path, "/routes") && r.Method == http.MethodGet:
+		h.handleGenerationRouteExport(w, r, strings.TrimSuffix(path, "/routes"))
 	case strings.HasSuffix(path, "/users") && r.Method == http.MethodGet:
 		// GET /api/admin/subscribe-files/{id}/users — 列出该订阅分配给哪些用户。
 		idStr := strings.TrimSuffix(path, "/users")
@@ -421,8 +427,8 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 	}
 
 	// 验证YAML格式
-	var yamlCheck map[string]any
-	if err := yaml.Unmarshal(body, &yamlCheck); err != nil {
+	body, err = normalizeImportedSubscription(body)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, errors.New("订阅内容不是有效的YAML格式"))
 		return
 	}
@@ -574,8 +580,8 @@ func (h *subscribeFilesHandler) handleUpload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	var yamlCheck map[string]any
-	if err := yaml.Unmarshal(content, &yamlCheck); err != nil {
+	content, err = normalizeImportedSubscription(content)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, errors.New("文件不是有效的YAML格式"))
 		return
 	}
@@ -723,6 +729,10 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 	}
 	if req.SelectedNodeIDs != nil {
 		existing.SelectedNodeIDs = req.SelectedNodeIDs
+		if err := validateSubscriptionNodeSelectionEdit(r.Context(), h.repo, existing); err != nil {
+			writeError(w, http.StatusUnprocessableEntity, err)
+			return
+		}
 	}
 	if req.SelectedCustomRuleIDs != nil {
 		existing.SelectedCustomRuleIDs = req.SelectedCustomRuleIDs
@@ -969,155 +979,53 @@ func (h *subscribeFilesHandler) handleReorder(w http.ResponseWriter, r *http.Req
 	respondJSON(w, http.StatusOK, map[string]string{"status": "reordered"})
 }
 
+// Each response describes the authenticated user's assigned subscription
+// nodes and user-management quotas; no creator or whole-server totals leak.
 func (h *subscribeFilesHandler) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
+	username := auth.UsernameFromContext(ctx)
+	if auth.IsGlobalAPIToken(ctx) {
+		username, _ = h.repo.FindActiveAdminUsername(ctx)
+	}
+	if username == "" {
+		writeError(w, http.StatusUnauthorized, errors.New("请先登录"))
+		return
+	}
 	files, err := h.repo.ListSubscribeFiles(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-
-	// 普通用户(开了"订阅管理"权限后能进来):流量列必须显示套餐口径,
-	// 跟 /api/traffic/summary 上的"流量信息"页保持一致 —— 否则下面那条
-	// GetAllRemoteServersTrafficTotals 路径会把全平台所有用户的 inbound 流量
-	// 全聚合返回,与该用户毫无关系。
-	username := auth.UsernameFromContext(ctx)
-	if !userIsAdmin(ctx, h.repo, username) {
-		h.handleTrafficForUser(ctx, w, username, files)
-		return
-	}
-
-	allNodes, err := h.repo.ListAllNodes(ctx)
+	admin := userIsAdmin(ctx, h.repo, username)
+	assigned, err := h.repo.GetUserSubscriptionIDs(ctx, username)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-
-	allExternalSubs, _ := h.repo.ListAllExternalSubscriptions(ctx)
-	extSubByName := make(map[string]storage.ExternalSubscription, len(allExternalSubs))
-	for _, s := range allExternalSubs {
-		extSubByName[s.Name] = s
+	allowed := make(map[int64]bool, len(assigned))
+	for _, id := range assigned {
+		allowed[id] = true
 	}
-
-	type trafficItem struct {
-		Used  int64 `json:"used"`
-		Limit int64 `json:"limit"`
+	if admin {
+		files = filterAdminVisibleSubscribeFiles(ctx, h.repo, files, username)
 	}
-	result := make(map[int64]trafficItem, len(files))
-
-	now := time.Now()
-	for _, f := range files {
-		nodes := allNodes
-		if len(f.SelectedTags) > 0 {
-			tagsMap := make(map[string]bool, len(f.SelectedTags))
-			for _, t := range f.SelectedTags {
-				tagsMap[t] = true
-			}
-			filtered := make([]storage.Node, 0)
-			for _, n := range allNodes {
-				if n.HasAnyTag(tagsMap) {
-					filtered = append(filtered, n)
-				}
-			}
-			nodes = filtered
-		}
-
-		// 收集外部订阅名(用于把订阅源自带的 used/total 也算进去 — 与服务器流量并列)
-		extSubNames := make(map[string]bool)
-		for _, n := range nodes {
-			if n.Tag != "" && n.Tag != "手动输入" {
-				extSubNames[n.Tag] = true
-			}
-		}
-
-		// 服务器流量范围:
-		//   stats_server_ids 非空 → 仅统计选中的服务器
-		//   stats_server_ids 空(默认)→ 统计全部服务器
-		var serverScopeIDs []int64
-		if strings.TrimSpace(f.StatsServerIDs) != "" {
-			for _, s := range strings.Split(f.StatsServerIDs, ",") {
-				if id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil && id > 0 {
-					serverScopeIDs = append(serverScopeIDs, id)
-				}
-			}
-		}
-
-		var totalUsed, totalLimit int64
-		if len(serverScopeIDs) > 0 {
-			limit, used, _ := h.repo.GetRemoteServerTrafficTotals(ctx, serverScopeIDs)
-			totalUsed += used
-			totalLimit += limit
-		} else {
-			limit, used, _ := h.repo.GetAllRemoteServersTrafficTotals(ctx)
-			totalUsed += used
-			totalLimit += limit
-		}
-
-		for name := range extSubNames {
-			sub, ok := extSubByName[name]
-			if !ok {
-				continue
-			}
-			if sub.Expire != nil && sub.Expire.Before(now) {
-				continue
-			}
-			totalLimit += sub.Total
-			switch sub.TrafficMode {
-			case "download":
-				totalUsed += sub.Download
-			case "upload":
-				totalUsed += sub.Upload
-			default:
-				totalUsed += sub.Upload + sub.Download
-			}
-		}
-
-		// 仅当订阅自带 traffic_limit > 0 时才作为"用户显式覆盖"使用;
-		// nil / 0 都视作"跟随服务器算出的 totalLimit",避免前端 inline payload 把 0 持久化后覆盖掉服务器额度。
-		if f.TrafficLimit != nil && *f.TrafficLimit > 0 {
-			totalLimit = int64(*f.TrafficLimit * 1024 * 1024 * 1024)
-		}
-		result[f.ID] = trafficItem{Used: totalUsed, Limit: totalLimit}
-	}
-
-	respondJSON(w, http.StatusOK, map[string]any{"traffic": result})
-}
-
-// handleTrafficForUser 给单个普通用户返回订阅流量:对该用户名下每个订阅文件
-// 都填同一组 {used, limit} = 用户套餐口径,跟 /api/traffic/summary 完全一致。
-// 没绑套餐的用户:返回 0/0(前端会显示无限制/未消耗,行为与流量信息页一致)。
-func (h *subscribeFilesHandler) handleTrafficForUser(ctx context.Context, w http.ResponseWriter, username string, files []storage.SubscribeFile) {
-	type trafficItem struct {
-		Used  int64 `json:"used"`
-		Limit int64 `json:"limit"`
-	}
-	result := make(map[int64]trafficItem, len(files))
-
-	var used, limit int64
-	if username != "" {
-		if user, err := h.repo.GetUser(ctx, username); err == nil && user.PackageID > 0 {
-			if pkg, perr := h.repo.GetPackage(ctx, user.PackageID); perr == nil {
-				limit = resolveTrafficLimitBytes(&user, pkg)
-				if billed, terr := h.repo.GetUserBillableTraffic(ctx, username); terr == nil {
-					used = billed
-				}
-			}
-		}
-	}
-
-	for _, f := range files {
-		if f.CreatedBy != username {
+	result := make(map[int64]subscriptionUserTraffic)
+	for _, file := range files {
+		if !admin && file.CreatedBy != username && !allowed[file.ID] {
 			continue
 		}
-		// 订阅自定义限额覆盖套餐限额(管理员路径的同款语义)
-		fileLimit := limit
-		if f.TrafficLimit != nil {
-			fileLimit = int64(*f.TrafficLimit * 1024 * 1024 * 1024)
+		ids, _, err := subscriptionBoundNodeIDs(ctx, h.repo, file)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
 		}
-		result[f.ID] = trafficItem{Used: used, Limit: fileLimit}
+		stats, err := resolveSubscriptionUserTraffic(ctx, h.repo, username, ids)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("用户订阅流量暂不可用"))
+			return
+		}
+		result[file.ID] = stats
 	}
-
 	respondJSON(w, http.StatusOK, map[string]any{"traffic": result})
 }
 
@@ -1175,30 +1083,32 @@ type subscribeFileRequest struct {
 }
 
 type subscribeFileDTO struct {
-	ID                        int64      `json:"id"`
-	Name                      string     `json:"name"`
-	Description               string     `json:"description"`
-	URL                       string     `json:"url,omitempty"`
-	Type                      string     `json:"type"`
-	Filename                  string     `json:"filename"`
-	FileShortCode             string     `json:"file_short_code"`
-	CustomShortCode           string     `json:"custom_short_code"`
-	AutoSyncCustomRules       bool       `json:"auto_sync_custom_rules"`
-	TemplateFilename          string     `json:"template_filename"`
-	SelectedTags              []string   `json:"selected_tags"`
-	SelectedNodeIDs           []int64    `json:"selected_node_ids"`
-	SelectedCustomRuleIDs     []int64    `json:"selected_custom_rule_ids"`
-	SelectedOverrideScriptIDs []int64    `json:"selected_override_script_ids"`
-	StatsServerIDs            string     `json:"stats_server_ids"`
-	TrafficLimit              *float64   `json:"traffic_limit"`
-	SortOrder                 int        `json:"sort_order"`
-	RawOutput                 bool       `json:"raw_output"`
-	CreatedBy                 string     `json:"created_by"`
-	AutoUpdateInterval        int        `json:"auto_update_interval"`
-	LastSyncAt                *time.Time `json:"last_sync_at,omitempty"`
-	CreatedAt                 time.Time  `json:"created_at"`
-	UpdatedAt                 time.Time  `json:"updated_at"`
-	LatestVersion             int64      `json:"latest_version,omitempty"`
+	Kind                      string                          `json:"kind"`
+	Generation                *storage.SubscriptionGeneration `json:"generation,omitempty"`
+	ID                        int64                           `json:"id"`
+	Name                      string                          `json:"name"`
+	Description               string                          `json:"description"`
+	URL                       string                          `json:"url,omitempty"`
+	Type                      string                          `json:"type"`
+	Filename                  string                          `json:"filename"`
+	FileShortCode             string                          `json:"file_short_code"`
+	CustomShortCode           string                          `json:"custom_short_code"`
+	AutoSyncCustomRules       bool                            `json:"auto_sync_custom_rules"`
+	TemplateFilename          string                          `json:"template_filename"`
+	SelectedTags              []string                        `json:"selected_tags"`
+	SelectedNodeIDs           []int64                         `json:"selected_node_ids"`
+	SelectedCustomRuleIDs     []int64                         `json:"selected_custom_rule_ids"`
+	SelectedOverrideScriptIDs []int64                         `json:"selected_override_script_ids"`
+	StatsServerIDs            string                          `json:"stats_server_ids"`
+	TrafficLimit              *float64                        `json:"traffic_limit"`
+	SortOrder                 int                             `json:"sort_order"`
+	RawOutput                 bool                            `json:"raw_output"`
+	CreatedBy                 string                          `json:"created_by"`
+	AutoUpdateInterval        int                             `json:"auto_update_interval"`
+	LastSyncAt                *time.Time                      `json:"last_sync_at,omitempty"`
+	CreatedAt                 time.Time                       `json:"created_at"`
+	UpdatedAt                 time.Time                       `json:"updated_at"`
+	LatestVersion             int64                           `json:"latest_version,omitempty"`
 }
 
 func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
@@ -1220,6 +1130,8 @@ func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
 		scriptIDs = []int64{}
 	}
 	return subscribeFileDTO{
+		Kind:                      subscriptionKind(file),
+		Generation:                file.Generation,
 		ID:                        file.ID,
 		Name:                      file.Name,
 		Description:               file.Description,
@@ -1858,8 +1770,8 @@ func (h *subscribeFilesHandler) syncSingleSubscribeFile(ctx context.Context, sf 
 		return fmt.Errorf("读取外部订阅内容失败: %w", err)
 	}
 
-	var yamlCheck map[string]any
-	if err := yaml.Unmarshal(body, &yamlCheck); err != nil {
+	body, err = normalizeImportedSubscription(body)
+	if err != nil {
 		return errors.New("外部订阅内容不是有效的 YAML 格式")
 	}
 

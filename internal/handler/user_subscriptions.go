@@ -79,14 +79,32 @@ func (h *userSubscriptionsHandler) handleUpdate(w http.ResponseWriter, r *http.R
 	}
 
 	validIDs := make(map[int64]bool)
+	filesByID := make(map[int64]storage.SubscribeFile)
 	for _, sub := range allSubscriptions {
 		validIDs[sub.ID] = true
+		filesByID[sub.ID] = sub
 	}
 
 	// 过滤掉无效的订阅ID（已删除的订阅）
 	filteredIDs := make([]int64, 0, len(req.SubscriptionIDs))
 	for _, id := range req.SubscriptionIDs {
 		if id > 0 && validIDs[id] {
+			file := filesByID[id]
+			if file.Generation != nil {
+				if err := validateSubscriptionNodeSelection(r.Context(), h.repo, file); err != nil {
+					writeError(w, http.StatusUnprocessableEntity, err)
+					return
+				}
+				_, external, err := subscriptionBoundNodeIDs(r.Context(), h.repo, file)
+				if err != nil {
+					writeError(w, http.StatusUnprocessableEntity, err)
+					return
+				}
+				if external && file.CreatedBy != username {
+					writeError(w, http.StatusUnprocessableEntity, errors.New("该订阅包含无法按用户统计的外部共享节点，不能分配给其他用户"))
+					return
+				}
+			}
 			filteredIDs = append(filteredIDs, id)
 		}
 	}

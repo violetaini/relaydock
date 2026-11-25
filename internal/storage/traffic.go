@@ -626,6 +626,7 @@ type RoutedNodeDetail struct {
 
 // SubscribeFile 表示订阅文件配置。
 type SubscribeFile struct {
+	Generation                *SubscriptionGeneration
 	ID                        int64
 	Name                      string
 	Description               string
@@ -2002,6 +2003,16 @@ CREATE INDEX IF NOT EXISTS idx_custom_rules_enabled ON custom_rules(enabled);
 		return err
 	}
 	if err := r.ensureSubscribeFileColumn("last_sync_at", "DATETIME"); err != nil {
+		return err
+	}
+
+	if err := r.ensureSubscribeFileColumn("generation_config", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := r.db.Exec(`CREATE TABLE IF NOT EXISTS subscription_node_health (
+ owner TEXT NOT NULL, fingerprint TEXT NOT NULL, failures INTEGER NOT NULL DEFAULT 0,
+ checked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, latency REAL NOT NULL DEFAULT 0,
+ PRIMARY KEY(owner,fingerprint))`); err != nil {
 		return err
 	}
 
