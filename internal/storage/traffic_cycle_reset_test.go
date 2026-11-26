@@ -194,3 +194,49 @@ VALUES (?, 'edge-in', 'inbound', 400, 100, 400, 100)`, server.ID); err != nil {
 		t.Fatal("server threshold marker survived cycle reset")
 	}
 }
+
+func TestResetAllNodeTrafficCycleAt(t *testing.T) {
+	repo := newTrafficCycleResetRepository(t)
+	ctx := context.Background()
+
+	server := &RemoteServer{Name: "edge", Token: "edge-token", TrafficSource: "xray", TrafficStatsMode: "both"}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatalf("CreateRemoteServer: %v", err)
+	}
+	if _, err := repo.db.ExecContext(ctx, `
+INSERT INTO node_traffic (server_id, tag, type, uplink, downlink, last_uplink, last_downlink)
+VALUES (?, 'inbound-567', 'inbound', 6000, 4000, 6000, 4000)`, server.ID); err != nil {
+		t.Fatalf("insert node traffic: %v", err)
+	}
+
+	resetAt := time.Date(2026, time.December, 1, 0, 5, 0, 0, time.UTC)
+	if err := repo.ResetAllNodeTrafficCycleAt(ctx, resetAt); err != nil {
+		t.Fatalf("ResetAllNodeTrafficCycleAt: %v", err)
+	}
+
+	var up, down, lastUp, lastDown int64
+	if err := repo.db.QueryRowContext(ctx, `SELECT uplink, downlink, last_uplink, last_downlink FROM node_traffic WHERE server_id = ? AND tag = 'inbound-567'`, server.ID).Scan(&up, &down, &lastUp, &lastDown); err != nil {
+		t.Fatalf("query node traffic: %v", err)
+	}
+	if up != 0 || down != 0 {
+		t.Fatalf("node traffic cycle after reset=(%d,%d), want (0,0)", up, down)
+	}
+	if lastUp != 6000 || lastDown != 4000 {
+		t.Fatalf("last raw counters=(%d,%d), want (6000,4000)", lastUp, lastDown)
+	}
+
+	// Verify snapshot created for yesterday
+	var snapUp, snapDown int64
+	if err := repo.db.QueryRowContext(ctx, `SELECT uplink, downlink FROM node_traffic_snapshots WHERE server_id = ? AND tag = 'inbound-567' AND date = '2026-11-30'`, server.ID).Scan(&snapUp, &snapDown); err != nil {
+		t.Fatalf("query node traffic snapshot: %v", err)
+	}
+	if snapUp != 6000 || snapDown != 4000 {
+		t.Fatalf("snapshot=(%d,%d), want (6000,4000)", snapUp, snapDown)
+	}
+
+	// Verify setting recorded
+	val, err := repo.GetSystemSetting(ctx, "last_node_traffic_reset_at")
+	if err != nil || val == "" {
+		t.Fatalf("get last_node_traffic_reset_at: %v, val=%s", err, val)
+	}
+}

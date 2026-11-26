@@ -103,3 +103,38 @@ func TestShouldResetNaturalPeriod(t *testing.T) {
 		})
 	}
 }
+
+func TestShouldResetNodeTrafficThisMonth(t *testing.T) {
+	loc := time.FixedZone("UTC+8", 8*60*60)
+
+	// Case 1: First of month, last reset was previous month -> should reset
+	nowDec1 := time.Date(2026, time.December, 1, 0, 10, 0, 0, loc)
+	lastNov := time.Date(2026, time.November, 1, 0, 0, 0, 0, loc)
+	if !shouldResetNodeTrafficThisMonth(nowDec1, &lastNov) {
+		t.Fatal("expected reset on Dec 1st when last reset was Nov")
+	}
+
+	// Case 2: Already reset this month -> should NOT reset
+	lastDec1 := time.Date(2026, time.December, 1, 0, 10, 0, 0, loc)
+	nowDec2 := time.Date(2026, time.December, 2, 10, 0, 0, 0, loc)
+	if shouldResetNodeTrafficThisMonth(nowDec2, &lastDec1) {
+		t.Fatal("expected no reset on Dec 2nd when already reset in Dec")
+	}
+
+	// Case 3: Year rollover: Jan 1st of next year -> should reset
+	nowJan1 := time.Date(2027, time.January, 1, 0, 5, 0, 0, loc)
+	if !shouldResetNodeTrafficThisMonth(nowJan1, &lastDec1) {
+		t.Fatal("expected reset on Jan 1st 2027 when last reset was Dec 2026")
+	}
+
+	// Case 4: Nil lastReset on Day 1 -> should reset
+	if !shouldResetNodeTrafficThisMonth(nowDec1, nil) {
+		t.Fatal("expected reset on Day 1 with nil lastReset")
+	}
+
+	// Case 5: Nil lastReset mid-month (e.g. Day 26) -> should NOT reset (waits for next month)
+	nowNov26 := time.Date(2026, time.November, 26, 15, 30, 0, 0, loc)
+	if shouldResetNodeTrafficThisMonth(nowNov26, nil) {
+		t.Fatal("expected no reset mid-month with nil lastReset")
+	}
+}

@@ -15323,6 +15323,51 @@ func (r *TrafficRepository) ResetUserTrafficCycleAt(ctx context.Context, usernam
 	return r.resetUserTrafficCycle(ctx, username, &resetAt)
 }
 
+// ResetAllNodeTrafficCycleAt performs the automatic monthly cycle reset for all nodes on the 1st of the month.
+// It archives the closing period's traffic into node_traffic_snapshots, resets cycle counters (uplink, downlink)
+// to 0 in node_traffic while preserving last_uplink and last_downlink for continuous delta calculation,
+// and records the reset timestamp in system_settings.
+func (r *TrafficRepository) ResetAllNodeTrafficCycleAt(ctx context.Context, resetAt time.Time) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if resetAt.IsZero() {
+		return errors.New("reset time is required")
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin reset all node traffic cycle: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Archive closing period snapshot for the preceding date
+	snapshotDate := resetAt.AddDate(0, 0, -1).Format("2006-01-02")
+	const snapshotStmt = `
+INSERT OR REPLACE INTO node_traffic_snapshots (server_id, tag, type, date, uplink, downlink)
+SELECT server_id, tag, type, ?, uplink, downlink FROM node_traffic`
+	if _, err := tx.ExecContext(ctx, snapshotStmt, snapshotDate); err != nil {
+		return fmt.Errorf("archive node traffic snapshot: %w", err)
+	}
+
+	// Reset cycle uplink and downlink to 0
+	const resetStmt = `UPDATE node_traffic SET uplink = 0, downlink = 0, updated_at = CURRENT_TIMESTAMP`
+	if _, err := tx.ExecContext(ctx, resetStmt); err != nil {
+		return fmt.Errorf("reset node traffic: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit reset all node traffic cycle: %w", err)
+	}
+
+	// Record timestamp in system_settings
+	if err := r.SetSystemSetting(ctx, "last_node_traffic_reset_at", resetAt.Format(time.RFC3339)); err != nil {
+		log.Printf("[TrafficRepository] failed to save last_node_traffic_reset_at: %v", err)
+	}
+
+	return nil
+}
+
 // UpdateUserLastResetAt 记录用户最近一次按 reset_day 触发的流量周期重置时间。
 // CheckAll 用这个时间戳判定"本周期是否已重置过",确保 enforcer 每 5 分钟跑一次时不反复 reset。
 func (r *TrafficRepository) UpdateUserLastResetAt(ctx context.Context, username string, t time.Time) error {

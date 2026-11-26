@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/violetaini/relaydock/internal/storage"
 	"github.com/violetaini/relaydock/internal/traffic"
@@ -59,6 +60,8 @@ func (h *TrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleNodeTotals(w, r)
 	case path == "user-connections":
 		h.handleUserConnections(w, r)
+	case path == "reset-nodes":
+		h.handleResetNodes(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -1008,4 +1011,20 @@ func (h *TrafficHandler) handleServerSystemSnapshots(w http.ResponseWriter, r *h
 		return
 	}
 	h.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "snapshots": snapshots})
+}
+
+// handleResetNodes POST /api/admin/traffic/reset-nodes 手动重置所有节点流量
+func (h *TrafficHandler) handleResetNodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx := r.Context()
+	now := time.Now()
+	if err := h.repo.ResetAllNodeTrafficCycleAt(ctx, now); err != nil {
+		log.Printf("[Traffic API] Failed to reset node traffic: %v", err)
+		h.writeJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	h.writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "节点流量已成功重置"})
 }

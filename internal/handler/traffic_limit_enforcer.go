@@ -383,6 +383,51 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 			log.Printf("[TrafficLimitEnforcer] list servers for reset failed: %v", sErr)
 		}
 	}
+
+	// 节点流量统一次月1号重置（重新统计）
+	e.checkNodeTrafficMonthlyReset(ctx, now)
+}
+
+func (e *TrafficLimitEnforcer) checkNodeTrafficMonthlyReset(ctx context.Context, now time.Time) {
+	val, err := e.repo.GetSystemSetting(ctx, "last_node_traffic_reset_at")
+	if err != nil {
+		log.Printf("[TrafficLimitEnforcer] get last_node_traffic_reset_at failed: %v", err)
+		return
+	}
+
+	var lastResetAt *time.Time
+	if val != "" {
+		if t, parseErr := time.Parse(time.RFC3339, val); parseErr == nil {
+			lastResetAt = &t
+		}
+	}
+
+	if lastResetAt == nil {
+		// 首次初始化：如果当前不是1号（例如月中部署），记录当前时间作为基准，避免月中启动时误清空当月流量。
+		// 这样将在次月1号准时触发第一次重置。
+		if now.Day() > 1 {
+			initTime := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+			_ = e.repo.SetSystemSetting(ctx, "last_node_traffic_reset_at", initTime.Format(time.RFC3339))
+			return
+		}
+	}
+
+	if shouldResetNodeTrafficThisMonth(now, lastResetAt) {
+		log.Printf("[TrafficLimitEnforcer] triggering monthly node traffic reset for %s (now: %s)", now.Format("2006-01"), now.Format(time.RFC3339))
+		if rErr := e.repo.ResetAllNodeTrafficCycleAt(ctx, now); rErr != nil {
+			log.Printf("[TrafficLimitEnforcer] reset all node traffic failed: %v", rErr)
+			return
+		}
+		log.Printf("[TrafficLimitEnforcer] all node traffic successfully reset for month %s", now.Format("2006-01"))
+	}
+}
+
+func shouldResetNodeTrafficThisMonth(now time.Time, lastResetAt *time.Time) bool {
+	if lastResetAt == nil {
+		return now.Day() == 1
+	}
+	last := lastResetAt.In(now.Location())
+	return (last.Year() != now.Year() || last.Month() != now.Month()) && now.Day() >= 1
 }
 
 func (e *TrafficLimitEnforcer) enforceUserOverLimit(ctx context.Context, username string, billableTraffic map[string]int64, pkgCache map[int64]*storage.Package) (int64, int64, bool) {
