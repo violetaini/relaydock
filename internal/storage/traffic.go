@@ -881,6 +881,8 @@ type RemoteServer struct {
 	// 与 ip_address_v6 是否为空解耦 —— 因为 agent 上报空 v6 时后端 COALESCE 会保留旧地址,
 	// 单靠"地址是否为空"无法表达"用户主动关闭了 v6"。
 	IPv6Enabled bool `json:"ipv6_enabled"`
+	// AutoUpdateAgent 是否自动平滑更新 Agent (默认 true)。创建与编辑时可在高级区关闭。
+	AutoUpdateAgent bool `json:"auto_update_agent"`
 	// OfflineNotified 当前离线周期是否已发过下线通知。配合 offline_since 做"容忍阈值"防抖:
 	// 离线满阈值秒才发下线通知(offline_notified 置 1);重连时只有 offline_notified=1 才补发上线通知。
 	OfflineNotified bool `json:"offline_notified"`
@@ -2507,6 +2509,10 @@ CREATE INDEX IF NOT EXISTS idx_remote_server_install_tickets_server
 	}
 	// 服务器按 traffic_reset_day 自动重置流量时,记录上次重置时间(防同月反复)
 	if err := r.ensureRemoteServerColumn("last_traffic_reset_at", "TIMESTAMP"); err != nil {
+		return err
+	}
+	// 默认自动更新 Agent (1=开启, 0=关闭)
+	if err := r.ensureRemoteServerColumn("auto_update_agent", "INTEGER NOT NULL DEFAULT 1"); err != nil {
 		return err
 	}
 
@@ -12773,6 +12779,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 		COALESCE(warp_installed, 0),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
 		last_traffic_reset_at,
+		COALESCE(auto_update_agent, 1),
 		EXISTS(SELECT 1 FROM federated_servers fs WHERE fs.server_id = remote_servers.id),
 		COALESCE((SELECT prefix FROM federated_servers fs WHERE fs.server_id = remote_servers.id), ''),
 		created_at, updated_at
@@ -12794,6 +12801,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 		var ddnsEnabledInt, ddnsPendingInt int
 		var ddnsLastSyncedAt sql.NullTime
 		var lastTrafficResetAt sql.NullTime
+		var autoUpdateAgentInt int
 		if err := rows.Scan(&server.ID, &server.Name, &server.Token, &server.Status, &lastHeartbeat, &server.IPAddress, &server.IPAddressV6, &server.IPv6Enabled, &server.OfflineNotified, &server.Domain,
 			&bootTime, &xrayBootTime, &server.BootCount, &server.XrayBootCount,
 			&tokenExpiresAt, &lastTokenRefresh,
@@ -12814,6 +12822,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 			&warpInstalledInt,
 			&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
 			&lastTrafficResetAt,
+			&autoUpdateAgentInt,
 			&server.IsFederated,
 			&server.FederationPrefix,
 			&server.CreatedAt, &server.UpdatedAt); err != nil {
@@ -12862,6 +12871,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 		server.FallbackToPull = fallbackToPull != 0
 		server.XrayRunning = xrayRunning != 0
 		server.WarpInstalled = warpInstalledInt != 0
+		server.AutoUpdateAgent = autoUpdateAgentInt != 0
 		if timeOffsetSeconds != 0 {
 			server.TimeOffsetSeconds = &timeOffsetSeconds
 		}
@@ -12904,6 +12914,7 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		COALESCE(warp_installed, 0),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
 		last_traffic_reset_at,
+		COALESCE(auto_update_agent, 1),
 		created_at, updated_at
 		FROM remote_servers WHERE id = ?`
 
@@ -12915,6 +12926,7 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 	var ddnsEnabledInt, ddnsPendingInt int
 	var ddnsLastSyncedAt sql.NullTime
 	var lastTrafficResetAt sql.NullTime
+	var autoUpdateAgentInt int
 	err := r.db.QueryRowContext(ctx, query, id).Scan(&server.ID, &server.Name, &server.Token, &server.Status, &lastHeartbeat, &server.IPAddress, &server.IPAddressV6, &server.IPv6Enabled, &server.OfflineNotified, &server.Domain,
 		&bootTime, &xrayBootTime, &server.BootCount, &server.XrayBootCount,
 		&tokenExpiresAt, &lastTokenRefresh,
@@ -12934,6 +12946,7 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		&warpInstalledInt,
 		&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
 		&lastTrafficResetAt,
+		&autoUpdateAgentInt,
 		&server.CreatedAt, &server.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -12972,6 +12985,7 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 	if lastAgentTokenRefresh.Valid {
 		server.LastAgentTokenRefresh = &lastAgentTokenRefresh.Time
 	}
+	server.AutoUpdateAgent = autoUpdateAgentInt != 0
 	return &server, nil
 }
 
@@ -12997,6 +13011,7 @@ func (r *TrafficRepository) GetRemoteServerByToken(ctx context.Context, token st
 		COALESCE(xray_mode, 'external'),
 		COALESCE(country_code, ''),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
+		COALESCE(auto_update_agent, 1),
 		created_at, updated_at
 		FROM remote_servers WHERE token = ?`
 
@@ -13006,6 +13021,7 @@ func (r *TrafficRepository) GetRemoteServerByToken(ctx context.Context, token st
 	var agentTokenExpiresAt, lastAgentTokenRefresh sql.NullTime
 	var ddnsEnabledInt, ddnsPendingInt int
 	var ddnsLastSyncedAt sql.NullTime
+	var autoUpdateAgentInt int
 	err := r.db.QueryRowContext(ctx, query, token).Scan(&server.ID, &server.Name, &server.Token, &server.Status, &lastHeartbeat, &server.IPAddress, &server.IPAddressV6, &server.IPv6Enabled, &server.OfflineNotified, &server.Domain,
 		&bootTime, &xrayBootTime, &server.BootCount, &server.XrayBootCount,
 		&tokenExpiresAt, &lastTokenRefresh,
@@ -13017,6 +13033,7 @@ func (r *TrafficRepository) GetRemoteServerByToken(ctx context.Context, token st
 		&server.XrayMode,
 		&server.CountryCode,
 		&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
+		&autoUpdateAgentInt,
 		&server.CreatedAt, &server.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -13045,6 +13062,7 @@ func (r *TrafficRepository) GetRemoteServerByToken(ctx context.Context, token st
 	if lastAgentTokenRefresh.Valid {
 		server.LastAgentTokenRefresh = &lastAgentTokenRefresh.Time
 	}
+	server.AutoUpdateAgent = autoUpdateAgentInt != 0
 	server.DDNSEnabled = ddnsEnabledInt != 0
 	server.DDNSPending = ddnsPendingInt != 0
 	if ddnsLastSyncedAt.Valid {
@@ -13075,6 +13093,7 @@ func (r *TrafficRepository) GetRemoteServerByName(ctx context.Context, name stri
 		COALESCE(xray_mode, 'external'),
 		COALESCE(country_code, ''),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
+		COALESCE(auto_update_agent, 1),
 		created_at, updated_at
 		FROM remote_servers WHERE name = ?`
 
@@ -13084,6 +13103,7 @@ func (r *TrafficRepository) GetRemoteServerByName(ctx context.Context, name stri
 	var agentTokenExpiresAt, lastAgentTokenRefresh sql.NullTime
 	var ddnsEnabledInt, ddnsPendingInt int
 	var ddnsLastSyncedAt sql.NullTime
+	var autoUpdateAgentInt int
 	err := r.db.QueryRowContext(ctx, query, name).Scan(&server.ID, &server.Name, &server.Token, &server.Status, &lastHeartbeat, &server.IPAddress, &server.IPAddressV6, &server.IPv6Enabled, &server.OfflineNotified, &server.Domain,
 		&bootTime, &xrayBootTime, &server.BootCount, &server.XrayBootCount,
 		&tokenExpiresAt, &lastTokenRefresh,
@@ -13095,6 +13115,7 @@ func (r *TrafficRepository) GetRemoteServerByName(ctx context.Context, name stri
 		&server.XrayMode,
 		&server.CountryCode,
 		&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
+		&autoUpdateAgentInt,
 		&server.CreatedAt, &server.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -13128,6 +13149,7 @@ func (r *TrafficRepository) GetRemoteServerByName(ctx context.Context, name stri
 	if lastAgentTokenRefresh.Valid {
 		server.LastAgentTokenRefresh = &lastAgentTokenRefresh.Time
 	}
+	server.AutoUpdateAgent = autoUpdateAgentInt != 0
 	return &server, nil
 }
 
@@ -13169,7 +13191,7 @@ func (r *TrafficRepository) CreateRemoteServer(ctx context.Context, server *Remo
 	// 将令牌有效期设置为从现在起 7 天
 	tokenExpiresAt := time.Now().Add(7 * 24 * time.Hour)
 
-	const stmt = `INSERT INTO remote_servers (name, token, status, ip_address, ip_address_v6, ipv6_enabled, domain, token_expires_at, last_token_refresh, connection_mode, listen_port, pull_address, pull_port, pull_token, use_443, steal_self, steal_mode, nginx_mode, site_type, site_value, xray_mode, traffic_limit, traffic_used_offset, traffic_reset_day, traffic_stats_mode, traffic_source, ddns_enabled, ddns_provider_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+	const stmt = `INSERT INTO remote_servers (name, token, status, ip_address, ip_address_v6, ipv6_enabled, auto_update_agent, domain, token_expires_at, last_token_refresh, connection_mode, listen_port, pull_address, pull_port, pull_token, use_443, steal_self, steal_mode, nginx_mode, site_type, site_value, xray_mode, traffic_limit, traffic_used_offset, traffic_reset_day, traffic_stats_mode, traffic_source, ddns_enabled, ddns_provider_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
 
 	stealMode := server.StealMode
 	if stealMode == "" {
@@ -13197,7 +13219,11 @@ func (r *TrafficRepository) CreateRemoteServer(ctx context.Context, server *Remo
 	if server.DDNSEnabled {
 		ddnsEnabledInt = 1
 	}
-	result, err := r.db.ExecContext(ctx, stmt, server.Name, server.Token, server.Status, server.IPAddress, server.IPAddressV6, server.IPv6Enabled, server.Domain, tokenExpiresAt, server.ConnectionMode, server.ListenPort, server.PullAddress, server.PullPort, server.PullToken, server.Use443, server.StealSelf, stealMode, nginxMode, server.SiteType, server.SiteValue, xrayMode, server.TrafficLimit, server.TrafficUsedOffset, server.TrafficResetDay, statsMode, trafficSource, ddnsEnabledInt, server.DDNSProviderID)
+	autoUpdateVal := 1
+	if !server.AutoUpdateAgent {
+		autoUpdateVal = 0
+	}
+	result, err := r.db.ExecContext(ctx, stmt, server.Name, server.Token, server.Status, server.IPAddress, server.IPAddressV6, server.IPv6Enabled, autoUpdateVal, server.Domain, tokenExpiresAt, server.ConnectionMode, server.ListenPort, server.PullAddress, server.PullPort, server.PullToken, server.Use443, server.StealSelf, stealMode, nginxMode, server.SiteType, server.SiteValue, xrayMode, server.TrafficLimit, server.TrafficUsedOffset, server.TrafficResetDay, statsMode, trafficSource, ddnsEnabledInt, server.DDNSProviderID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return ErrRemoteServerExists
@@ -15837,6 +15863,22 @@ func (r *TrafficRepository) UpdateRemoteServerDDNSStatus(ctx context.Context, se
 
 // UpdateRemoteServerDDNSConfig 更新 DDNS 配置(enabled + provider_id),由 server 创建/编辑路径调用。
 // 关闭(enabled=false)时同时清掉 last_error,避免下次开启时仍带旧错误。
+// UpdateRemoteServerAutoUpdateAgent 更新服务器的自动更新 Agent 开关
+func (r *TrafficRepository) UpdateRemoteServerAutoUpdateAgent(ctx context.Context, id int64, enabled bool) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if id <= 0 {
+		return errors.New("remote server id is required")
+	}
+	val := 0
+	if enabled {
+		val = 1
+	}
+	_, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET auto_update_agent = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, val, id)
+	return err
+}
+
 func (r *TrafficRepository) UpdateRemoteServerDDNSConfig(ctx context.Context, serverID int64, enabled bool, providerID int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")

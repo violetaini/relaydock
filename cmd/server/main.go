@@ -822,7 +822,8 @@ func main() {
 	mux.Handle("/api/admin/remote/nginx/remove-stream", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxRemoveStream)))
 	mux.Handle("/api/admin/remote/agent/upgrade-stream", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleAgentUpgradeStream)))
 	mux.Handle("/api/admin/remote/agent/uninstall-stream", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleAgentUninstallStream)))
-	mux.Handle("/api/admin/remote/agent/version-info", auth.RequireAdmin(tokenStore, userRepo, handler.NewAgentVersionHandler(remoteManageHandler, repo)))
+	agentVersionHandler := handler.NewAgentVersionHandler(remoteManageHandler, repo)
+	mux.Handle("/api/admin/remote/agent/version-info", auth.RequireAdmin(tokenStore, userRepo, agentVersionHandler))
 	mux.Handle("/api/admin/remote/nginx/config", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxConfig)))
 	mux.Handle("/api/admin/remote/nginx/config/files", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxConfigFiles)))
 	mux.Handle("/api/admin/remote/nginx/servers-list", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxServersList)))
@@ -1461,6 +1462,8 @@ func main() {
 	// 启动外部订阅文件的后台自动更新任务（每 1 分钟检查到期外部订阅并自动拉取更新）
 	go handler.StartSubscribeFilesAutoUpdater(collectorCtx, repo)
 	go handler.StartSubscriptionHealthUpdater(collectorCtx, repo)
+	// 启动受管服务器 Agent 后台自动平滑更新任务
+	go handler.StartAgentAutoUpdater(collectorCtx, agentVersionHandler, remoteManageHandler, repo)
 
 	// 外部测速组件由当前后端的内置目录明确指定版本。启动时立即对比，
 	// 之后定期重试下载失败项；只更新已由 Arcway 管理的副本。

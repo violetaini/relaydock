@@ -130,6 +130,7 @@ type RemoteServerCreateRequest struct {
 	TrafficStatsMode  string `json:"traffic_stats_mode"`  // "both"(默认) | "upload" | "download" — 节点流量统计方向
 	TrafficSource     string `json:"traffic_source"`      // "xray"(默认,聚合 node_traffic) | "system"(用 agent 上报系统级网卡累计)
 	IPv6Enabled       *bool  `json:"ipv6_enabled"`        // 指针:nil=默认启用;false=创建时即关闭 v6
+	AutoUpdateAgent   *bool  `json:"auto_update_agent"`   // 指针:nil=默认启用;false=关闭自动更新 Agent
 	// DDNS 自动同步:开启时 PullAddress 必须是域名,agent 上报新 IP 时自动更新 A/AAAA 记录。
 	// DDNSProviderID=0 → 自动模式(按 PullAddress 找匹配的通配符证书,取证书的 dns_provider_id);>0 → 显式指定
 	DDNSEnabled    bool  `json:"ddns_enabled"`
@@ -224,6 +225,7 @@ type RemoteServerUpdateRequest struct {
 	TrafficStatsMode string `json:"traffic_stats_mode"` // both | upload | download
 	TrafficSource    string `json:"traffic_source"`     // xray | system
 	IPv6Enabled      *bool  `json:"ipv6_enabled"`       // 指针:nil=不改;false=关闭(服务管理不显示 v6、加节点不可选 v6)
+	AutoUpdateAgent  *bool  `json:"auto_update_agent"`  // 指针:nil=不改;true=开启自动更新;false=关闭
 	// DDNS 同 Create
 	DDNSEnabled    bool    `json:"ddns_enabled"`
 	DDNSProviderID int64   `json:"ddns_provider_id"`
@@ -981,6 +983,7 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		TrafficStatsMode:  trafficStatsMode,
 		TrafficSource:     trafficSource,
 		IPv6Enabled:       req.IPv6Enabled == nil || *req.IPv6Enabled, // 默认启用;仅显式 false 才关闭
+		AutoUpdateAgent:   req.AutoUpdateAgent == nil || *req.AutoUpdateAgent, // 默认启用;仅显式 false 才关闭
 		DDNSEnabled:       req.DDNSEnabled,
 		DDNSProviderID:    req.DDNSProviderID,
 	}
@@ -2204,6 +2207,12 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		w.WriteHeader(stdhttp.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("更新 DDNS 配置失败: %s", err.Error())})
 		return
+	}
+
+	if req.AutoUpdateAgent != nil {
+		if err := h.repo.UpdateRemoteServerAutoUpdateAgent(ctx, req.ID, *req.AutoUpdateAgent); err != nil {
+			log.Printf("[Remote Server] Failed to update auto_update_agent for server %d: %v", req.ID, err)
+		}
 	}
 
 	if siteConfigProvided {
