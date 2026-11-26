@@ -13293,12 +13293,13 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeat(ctx context.Context, tok
 		last_heartbeat = CURRENT_TIMESTAMP,
 		ip_address = COALESCE(NULLIF(?, ''), ip_address),
 		ip_address_v6 = COALESCE(NULLIF(?, ''), ip_address_v6),
+		ipv6_enabled = CASE WHEN COALESCE(NULLIF(?, ''), ip_address_v6, '') != '' THEN 1 ELSE ipv6_enabled END,
 		offline_since = NULL,
 		offline_notified = 0,
 		updated_at = CURRENT_TIMESTAMP
 		WHERE token = ?`
 
-	res, err := r.db.ExecContext(ctx, stmt, RemoteServerStatusConnected, ipAddress, ipAddressV6, token)
+	res, err := r.db.ExecContext(ctx, stmt, RemoteServerStatusConnected, ipAddress, ipAddressV6, ipAddressV6, token)
 	if err != nil {
 		return false, nil, fmt.Errorf("update remote server heartbeat: %w", err)
 	}
@@ -13457,6 +13458,7 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 		last_heartbeat = CURRENT_TIMESTAMP,
 		ip_address = COALESCE(NULLIF(?, ''), ip_address),
 		ip_address_v6 = COALESCE(NULLIF(?, ''), ip_address_v6),
+		ipv6_enabled = CASE WHEN COALESCE(NULLIF(?, ''), ip_address_v6, '') != '' THEN 1 ELSE ipv6_enabled END,
 		boot_time = ?,
 		xray_boot_time = ?,
 		boot_count = ?,
@@ -13472,6 +13474,7 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 	_, err = r.db.ExecContext(ctx, stmt,
 		RemoteServerStatusConnected,
 		update.IPAddress,
+		update.IPAddressV6,
 		update.IPAddressV6,
 		update.BootTime,
 		update.XrayBootTime,
