@@ -27,8 +27,8 @@ func (h *RemoteManageHandler) HandleSwitchStealMode(w http.ResponseWriter, r *ht
 		remoteWriteError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.StealMode != "tunnel" && req.StealMode != "fallback" && req.StealMode != "default" {
-		remoteWriteError(w, http.StatusBadRequest, "steal_mode must be tunnel, fallback, or default")
+	if req.StealMode != "default" {
+		remoteWriteError(w, http.StatusBadRequest, "接管模式 tunnel 与 fallback 已彻底退役，仅支持标准模式 (default)")
 		return
 	}
 

@@ -110,12 +110,15 @@ func TestHandleSwitchStealModeFailsClosedBeforeAnyMutation(t *testing.T) {
 
 func TestHandleSwitchStealModeSameModeIsReadOnly(t *testing.T) {
 	handler, repo, server, agentRequests := newSwitchModeTestHandler(t)
+	if err := repo.UpdateRemoteServerStealMode(context.Background(), server.ID, "default"); err != nil {
+		t.Fatal(err)
+	}
 	before, err := repo.GetRemoteServer(context.Background(), server.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	response := performSwitchRequest(t, handler, server.ID, "tunnel")
+	response := performSwitchRequest(t, handler, server.ID, "default")
 	if response.Code != http.StatusOK {
 		t.Fatalf("same-mode response=%d body=%s, want 200", response.Code, response.Body.String())
 	}
@@ -133,9 +136,11 @@ func TestHandleSwitchStealModeSameModeIsReadOnly(t *testing.T) {
 
 func TestHandleSwitchStealModeStillValidatesInput(t *testing.T) {
 	handler, _, server, agentRequests := newSwitchModeTestHandler(t)
-	response := performSwitchRequest(t, handler, server.ID, "unsupported")
-	if response.Code != http.StatusBadRequest {
-		t.Fatalf("invalid-mode response=%d body=%s, want 400", response.Code, response.Body.String())
+	for _, invalidMode := range []string{"unsupported", "tunnel", "fallback"} {
+		response := performSwitchRequest(t, handler, server.ID, invalidMode)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("invalid-mode %q response=%d body=%s, want 400", invalidMode, response.Code, response.Body.String())
+		}
 	}
 	if got := agentRequests.Load(); got != 0 {
 		t.Fatalf("invalid-mode request sent %d request(s) to the Agent", got)

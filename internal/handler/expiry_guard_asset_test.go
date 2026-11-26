@@ -2103,50 +2103,35 @@ func TestCreateRemoteServerPersistsConsistentTakeoverSettings(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = repo.Close() })
 	handler := NewXrayServerHandler(repo, nil, nil)
-	tests := []struct {
-		name      string
-		stealSelf bool
-		stealMode string
-		domain    string
-	}{
-		{name: "disabled", stealMode: "default"},
-		{name: "tunnel", stealSelf: true, stealMode: "tunnel", domain: "tunnel.example.com"},
-		{name: "fallback", stealSelf: true, stealMode: "fallback", domain: "fallback.example.com"},
+	body, err := json.Marshal(RemoteServerCreateRequest{
+		Name: "standard", ConnectionMode: storage.ConnectionModeWebSocket,
+		StealSelf: false, Use443: false, StealMode: "default", Domain: "standard.example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			body, err := json.Marshal(RemoteServerCreateRequest{
-				Name: tc.name, ConnectionMode: storage.ConnectionModeWebSocket,
-				StealSelf: tc.stealSelf, Use443: tc.stealSelf, StealMode: tc.stealMode, Domain: tc.domain,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			request := httptest.NewRequest(http.MethodPost, "https://panel.example/api/admin/remote-servers", strings.NewReader(string(body)))
-			response := httptest.NewRecorder()
-			handler.CreateRemoteServer(response, request)
-			if response.Code != http.StatusOK {
-				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
-			}
-			var result RemoteServerResponse
-			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
-				t.Fatal(err)
-			}
-			if result.Server == nil || result.Server.StealSelf != tc.stealSelf || result.Server.Use443 != tc.stealSelf || result.Server.StealMode != tc.stealMode {
-				t.Fatalf("server=%+v want steal_self/use_443=%v steal_mode=%s", result.Server, tc.stealSelf, tc.stealMode)
-			}
-			hasQueryOption := strings.Contains(result.InstallCommand, "steal_self=1")
-			if hasQueryOption != tc.stealSelf {
-				t.Fatalf("command takeover option=%v want=%v: %s", hasQueryOption, tc.stealSelf, result.InstallCommand)
-			}
-			stored, err := repo.GetRemoteServer(context.Background(), result.Server.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if stored.StealSelf != tc.stealSelf || stored.Use443 != tc.stealSelf || stored.StealMode != tc.stealMode {
-				t.Fatalf("stored=%+v", stored)
-			}
-		})
+	request := httptest.NewRequest(http.MethodPost, "https://panel.example/api/admin/remote-servers", strings.NewReader(string(body)))
+	response := httptest.NewRecorder()
+	handler.CreateRemoteServer(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result RemoteServerResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Server == nil || result.Server.StealSelf != false || result.Server.Use443 != false || result.Server.StealMode != "default" {
+		t.Fatalf("server=%+v want steal_self/use_443=false steal_mode=default", result.Server)
+	}
+	if strings.Contains(result.InstallCommand, "steal_self=1") {
+		t.Fatalf("command takeover option unexpectedly found: %s", result.InstallCommand)
+	}
+	stored, err := repo.GetRemoteServer(context.Background(), result.Server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.StealSelf != false || stored.Use443 != false || stored.StealMode != "default" {
+		t.Fatalf("stored=%+v", stored)
 	}
 }
 

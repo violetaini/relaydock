@@ -782,25 +782,19 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	if stealMode == "" {
 		stealMode = "default"
 	}
-	if stealMode != "default" && stealMode != "tunnel" && stealMode != "fallback" {
+	if stealMode != "default" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(stdhttp.StatusBadRequest)
-		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "接管模式必须为 default、tunnel 或 fallback"})
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "接管模式 tunnel 与 fallback 已彻底退役，仅支持标准模式（default）"})
 		return
 	}
-	stealSelf := stealMode == "tunnel" || stealMode == "fallback"
-	if req.StealSelf != stealSelf || req.Use443 != stealSelf {
+	if req.StealSelf || req.Use443 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(stdhttp.StatusBadRequest)
-		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "接管模式、443 部署和安装授权必须保持一致"})
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "443 接管模式已退役，仅支持标准模式"})
 		return
 	}
-	if stealSelf && reqDomain == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(stdhttp.StatusBadRequest)
-		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "Tunnel/Fallback 接管模式必须填写节点域名"})
-		return
-	}
+	stealSelf := false
 	nginxMode := strings.TrimSpace(req.NginxMode)
 	if nginxMode == "" {
 		nginxMode = "managed"
