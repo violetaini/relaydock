@@ -323,6 +323,7 @@ type Package struct {
 	ResetDay               int               `json:"reset_day"`                  // 重置的月份日期 (1-31)
 	NodeTrafficResetPeriod string            `json:"node_traffic_reset_period"`  // monthly / quarterly / yearly
 	Nodes                  []int64           `json:"nodes"`                      // 关联节点 ID
+	SubscribeFileIDs       []int64           `json:"subscribe_file_ids,omitempty"` // 关联订阅 ID
 	NodeMultipliers        map[int64]float64 `json:"node_multipliers,omitempty"` // node_id → 倍率;遗留套餐为 nil = 全部按 1
 	SpeedLimitMbps         float64           `json:"speed_limit_mbps"`           // 限速 (Mbps)，0=不限
 	DeviceLimit            int               `json:"device_limit"`               // 设备数限制，0=不限
@@ -1664,6 +1665,12 @@ CREATE INDEX IF NOT EXISTS idx_user_subscriptions_subscription_id ON user_subscr
 	if _, err := r.db.Exec(userSubscriptionsSchema); err != nil {
 		return fmt.Errorf("migrate user_subscriptions: %w", err)
 	}
+	if err := r.ensureTableColumn("user_subscriptions", "source_type", "TEXT NOT NULL DEFAULT 'manual'"); err != nil {
+		return fmt.Errorf("migrate user_subscriptions.source_type: %w", err)
+	}
+	if err := r.ensureTableColumn("user_subscriptions", "source_package_id", "INTEGER DEFAULT NULL"); err != nil {
+		return fmt.Errorf("migrate user_subscriptions.source_package_id: %w", err)
+	}
 
 	const userSettingsSchema = `
 CREATE TABLE IF NOT EXISTS user_settings (
@@ -2538,6 +2545,9 @@ CREATE INDEX IF NOT EXISTS idx_remote_server_install_tickets_server
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN node_speed_limits TEXT DEFAULT '{}'")
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN node_traffic_limits TEXT DEFAULT '{}'")
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN node_device_limits TEXT DEFAULT '{}'")
+	if err := r.ensureTableColumn("packages", "subscribe_file_ids", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return fmt.Errorf("migrate packages.subscribe_file_ids: %w", err)
+	}
 	_, _ = r.db.Exec("ALTER TABLE users ADD COLUMN node_speed_limit_overrides TEXT DEFAULT '{}'")
 	_, _ = r.db.Exec("ALTER TABLE users ADD COLUMN node_device_limit_overrides TEXT DEFAULT '{}'")
 	if err := r.ensureUserColumn("node_traffic_limit_overrides", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
@@ -6503,15 +6513,16 @@ func (r *TrafficRepository) SetUserSubscriptions(ctx context.Context, username s
 	}
 	defer tx.Rollback()
 
-	// 删除用户的所有现有订阅
-	_, err = tx.ExecContext(ctx, `DELETE FROM user_subscriptions WHERE username = ?`, username)
+	// 删除用户的现有手动订阅(保留套餐下发的订阅)
+	_, err = tx.ExecContext(ctx, `DELETE FROM user_subscriptions WHERE username = ? AND COALESCE(source_type, 'manual') = 'manual'`, username)
 	if err != nil {
 		return fmt.Errorf("delete existing subscriptions: %w", err)
 	}
 
 	// 插入新的订阅
 	if len(subscriptionIDs) > 0 {
-		stmt, err := tx.PrepareContext(ctx, `INSERT INTO user_subscriptions (username, subscription_id) VALUES (?, ?)`)
+		stmt, err := tx.PrepareContext(ctx, `INSERT INTO user_subscriptions (username, subscription_id, source_type, source_package_id) VALUES (?, ?, 'manual', NULL)
+			ON CONFLICT(username, subscription_id) DO UPDATE SET source_type = 'manual', source_package_id = NULL`)
 		if err != nil {
 			return fmt.Errorf("prepare insert statement: %w", err)
 		}
@@ -8767,7 +8778,7 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
-		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
+		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(subscribe_file_ids, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
 		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		ORDER BY created_at DESC
@@ -8783,9 +8794,9 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 	for rows.Next() {
 		var pkg Package
 		var isReset int
-		var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
+		var nodesJSON, subscribeFileIDsJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 		err := rows.Scan(&pkg.ID, &pkg.Name, &pkg.Description, &pkg.TrafficLimitBytes,
-			&pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON, &pkg.SpeedLimitMbps, &pkg.DeviceLimit,
+			&pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON, &subscribeFileIDsJSON, &pkg.SpeedLimitMbps, &pkg.DeviceLimit,
 			&autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode, &pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("scan package: %w", err)
@@ -8797,6 +8808,12 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 		if nodesJSON != "" && nodesJSON != "[]" {
 			if err := json.Unmarshal([]byte(nodesJSON), &pkg.Nodes); err != nil {
 				pkg.Nodes = []int64{}
+			}
+		}
+		pkg.SubscribeFileIDs = []int64{}
+		if subscribeFileIDsJSON != "" && subscribeFileIDsJSON != "[]" {
+			if err := json.Unmarshal([]byte(subscribeFileIDsJSON), &pkg.SubscribeFileIDs); err != nil {
+				pkg.SubscribeFileIDs = []int64{}
 			}
 		}
 		if autoSpeedJSON != "" {
@@ -8865,7 +8882,7 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
-		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
+		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(subscribe_file_ids, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
 		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		WHERE id = ?
@@ -8873,9 +8890,9 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 
 	var pkg Package
 	var isReset int
-	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
+	var nodesJSON, subscribeFileIDsJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 	err := r.db.QueryRowContext(ctx, query, id).Scan(&pkg.ID, &pkg.Name, &pkg.Description,
-		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON,
+		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON, &subscribeFileIDsJSON,
 		&pkg.SpeedLimitMbps, &pkg.DeviceLimit, &autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode,
 		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 	if err != nil {
@@ -8892,6 +8909,12 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 	if nodesJSON != "" && nodesJSON != "[]" {
 		if err := json.Unmarshal([]byte(nodesJSON), &pkg.Nodes); err != nil {
 			pkg.Nodes = []int64{}
+		}
+	}
+	pkg.SubscribeFileIDs = []int64{}
+	if subscribeFileIDsJSON != "" && subscribeFileIDsJSON != "[]" {
+		if err := json.Unmarshal([]byte(subscribeFileIDsJSON), &pkg.SubscribeFileIDs); err != nil {
+			pkg.SubscribeFileIDs = []int64{}
 		}
 	}
 	if autoSpeedJSON != "" {
@@ -8932,7 +8955,7 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 
 	const query = `
 		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
-		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
+		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(subscribe_file_ids, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
 		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
 		WHERE name = ?
@@ -8940,9 +8963,9 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 
 	var pkg Package
 	var isReset int
-	var nodesJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
+	var nodesJSON, subscribeFileIDsJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 	err := r.db.QueryRowContext(ctx, query, name).Scan(&pkg.ID, &pkg.Name, &pkg.Description,
-		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON,
+		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON, &subscribeFileIDsJSON,
 		&pkg.SpeedLimitMbps, &pkg.DeviceLimit, &autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode,
 		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 	if err != nil {
@@ -8959,6 +8982,12 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 	if nodesJSON != "" && nodesJSON != "[]" {
 		if err := json.Unmarshal([]byte(nodesJSON), &pkg.Nodes); err != nil {
 			pkg.Nodes = []int64{}
+		}
+	}
+	pkg.SubscribeFileIDs = []int64{}
+	if subscribeFileIDsJSON != "" && subscribeFileIDsJSON != "[]" {
+		if err := json.Unmarshal([]byte(subscribeFileIDsJSON), &pkg.SubscribeFileIDs); err != nil {
+			pkg.SubscribeFileIDs = []int64{}
 		}
 	}
 	if autoSpeedJSON != "" {
@@ -9006,6 +9035,10 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	if err != nil {
 		return 0, fmt.Errorf("serialize nodes: %w", err)
 	}
+	subscribeFileIDsJSON, err := json.Marshal(pkg.SubscribeFileIDs)
+	if err != nil {
+		return 0, fmt.Errorf("serialize subscribe_file_ids: %w", err)
+	}
 
 	var autoSpeedJSON string
 	if len(pkg.AutoSpeedRules) > 0 {
@@ -9031,8 +9064,8 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	}
 
 	const query = `
-		INSERT INTO packages (name, description, traffic_limit_bytes, cycle_days, is_reset, reset_day, node_traffic_reset_period, nodes, speed_limit_mbps, device_limit, auto_speed_limit_json, short_code, traffic_mode, template_filename, node_multipliers, node_speed_limits, node_traffic_limits, node_device_limits, server_grants, forwarding_grants)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO packages (name, description, traffic_limit_bytes, cycle_days, is_reset, reset_day, node_traffic_reset_period, nodes, subscribe_file_ids, speed_limit_mbps, device_limit, auto_speed_limit_json, short_code, traffic_mode, template_filename, node_multipliers, node_speed_limits, node_traffic_limits, node_device_limits, server_grants, forwarding_grants)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	isReset := 0
@@ -9046,7 +9079,7 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	}
 
 	result, err := r.db.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
-		pkg.CycleDays, isReset, pkg.ResetDay, pkg.NodeTrafficResetPeriod, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, shortCode, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON)
+		pkg.CycleDays, isReset, pkg.ResetDay, pkg.NodeTrafficResetPeriod, string(nodesJSON), string(subscribeFileIDsJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, shortCode, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON)
 	if err != nil {
 		return 0, fmt.Errorf("create package: %w", err)
 	}
@@ -9095,6 +9128,10 @@ func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package
 	if err != nil {
 		return nil, fmt.Errorf("serialize nodes: %w", err)
 	}
+	subscribeFileIDsJSON, err := json.Marshal(pkg.SubscribeFileIDs)
+	if err != nil {
+		return nil, fmt.Errorf("serialize subscribe_file_ids: %w", err)
+	}
 
 	var autoSpeedJSON string
 	if len(pkg.AutoSpeedRules) > 0 {
@@ -9114,7 +9151,7 @@ func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package
 	const query = `
 		UPDATE packages
 		SET name = ?, description = ?, traffic_limit_bytes = ?, cycle_days = ?,
-		    is_reset = ?, reset_day = ?, node_traffic_reset_period = ?, nodes = ?, speed_limit_mbps = ?, device_limit = ?,
+		    is_reset = ?, reset_day = ?, node_traffic_reset_period = ?, nodes = ?, subscribe_file_ids = ?, speed_limit_mbps = ?, device_limit = ?,
 		    auto_speed_limit_json = ?, traffic_mode = ?, template_filename = ?, node_multipliers = ?,
 		    node_speed_limits = ?, node_traffic_limits = ?, node_device_limits = ?, server_grants = ?, forwarding_grants = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
@@ -9136,7 +9173,7 @@ func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
-		pkg.CycleDays, isReset, pkg.ResetDay, pkg.NodeTrafficResetPeriod, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON, pkg.ID)
+		pkg.CycleDays, isReset, pkg.ResetDay, pkg.NodeTrafficResetPeriod, string(nodesJSON), string(subscribeFileIDsJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON, pkg.ID)
 	if err != nil {
 		return nil, fmt.Errorf("update package: %w", err)
 	}

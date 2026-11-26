@@ -107,7 +107,73 @@ func (r *TrafficRepository) validateAndNormalizePackageBundle(ctx context.Contex
 	if pkg.ForwardingGrants == nil {
 		pkg.ForwardingGrants = []PackageForwardingGrant{}
 	}
+	if len(pkg.SubscribeFileIDs) > 0 {
+		seenSubs := make(map[int64]bool, len(pkg.SubscribeFileIDs))
+		normalizedSubs := make([]int64, 0, len(pkg.SubscribeFileIDs))
+		nodeSet := make(map[int64]bool, len(pkg.Nodes))
+		for _, nid := range pkg.Nodes {
+			if nid > 0 {
+				nodeSet[nid] = true
+			}
+		}
+		for _, subID := range pkg.SubscribeFileIDs {
+			if subID <= 0 || seenSubs[subID] {
+				continue
+			}
+			subFile, subErr := r.GetSubscribeFileByID(ctx, subID)
+			if subErr != nil {
+				return fmt.Errorf("invalid package subscription %d: %w", subID, subErr)
+			}
+			seenSubs[subID] = true
+			normalizedSubs = append(normalizedSubs, subID)
+
+			// Automatically include panel nodes referenced by this subscription (and its strategy sources)
+			// so that Xray multi-user credentials and per-user traffic statistics are provisioned.
+			subNodeIDs := r.collectSubscribeFilePanelNodeIDs(ctx, subFile)
+			for _, nid := range subNodeIDs {
+				if nid > 0 && !nodeSet[nid] {
+					pkg.Nodes = append(pkg.Nodes, nid)
+					nodeSet[nid] = true
+				}
+			}
+		}
+		pkg.SubscribeFileIDs = normalizedSubs
+	} else {
+		pkg.SubscribeFileIDs = []int64{}
+	}
 	return nil
+}
+
+func (r *TrafficRepository) collectSubscribeFilePanelNodeIDs(ctx context.Context, sub SubscribeFile) []int64 {
+	var collected []int64
+	seenNodes := make(map[int64]bool)
+	addNodes := func(ids []int64) {
+		for _, id := range ids {
+			if id <= 0 || seenNodes[id] {
+				continue
+			}
+			node, err := r.GetNodeByID(ctx, id)
+			if err != nil {
+				continue
+			}
+			if strings.TrimSpace(node.OriginalServer) != "" || node.NodeType == "routed" {
+				collected = append(collected, id)
+				seenNodes[id] = true
+			}
+		}
+	}
+	addNodes(sub.SelectedNodeIDs)
+	if sub.Generation != nil {
+		for _, srcID := range sub.Generation.SourceIDs {
+			if srcID <= 0 {
+				continue
+			}
+			if srcFile, err := r.GetSubscribeFileByID(ctx, srcID); err == nil {
+				addNodes(srcFile.SelectedNodeIDs)
+			}
+		}
+	}
+	return collected
 }
 
 func packageGrantWarning(kind string, resourceID int64) string {
@@ -396,7 +462,29 @@ VALUES('package','grant.materialized','tunnel_grant',?,?)`, id, username); err !
 			return nil, fmt.Errorf("audit package forwarding grant: %w", err)
 		}
 	}
+	if err := syncPackageUserSubscriptionsTx(ctx, tx, username, pkg.ID, pkg.SubscribeFileIDs); err != nil {
+		return nil, err
+	}
 	return warnings, nil
+}
+
+func syncPackageUserSubscriptionsTx(ctx context.Context, tx *sql.Tx, username string, packageID int64, subscribeFileIDs []int64) error {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM user_subscriptions WHERE username = ? AND source_type = 'package' AND source_package_id = ?`,
+		username, packageID); err != nil {
+		return fmt.Errorf("clear stale package subscriptions: %w", err)
+	}
+	for _, subID := range subscribeFileIDs {
+		if subID <= 0 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO user_subscriptions (username, subscription_id, source_type, source_package_id) VALUES (?, ?, 'package', ?)`,
+			username, subID, packageID); err != nil {
+			return fmt.Errorf("assign package subscription %d: %w", subID, err)
+		}
+	}
+	return nil
 }
 
 func revokePackageBundleGrantsTx(ctx context.Context, tx *sql.Tx, username string, packageID int64, now time.Time) error {
@@ -437,6 +525,11 @@ func revokePackageBundleGrantsTx(ctx context.Context, tx *sql.Tx, username strin
 		if err := removePackageTunnelGrantTx(ctx, tx, id, now); err != nil {
 			return err
 		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM user_subscriptions WHERE username = ? AND source_type = 'package' AND source_package_id = ?`,
+		username, packageID); err != nil {
+		return fmt.Errorf("revoke package subscriptions: %w", err)
 	}
 	return nil
 }

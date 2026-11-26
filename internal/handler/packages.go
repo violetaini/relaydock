@@ -162,6 +162,7 @@ type createPackageRequest struct {
 	ResetDay               int                              `json:"reset_day"`
 	NodeTrafficResetPeriod string                           `json:"node_traffic_reset_period"`
 	Nodes                  []int64                          `json:"nodes"`
+	SubscribeFileIDs       []int64                          `json:"subscribe_file_ids"`
 	NodeMultipliers        map[int64]float64                `json:"node_multipliers"`    // node_id → 倍率
 	NodeSpeedLimits        map[int64]float64                `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
 	NodeTrafficLimits      map[int64]float64                `json:"node_traffic_limits"` // 套餐固定节点独立流量额度 (GB);0/缺省=不限
@@ -374,6 +375,7 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		ResetDay:               req.ResetDay,
 		NodeTrafficResetPeriod: resetPeriod,
 		Nodes:                  nodes,
+		SubscribeFileIDs:       req.SubscribeFileIDs,
 		NodeMultipliers:        req.NodeMultipliers,
 		NodeSpeedLimits:        req.NodeSpeedLimits,
 		NodeTrafficLimits:      req.NodeTrafficLimits,
@@ -559,6 +561,7 @@ type updatePackageRequest struct {
 	ResetDay               *int                             `json:"reset_day"` // 同上
 	NodeTrafficResetPeriod *string                          `json:"node_traffic_reset_period"`
 	Nodes                  []int64                          `json:"nodes"`
+	SubscribeFileIDs       []int64                          `json:"subscribe_file_ids"`
 	NodeMultipliers        map[int64]float64                `json:"node_multipliers"`    // node_id → 倍率
 	NodeSpeedLimits        map[int64]float64                `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
 	NodeTrafficLimits      map[int64]float64                `json:"node_traffic_limits"` // 套餐固定节点独立流量额度 (GB);0/缺省=不限
@@ -690,6 +693,7 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		ResetDay:               resetDay,
 		NodeTrafficResetPeriod: resetPeriod,
 		Nodes:                  nodes,
+		SubscribeFileIDs:       req.SubscribeFileIDs,
 		NodeMultipliers:        req.NodeMultipliers,
 		NodeSpeedLimits:        req.NodeSpeedLimits,
 		NodeTrafficLimits:      req.NodeTrafficLimits,
@@ -790,6 +794,9 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	// 异步同步 xray 用户凭据：对比新旧节点差异，为绑定此套餐的用户添加/移除入站配置
+	if updatedPkg, uerr := h.repo.GetPackage(updateCtx, req.ID); uerr == nil && updatedPkg != nil {
+		nodes = updatedPkg.Nodes
+	}
 	go h.syncInboundUsersAfterNodeChange(context.Background(), req.ID, oldNodes, nodes)
 
 	w.Header().Set("Content-Type", "application/json")

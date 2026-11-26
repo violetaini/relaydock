@@ -576,3 +576,78 @@ func TestPackageBundleUpdateRejectsActiveNodeLimitNarrowing(t *testing.T) {
 		t.Fatalf("failed package update was partially committed: %+v", grants[0])
 	}
 }
+
+func TestPackageBundleSyncsAndRevokesSubscriptionsAndNodes(t *testing.T) {
+	ctx := context.Background()
+	repo := packageBundleTestRepo(t)
+	if err := repo.EnsureUser(ctx, "alice", "hash"); err != nil {
+		t.Fatal(err)
+	}
+	serverID := addPackageBundleServer(t, repo, "sub-sync-server")
+	_ = serverID
+
+	node1, err := repo.CreateNode(ctx, Node{
+		Username: "admin", NodeName: "HK-1", Protocol: "vless",
+		ClashConfig: `{"name":"HK-1","type":"vless","server":"1.2.3.4","port":443}`,
+		OriginalServer: "sub-sync-server", InboundTag: "inbound-1", Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub1, err := repo.CreateSubscribeFile(ctx, SubscribeFile{
+		Name: "VIP Sub", Type: "create", Filename: "vip_sub.yaml",
+		SelectedNodeIDs: []int64{node1.ID}, CreatedBy: "admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manualSub, err := repo.CreateSubscribeFile(ctx, SubscribeFile{
+		Name: "Manual Sub", Type: "create", Filename: "manual_sub.yaml",
+		CreatedBy: "admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetUserSubscriptions(ctx, "alice", []int64{manualSub.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	packageID, err := repo.CreatePackage(ctx, Package{
+		Name: "vip-pkg", CycleDays: 30, ResetDay: 1,
+		SubscribeFileIDs: []int64{sub1.ID},
+	})
+	if err != nil {
+		t.Fatalf("CreatePackage: %v", err)
+	}
+	pkg, err := repo.GetPackage(ctx, packageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkg.Nodes) != 1 || pkg.Nodes[0] != node1.ID {
+		t.Fatalf("expected package to auto-include subscription node %d, got %+v", node1.ID, pkg.Nodes)
+	}
+
+	now := time.Now().UTC()
+	if _, err := repo.AssignPackageBundleToUser(ctx, "alice", packageID, now, now.Add(24*time.Hour), false, 1); err != nil {
+		t.Fatalf("AssignPackageBundleToUser: %v", err)
+	}
+
+	subs, err := repo.GetUserSubscriptions(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subs) != 2 {
+		t.Fatalf("expected 2 subscriptions (manual + package), got %d", len(subs))
+	}
+
+	if err := repo.RemovePackageFromUser(ctx, "alice"); err != nil {
+		t.Fatalf("RemovePackageFromUser: %v", err)
+	}
+	subsAfterUnbind, err := repo.GetUserSubscriptions(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subsAfterUnbind) != 1 || subsAfterUnbind[0].ID != manualSub.ID {
+		t.Fatalf("expected only manual subscription %d after unbind, got %+v", manualSub.ID, subsAfterUnbind)
+	}
+}
