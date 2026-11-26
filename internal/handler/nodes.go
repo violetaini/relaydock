@@ -420,6 +420,7 @@ func (h *nodesHandler) handleList(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	populateNodesTraffic(r.Context(), h.repo, dto, nodes, nil)
 	respondJSON(w, http.StatusOK, map[string]any{
 		"nodes": dto,
 	})
@@ -2427,6 +2428,9 @@ type nodeDTO struct {
 	RelayOrigServer string    `json:"relay_orig_server,omitempty"`
 	RelayOrigPort   int       `json:"relay_orig_port,omitempty"`
 	CountryCode     string    `json:"country_code,omitempty"`
+	TrafficUsed     int64     `json:"traffic_used"`
+	TrafficUplink   int64     `json:"traffic_uplink"`
+	TrafficDownlink int64     `json:"traffic_downlink"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -2624,7 +2628,61 @@ func convertAdminNodes(ctx context.Context, repo *storage.TrafficRepository, nod
 			}
 		}
 	}
+	populateNodesTraffic(ctx, repo, result, nodes, byName)
 	return result
+}
+
+type nodeTrafficLookupKey struct {
+	serverID    int64
+	tag         string
+	trafficType string
+}
+
+func populateNodesTraffic(ctx context.Context, repo *storage.TrafficRepository, result []nodeDTO, nodes []storage.Node, byName map[string]storage.RemoteServer) {
+	if repo == nil || len(nodes) == 0 || len(result) == 0 {
+		return
+	}
+	if byName == nil {
+		servers, err := repo.ListRemoteServers(ctx)
+		if err != nil {
+			return
+		}
+		byName = make(map[string]storage.RemoteServer, len(servers))
+		for _, s := range servers {
+			byName[s.Name] = s
+		}
+	}
+	allNodeTraffic, err := repo.GetAllNodeTraffic(ctx)
+	if err != nil || len(allNodeTraffic) == 0 {
+		return
+	}
+	trafficMap := make(map[nodeTrafficLookupKey]storage.NodeTraffic, len(allNodeTraffic))
+	for _, nt := range allNodeTraffic {
+		trafficMap[nodeTrafficLookupKey{serverID: nt.ServerID, tag: nt.Tag, trafficType: nt.Type}] = nt
+	}
+
+	for i, node := range nodes {
+		if i >= len(result) {
+			break
+		}
+		server, ok := byName[node.OriginalServer]
+		if !ok || server.ID <= 0 {
+			continue
+		}
+		if node.InboundTag != "" {
+			if nt, found := trafficMap[nodeTrafficLookupKey{serverID: server.ID, tag: node.InboundTag, trafficType: "inbound"}]; found {
+				result[i].TrafficUplink = nt.Uplink
+				result[i].TrafficDownlink = nt.Downlink
+				result[i].TrafficUsed = nt.Uplink + nt.Downlink
+			}
+		} else if node.NodeType == "routed" && node.RoutedOutboundTag != "" {
+			if nt, found := trafficMap[nodeTrafficLookupKey{serverID: server.ID, tag: node.RoutedOutboundTag, trafficType: "outbound"}]; found {
+				result[i].TrafficUplink = nt.Uplink
+				result[i].TrafficDownlink = nt.Downlink
+				result[i].TrafficUsed = nt.Uplink + nt.Downlink
+			}
+		}
+	}
 }
 
 func convertNodes(nodes []storage.Node) []nodeDTO {
