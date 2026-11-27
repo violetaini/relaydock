@@ -85,7 +85,12 @@ func managementPackageQuota(ctx context.Context, repo *storage.TrafficRepository
 		seen[key] = true
 		individual.Total++
 		// Selected nodes are already represented by their server module.
-		if !v.Related {
+		// A subscription reports usage already represented by its linked nodes,
+		// but it still belongs in the subscription module and has its own cap.
+		// Server-selected child nodes remain folded into the server module.
+		if v.Kind == "subscription" {
+			moduleCount[v.Kind]++
+		} else if !v.Related {
 			moduleCount[v.Kind]++
 		}
 		module := v.Kind

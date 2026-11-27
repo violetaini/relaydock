@@ -161,7 +161,7 @@ func buildManagementOverview(user storage.User, billed int64, resources []manage
 		if v.State == "unknown" {
 			out.Unconfirmed++
 		}
-		if v.Kind == "node" || v.Kind == "server" || v.Kind == "forwarding" || v.Kind == "package" && v.Limit > 0 {
+		if v.Kind == "node" || v.Kind == "server" || v.Kind == "forwarding" || v.Kind == "subscription" || v.Kind == "package" && v.Limit > 0 {
 			if v.Limit > 0 {
 				out.LimitedResources++
 				if v.Used >= v.Limit {
@@ -171,7 +171,7 @@ func buildManagementOverview(user storage.User, billed int64, resources []manage
 					out.NearLimit++
 					add("quota_near", "warn", v, "已使用至少 80% 的额度，请留意剩余用量。", "traffic")
 				}
-			} else if v.LimitNote == "" {
+			} else if v.Kind != "subscription" && v.LimitNote == "" {
 				out.UnlimitedResources++
 			}
 		}
