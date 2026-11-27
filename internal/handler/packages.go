@@ -180,9 +180,10 @@ type createPackageRequest struct {
 }
 
 // validatePackageTemplateFilename 非空时校验 rule_templates 下文件存在。空字符串直接通过(表示用系统默认)。
+// "__raw__" / "__none__" / "none" / "raw" 表示保留原订阅（不套用规则模板）。
 func validatePackageTemplateFilename(name string) error {
 	name = strings.TrimSpace(name)
-	if name == "" {
+	if name == "" || name == "__raw__" || name == "__none__" || name == "none" || name == "raw" {
 		return nil
 	}
 	// 防目录穿越

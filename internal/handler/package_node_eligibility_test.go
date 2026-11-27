@@ -252,3 +252,14 @@ func TestPackageCreateAndValidationRejectsNonMultiUserNodes(t *testing.T) {
 		t.Fatalf("expected HTTP 201 when creating package with multi-user node, got %d: %s", recValid.Code, recValid.Body.String())
 	}
 }
+
+func TestValidatePackageTemplateFilenamePreserveRaw(t *testing.T) {
+	for _, val := range []string{"", "__raw__", "__none__", "none", "raw"} {
+		if err := validatePackageTemplateFilename(val); err != nil {
+			t.Fatalf("expected template %q to be valid, got: %v", val, err)
+		}
+	}
+	if err := validatePackageTemplateFilename("definitely_nonexistent_template_99999.yaml"); err == nil {
+		t.Fatal("expected error for nonexistent template, got nil")
+	}
+}

@@ -182,25 +182,36 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Load template: 套餐模板 > 系统默认 > 目录第一个
-	templateContent, err := h.loadTemplate(r, pkg)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
+	var result string
+	isPreserveRaw := pkg != nil && (pkg.TemplateFilename == "__raw__" || pkg.TemplateFilename == "__none__" || pkg.TemplateFilename == "none" || pkg.TemplateFilename == "raw")
+	if isPreserveRaw {
+		rawYaml, err := yaml.Marshal(map[string]any{"proxies": proxies})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		result = string(rawYaml)
+	} else {
+		// Load template: 套餐模板 > 系统默认 > 目录第一个
+		templateContent, err := h.loadTemplate(r, pkg)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 
-	// Process template with nodes and the requesting user's Provider namespace.
-	result, err := renderTemplateWithProxyProviders(
-		r.Context(),
-		h.repo,
-		templateContent,
-		proxies,
-		username,
-		proxyProviderRequiresServerMaterialization(r.URL.Query().Get("t")),
-	)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		// Process template with nodes and the requesting user's Provider namespace.
+		result, err = renderTemplateWithProxyProviders(
+			r.Context(),
+			h.repo,
+			templateContent,
+			proxies,
+			username,
+			proxyProviderRequiresServerMaterialization(r.URL.Query().Get("t")),
+		)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
 
 	// 节点名重命名了 → 同步 proxy-groups 里手写的全名引用(模板若用 filter 自动会用新名,这里兜底全名引用场景)

@@ -484,15 +484,20 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			if creator != "" {
 				if u, uerr := h.repo.GetUser(r.Context(), creator); uerr == nil && u.PackageID > 0 {
 					if pkg, perr := h.repo.GetPackage(r.Context(), u.PackageID); perr == nil && pkg != nil && strings.TrimSpace(pkg.TemplateFilename) != "" {
-						effectiveTemplate = pkg.TemplateFilename
-						logger.Info("[Subscription] 订阅未绑定模板，使用套餐模板", "template", effectiveTemplate, "package_id", pkg.ID)
+						tmpl := strings.TrimSpace(pkg.TemplateFilename)
+						if tmpl == "__raw__" || tmpl == "__none__" || tmpl == "none" || tmpl == "raw" {
+							effectiveTemplate = "__raw__"
+						} else {
+							effectiveTemplate = tmpl
+							logger.Info("[Subscription] 订阅未绑定模板，使用套餐模板", "template", effectiveTemplate, "package_id", pkg.ID)
+						}
 					}
 				}
 			}
 		}
-		// 注意:不再回退到系统默认模板。订阅没绑模板 + 套餐也没模板 → 直接读原始文件,
+		// 注意:不再回退到系统默认模板。订阅没绑模板 + 套餐也没模板(或显式配置为保留原订阅) → 直接读原始文件,
 		// 避免用户精心配的原始 YAML 被系统默认模板"自动套上"覆盖。
-		if effectiveTemplate != "" {
+		if effectiveTemplate != "" && effectiveTemplate != "__raw__" {
 			stepStart = time.Now()
 			sfForGen := subscribeFile
 			sfForGen.TemplateFilename = effectiveTemplate
