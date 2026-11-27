@@ -189,15 +189,33 @@ func NewUserManagementListHandler(repo *storage.TrafficRepository) http.Handler 
 			filtered = append(filtered, item)
 		}
 		sortKey := q.Get("sort")
+		sortOrder := strings.ToLower(strings.TrimSpace(q.Get("order")))
+		if sortOrder != "asc" && sortOrder != "desc" {
+			switch sortKey {
+			case "name", "expiry", "oldest":
+				sortOrder = "asc"
+			default:
+				sortOrder = "desc"
+			}
+		}
 		sort.SliceStable(filtered, func(i, j int) bool {
 			a, b := filtered[i], filtered[j]
 			switch sortKey {
 			case "name":
 				if a.Nickname != b.Nickname {
+					if sortOrder == "desc" {
+						return a.Nickname > b.Nickname
+					}
 					return a.Nickname < b.Nickname
+				}
+				if sortOrder == "desc" {
+					return a.Username > b.Username
 				}
 			case "traffic":
 				if a.TrafficUsed != b.TrafficUsed {
+					if sortOrder == "asc" {
+						return a.TrafficUsed < b.TrafficUsed
+					}
 					return a.TrafficUsed > b.TrafficUsed
 				}
 			case "expiry":
@@ -208,14 +226,16 @@ func NewUserManagementListHandler(repo *storage.TrafficRepository) http.Handler 
 					return true
 				}
 				if a.NearestExpiry != nil && b.NearestExpiry != nil && !a.NearestExpiry.Equal(*b.NearestExpiry) {
+					if sortOrder == "desc" {
+						return a.NearestExpiry.After(*b.NearestExpiry)
+					}
 					return a.NearestExpiry.Before(*b.NearestExpiry)
-				}
-			case "oldest":
-				if !a.CreatedAt.Equal(b.CreatedAt) {
-					return a.CreatedAt.Before(b.CreatedAt)
 				}
 			default:
 				if !a.CreatedAt.Equal(b.CreatedAt) {
+					if sortOrder == "asc" {
+						return a.CreatedAt.Before(b.CreatedAt)
+					}
 					return a.CreatedAt.After(b.CreatedAt)
 				}
 			}
