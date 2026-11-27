@@ -410,6 +410,8 @@ func main() {
 	mux.Handle("/api/admin/tgbot/", auth.RequireAdmin(tokenStore, userRepo, tgbotAPIHandler))
 	mux.Handle("/api/admin/announcements", auth.RequireAdmin(tokenStore, userRepo, handler.NewAnnouncementAdminHandler(repo)))
 	mux.Handle("/api/admin/users", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserListHandler(repo)))
+	mux.Handle("/api/admin/users/management", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserManagementListHandler(repo)))
+	mux.Handle("/api/admin/users/{username}/management", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserManagementDetailHandler(repo)))
 	userCreateHandler := handler.NewUserCreateHandler(repo)
 	mux.Handle("/api/admin/users/create", auth.RequireAdmin(tokenStore, userRepo, userCreateHandler))
 	// /api/admin/users/delete 依赖 remoteManageHandler + limiterPusher 做 xray client 清理，注册下移到 ~line 348 之后
@@ -475,6 +477,9 @@ func main() {
 	mux.Handle("/api/user/2fa/disable", auth.RequireToken(tokenStore, userRepo, handler.NewTwoFactorDisableHandler(authManager, repo)))
 	mux.Handle("/api/user/password", auth.RequireToken(tokenStore, userRepo, handler.NewPasswordHandler(authManager, tokenStore, repo, twoFactorStore)))
 	mux.Handle("/api/user/profile", auth.RequireToken(tokenStore, userRepo, handler.NewProfileHandler(repo)))
+	avatarHandler := handler.NewAvatarHandler(repo, filepath.Join(dataDirectory, "avatars"))
+	mux.Handle("/api/user/avatar", auth.RequireToken(tokenStore, userRepo, avatarHandler))
+	mux.Handle("/api/user/avatar/", avatarHandler)
 	mux.Handle("/api/user/portal-summary", auth.RequireToken(tokenStore, userRepo, handler.NewPortalSummaryHandler(repo)))
 	mux.Handle("/api/user/config", auth.RequireToken(tokenStore, userRepo, handler.NewUserConfigHandler(repo)))
 	mux.Handle("/api/user/token", auth.RequireToken(tokenStore, userRepo, handler.NewUserTokenHandler(repo)))
@@ -727,6 +732,7 @@ func main() {
 	tgbotAPIHandler.SetPackageAssign(packageAssignHandler) // 让 TGBOT 注册/兑换的套餐走同一套下发
 	mux.Handle("/api/admin/packages/assign", auth.RequireAdmin(tokenStore, userRepo, packageAssignHandler))
 	serviceAuthorizationHandler := handler.NewServiceAuthorizationHandler(repo, packageAssignHandler, managedNodesHandler, forwardingHandler)
+	mux.Handle("/api/admin/users/management/batch", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(serviceAuthorizationHandler.HandleManagementBatch)))
 	mux.Handle("/api/admin/users/service-authorization/batch", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(serviceAuthorizationHandler.HandleBatch)))
 	mux.Handle("/api/admin/users/{username}/service-authorization", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(serviceAuthorizationHandler.HandleUser)))
 	// 快捷续期:复用 packageAssignHandler 的 AssignAndProvision(samePackage 快路径),只延长 package_end_date
