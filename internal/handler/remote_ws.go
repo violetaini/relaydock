@@ -401,7 +401,7 @@ type RemoteWSHandler struct {
 	tokenConflicts sync.Map // map[string]*tokenConflictRecord
 	// ddnsManager 心跳检测到 IP 漂移时触发 DNS provider API 更新域名 A/AAAA 记录。
 	// 用 setter 注入避免循环依赖(ddns 包不能依赖 handler 包)。
-	ddnsManager *ddns.Manager
+	ddnsManager     *ddns.Manager
 	ipDriftCallback func(ctx context.Context, serverID int64, newIP string) error
 }
 
@@ -1243,6 +1243,7 @@ func (h *RemoteWSHandler) handleTraffic(wsConn *RemoteWSConnection, payload json
 
 	// 存最近一次 group 并发连接数(nil = 该 server 当前无连接,覆盖清零)。
 	connCountsByServer.Store(wsConn.ServerID, trafficPayload.ConnCounts)
+	recordManagementConnections(wsConn.ServerID, trafficPayload.ConnCounts, time.Now())
 
 	// 系统级网卡累计 — 同 HTTP path 的 RemoteTrafficHandler 处理。WS path 之前漏了这段,
 	// 导致 source=system 的 server 在 WS 连接模式下 system_*_cycle 永远不动 → traffic_used 静止。

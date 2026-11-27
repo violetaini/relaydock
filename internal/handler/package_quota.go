@@ -34,6 +34,11 @@ type PackageQuotaState struct {
 }
 
 func evaluatePackageQuotaState(ctx context.Context, repo *storage.TrafficRepository, user *storage.User, pkg *storage.Package) (PackageQuotaState, error) {
+	return evaluatePackageQuotaUsage(ctx, repo, user, pkg, false)
+}
+
+// Views need usage even for unconfigured tiers; enforcement can skip those reads.
+func evaluatePackageQuotaUsage(ctx context.Context, repo *storage.TrafficRepository, user *storage.User, pkg *storage.Package, allUsage bool) (PackageQuotaState, error) {
 	var state PackageQuotaState
 	if repo == nil || user == nil || pkg == nil || user.AuthorizationMode != storage.AuthorizationModePackage || user.PackageID <= 0 {
 		return state, nil
@@ -47,11 +52,11 @@ func evaluatePackageQuotaState(ctx context.Context, repo *storage.TrafficReposit
 	if state.PackageLimitBytes <= 0 &&
 		state.NodeModuleLimitBytes <= 0 &&
 		state.ServerModuleLimitBytes <= 0 &&
-		state.ForwardingModuleLimitBytes <= 0 {
+		state.ForwardingModuleLimitBytes <= 0 && !allUsage {
 		return state, nil
 	}
 
-	needTotal := state.PackageLimitBytes > 0
+	needTotal := state.PackageLimitBytes > 0 || allUsage
 
 	if (needTotal || state.NodeModuleLimitBytes > 0) && len(pkg.Nodes) > 0 {
 		nodeIDs := make([]int64, 0, len(pkg.Nodes))

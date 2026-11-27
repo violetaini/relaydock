@@ -264,12 +264,19 @@ func NewUserManagementListHandler(repo *storage.TrafficRepository) http.Handler 
 }
 
 type managementResourceUsage struct {
+	ServerID       int64      `json:"server_id,omitempty"`
+	ServerName     string     `json:"server_name,omitempty"`
+	ServerOffline  bool       `json:"server_offline,omitempty"`
+	ProvisionError bool       `json:"provision_error,omitempty"`
+	NextResetAt    *time.Time `json:"next_reset_at,omitempty"`
+
 	Kind      string     `json:"kind"`
 	ID        int64      `json:"id"`
 	Name      string     `json:"name"`
 	Source    string     `json:"source"`
 	Used      int64      `json:"used"`
 	Limit     int64      `json:"limit"`
+	LimitNote string     `json:"limit_note,omitempty"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	Reset     string     `json:"reset"`
 	UpdatedAt *time.Time `json:"updated_at,omitempty"`
@@ -299,6 +306,11 @@ func NewUserManagementDetailHandler(repo *storage.TrafficRepository) http.Handle
 			writeError(w, 500, err)
 			return
 		}
+		resources, quotaLayers, err := managementPackageQuota(r.Context(), repo, user, resources)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		for i := range resources {
 			if resources[i].ExpiresAt != nil && !resources[i].ExpiresAt.After(time.Now()) {
 				resources[i].State = "expired"
@@ -324,7 +336,14 @@ func NewUserManagementDetailHandler(repo *storage.TrafficRepository) http.Handle
 			records = append(records, audit{v.Actor, v.Action, v.EntityType, v.CreatedAt})
 		}
 		entries := buildUserEntries(r.Context(), repo, []storage.User{user})
-		writeJSON(w, 200, map[string]any{"user": entries[0], "resources": resources, "records": records, "as_of": time.Now().UTC(), "usage_note": "总用量来自用户计费记录，订阅及套餐关联用量不重复累加。各资源按自己的重置周期统计。"})
+		billed, billedErr := repo.GetUserBillableTraffic(r.Context(), username)
+		if billedErr != nil {
+			writeError(w, http.StatusServiceUnavailable, billedErr)
+			return
+		}
+		entries[0].TrafficUsed = billed
+
+		writeJSON(w, 200, map[string]any{"user": entries[0], "overview": buildManagementOverview(user, entries[0].TrafficUsed, resources, time.Now().UTC(), quotaLayers...), "resources": resources, "records": records, "as_of": time.Now().UTC(), "usage_note": "总用量来自用户计费记录，订阅及套餐关联用量不重复累加。各资源按自己的重置周期统计。"})
 	})
 }
 
@@ -361,13 +380,7 @@ func userManagementUsage(ctx context.Context, repo *storage.TrafficRepository, u
 	}
 	nodeUsed := map[int64]int64{}
 	seen := map[int64]bool{}
-	reset := "不自动重置"
-	if user.NodeTrafficResetPeriod == "monthly" || user.IsReset {
-		reset = "每月重置"
-		if user.IsReset {
-			reset = "每月 " + strconv.Itoa(user.ResetDay) + " 日重置"
-		}
-	}
+	reset := managementFixedResetLabel(user)
 	if pkg != nil {
 		packageSources, e := repo.ListUserInboundAccessSources(ctx, user.Username, 0)
 		if e != nil {
@@ -411,15 +424,19 @@ func userManagementUsage(ctx context.Context, repo *storage.TrafficRepository, u
 		used := usage[n.ID]
 		nodeUsed[n.ID] = used
 		seen[n.ID] = true
-		result = append(result, managementResourceUsage{Kind: "node", ID: n.ID, Name: n.NodeName, Source: v.Grant.SourceType, Used: used, Limit: int64(limit * userTrafficLimitBytesPerGB), ExpiresAt: v.Source.ExpiresAt, Reset: reset, State: v.Source.ObservedState, UpdatedAt: &v.Source.UpdatedAt})
+		result = append(result, managementResourceUsage{Kind: "node", ID: n.ID, Name: n.NodeName, Source: v.Grant.SourceType, Used: used, Limit: int64(limit * userTrafficLimitBytesPerGB), ExpiresAt: v.Source.ExpiresAt, Reset: reset, ServerID: v.Source.ServerID, ProvisionError: managementSourceFailed(v.Source), State: v.Source.ObservedState, UpdatedAt: &v.Source.UpdatedAt})
 	}
 	servers, err := repo.ListRemoteServers(ctx)
 	if err != nil {
 		return nil, err
 	}
 	names := map[int64]string{}
+	serverByName := map[string]storage.RemoteServer{}
+	serverByID := map[int64]storage.RemoteServer{}
 	for _, v := range servers {
 		names[v.ID] = v.Name
+		serverByName[v.Name] = v
+		serverByID[v.ID] = v
 	}
 	grants, err := repo.ListUserServerGrants(ctx, user.Username)
 	if err != nil {
@@ -430,8 +447,10 @@ func userManagementUsage(ctx context.Context, repo *storage.TrafficRepository, u
 		return nil, err
 	}
 	nodeBySource := map[int64]int64{}
+	sourceByID := map[int64]storage.UserInboundAccessSource{}
 	for _, v := range sources {
 		nodeBySource[v.ID] = v.NodeID
+		sourceByID[v.ID] = v
 	}
 	selections, err := repo.ListUserNodeSelections(ctx, user.Username, false)
 	if err != nil {
@@ -449,7 +468,7 @@ func userManagementUsage(ctx context.Context, repo *storage.TrafficRepository, u
 		if g.ResetPolicy == storage.ManagedResetMonthly {
 			period = "每月 " + strconv.Itoa(g.ResetDay) + " 日重置"
 		}
-		result = append(result, managementResourceUsage{Kind: "server", ID: g.ServerID, Name: names[g.ServerID], Source: g.SourceType, Used: used, Limit: g.TrafficLimitBytes, ExpiresAt: g.ExpiresAt, Reset: period, State: "authorized", Note: "包含此服务器授权下所选节点的用量"})
+		result = append(result, managementResourceUsage{Kind: "server", ID: g.ServerID, Name: names[g.ServerID], Source: g.SourceType, Used: used, Limit: g.TrafficLimitBytes, ExpiresAt: g.ExpiresAt, Reset: period, ServerID: g.ServerID, NextResetAt: g.NextResetAt, ServerName: names[g.ServerID], ServerOffline: serverByID[g.ServerID].Status == storage.RemoteServerStatusOffline, State: g.StateAt(time.Now().UTC(), user.IsActive, used), Note: "包含此服务器授权下所选节点的用量"})
 		for _, sel := range selections {
 			if sel.GrantID != g.ID || sel.AccessSourceID == nil {
 				continue
@@ -468,16 +487,45 @@ func userManagementUsage(ctx context.Context, repo *storage.TrafficRepository, u
 			}
 			nodeUsed[id] = counter.BilledBytes(mode)
 			if seen[id] {
+				for i := range result {
+					if result[i].Kind == "node" && result[i].ID == id {
+						result[i].Used = nodeUsed[id]
+						result[i].Related = true
+						result[i].ServerID = g.ServerID
+						result[i].Source = "server"
+						result[i].Reset = period
+						result[i].NextResetAt = g.NextResetAt
+						at := counter.UpdatedAt
+						result[i].UpdatedAt = &at
+						result[i].Note = "已包含在服务器授权用量中"
+					}
+				}
 				continue
 			}
 			seen[id] = true
 			limit, _ := nodeTrafficLimitGB(&user, pkg, id)
 			state := "inactive"
 			if sel.DesiredEnabled {
-				state = "active"
+				state = sourceByID[*sel.AccessSourceID].ObservedState
+				if state == "" {
+					state = "unknown"
+				}
 			}
-			result = append(result, managementResourceUsage{Kind: "node", ID: id, Name: byID[id].NodeName, Source: "server", Used: nodeUsed[id], Limit: int64(limit * userTrafficLimitBytesPerGB), ExpiresAt: g.ExpiresAt, Reset: period, UpdatedAt: &counter.UpdatedAt, State: state, Related: true, Note: "已包含在服务器授权用量中"})
+			result = append(result, managementResourceUsage{Kind: "node", ID: id, Name: byID[id].NodeName, Source: "server", ServerID: g.ServerID, ProvisionError: managementSourceFailed(sourceByID[*sel.AccessSourceID]) && sel.DesiredEnabled, Used: nodeUsed[id], Limit: int64(limit * userTrafficLimitBytesPerGB), ExpiresAt: g.ExpiresAt, Reset: period, UpdatedAt: &counter.UpdatedAt, State: state, Related: true, Note: "已包含在服务器授权用量中"})
 		}
+	}
+	for i := range result {
+		v := &result[i]
+		if v.Kind != "node" {
+			continue
+		}
+		if v.ServerID == 0 {
+			n := byID[v.ID]
+			v.ServerID = serverByName[n.OriginalServer].ID
+		}
+		server := serverByID[v.ServerID]
+		v.ServerName = server.Name
+		v.ServerOffline = server.Status == storage.RemoteServerStatusOffline
 	}
 	files, err := repo.GetUserSubscriptions(ctx, user.Username)
 	if err != nil {

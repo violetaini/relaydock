@@ -143,6 +143,25 @@ func TestEvaluatePackageQuotaStateThreeTiersAndPartialTiers(t *testing.T) {
 	if !state.PackageOver || !state.NodeModuleOver || !state.ServerModuleOver || !state.ForwardingModuleOver {
 		t.Fatalf("expected all modules over when package total exceeded: %+v", state)
 	}
+	view, layers, err := managementPackageQuota(ctx, repo, user, []managementResourceUsage{{Kind: "package", ID: pkg.ID}, {Kind: "node", ID: node.ID, Used: 650, Source: "package"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layers) != 2 || layers[0].Items[0].Used != 1050 {
+		t.Fatalf("package view must include forwarding once: %+v", layers)
+	}
+	foundForward := false
+	for _, v := range view {
+		if v.Kind == "forwarding" {
+			foundForward = true
+			if v.Used != 400 || v.LimitNote == "" {
+				t.Fatalf("forwarding view: %+v", v)
+			}
+		}
+	}
+	if !foundForward {
+		t.Fatal("forwarding usage omitted from user view")
+	}
 
 	// Verify effectiveManagedGrantState & effectiveTunnelGrantState both report over_limit
 	serverGrants, err := repo.ListUserServerGrants(ctx, "alice")

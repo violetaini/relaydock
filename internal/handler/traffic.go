@@ -814,7 +814,8 @@ func (h *RemoteTrafficHandler) SetProbeMetricsStore(store *ProbeMetricsStore) {
 
 // RemoteTrafficRequest 表示来自远程服务器的流量报告
 type RemoteTrafficRequest struct {
-	Stats *traffic.XrayStats `json:"stats,omitempty"`
+	ConnCounts map[string]int64   `json:"conn_counts,omitempty"`
+	Stats      *traffic.XrayStats `json:"stats,omitempty"`
 	// AgentVersion and Capabilities are supplied by current HTTP-mode Agents.
 	// They let the control plane apply feature-gated response configuration
 	// without guessing from a version string. Older Agents omit both fields.
@@ -888,7 +889,7 @@ func (h *RemoteTrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if req.Stats == nil && req.System == nil && req.Sysmetrics == nil {
+	if req.Stats == nil && req.System == nil && req.Sysmetrics == nil && req.ConnCounts == nil {
 		respData, _ := json.Marshal(map[string]interface{}{
 			"success":        true,
 			"message":        "No stats to process",
@@ -926,6 +927,8 @@ func (h *RemoteTrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
+
+	recordManagementConnections(serverID, req.ConnCounts, time.Now())
 
 	// 系统级网卡累计:把 delta 累加到 server.system_*_cycle(用于 traffic_source='system')。
 	// 老 agent 不上报 → req.System == nil → 跳过,server 视图自动回退 xray 路径。
