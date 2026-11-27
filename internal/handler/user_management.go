@@ -387,7 +387,9 @@ func userManagementUsage(ctx context.Context, repo *storage.TrafficRepository, u
 			seen[id] = true
 			nodeUsed[id] = usage[id]
 			limit, _ := nodeTrafficLimitGB(&user, pkg, id)
-			state := "unknown"
+			// Legacy package provisioning does not create an access-source receipt.
+			// The package proves authorization, not an outstanding delivery job.
+			state := "authorized"
 			var updated *time.Time
 			if v, ok := states[id]; ok {
 				state = v.ObservedState

@@ -275,6 +275,9 @@ func TestUserManagementPackageFixedNodesAppearInFiltersAndUsage(t *testing.T) {
 	found := false
 	for _, v := range resources {
 		if v.Kind == "node" && v.ID == node.ID && v.Source == "package" {
+			if v.State != "authorized" || v.UpdatedAt != nil {
+				t.Fatalf("legacy package without receipt must be authorized, not pending or confirmed active: %+v", v)
+			}
 			found = true
 		}
 	}
