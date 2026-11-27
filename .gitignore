@@ -32,6 +32,9 @@ docs/change-records/
 deploy/original-reference.*
 token_invalid.yaml
 
+subscribes/subscription_*.yaml
+internal/handler/subscribes/subscription_*.yaml
+
 # Go workspace files
 go.work
 go.work.sum
