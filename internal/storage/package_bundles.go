@@ -11,6 +11,19 @@ import (
 	"time"
 )
 
+func normalizePackageTrafficQuota(label string, gb float64, bytes int64) (float64, int64, error) {
+	if math.IsNaN(gb) || math.IsInf(gb, 0) || gb < 0 || gb > float64(math.MaxInt64)/(1024*1024*1024) || bytes < 0 {
+		return 0, 0, fmt.Errorf("invalid %s traffic limit", label)
+	}
+	if gb > 0 {
+		return gb, int64(math.Round(gb * 1024 * 1024 * 1024)), nil
+	}
+	if bytes > 0 {
+		return float64(bytes) / (1024 * 1024 * 1024), bytes, nil
+	}
+	return 0, 0, nil
+}
+
 // validateAndNormalizePackageBundle validates resource references and applies
 // the same defaults used by individually-created grants.
 func (r *TrafficRepository) validateAndNormalizePackageBundle(ctx context.Context, pkg *Package) error {
@@ -19,16 +32,50 @@ func (r *TrafficRepository) validateAndNormalizePackageBundle(ctx context.Contex
 		return err
 	}
 	pkg.NodeTrafficResetPeriod = resetPeriod
-	// Aggregate package traffic/speed limits were retired in favor of explicit
-	// resource limits. Keep the legacy fields readable, but never persist a new
-	// non-zero value from old API clients.
-	pkg.TrafficLimitGB = 0
-	pkg.TrafficLimitBytes = 0
 	pkg.SpeedLimitMbps = 0
 	pkg.AutoSpeedRules = []AutoSpeedLimitRule{}
+
+	pkg.TrafficLimitGB, pkg.TrafficLimitBytes, err = normalizePackageTrafficQuota("package", pkg.TrafficLimitGB, pkg.TrafficLimitBytes)
+	if err != nil {
+		return err
+	}
+	pkg.NodeModuleTrafficLimitGB, pkg.NodeModuleTrafficLimitBytes, err = normalizePackageTrafficQuota("node module", pkg.NodeModuleTrafficLimitGB, pkg.NodeModuleTrafficLimitBytes)
+	if err != nil {
+		return err
+	}
+	pkg.ServerModuleTrafficLimitGB, pkg.ServerModuleTrafficLimitBytes, err = normalizePackageTrafficQuota("server module", pkg.ServerModuleTrafficLimitGB, pkg.ServerModuleTrafficLimitBytes)
+	if err != nil {
+		return err
+	}
+	pkg.ForwardingModuleTrafficLimitGB, pkg.ForwardingModuleTrafficLimitBytes, err = normalizePackageTrafficQuota("forwarding module", pkg.ForwardingModuleTrafficLimitGB, pkg.ForwardingModuleTrafficLimitBytes)
+	if err != nil {
+		return err
+	}
+
+	if pkg.TrafficLimitBytes > 0 {
+		if pkg.NodeModuleTrafficLimitBytes > pkg.TrafficLimitBytes {
+			return errors.New("固定节点模块总流量不能高于套餐总流量")
+		}
+		if pkg.ServerModuleTrafficLimitBytes > pkg.TrafficLimitBytes {
+			return errors.New("服务器授权模块总流量不能高于套餐总流量")
+		}
+		if pkg.ForwardingModuleTrafficLimitBytes > pkg.TrafficLimitBytes {
+			return errors.New("转发线路模块总流量不能高于套餐总流量")
+		}
+	}
+
 	for nodeID, gb := range pkg.NodeTrafficLimits {
 		if nodeID <= 0 || math.IsNaN(gb) || math.IsInf(gb, 0) || gb < 0 || gb > float64(math.MaxInt64)/(1024*1024*1024) {
 			return fmt.Errorf("invalid package traffic limit for node %d", nodeID)
+		}
+		if gb > 0 {
+			nodeBytes := int64(math.Round(gb * 1024 * 1024 * 1024))
+			if pkg.NodeModuleTrafficLimitBytes > 0 && nodeBytes > pkg.NodeModuleTrafficLimitBytes {
+				return fmt.Errorf("固定节点 #%d 流量额度不能高于固定节点模块总流量", nodeID)
+			}
+			if pkg.TrafficLimitBytes > 0 && nodeBytes > pkg.TrafficLimitBytes {
+				return fmt.Errorf("固定节点 #%d 流量额度不能高于套餐总流量", nodeID)
+			}
 		}
 	}
 	seenServers := make(map[int64]struct{}, len(pkg.ServerGrants))
@@ -36,6 +83,14 @@ func (r *TrafficRepository) validateAndNormalizePackageBundle(ctx context.Contex
 		entry := &pkg.ServerGrants[i]
 		if _, duplicate := seenServers[entry.ServerID]; entry.ServerID <= 0 || duplicate {
 			return fmt.Errorf("invalid package server grant for server %d", entry.ServerID)
+		}
+		if entry.TrafficLimitBytes > 0 {
+			if pkg.ServerModuleTrafficLimitBytes > 0 && entry.TrafficLimitBytes > pkg.ServerModuleTrafficLimitBytes {
+				return fmt.Errorf("服务器 #%d 授权流量不能高于服务器授权模块总流量", entry.ServerID)
+			}
+			if pkg.TrafficLimitBytes > 0 && entry.TrafficLimitBytes > pkg.TrafficLimitBytes {
+				return fmt.Errorf("服务器 #%d 授权流量不能高于套餐总流量", entry.ServerID)
+			}
 		}
 		seenServers[entry.ServerID] = struct{}{}
 		packageID := pkg.ID
@@ -74,6 +129,14 @@ func (r *TrafficRepository) validateAndNormalizePackageBundle(ctx context.Contex
 		entry := &pkg.ForwardingGrants[i]
 		if _, duplicate := seenTunnels[entry.TunnelID]; entry.TunnelID <= 0 || duplicate || entry.PerForwardConnectionLimit != 0 {
 			return fmt.Errorf("invalid package forwarding grant for tunnel %d", entry.TunnelID)
+		}
+		if entry.TrafficLimitBytes > 0 {
+			if pkg.ForwardingModuleTrafficLimitBytes > 0 && entry.TrafficLimitBytes > pkg.ForwardingModuleTrafficLimitBytes {
+				return fmt.Errorf("转发线路 #%d 授权流量不能高于转发线路模块总流量", entry.TunnelID)
+			}
+			if pkg.TrafficLimitBytes > 0 && entry.TrafficLimitBytes > pkg.TrafficLimitBytes {
+				return fmt.Errorf("转发线路 #%d 授权流量不能高于套餐总流量", entry.TunnelID)
+			}
 		}
 		seenTunnels[entry.TunnelID] = struct{}{}
 		packageID := pkg.ID

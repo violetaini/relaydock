@@ -74,7 +74,7 @@ func (h *ManagedNodesHandler) activeUserServerGrant(ctx context.Context, usernam
 	if err != nil {
 		return nil, err
 	}
-	if state := grant.StateAt(time.Now().UTC(), user.IsActive, billed); state != storage.ManagedGrantActive {
+	if state := effectiveManagedGrantState(ctx, h.repo, user, *grant, billed, time.Now().UTC(), nil, nil); state != storage.ManagedGrantActive {
 		if state == storage.ManagedGrantOverLimit {
 			return nil, storage.ErrManagedTrafficLimit
 		}

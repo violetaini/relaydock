@@ -270,6 +270,8 @@ func (p *LimiterConfigPusher) buildManagedLimiterLimits(ctx context.Context, ser
 		return nil, err
 	}
 	limits := make(map[managedLimiterKey]managedLimiterLimit)
+	pkgCache := make(map[int64]*storage.Package)
+	quotaCache := make(map[string]PackageQuotaState)
 	for _, grant := range grants {
 		if grant.ServerID != serverID {
 			continue
@@ -282,7 +284,7 @@ func (p *LimiterConfigPusher) buildManagedLimiterLimits(ctx context.Context, ser
 		if err != nil {
 			return nil, err
 		}
-		if grant.StateAt(now, user.IsActive, billed) != storage.ManagedGrantActive {
+		if effectiveManagedGrantState(ctx, p.repo, user, grant, billed, now, pkgCache, quotaCache) != storage.ManagedGrantActive {
 			continue
 		}
 		selections, err := p.repo.ListUserNodeSelections(ctx, grant.Username, true)
@@ -437,6 +439,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 	pendingDisableUsers := make(map[string]bool)
 	overLimitUsers := make(map[string]bool)
 	pkgCache := make(map[int64]*storage.Package)
+	pkgQuotaByUser := make(map[string]PackageQuotaState)
 
 	for username := range usernames {
 		user, err := p.repo.GetUser(ctx, username)
@@ -469,6 +472,11 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			}
 			pkg = pkgCache[user.PackageID]
 		}
+		pkgQuota, quotaErr := evaluatePackageQuotaState(ctx, p.repo, &user, pkg)
+		if quotaErr != nil {
+			return nil, fmt.Errorf("evaluate package quota for %s: %w", username, quotaErr)
+		}
+		pkgQuotaByUser[username] = pkgQuota
 		limits := effectiveNodeTrafficLimits(&user, pkg)
 		if len(limits) > 0 {
 			nodeIDs := make([]int64, 0, len(limits))
@@ -633,7 +641,8 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			pkg = pkgCache[user.PackageID]
 		}
 		ref := physicalByTag[c.InboundTag] // 不存在时 NodeID=0,resolveLimit 容错
-		nodeTrafficDenied := (hasPackageAccess || hasDirectAccess) && userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[c.Username], ref.NodeID)
+		nodeTrafficDenied := (hasPackageAccess && pkgQuotaByUser[c.Username].NodeModuleOver) ||
+			((hasPackageAccess || hasDirectAccess) && userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[c.Username], ref.NodeID))
 		speedMbps, deviceLimit := float64(0), 0
 		physicalNodeID := ref.NodeID
 		managedLimit, hasManagedLimit := managedLimits[managedLimiterKey{username: c.Username, inboundTag: c.InboundTag}]
@@ -711,7 +720,8 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		}
 		ref := routedByTag[sa.InboundTag]
 		speedMbps, deviceLimit := resolveLimit(user, pkg, ref.NodeID, ref.ParentID)
-		nodeTrafficDenied := userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[sa.Username], ref.NodeID)
+		nodeTrafficDenied := (pkg != nil && pkgQuotaByUser[sa.Username].NodeModuleOver) ||
+			userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[sa.Username], ref.NodeID)
 		var speedBytes uint64
 		if speedMbps > 0 {
 			speedBytes = uint64(speedMbps * 1000000 / 8)

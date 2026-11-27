@@ -2445,13 +2445,25 @@ func (h *ForwardingHandler) WaitForReconciler() {
 }
 
 func (h *ForwardingHandler) activeGrantForForward(ctx context.Context, f storage.UserForwardRule) bool {
+	user, err := h.repo.GetUser(ctx, f.Username)
+	if err != nil {
+		return false
+	}
 	grants, err := h.repo.ListUserTunnelGrants(ctx, f.Username)
 	if err != nil {
 		return false
 	}
+	pkgCache := make(map[int64]*storage.Package)
+	quotaCache := make(map[string]PackageQuotaState)
+	now := time.Now().UTC()
 	for _, grant := range grants {
 		if grant.ID == f.GrantID {
-			return grant.State == "active" || grant.State == "tunnel_draining"
+			tunnelState := storage.TunnelStateSuspended
+			if grant.Tunnel != nil {
+				tunnelState = grant.Tunnel.State
+			}
+			state := effectiveTunnelGrantState(ctx, h.repo, user, grant, tunnelState, now, pkgCache, quotaCache)
+			return state == "active" || state == "tunnel_draining"
 		}
 	}
 	return false

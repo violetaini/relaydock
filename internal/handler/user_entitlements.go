@@ -157,7 +157,13 @@ func ResolveUserServiceEntitlements(ctx context.Context, repo *storage.TrafficRe
 	if err != nil {
 		return entitlements, err
 	}
-	entitlements.Nodes = len(nodeIDs) > 0
+	pkgCache := make(map[int64]*storage.Package)
+	quotaCache := make(map[string]PackageQuotaState)
+	var nodeModuleOver bool
+	if user.AuthorizationMode == storage.AuthorizationModePackage && packageActive {
+		nodeModuleOver = resolveUserPackageQuotaCached(ctx, repo, &user, pkgCache, quotaCache).NodeModuleOver
+	}
+	entitlements.Nodes = len(nodeIDs) > 0 && !nodeModuleOver
 
 	serverGrants, err := repo.ListUserServerGrants(ctx, username)
 	if err != nil {
@@ -171,7 +177,7 @@ func ResolveUserServiceEntitlements(ctx context.Context, repo *storage.TrafficRe
 		if usageErr != nil {
 			return entitlements, fmt.Errorf("resolve server grant usage: %w", usageErr)
 		}
-		if grant.StateAt(now, user.IsActive, billed) == storage.ManagedGrantActive {
+		if effectiveManagedGrantState(ctx, repo, user, grant, billed, now, pkgCache, quotaCache) == storage.ManagedGrantActive {
 			entitlements.Servers = true
 			break
 		}
@@ -189,7 +195,7 @@ func ResolveUserServiceEntitlements(ctx context.Context, repo *storage.TrafficRe
 		if grant.Tunnel != nil {
 			tunnelState = grant.Tunnel.State
 		}
-		if grant.StateAt(now, user.IsActive, tunnelState, grant.UsedBytes) == storage.ManagedGrantActive {
+		if effectiveTunnelGrantState(ctx, repo, user, grant, tunnelState, now, pkgCache, quotaCache) == storage.ManagedGrantActive {
 			entitlements.Forwarding = true
 			break
 		}

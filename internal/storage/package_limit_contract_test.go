@@ -74,7 +74,8 @@ func TestPackageLimitContractAggregateNormalization(t *testing.T) {
 	ctx := context.Background()
 	repo := packageBundleTestRepo(t)
 	packageID, err := repo.CreatePackage(ctx, Package{
-		Name: "retired-aggregates-create", TrafficLimitBytes: 123456, TrafficLimitGB: 987,
+		Name: "three-tier-package", TrafficLimitGB: 100,
+		NodeModuleTrafficLimitGB: 50, ServerModuleTrafficLimitGB: 40, ForwardingModuleTrafficLimitGB: 30,
 		CycleDays: 30, IsReset: false, ResetDay: 17, SpeedLimitMbps: 88,
 		AutoSpeedRules: []AutoSpeedLimitRule{{
 			Type: "sustained", ThresholdMbps: 50, SustainedSeconds: 10, LimitMbps: 5, LimitDuration: 60,
@@ -83,21 +84,33 @@ func TestPackageLimitContractAggregateNormalization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreatePackage: %v", err)
 	}
-	stored := assertRetiredPackageAggregates(t, repo, packageID, false)
-
-	stored.TrafficLimitBytes = 654321
-	stored.TrafficLimitGB = 456
-	stored.SpeedLimitMbps = 44
-	stored.AutoSpeedRules = []AutoSpeedLimitRule{{
-		Type: "burst", ThresholdMbps: 30, SustainedSeconds: 2, WindowSeconds: 20,
-		BurstCount: 3, LimitMbps: 4, LimitDuration: 90,
-	}}
-	stored.IsReset = false
-	stored.ResetDay = 9
-	if err := repo.UpdatePackage(ctx, *stored); err != nil {
-		t.Fatalf("UpdatePackage: %v", err)
+	stored, err := repo.GetPackage(ctx, packageID)
+	if err != nil {
+		t.Fatalf("GetPackage: %v", err)
 	}
-	assertRetiredPackageAggregates(t, repo, packageID, false)
+	if stored.TrafficLimitGB != 100 || stored.NodeModuleTrafficLimitGB != 50 ||
+		stored.ServerModuleTrafficLimitGB != 40 || stored.ForwardingModuleTrafficLimitGB != 30 {
+		t.Fatalf("three-tier limits not persisted: %+v", stored)
+	}
+	if stored.SpeedLimitMbps != 0 || len(stored.AutoSpeedRules) != 0 {
+		t.Fatalf("retired speed limits were persisted: speed=%v auto=%+v", stored.SpeedLimitMbps, stored.AutoSpeedRules)
+	}
+
+	// Hierarchy validation: module limit > package limit must be rejected.
+	stored.NodeModuleTrafficLimitGB = 120
+	if err := repo.UpdatePackage(ctx, *stored); err == nil {
+		t.Fatal("expected error when node module limit exceeds package limit")
+	}
+
+	// Single-tier or two-tier (omitting package total) must be accepted.
+	stored.TrafficLimitGB = 0
+	stored.TrafficLimitBytes = 0
+	stored.NodeModuleTrafficLimitGB = 50
+	stored.ServerModuleTrafficLimitGB = 0
+	stored.ForwardingModuleTrafficLimitGB = 0
+	if err := repo.UpdatePackage(ctx, *stored); err != nil {
+		t.Fatalf("UpdatePackage partial tiers: %v", err)
+	}
 }
 
 func TestPackageLimitContractForwardingGrantValidation(t *testing.T) {

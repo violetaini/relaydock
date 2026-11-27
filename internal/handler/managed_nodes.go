@@ -749,13 +749,15 @@ func (h *ManagedNodesHandler) reconcileAll(ctx context.Context) {
 	h.syncManagedUsage(ctx, now)
 	grants, err := h.repo.ListAllUserServerGrants(ctx)
 	if err == nil {
+		pkgCache := make(map[int64]*storage.Package)
+		quotaCache := make(map[string]PackageQuotaState)
 		for _, grant := range grants {
 			user, userErr := h.repo.GetUser(ctx, grant.Username)
 			_, _, billed, usageErr := h.repo.GetUserServerGrantUsage(ctx, grant.ID)
 			if userErr != nil || usageErr != nil {
 				continue
 			}
-			state := managedGrantState(grant, user.IsActive, billed, now)
+			state := effectiveManagedGrantState(ctx, h.repo, user, grant, billed, now, pkgCache, quotaCache)
 			grantDesired := storage.ManagedDesiredActive
 			if state != storage.ManagedGrantActive {
 				grantDesired = storage.ManagedDesiredInactive

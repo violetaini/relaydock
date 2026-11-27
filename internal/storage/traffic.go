@@ -316,8 +316,14 @@ type Package struct {
 	ID                     int64             `json:"id"`
 	Name                   string            `json:"name"`
 	Description            string            `json:"description"`
-	TrafficLimitGB         float64           `json:"traffic_limit_gb"`           // GB 流量限制
-	TrafficLimitBytes      int64             `json:"-"`                          // 流量限制（以字节为单位）（仅限内部使用）
+	TrafficLimitGB                    float64           `json:"traffic_limit_gb"`                       // 套餐总流量限制 (GB)，0=不限
+	TrafficLimitBytes                 int64             `json:"-"`                                      // 套餐总流量限制（字节）
+	NodeModuleTrafficLimitGB          float64           `json:"node_module_traffic_limit_gb"`           // 固定节点模块总流量限制 (GB)，0=不限
+	NodeModuleTrafficLimitBytes       int64             `json:"-"`                                      // 固定节点模块总流量限制（字节）
+	ServerModuleTrafficLimitGB        float64           `json:"server_module_traffic_limit_gb"`         // 服务器授权模块总流量限制 (GB)，0=不限
+	ServerModuleTrafficLimitBytes     int64             `json:"-"`                                      // 服务器授权模块总流量限制（字节）
+	ForwardingModuleTrafficLimitGB    float64           `json:"forwarding_module_traffic_limit_gb"`     // 转发线路模块总流量限制 (GB)，0=不限
+	ForwardingModuleTrafficLimitBytes int64             `json:"-"`                                      // 转发线路模块总流量限制（字节）
 	CycleDays              int               `json:"cycle_days"`                 // 包裹持续时间（天）
 	IsReset                bool              `json:"is_reset"`                   // 是否启用固定节点流量定期重置
 	ResetDay               int               `json:"reset_day"`                  // 重置的月份日期 (1-31)
@@ -2183,6 +2189,15 @@ CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(name);
 	}
 	if err := r.ensureTableColumn("packages", "forwarding_grants", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return fmt.Errorf("migrate package forwarding grants: %w", err)
+	}
+	if err := r.ensureTableColumn("packages", "node_module_traffic_limit_bytes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate package node module traffic limit: %w", err)
+	}
+	if err := r.ensureTableColumn("packages", "server_module_traffic_limit_bytes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate package server module traffic limit: %w", err)
+	}
+	if err := r.ensureTableColumn("packages", "forwarding_module_traffic_limit_bytes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate package forwarding module traffic limit: %w", err)
 	}
 
 	// 节点倍率(套餐级 per-node):JSON {"<node_id>": multiplier}。空 = 全部按 1.0
@@ -8777,7 +8792,7 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 	}
 
 	const query = `
-		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
+		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, COALESCE(node_module_traffic_limit_bytes, 0), COALESCE(server_module_traffic_limit_bytes, 0), COALESCE(forwarding_module_traffic_limit_bytes, 0), cycle_days,
 		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(subscribe_file_ids, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
 		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
@@ -8796,6 +8811,7 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 		var isReset int
 		var nodesJSON, subscribeFileIDsJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 		err := rows.Scan(&pkg.ID, &pkg.Name, &pkg.Description, &pkg.TrafficLimitBytes,
+			&pkg.NodeModuleTrafficLimitBytes, &pkg.ServerModuleTrafficLimitBytes, &pkg.ForwardingModuleTrafficLimitBytes,
 			&pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON, &subscribeFileIDsJSON, &pkg.SpeedLimitMbps, &pkg.DeviceLimit,
 			&autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode, &pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 		if err != nil {
@@ -8803,6 +8819,9 @@ func (r *TrafficRepository) ListPackages(ctx context.Context) ([]Package, error)
 		}
 		pkg.IsReset = isReset != 0
 		pkg.TrafficLimitGB = float64(pkg.TrafficLimitBytes) / (1024 * 1024 * 1024)
+		pkg.NodeModuleTrafficLimitGB = float64(pkg.NodeModuleTrafficLimitBytes) / (1024 * 1024 * 1024)
+		pkg.ServerModuleTrafficLimitGB = float64(pkg.ServerModuleTrafficLimitBytes) / (1024 * 1024 * 1024)
+		pkg.ForwardingModuleTrafficLimitGB = float64(pkg.ForwardingModuleTrafficLimitBytes) / (1024 * 1024 * 1024)
 
 		pkg.Nodes = []int64{}
 		if nodesJSON != "" && nodesJSON != "[]" {
@@ -8881,7 +8900,7 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 	}
 
 	const query = `
-		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
+		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, COALESCE(node_module_traffic_limit_bytes, 0), COALESCE(server_module_traffic_limit_bytes, 0), COALESCE(forwarding_module_traffic_limit_bytes, 0), cycle_days,
 		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(subscribe_file_ids, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
 		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
@@ -8892,7 +8911,8 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 	var isReset int
 	var nodesJSON, subscribeFileIDsJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 	err := r.db.QueryRowContext(ctx, query, id).Scan(&pkg.ID, &pkg.Name, &pkg.Description,
-		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON, &subscribeFileIDsJSON,
+		&pkg.TrafficLimitBytes, &pkg.NodeModuleTrafficLimitBytes, &pkg.ServerModuleTrafficLimitBytes, &pkg.ForwardingModuleTrafficLimitBytes,
+		&pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON, &subscribeFileIDsJSON,
 		&pkg.SpeedLimitMbps, &pkg.DeviceLimit, &autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode,
 		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 	if err != nil {
@@ -8904,6 +8924,9 @@ func (r *TrafficRepository) GetPackage(ctx context.Context, id int64) (*Package,
 
 	pkg.IsReset = isReset != 0
 	pkg.TrafficLimitGB = float64(pkg.TrafficLimitBytes) / (1024 * 1024 * 1024)
+	pkg.NodeModuleTrafficLimitGB = float64(pkg.NodeModuleTrafficLimitBytes) / (1024 * 1024 * 1024)
+	pkg.ServerModuleTrafficLimitGB = float64(pkg.ServerModuleTrafficLimitBytes) / (1024 * 1024 * 1024)
+	pkg.ForwardingModuleTrafficLimitGB = float64(pkg.ForwardingModuleTrafficLimitBytes) / (1024 * 1024 * 1024)
 
 	pkg.Nodes = []int64{}
 	if nodesJSON != "" && nodesJSON != "[]" {
@@ -8954,7 +8977,7 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 	}
 
 	const query = `
-		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, cycle_days,
+		SELECT id, name, COALESCE(description, ''), traffic_limit_bytes, COALESCE(node_module_traffic_limit_bytes, 0), COALESCE(server_module_traffic_limit_bytes, 0), COALESCE(forwarding_module_traffic_limit_bytes, 0), cycle_days,
 		       is_reset, reset_day, COALESCE(node_traffic_reset_period, 'monthly'), COALESCE(nodes, '[]'), COALESCE(subscribe_file_ids, '[]'), COALESCE(speed_limit_mbps, 0), COALESCE(device_limit, 0),
 		       COALESCE(auto_speed_limit_json, ''), COALESCE(short_code, ''), COALESCE(traffic_mode, 'oneway'), COALESCE(template_filename, ''), COALESCE(node_multipliers, '{}'), COALESCE(node_speed_limits, '{}'), COALESCE(node_traffic_limits, '{}'), COALESCE(node_device_limits, '{}'), COALESCE(server_grants, '[]'), COALESCE(forwarding_grants, '[]'), created_at, updated_at
 		FROM packages
@@ -8965,7 +8988,8 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 	var isReset int
 	var nodesJSON, subscribeFileIDsJSON, autoSpeedJSON, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON string
 	err := r.db.QueryRowContext(ctx, query, name).Scan(&pkg.ID, &pkg.Name, &pkg.Description,
-		&pkg.TrafficLimitBytes, &pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON, &subscribeFileIDsJSON,
+		&pkg.TrafficLimitBytes, &pkg.NodeModuleTrafficLimitBytes, &pkg.ServerModuleTrafficLimitBytes, &pkg.ForwardingModuleTrafficLimitBytes,
+		&pkg.CycleDays, &isReset, &pkg.ResetDay, &pkg.NodeTrafficResetPeriod, &nodesJSON, &subscribeFileIDsJSON,
 		&pkg.SpeedLimitMbps, &pkg.DeviceLimit, &autoSpeedJSON, &pkg.ShortCode, &pkg.TrafficMode,
 		&pkg.TemplateFilename, &nodeMultJSON, &nodeSpeedJSON, &nodeTrafficJSON, &nodeDeviceJSON, &serverGrantsJSON, &forwardingGrantsJSON, &pkg.CreatedAt, &pkg.UpdatedAt)
 	if err != nil {
@@ -8977,6 +9001,9 @@ func (r *TrafficRepository) GetPackageByName(ctx context.Context, name string) (
 
 	pkg.IsReset = isReset != 0
 	pkg.TrafficLimitGB = float64(pkg.TrafficLimitBytes) / (1024 * 1024 * 1024)
+	pkg.NodeModuleTrafficLimitGB = float64(pkg.NodeModuleTrafficLimitBytes) / (1024 * 1024 * 1024)
+	pkg.ServerModuleTrafficLimitGB = float64(pkg.ServerModuleTrafficLimitBytes) / (1024 * 1024 * 1024)
+	pkg.ForwardingModuleTrafficLimitGB = float64(pkg.ForwardingModuleTrafficLimitBytes) / (1024 * 1024 * 1024)
 
 	pkg.Nodes = []int64{}
 	if nodesJSON != "" && nodesJSON != "[]" {
@@ -9064,8 +9091,8 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	}
 
 	const query = `
-		INSERT INTO packages (name, description, traffic_limit_bytes, cycle_days, is_reset, reset_day, node_traffic_reset_period, nodes, subscribe_file_ids, speed_limit_mbps, device_limit, auto_speed_limit_json, short_code, traffic_mode, template_filename, node_multipliers, node_speed_limits, node_traffic_limits, node_device_limits, server_grants, forwarding_grants)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO packages (name, description, traffic_limit_bytes, node_module_traffic_limit_bytes, server_module_traffic_limit_bytes, forwarding_module_traffic_limit_bytes, cycle_days, is_reset, reset_day, node_traffic_reset_period, nodes, subscribe_file_ids, speed_limit_mbps, device_limit, auto_speed_limit_json, short_code, traffic_mode, template_filename, node_multipliers, node_speed_limits, node_traffic_limits, node_device_limits, server_grants, forwarding_grants)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	isReset := 0
@@ -9079,6 +9106,7 @@ func (r *TrafficRepository) CreatePackage(ctx context.Context, pkg Package) (int
 	}
 
 	result, err := r.db.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
+		pkg.NodeModuleTrafficLimitBytes, pkg.ServerModuleTrafficLimitBytes, pkg.ForwardingModuleTrafficLimitBytes,
 		pkg.CycleDays, isReset, pkg.ResetDay, pkg.NodeTrafficResetPeriod, string(nodesJSON), string(subscribeFileIDsJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, shortCode, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON)
 	if err != nil {
 		return 0, fmt.Errorf("create package: %w", err)
@@ -9150,7 +9178,7 @@ func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package
 
 	const query = `
 		UPDATE packages
-		SET name = ?, description = ?, traffic_limit_bytes = ?, cycle_days = ?,
+		SET name = ?, description = ?, traffic_limit_bytes = ?, node_module_traffic_limit_bytes = ?, server_module_traffic_limit_bytes = ?, forwarding_module_traffic_limit_bytes = ?, cycle_days = ?,
 		    is_reset = ?, reset_day = ?, node_traffic_reset_period = ?, nodes = ?, subscribe_file_ids = ?, speed_limit_mbps = ?, device_limit = ?,
 		    auto_speed_limit_json = ?, traffic_mode = ?, template_filename = ?, node_multipliers = ?,
 		    node_speed_limits = ?, node_traffic_limits = ?, node_device_limits = ?, server_grants = ?, forwarding_grants = ?, updated_at = CURRENT_TIMESTAMP
@@ -9173,6 +9201,7 @@ func (r *TrafficRepository) UpdatePackageBundle(ctx context.Context, pkg Package
 	}
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
+		pkg.NodeModuleTrafficLimitBytes, pkg.ServerModuleTrafficLimitBytes, pkg.ForwardingModuleTrafficLimitBytes,
 		pkg.CycleDays, isReset, pkg.ResetDay, pkg.NodeTrafficResetPeriod, string(nodesJSON), string(subscribeFileIDsJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, trafficMode, pkg.TemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeTrafficJSON, nodeDeviceJSON, serverGrantsJSON, forwardingGrantsJSON, pkg.ID)
 	if err != nil {
 		return nil, fmt.Errorf("update package: %w", err)

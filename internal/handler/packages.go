@@ -156,8 +156,11 @@ func requirePackageForwardingSpeedCapabilities(ctx context.Context, repo *storag
 type createPackageRequest struct {
 	Name                   string                           `json:"name"`
 	Description            string                           `json:"description"`
-	TrafficLimitGB         float64                          `json:"traffic_limit_gb"`
-	CycleDays              int                              `json:"cycle_days"`
+	TrafficLimitGB                 float64                          `json:"traffic_limit_gb"`
+	NodeModuleTrafficLimitGB       float64                          `json:"node_module_traffic_limit_gb"`
+	ServerModuleTrafficLimitGB     float64                          `json:"server_module_traffic_limit_gb"`
+	ForwardingModuleTrafficLimitGB float64                          `json:"forwarding_module_traffic_limit_gb"`
+	CycleDays                      int                              `json:"cycle_days"`
 	IsReset                bool                             `json:"is_reset"`
 	ResetDay               int                              `json:"reset_day"`
 	NodeTrafficResetPeriod string                           `json:"node_traffic_reset_period"`
@@ -366,11 +369,13 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	pkg := storage.Package{
-		Name:                   req.Name,
-		Description:            req.Description,
-		TrafficLimitGB:         0,
-		TrafficLimitBytes:      0,
-		CycleDays:              req.CycleDays,
+		Name:                           req.Name,
+		Description:                    req.Description,
+		TrafficLimitGB:                 req.TrafficLimitGB,
+		NodeModuleTrafficLimitGB:       req.NodeModuleTrafficLimitGB,
+		ServerModuleTrafficLimitGB:     req.ServerModuleTrafficLimitGB,
+		ForwardingModuleTrafficLimitGB: req.ForwardingModuleTrafficLimitGB,
+		CycleDays:                      req.CycleDays,
 		IsReset:                req.IsReset,
 		ResetDay:               req.ResetDay,
 		NodeTrafficResetPeriod: resetPeriod,
@@ -555,8 +560,11 @@ type updatePackageRequest struct {
 	ID                     int64                            `json:"id"`
 	Name                   string                           `json:"name"`
 	Description            string                           `json:"description"`
-	TrafficLimitGB         float64                          `json:"traffic_limit_gb"`
-	CycleDays              int                              `json:"cycle_days"`
+	TrafficLimitGB                 float64                          `json:"traffic_limit_gb"`
+	NodeModuleTrafficLimitGB       float64                          `json:"node_module_traffic_limit_gb"`
+	ServerModuleTrafficLimitGB     float64                          `json:"server_module_traffic_limit_gb"`
+	ForwardingModuleTrafficLimitGB float64                          `json:"forwarding_module_traffic_limit_gb"`
+	CycleDays                      int                              `json:"cycle_days"`
 	IsReset                *bool                            `json:"is_reset"`  // 指针:请求未携带时保留库中旧值,不按零值覆盖
 	ResetDay               *int                             `json:"reset_day"` // 同上
 	NodeTrafficResetPeriod *string                          `json:"node_traffic_reset_period"`
@@ -683,12 +691,14 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	pkg := storage.Package{
-		ID:                     req.ID,
-		Name:                   req.Name,
-		Description:            req.Description,
-		TrafficLimitGB:         0,
-		TrafficLimitBytes:      0,
-		CycleDays:              req.CycleDays,
+		ID:                             req.ID,
+		Name:                           req.Name,
+		Description:                    req.Description,
+		TrafficLimitGB:                 req.TrafficLimitGB,
+		NodeModuleTrafficLimitGB:       req.NodeModuleTrafficLimitGB,
+		ServerModuleTrafficLimitGB:     req.ServerModuleTrafficLimitGB,
+		ForwardingModuleTrafficLimitGB: req.ForwardingModuleTrafficLimitGB,
+		CycleDays:                      req.CycleDays,
 		IsReset:                isReset,
 		ResetDay:               resetDay,
 		NodeTrafficResetPeriod: resetPeriod,

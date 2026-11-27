@@ -26,9 +26,9 @@ func NewTrafficLimitEnforcer(repo *storage.TrafficRepository, remoteManage *Remo
 	return &TrafficLimitEnforcer{repo: repo, remoteManage: remoteManage, pusher: pusher, nodeQuotaState: make(map[string]string)}
 }
 
-func nodeQuotaState(user *storage.User, pkg *storage.Package, usage map[int64]int64) string {
+func nodeQuotaState(user *storage.User, pkg *storage.Package, usage map[int64]int64, pkgQuota PackageQuotaState) string {
 	limits := effectiveNodeTrafficLimits(user, pkg)
-	if len(limits) == 0 {
+	if len(limits) == 0 && !pkgQuota.NodeModuleOver {
 		return ""
 	}
 	ids := make([]int64, 0, len(limits))
@@ -37,6 +37,9 @@ func nodeQuotaState(user *storage.User, pkg *storage.Package, usage map[int64]in
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	var state strings.Builder
+	if pkgQuota.NodeModuleOver {
+		state.WriteString("module:1;")
+	}
 	for _, nodeID := range ids {
 		state.WriteString(strconv.FormatInt(nodeID, 10))
 		state.WriteByte(':')
@@ -54,10 +57,15 @@ func (e *TrafficLimitEnforcer) refreshNodeQuotas(ctx context.Context, user stora
 	if e == nil || e.pusher == nil {
 		return
 	}
+	pkgQuota, quotaErr := evaluatePackageQuotaState(ctx, e.repo, &user, pkg)
+	if quotaErr != nil {
+		log.Printf("[TrafficLimitEnforcer] Failed to evaluate package quota for %s: %v", user.Username, quotaErr)
+		return
+	}
 	limits := effectiveNodeTrafficLimits(&user, pkg)
-	hasQuota := len(limits) > 0
+	hasQuota := len(limits) > 0 || pkgQuota.PackageLimitBytes > 0 || pkgQuota.NodeModuleLimitBytes > 0
 	usage := map[int64]int64{}
-	if hasQuota {
+	if len(limits) > 0 {
 		nodeIDs := make([]int64, 0, len(limits))
 		for nodeID := range limits {
 			nodeIDs = append(nodeIDs, nodeID)
@@ -69,7 +77,7 @@ func (e *TrafficLimitEnforcer) refreshNodeQuotas(ctx context.Context, user stora
 			return
 		}
 	}
-	state := nodeQuotaState(&user, pkg, usage)
+	state := nodeQuotaState(&user, pkg, usage, pkgQuota)
 	e.nodeQuotaMu.Lock()
 	previous, seen := e.nodeQuotaState[user.Username]
 	e.nodeQuotaMu.Unlock()
