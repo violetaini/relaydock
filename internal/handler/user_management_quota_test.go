@@ -65,8 +65,8 @@ func TestManagementPackageQuotaReadsAllTiersAndLivePackageEdits(t *testing.T) {
 		t.Fatal(err)
 	}
 	resources, layers = read()
-	if len(layers) != 1 || layers[0].Items[0].Used != 90 {
-		t.Fatalf("single tier after live edit: %+v", layers)
+	if len(layers) != 3 || layers[0].Items[0].Used != 90 || layers[1].Items[0].Limit != 0 || layers[2].Items[0].Limit != 0 {
+		t.Fatalf("unlimited tiers must retain structural usage after live edit: %+v", layers)
 	}
 	overview = buildManagementOverview(user, 90, resources, now, layers...)
 	if overview.LimitedResources != 1 || overview.OverLimit != 0 || overview.NearLimit != 0 {
@@ -85,7 +85,7 @@ func TestManagementPackageQuotaReadsAllTiersAndLivePackageEdits(t *testing.T) {
 		t.Fatal(err)
 	}
 	resources, layers = read()
-	if len(layers) != 1 || layers[0].Key != "module" || layers[0].Items[0].Used != 90 {
+	if len(layers) != 3 || layers[0].Items[0].Limit != 0 || layers[1].Key != "module" || layers[1].Items[0].Used != 90 || layers[2].Items[0].LimitNote == "" {
 		t.Fatalf("module-only quota counters: %+v", layers)
 	}
 	pkg.NodeModuleTrafficLimitGB = 0
@@ -94,7 +94,14 @@ func TestManagementPackageQuotaReadsAllTiersAndLivePackageEdits(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, layers = read()
-	if len(layers) != 0 {
-		t.Fatalf("unconfigured layers fabricated: %+v", layers)
+	if len(layers) != 3 {
+		t.Fatalf("structural layers lost: %+v", layers)
+	}
+	for _, layer := range layers {
+		for _, item := range layer.Items {
+			if item.Limit != 0 {
+				t.Fatalf("unconfigured limit fabricated: %+v", item)
+			}
+		}
 	}
 }

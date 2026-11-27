@@ -344,7 +344,39 @@ func TestPackageFixedNodeTrafficQuotaIsIndependentAndRefreshesChecked(t *testing
 		t.Fatal(err)
 	}
 	enforcer.CheckAll(ctx)
-	assertNodeQuotaRecords(t, agentState.recordsSince(offset), map[string]bool{"quota-a": false, "quota-b": false})
+	records = agentState.recordsSince(offset)
+	assertNodeQuotaRecords(t, records, map[string]bool{"quota-a": false, "quota-b": false})
+	offset += len(records)
+
+	// Neither child has a cap: a module boundary must still deny both peers.
+	pkg.NodeModuleTrafficLimitGB = 200.0 / userTrafficLimitBytesPerGB
+	if err := repo.UpdatePackage(ctx, *pkg); err != nil {
+		t.Fatal(err)
+	}
+	enforcer.CheckAll(ctx)
+	records = agentState.recordsSince(offset)
+	assertNodeQuotaRecords(t, records, map[string]bool{"quota-a": true, "quota-b": true})
+	offset += len(records)
+
+	// Raising the parent cap clears both deny rules without reauthorizing peers.
+	pkg.NodeModuleTrafficLimitGB = 300.0 / userTrafficLimitBytesPerGB
+	if err := repo.UpdatePackage(ctx, *pkg); err != nil {
+		t.Fatal(err)
+	}
+	enforcer.CheckAll(ctx)
+	records = agentState.recordsSince(offset)
+	assertNodeQuotaRecords(t, records, map[string]bool{"quota-a": false, "quota-b": false})
+	offset += len(records)
+
+	// With module and child caps disabled, the package boundary still wins.
+	pkg.NodeModuleTrafficLimitGB = 0
+	pkg.NodeModuleTrafficLimitBytes = 0
+	pkg.TrafficLimitGB = 200.0 / userTrafficLimitBytesPerGB
+	if err := repo.UpdatePackage(ctx, *pkg); err != nil {
+		t.Fatal(err)
+	}
+	enforcer.CheckAll(ctx)
+	assertNodeQuotaRecords(t, agentState.recordsSince(offset), map[string]bool{"quota-a": true, "quota-b": true})
 }
 
 func TestCustomDirectFixedNodeTrafficQuotaUsesUserCycle(t *testing.T) {

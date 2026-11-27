@@ -10,12 +10,13 @@ import (
 )
 
 type managementQuotaItem struct {
-	Kind  string `json:"kind"`
-	ID    int64  `json:"id"`
-	Name  string `json:"name"`
-	Used  int64  `json:"used"`
-	Limit int64  `json:"limit"`
-	Reset string `json:"reset,omitempty"`
+	Kind      string `json:"kind"`
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Used      int64  `json:"used"`
+	Limit     int64  `json:"limit"`
+	Reset     string `json:"reset,omitempty"`
+	LimitNote string `json:"limit_note,omitempty"`
 }
 type managementQuotaLayer struct {
 	Key   string                `json:"key"`
@@ -106,20 +107,18 @@ func managementPackageQuota(ctx context.Context, repo *storage.TrafficRepository
 				v.State = "over_limit"
 			}
 		}
-		if v.Limit > 0 {
-			individual.Items = append(individual.Items, managementQuotaItem{Kind: v.Kind, ID: v.ID, Name: v.Name, Used: v.Used, Limit: v.Limit, Reset: v.Reset})
-		}
+		individual.Items = append(individual.Items, managementQuotaItem{Kind: v.Kind, ID: v.ID, Name: v.Name, Used: v.Used, Limit: v.Limit, Reset: v.Reset, LimitNote: v.LimitNote})
 	}
-	if quota.PackageLimitBytes > 0 {
-		layers = append(layers, managementQuotaLayer{Key: "package", Title: "套餐总量", Total: 1, Items: []managementQuotaItem{{Kind: "package", ID: pkg.ID, Name: pkg.Name, Used: quota.PackageUsedBytes, Limit: quota.PackageLimitBytes, Reset: "各模块按自身周期统计"}}})
-	}
+	layers = append(layers, managementQuotaLayer{Key: "package", Title: "套餐总量", Total: 1, Items: []managementQuotaItem{{Kind: "package", ID: pkg.ID, Name: pkg.Name, Used: quota.PackageUsedBytes, Limit: quota.PackageLimitBytes, Reset: "各模块按自身周期统计"}}})
 	modules := managementQuotaLayer{Key: "module", Title: "模块额度", Items: []managementQuotaItem{}}
 	for _, kind := range []string{"node", "server", "forwarding"} {
 		if moduleCount[kind] > 0 || moduleLimits[kind] > 0 {
 			modules.Total++
-			if moduleLimits[kind] > 0 {
-				modules.Items = append(modules.Items, managementQuotaItem{Kind: kind, Name: moduleNames[kind], Used: moduleUsed[kind], Limit: moduleLimits[kind], Reset: "模块内各资源按自身周期统计"})
+			note := ""
+			if quota.PackageLimitBytes > 0 {
+				note = "受套餐总量额度约束"
 			}
+			modules.Items = append(modules.Items, managementQuotaItem{Kind: kind, Name: moduleNames[kind], Used: moduleUsed[kind], Limit: moduleLimits[kind], Reset: "模块内各资源按自身周期统计", LimitNote: note})
 		}
 	}
 	if len(modules.Items) > 0 {

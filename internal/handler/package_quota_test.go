@@ -147,7 +147,7 @@ func TestEvaluatePackageQuotaStateThreeTiersAndPartialTiers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(layers) != 2 || layers[0].Items[0].Used != 1050 {
+	if len(layers) != 3 || layers[0].Items[0].Used != 1050 {
 		t.Fatalf("package view must include forwarding once: %+v", layers)
 	}
 	foundForward := false
@@ -177,5 +177,48 @@ func TestEvaluatePackageQuotaStateThreeTiersAndPartialTiers(t *testing.T) {
 	}
 	if got := effectiveTunnelGrantState(ctx, repo, user, tunnelGrants[0], storage.TunnelStateActive, now, nil, nil); got != "over_limit" {
 		t.Fatalf("effectiveTunnelGrantState=%s want=over_limit", got)
+	}
+
+	// An unlimited module or individual resource never bypasses its package cap.
+	pkg.NodeModuleTrafficLimitGB, pkg.NodeModuleTrafficLimitBytes = 0, 0
+	pkg.ServerModuleTrafficLimitGB, pkg.ServerModuleTrafficLimitBytes = 0, 0
+	pkg.ForwardingModuleTrafficLimitGB, pkg.ForwardingModuleTrafficLimitBytes = 0, 0
+	pkg.TrafficLimitGB, pkg.TrafficLimitBytes = 2000.0/gb, 2000
+	if err := repo.UpdatePackage(ctx, *pkg); err != nil {
+		t.Fatal(err)
+	}
+	if got := effectiveManagedGrantState(ctx, repo, user, serverGrants[0], 0, now, nil, nil); got != storage.ManagedGrantActive {
+		t.Fatalf("server baseline=%s", got)
+	}
+	if got := effectiveTunnelGrantState(ctx, repo, user, tunnelGrants[0], storage.TunnelStateActive, now, nil, nil); got != "active" {
+		t.Fatalf("forwarding baseline=%s", got)
+	}
+	forwarding := &ForwardingHandler{repo: repo}
+	if !forwarding.activeGrantForForward(ctx, *fwd) {
+		t.Fatal("forwarding baseline must be usable")
+	}
+	pkg.TrafficLimitGB, pkg.TrafficLimitBytes = 1050.0/gb, 1050
+	if err := repo.UpdatePackage(ctx, *pkg); err != nil {
+		t.Fatal(err)
+	}
+	quota, err := evaluatePackageQuotaState(ctx, repo, &user, pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !quota.PackageOver || !quota.NodeModuleOver || !quota.ServerModuleOver || !quota.ForwardingModuleOver {
+		t.Fatalf("exact package boundary did not cascade: %+v", quota)
+	}
+	if got := effectiveManagedGrantState(ctx, repo, user, serverGrants[0], 0, now, nil, nil); got != storage.ManagedGrantOverLimit {
+		t.Fatalf("unlimited server bypassed package: %s", got)
+	}
+	if got := effectiveTunnelGrantState(ctx, repo, user, tunnelGrants[0], storage.TunnelStateActive, now, nil, nil); got != "over_limit" {
+		t.Fatalf("unlimited forwarding bypassed package: %s", got)
+	}
+	if forwarding.activeGrantForForward(ctx, *fwd) {
+		t.Fatal("forwarding must reject an exhausted ancestor")
+	}
+	latest, err := repo.GetUser(ctx, user.Username)
+	if err != nil || !latest.IsActive || latest.PackageID != pkg.ID {
+		t.Fatal("quota policy must not delete assignment or disable the account")
 	}
 }
