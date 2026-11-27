@@ -222,3 +222,121 @@ func TestEvaluatePackageQuotaStateThreeTiersAndPartialTiers(t *testing.T) {
 		t.Fatal("quota policy must not delete assignment or disable the account")
 	}
 }
+
+func TestEvaluatePackageQuotaStateSubscriptionModuleAndPerSubLimits(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "subquota.db"))
+	if err != nil {
+		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+
+	srv := &storage.RemoteServer{
+		Name: "sub-edge", Token: "tok-sub", IPAddress: "10.0.0.10",
+		ListenPort: 2222, XrayMode: "embedded",
+		ConnectionMode: storage.ConnectionModePush, Status: storage.RemoteServerStatusConnected,
+	}
+	if err := repo.CreateRemoteServer(ctx, srv); err != nil {
+		t.Fatal(err)
+	}
+	srvID := srv.ID
+	node1, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "sub-node-1", Protocol: "vless",
+		OriginalServer: "sub-edge", InboundTag: "sub-in-1", Enabled: true,
+		ClashConfig: `{"name":"sub-node-1","type":"vless","server":"10.0.0.10","port":443,"uuid":"u1"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node2, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", NodeName: "sub-node-2", Protocol: "vless",
+		OriginalServer: "sub-edge", InboundTag: "sub-in-2", Enabled: true,
+		ClashConfig: `{"name":"sub-node-2","type":"vless","server":"10.0.0.10","port":444,"uuid":"u2"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub1, err := repo.CreateSubscribeFile(ctx, storage.SubscribeFile{
+		Name: "Sub-A", Type: storage.SubscribeTypeCreate, Filename: "sub_a.yaml",
+		CreatedBy: "admin", SelectedNodeIDs: []int64{node1.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub2, err := repo.CreateSubscribeFile(ctx, storage.SubscribeFile{
+		Name: "Sub-B", Type: storage.SubscribeTypeCreate, Filename: "sub_b.yaml",
+		CreatedBy: "admin", SelectedNodeIDs: []int64{node2.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateUser(ctx, "bob", "bob@example.test", "Bob", "hash", storage.RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	const gb = float64(1024 * 1024 * 1024)
+	pkgID, err := repo.CreatePackage(ctx, storage.Package{
+		Name:                          "SubQuotaPkg",
+		CycleDays:                     30,
+		ResetDay:                      1,
+		TrafficLimitGB:                1000.0 / gb,
+		SubscribeModuleTrafficLimitGB: 500.0 / gb,
+		SubscribeFileIDs:              []int64{sub1.ID, sub2.ID},
+		SubscribeTrafficLimits:        map[int64]float64{sub1.ID: 200.0 / gb, sub2.ID: 400.0 / gb},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := repo.AssignPackageToUser(ctx, "bob", pkgID, now.Add(-time.Hour), now.Add(24*time.Hour), false, 1); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := repo.GetPackage(ctx, pkgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := repo.GetUser(ctx, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sub-A uses 250 bytes (> 200), Sub-B uses 100 bytes (< 400). Module total = 350 (< 500).
+	for _, sample := range []storage.UserTrafficSample{
+		{Email: "bob__sub-in-1", Username: "bob", Downlink: 0, BillingMultiplier: 1},
+		{Email: "bob__sub-in-1", Username: "bob", Downlink: 250, BillingMultiplier: 1},
+		{Email: "bob__sub-in-2", Username: "bob", Downlink: 0, BillingMultiplier: 1},
+		{Email: "bob__sub-in-2", Username: "bob", Downlink: 100, BillingMultiplier: 1},
+	} {
+		if err := repo.UpsertUserTrafficBatch(ctx, srvID, []storage.UserTrafficSample{sample}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	state, err := evaluatePackageQuotaState(ctx, repo, &user, pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.SubscribeModuleOver {
+		t.Fatalf("expected SubscribeModuleOver=false at 350/500, got true")
+	}
+	if !state.SubscribeOver[sub1.ID] || state.SubscribeOver[sub2.ID] {
+		t.Fatalf("expected only sub1 over limit, got: %+v", state.SubscribeOver)
+	}
+	if !state.SubscribeNodeDenied[node1.ID] || state.SubscribeNodeDenied[node2.ID] {
+		t.Fatalf("expected only node1 denied, got: %+v", state.SubscribeNodeDenied)
+	}
+
+	// Push Sub-B to 300 bytes -> module total 550 (> 500), both nodes must be denied!
+	if err := repo.UpsertUserTrafficBatch(ctx, srvID, []storage.UserTrafficSample{
+		{Email: "bob__sub-in-2", Username: "bob", Downlink: 300, BillingMultiplier: 1},
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	state, err = evaluatePackageQuotaState(ctx, repo, &user, pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.SubscribeModuleOver || !state.SubscribeNodeDenied[node1.ID] || !state.SubscribeNodeDenied[node2.ID] {
+		t.Fatalf("expected SubscribeModuleOver and all sub nodes denied, got: %+v", state)
+	}
+}

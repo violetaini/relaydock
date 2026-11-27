@@ -553,7 +553,13 @@ func userManagementUsage(ctx context.Context, repo *storage.TrafficRepository, u
 		if external {
 			note = "包含外部共享节点，仅能展示可按用户统计的关联节点用量"
 		}
-		result = append(result, managementResourceUsage{Kind: "subscription", ID: f.ID, Name: f.Name, Source: assignment[f.ID], Used: sum, Reset: "跟随关联节点", State: "authorized", Related: true, Note: note})
+		subLimit := int64(0)
+		if pkg != nil {
+			if limitGB := pkg.SubscribeTrafficLimits[f.ID]; limitGB > 0 {
+				subLimit = int64(limitGB * 1024 * 1024 * 1024)
+			}
+		}
+		result = append(result, managementResourceUsage{Kind: "subscription", ID: f.ID, Name: f.Name, Source: assignment[f.ID], Used: sum, Limit: subLimit, Reset: "跟随关联节点", State: "authorized", Related: true, Note: note})
 	}
 	if pkg != nil {
 		sum := int64(0)

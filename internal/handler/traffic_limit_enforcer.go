@@ -28,7 +28,7 @@ func NewTrafficLimitEnforcer(repo *storage.TrafficRepository, remoteManage *Remo
 
 func nodeQuotaState(user *storage.User, pkg *storage.Package, usage map[int64]int64, pkgQuota PackageQuotaState) string {
 	limits := effectiveNodeTrafficLimits(user, pkg)
-	if len(limits) == 0 && !pkgQuota.NodeModuleOver {
+	if len(limits) == 0 && !pkgQuota.NodeModuleOver && !pkgQuota.SubscribeModuleOver && len(pkgQuota.SubscribeNodeDenied) == 0 {
 		return ""
 	}
 	ids := make([]int64, 0, len(limits))
@@ -39,6 +39,23 @@ func nodeQuotaState(user *storage.User, pkg *storage.Package, usage map[int64]in
 	var state strings.Builder
 	if pkgQuota.NodeModuleOver {
 		state.WriteString("module:1;")
+	}
+	if pkgQuota.SubscribeModuleOver {
+		state.WriteString("submodule:1;")
+	}
+	if len(pkgQuota.SubscribeNodeDenied) > 0 {
+		subDeniedIDs := make([]int64, 0, len(pkgQuota.SubscribeNodeDenied))
+		for nodeID, denied := range pkgQuota.SubscribeNodeDenied {
+			if denied {
+				subDeniedIDs = append(subDeniedIDs, nodeID)
+			}
+		}
+		sort.Slice(subDeniedIDs, func(i, j int) bool { return subDeniedIDs[i] < subDeniedIDs[j] })
+		for _, nodeID := range subDeniedIDs {
+			state.WriteString("subnode:")
+			state.WriteString(strconv.FormatInt(nodeID, 10))
+			state.WriteByte(';')
+		}
 	}
 	for _, nodeID := range ids {
 		state.WriteString(strconv.FormatInt(nodeID, 10))

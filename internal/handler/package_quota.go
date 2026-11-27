@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/violetaini/relaydock/internal/storage"
@@ -10,8 +11,8 @@ import (
 // PackageQuotaState captures the evaluated three-tier quota status for a
 // package-mode user:
 //   - Tier 1: PackageTotal (TrafficLimitBytes) -> disables all modules if exceeded
-//   - Tier 2: ModuleTotals (NodeModule / ServerModule / ForwardingModule) -> disables only that module if exceeded
-//   - Tier 3: Individual resources (per-node / per-server / per-tunnel) -> evaluated separately per resource
+//   - Tier 2: ModuleTotals (NodeModule / ServerModule / ForwardingModule / SubscribeModule) -> disables only that module if exceeded
+//   - Tier 3: Individual resources (per-node / per-server / per-tunnel / per-subscribe) -> evaluated separately per resource
 //
 // Any tier with limit <= 0 is treated as unlimited/unconfigured, so 1-tier,
 // 2-tier, and 3-tier configurations all work seamlessly.
@@ -31,6 +32,14 @@ type PackageQuotaState struct {
 	ForwardingModuleLimitBytes int64
 	ForwardingModuleUsedBytes  int64
 	ForwardingModuleOver       bool
+
+	SubscribeModuleLimitBytes int64
+	SubscribeModuleUsedBytes  int64
+	SubscribeModuleOver       bool
+
+	SubscribeUsedByID   map[int64]int64
+	SubscribeOver       map[int64]bool
+	SubscribeNodeDenied map[int64]bool
 }
 
 func evaluatePackageQuotaState(ctx context.Context, repo *storage.TrafficRepository, user *storage.User, pkg *storage.Package) (PackageQuotaState, error) {
@@ -48,15 +57,27 @@ func evaluatePackageQuotaUsage(ctx context.Context, repo *storage.TrafficReposit
 	state.NodeModuleLimitBytes = pkg.NodeModuleTrafficLimitBytes
 	state.ServerModuleLimitBytes = pkg.ServerModuleTrafficLimitBytes
 	state.ForwardingModuleLimitBytes = pkg.ForwardingModuleTrafficLimitBytes
+	state.SubscribeModuleLimitBytes = pkg.SubscribeModuleTrafficLimitBytes
+
+	hasSubLimits := false
+	for _, gb := range pkg.SubscribeTrafficLimits {
+		if gb > 0 {
+			hasSubLimits = true
+			break
+		}
+	}
 
 	if state.PackageLimitBytes <= 0 &&
 		state.NodeModuleLimitBytes <= 0 &&
 		state.ServerModuleLimitBytes <= 0 &&
-		state.ForwardingModuleLimitBytes <= 0 && !allUsage {
+		state.ForwardingModuleLimitBytes <= 0 &&
+		state.SubscribeModuleLimitBytes <= 0 &&
+		!hasSubLimits && !allUsage {
 		return state, nil
 	}
 
 	needTotal := state.PackageLimitBytes > 0 || allUsage
+	var cachedNodeUsage map[int64]int64
 
 	if (needTotal || state.NodeModuleLimitBytes > 0) && len(pkg.Nodes) > 0 {
 		nodeIDs := make([]int64, 0, len(pkg.Nodes))
@@ -76,8 +97,46 @@ func evaluatePackageQuotaUsage(ctx context.Context, repo *storage.TrafficReposit
 			if err != nil {
 				return state, err
 			}
+			cachedNodeUsage = usage
 			for _, id := range nodeIDs {
 				state.NodeModuleUsedBytes += usage[id]
+			}
+		}
+	}
+
+	if (needTotal || state.SubscribeModuleLimitBytes > 0 || hasSubLimits) && len(pkg.SubscribeFileIDs) > 0 {
+		subNodeMap, uniqueSubNodes := repo.GetPackageSubscribeNodeMap(ctx, pkg.SubscribeFileIDs)
+		if len(uniqueSubNodes) > 0 {
+			subUsage := cachedNodeUsage
+			if subUsage == nil {
+				var err error
+				subUsage, err = repo.GetUserNodeTraffic(ctx, user.Username, uniqueSubNodes, pkg)
+				if err != nil {
+					return state, err
+				}
+			}
+			for _, nid := range uniqueSubNodes {
+				state.SubscribeModuleUsedBytes += subUsage[nid]
+			}
+			state.SubscribeUsedByID = make(map[int64]int64, len(pkg.SubscribeFileIDs))
+			state.SubscribeOver = make(map[int64]bool, len(pkg.SubscribeFileIDs))
+			state.SubscribeNodeDenied = make(map[int64]bool, len(uniqueSubNodes))
+			for _, subID := range pkg.SubscribeFileIDs {
+				nids := subNodeMap[subID]
+				var used int64
+				for _, nid := range nids {
+					used += subUsage[nid]
+				}
+				state.SubscribeUsedByID[subID] = used
+				if limitGB := pkg.SubscribeTrafficLimits[subID]; limitGB > 0 && !math.IsNaN(limitGB) && !math.IsInf(limitGB, 0) {
+					limitBytes := int64(math.Round(limitGB * 1024 * 1024 * 1024))
+					if trafficLimitExceeded(used, limitBytes) {
+						state.SubscribeOver[subID] = true
+						for _, nid := range nids {
+							state.SubscribeNodeDenied[nid] = true
+						}
+					}
+				}
 			}
 		}
 	}
@@ -112,11 +171,23 @@ func evaluatePackageQuotaUsage(ctx context.Context, repo *storage.TrafficReposit
 		}
 	}
 
+	// Note: pkg.Nodes already includes panel nodes from pkg.SubscribeFileIDs, so NodeModuleUsedBytes
+	// already accounts for subscription panel nodes without double counting.
 	state.PackageUsedBytes = state.NodeModuleUsedBytes + state.ServerModuleUsedBytes + state.ForwardingModuleUsedBytes
 	state.PackageOver = trafficLimitExceeded(state.PackageUsedBytes, state.PackageLimitBytes)
 	state.NodeModuleOver = state.PackageOver || trafficLimitExceeded(state.NodeModuleUsedBytes, state.NodeModuleLimitBytes)
 	state.ServerModuleOver = state.PackageOver || trafficLimitExceeded(state.ServerModuleUsedBytes, state.ServerModuleLimitBytes)
 	state.ForwardingModuleOver = state.PackageOver || trafficLimitExceeded(state.ForwardingModuleUsedBytes, state.ForwardingModuleLimitBytes)
+	state.SubscribeModuleOver = state.PackageOver || trafficLimitExceeded(state.SubscribeModuleUsedBytes, state.SubscribeModuleLimitBytes)
+	if state.SubscribeModuleOver && len(pkg.SubscribeFileIDs) > 0 {
+		_, uniqueSubNodes := repo.GetPackageSubscribeNodeMap(ctx, pkg.SubscribeFileIDs)
+		if state.SubscribeNodeDenied == nil {
+			state.SubscribeNodeDenied = make(map[int64]bool, len(uniqueSubNodes))
+		}
+		for _, nid := range uniqueSubNodes {
+			state.SubscribeNodeDenied[nid] = true
+		}
+	}
 	return state, nil
 }
 

@@ -160,12 +160,17 @@ type createPackageRequest struct {
 	NodeModuleTrafficLimitGB       float64                          `json:"node_module_traffic_limit_gb"`
 	ServerModuleTrafficLimitGB     float64                          `json:"server_module_traffic_limit_gb"`
 	ForwardingModuleTrafficLimitGB float64                          `json:"forwarding_module_traffic_limit_gb"`
+	SubscribeModuleTrafficLimitGB  float64                          `json:"subscribe_module_traffic_limit_gb"`
 	CycleDays                      int                              `json:"cycle_days"`
 	IsReset                bool                             `json:"is_reset"`
 	ResetDay               int                              `json:"reset_day"`
 	NodeTrafficResetPeriod string                           `json:"node_traffic_reset_period"`
 	Nodes                  []int64                          `json:"nodes"`
 	SubscribeFileIDs       []int64                          `json:"subscribe_file_ids"`
+	SubscribeMultipliers   map[int64]float64                `json:"subscribe_multipliers"`
+	SubscribeSpeedLimits   map[int64]float64                `json:"subscribe_speed_limits"`
+	SubscribeTrafficLimits map[int64]float64                `json:"subscribe_traffic_limits"`
+	SubscribeDeviceLimits  map[int64]int                    `json:"subscribe_device_limits"`
 	NodeMultipliers        map[int64]float64                `json:"node_multipliers"`    // node_id → 倍率
 	NodeSpeedLimits        map[int64]float64                `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
 	NodeTrafficLimits      map[int64]float64                `json:"node_traffic_limits"` // 套餐固定节点独立流量额度 (GB);0/缺省=不限
@@ -320,12 +325,13 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if !validNodeTrafficLimits(req.NodeTrafficLimits) {
-		http.Error(w, "Node traffic limits must be finite non-negative GB values", http.StatusBadRequest)
+	if !validNodeTrafficLimits(req.NodeTrafficLimits) || !validNodeTrafficLimits(req.SubscribeTrafficLimits) {
+		http.Error(w, "Traffic limits must be finite non-negative GB values", http.StatusBadRequest)
 		return
 	}
 
-	if (hasNonZeroLimit(req.NodeSpeedLimits) || hasNonZeroIntLimit(req.NodeDeviceLimits) || hasNonZeroLimit(req.NodeTrafficLimits)) && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
+	if (hasNonZeroLimit(req.NodeSpeedLimits) || hasNonZeroIntLimit(req.NodeDeviceLimits) || hasNonZeroLimit(req.NodeTrafficLimits) ||
+		hasNonZeroLimit(req.SubscribeSpeedLimits) || hasNonZeroIntLimit(req.SubscribeDeviceLimits) || hasNonZeroLimit(req.SubscribeTrafficLimits)) && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
 		http.Error(w, "当前构建未启用限速器", http.StatusForbidden)
 		return
 	}
@@ -376,12 +382,17 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		NodeModuleTrafficLimitGB:       req.NodeModuleTrafficLimitGB,
 		ServerModuleTrafficLimitGB:     req.ServerModuleTrafficLimitGB,
 		ForwardingModuleTrafficLimitGB: req.ForwardingModuleTrafficLimitGB,
+		SubscribeModuleTrafficLimitGB:  req.SubscribeModuleTrafficLimitGB,
 		CycleDays:                      req.CycleDays,
 		IsReset:                req.IsReset,
 		ResetDay:               req.ResetDay,
 		NodeTrafficResetPeriod: resetPeriod,
 		Nodes:                  nodes,
 		SubscribeFileIDs:       req.SubscribeFileIDs,
+		SubscribeMultipliers:   req.SubscribeMultipliers,
+		SubscribeSpeedLimits:   req.SubscribeSpeedLimits,
+		SubscribeTrafficLimits: req.SubscribeTrafficLimits,
+		SubscribeDeviceLimits:  req.SubscribeDeviceLimits,
 		NodeMultipliers:        req.NodeMultipliers,
 		NodeSpeedLimits:        req.NodeSpeedLimits,
 		NodeTrafficLimits:      req.NodeTrafficLimits,
@@ -565,12 +576,17 @@ type updatePackageRequest struct {
 	NodeModuleTrafficLimitGB       float64                          `json:"node_module_traffic_limit_gb"`
 	ServerModuleTrafficLimitGB     float64                          `json:"server_module_traffic_limit_gb"`
 	ForwardingModuleTrafficLimitGB float64                          `json:"forwarding_module_traffic_limit_gb"`
+	SubscribeModuleTrafficLimitGB  float64                          `json:"subscribe_module_traffic_limit_gb"`
 	CycleDays                      int                              `json:"cycle_days"`
 	IsReset                *bool                            `json:"is_reset"`  // 指针:请求未携带时保留库中旧值,不按零值覆盖
 	ResetDay               *int                             `json:"reset_day"` // 同上
 	NodeTrafficResetPeriod *string                          `json:"node_traffic_reset_period"`
 	Nodes                  []int64                          `json:"nodes"`
 	SubscribeFileIDs       []int64                          `json:"subscribe_file_ids"`
+	SubscribeMultipliers   map[int64]float64                `json:"subscribe_multipliers"`
+	SubscribeSpeedLimits   map[int64]float64                `json:"subscribe_speed_limits"`
+	SubscribeTrafficLimits map[int64]float64                `json:"subscribe_traffic_limits"`
+	SubscribeDeviceLimits  map[int64]int                    `json:"subscribe_device_limits"`
 	NodeMultipliers        map[int64]float64                `json:"node_multipliers"`    // node_id → 倍率
 	NodeSpeedLimits        map[int64]float64                `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
 	NodeTrafficLimits      map[int64]float64                `json:"node_traffic_limits"` // 套餐固定节点独立流量额度 (GB);0/缺省=不限
@@ -607,12 +623,13 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if !validNodeTrafficLimits(req.NodeTrafficLimits) {
-		http.Error(w, "Node traffic limits must be finite non-negative GB values", http.StatusBadRequest)
+	if !validNodeTrafficLimits(req.NodeTrafficLimits) || !validNodeTrafficLimits(req.SubscribeTrafficLimits) {
+		http.Error(w, "Traffic limits must be finite non-negative GB values", http.StatusBadRequest)
 		return
 	}
 
-	if (hasNonZeroLimit(req.NodeSpeedLimits) || hasNonZeroIntLimit(req.NodeDeviceLimits) || hasNonZeroLimit(req.NodeTrafficLimits)) && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
+	if (hasNonZeroLimit(req.NodeSpeedLimits) || hasNonZeroIntLimit(req.NodeDeviceLimits) || hasNonZeroLimit(req.NodeTrafficLimits) ||
+		hasNonZeroLimit(req.SubscribeSpeedLimits) || hasNonZeroIntLimit(req.SubscribeDeviceLimits) || hasNonZeroLimit(req.SubscribeTrafficLimits)) && h.capabilityManager != nil && !h.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
 		http.Error(w, "当前构建未启用限速器", http.StatusForbidden)
 		return
 	}
@@ -699,12 +716,17 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		NodeModuleTrafficLimitGB:       req.NodeModuleTrafficLimitGB,
 		ServerModuleTrafficLimitGB:     req.ServerModuleTrafficLimitGB,
 		ForwardingModuleTrafficLimitGB: req.ForwardingModuleTrafficLimitGB,
+		SubscribeModuleTrafficLimitGB:  req.SubscribeModuleTrafficLimitGB,
 		CycleDays:                      req.CycleDays,
 		IsReset:                isReset,
 		ResetDay:               resetDay,
 		NodeTrafficResetPeriod: resetPeriod,
 		Nodes:                  nodes,
 		SubscribeFileIDs:       req.SubscribeFileIDs,
+		SubscribeMultipliers:   req.SubscribeMultipliers,
+		SubscribeSpeedLimits:   req.SubscribeSpeedLimits,
+		SubscribeTrafficLimits: req.SubscribeTrafficLimits,
+		SubscribeDeviceLimits:  req.SubscribeDeviceLimits,
 		NodeMultipliers:        req.NodeMultipliers,
 		NodeSpeedLimits:        req.NodeSpeedLimits,
 		NodeTrafficLimits:      req.NodeTrafficLimits,

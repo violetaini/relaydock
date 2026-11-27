@@ -51,6 +51,10 @@ func (r *TrafficRepository) validateAndNormalizePackageBundle(ctx context.Contex
 	if err != nil {
 		return err
 	}
+	pkg.SubscribeModuleTrafficLimitGB, pkg.SubscribeModuleTrafficLimitBytes, err = normalizePackageTrafficQuota("subscribe module", pkg.SubscribeModuleTrafficLimitGB, pkg.SubscribeModuleTrafficLimitBytes)
+	if err != nil {
+		return err
+	}
 
 	if pkg.TrafficLimitBytes > 0 {
 		if pkg.NodeModuleTrafficLimitBytes > pkg.TrafficLimitBytes {
@@ -61,6 +65,24 @@ func (r *TrafficRepository) validateAndNormalizePackageBundle(ctx context.Contex
 		}
 		if pkg.ForwardingModuleTrafficLimitBytes > pkg.TrafficLimitBytes {
 			return errors.New("转发线路模块总流量不能高于套餐总流量")
+		}
+		if pkg.SubscribeModuleTrafficLimitBytes > pkg.TrafficLimitBytes {
+			return errors.New("关联订阅模块总流量不能高于套餐总流量")
+		}
+	}
+
+	for subID, gb := range pkg.SubscribeTrafficLimits {
+		if subID <= 0 || math.IsNaN(gb) || math.IsInf(gb, 0) || gb < 0 || gb > float64(math.MaxInt64)/(1024*1024*1024) {
+			return fmt.Errorf("invalid package traffic limit for subscription %d", subID)
+		}
+		if gb > 0 {
+			subBytes := int64(math.Round(gb * 1024 * 1024 * 1024))
+			if pkg.SubscribeModuleTrafficLimitBytes > 0 && subBytes > pkg.SubscribeModuleTrafficLimitBytes {
+				return fmt.Errorf("关联订阅 #%d 流量额度不能高于关联订阅模块总流量", subID)
+			}
+			if pkg.TrafficLimitBytes > 0 && subBytes > pkg.TrafficLimitBytes {
+				return fmt.Errorf("关联订阅 #%d 流量额度不能高于套餐总流量", subID)
+			}
 		}
 	}
 
@@ -205,6 +227,30 @@ func (r *TrafficRepository) validateAndNormalizePackageBundle(ctx context.Contex
 		pkg.SubscribeFileIDs = []int64{}
 	}
 	return nil
+}
+
+func (r *TrafficRepository) GetPackageSubscribeNodeMap(ctx context.Context, subIDs []int64) (map[int64][]int64, []int64) {
+	bySub := make(map[int64][]int64, len(subIDs))
+	var uniqueNodes []int64
+	seen := make(map[int64]bool)
+	for _, subID := range subIDs {
+		if subID <= 0 {
+			continue
+		}
+		subFile, err := r.GetSubscribeFileByID(ctx, subID)
+		if err != nil {
+			continue
+		}
+		nodeIDs := r.collectSubscribeFilePanelNodeIDs(ctx, subFile)
+		bySub[subID] = nodeIDs
+		for _, nid := range nodeIDs {
+			if nid > 0 && !seen[nid] {
+				seen[nid] = true
+				uniqueNodes = append(uniqueNodes, nid)
+			}
+		}
+	}
+	return bySub, uniqueNodes
 }
 
 func (r *TrafficRepository) collectSubscribeFilePanelNodeIDs(ctx context.Context, sub SubscribeFile) []int64 {

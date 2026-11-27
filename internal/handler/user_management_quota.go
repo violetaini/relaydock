@@ -57,9 +57,9 @@ func managementPackageQuota(ctx context.Context, repo *storage.TrafficRepository
 	if err != nil {
 		return nil, nil, err
 	}
-	moduleLimits := map[string]int64{"node": quota.NodeModuleLimitBytes, "server": quota.ServerModuleLimitBytes, "forwarding": quota.ForwardingModuleLimitBytes}
-	moduleUsed := map[string]int64{"node": quota.NodeModuleUsedBytes, "server": quota.ServerModuleUsedBytes, "forwarding": quota.ForwardingModuleUsedBytes}
-	moduleNames := map[string]string{"node": "节点模块", "server": "服务器模块", "forwarding": "转发模块"}
+	moduleLimits := map[string]int64{"node": quota.NodeModuleLimitBytes, "server": quota.ServerModuleLimitBytes, "forwarding": quota.ForwardingModuleLimitBytes, "subscription": quota.SubscribeModuleLimitBytes}
+	moduleUsed := map[string]int64{"node": quota.NodeModuleUsedBytes, "server": quota.ServerModuleUsedBytes, "forwarding": quota.ForwardingModuleUsedBytes, "subscription": quota.SubscribeModuleUsedBytes}
+	moduleNames := map[string]string{"node": "节点模块", "server": "服务器模块", "forwarding": "转发模块", "subscription": "订阅模块"}
 	moduleCount := map[string]int{}
 	individual := managementQuotaLayer{Key: "resource", Title: "单独资源", Items: []managementQuotaItem{}}
 	seen := map[string]bool{}
@@ -111,7 +111,7 @@ func managementPackageQuota(ctx context.Context, repo *storage.TrafficRepository
 	}
 	layers = append(layers, managementQuotaLayer{Key: "package", Title: "套餐总量", Total: 1, Items: []managementQuotaItem{{Kind: "package", ID: pkg.ID, Name: pkg.Name, Used: quota.PackageUsedBytes, Limit: quota.PackageLimitBytes, Reset: "各模块按自身周期统计"}}})
 	modules := managementQuotaLayer{Key: "module", Title: "模块额度", Items: []managementQuotaItem{}}
-	for _, kind := range []string{"node", "server", "forwarding"} {
+	for _, kind := range []string{"node", "subscription", "server", "forwarding"} {
 		if moduleCount[kind] > 0 || moduleLimits[kind] > 0 {
 			modules.Total++
 			note := ""

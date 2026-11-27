@@ -641,7 +641,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			pkg = pkgCache[user.PackageID]
 		}
 		ref := physicalByTag[c.InboundTag] // 不存在时 NodeID=0,resolveLimit 容错
-		nodeTrafficDenied := (hasPackageAccess && pkgQuotaByUser[c.Username].NodeModuleOver) ||
+		nodeTrafficDenied := (hasPackageAccess && (pkgQuotaByUser[c.Username].NodeModuleOver || pkgQuotaByUser[c.Username].SubscribeNodeDenied[ref.NodeID])) ||
 			((hasPackageAccess || hasDirectAccess) && userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[c.Username], ref.NodeID))
 		speedMbps, deviceLimit := float64(0), 0
 		physicalNodeID := ref.NodeID
@@ -720,7 +720,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		}
 		ref := routedByTag[sa.InboundTag]
 		speedMbps, deviceLimit := resolveLimit(user, pkg, ref.NodeID, ref.ParentID)
-		nodeTrafficDenied := (pkg != nil && pkgQuotaByUser[sa.Username].NodeModuleOver) ||
+		nodeTrafficDenied := (pkg != nil && (pkgQuotaByUser[sa.Username].NodeModuleOver || pkgQuotaByUser[sa.Username].SubscribeNodeDenied[ref.NodeID])) ||
 			userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[sa.Username], ref.NodeID)
 		var speedBytes uint64
 		if speedMbps > 0 {
