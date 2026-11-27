@@ -916,3 +916,49 @@ func productTestWriteWebArchive(t *testing.T, path string, metadata productrelea
 		t.Fatal(err)
 	}
 }
+
+func TestDetectSystemdUnitFromCgroupAndInstalledUnits(t *testing.T) {
+	dir := t.TempDir()
+	relaydockCgroup := filepath.Join(dir, "cgroup-relaydock")
+	if err := os.WriteFile(relaydockCgroup, []byte("0::/system.slice/relaydock.service\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectSystemdUnitFromCgroup(relaydockCgroup); got != "relaydock" {
+		t.Fatalf("detectSystemdUnitFromCgroup(relaydock) = %q, want %q", got, "relaydock")
+	}
+
+	runnerCgroup := filepath.Join(dir, "cgroup-runner")
+	if err := os.WriteFile(runnerCgroup, []byte("0::/system.slice/actions.runner.service\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectSystemdUnitFromCgroup(runnerCgroup); got != "" {
+		t.Fatalf("detectSystemdUnitFromCgroup(runner) = %q, want empty", got)
+	}
+
+	helperCgroup := filepath.Join(dir, "cgroup-helper")
+	if err := os.WriteFile(helperCgroup, []byte("0::/system.slice/arcway-update-0123456789abcdef01234567.service\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectSystemdUnitFromCgroup(helperCgroup); got != "" {
+		t.Fatalf("detectSystemdUnitFromCgroup(helper) = %q, want empty", got)
+	}
+
+	unitDir := filepath.Join(dir, "systemd")
+	if err := os.MkdirAll(unitDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, "relaydock.service"), []byte("[Unit]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/null", filepath.Join(unitDir, "arcway.service")); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectInstalledSystemdUnit(unitDir); got != "relaydock" {
+		t.Fatalf("detectInstalledSystemdUnit() = %q, want %q", got, "relaydock")
+	}
+
+	t.Setenv(productUpdateSystemdUnitEnv, "custom-relaydock")
+	if got := defaultSystemdUnit(); got != "custom-relaydock" {
+		t.Fatalf("defaultSystemdUnit() with env = %q, want %q", got, "custom-relaydock")
+	}
+}

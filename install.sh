@@ -1071,6 +1071,7 @@ SyslogIdentifier=$SERVICE_NAME
 Environment="PORT=$PORT_INPUT"
 Environment="DATABASE_PATH=$DATA_DIR/data/arcway.db"
 Environment="LOG_LEVEL=info"
+Environment="ARCWAY_SYSTEMD_UNIT=$SERVICE_NAME"
 Environment="ARCWAY_GUARD_ASSET_DIR=$GUARD_ASSET_DIR"
 Environment="ARCWAY_PANEL_IPS=$PANEL_SOURCE_IPS"
 

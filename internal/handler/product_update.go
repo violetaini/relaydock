@@ -239,7 +239,82 @@ func defaultSystemdUnit() string {
 	if unit := strings.TrimSpace(os.Getenv(productUpdateSystemdUnitEnv)); unit != "" {
 		return unit
 	}
+	if unit := detectSystemdUnitFromCgroup("/proc/self/cgroup"); unit != "" {
+		return unit
+	}
+	if unit := detectInstalledSystemdUnit("/etc/systemd/system"); unit != "" {
+		return unit
+	}
 	return "arcway"
+}
+
+func detectSystemdUnitFromCgroup(cgroupPath string) string {
+	raw, err := os.ReadFile(cgroupPath)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		segments := strings.Split(parts[2], "/")
+		for i := len(segments) - 1; i >= 0; i-- {
+			segment := strings.TrimSpace(segments[i])
+			if !strings.HasSuffix(segment, ".service") {
+				continue
+			}
+			unit := strings.TrimSuffix(segment, ".service")
+			if isControlPlaneSystemdUnit(unit) {
+				return unit
+			}
+		}
+	}
+	return ""
+}
+
+func isControlPlaneSystemdUnit(unit string) bool {
+	if !productUpdateUnitPattern.MatchString(unit) {
+		return false
+	}
+	if strings.HasPrefix(unit, "arcway-update-") {
+		return false
+	}
+	return unit == "relaydock" ||
+		unit == "arcway" ||
+		strings.HasPrefix(unit, "relaydock-") ||
+		strings.HasPrefix(unit, "arcway-")
+}
+
+func detectInstalledSystemdUnit(unitDir string) string {
+	relaydockReady := systemdUnitUsable(filepath.Join(unitDir, "relaydock.service"))
+	arcwayReady := systemdUnitUsable(filepath.Join(unitDir, "arcway.service"))
+	if relaydockReady && !arcwayReady {
+		return "relaydock"
+	}
+	if arcwayReady {
+		return "arcway"
+	}
+	if relaydockReady {
+		return "relaydock"
+	}
+	return ""
+}
+
+func systemdUnitUsable(unitPath string) bool {
+	target, err := os.Readlink(unitPath)
+	if err == nil && strings.TrimSpace(target) == "/dev/null" {
+		return false
+	}
+	info, err := os.Stat(unitPath)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
 }
 
 func defaultUpdateHealthURL() string {
