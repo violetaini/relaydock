@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -18,29 +19,30 @@ import (
 )
 
 type userEntry struct {
-	Username               string   `json:"username"`
-	Email                  string   `json:"email"`
-	Nickname               string   `json:"nickname"`
-	Avatar                 string   `json:"avatar_url"`
-	Role                   string   `json:"role"`
-	IsActive               bool     `json:"is_active"`
-	Remark                 string   `json:"remark"`
-	AuthorizationMode      string   `json:"authorization_mode"`
-	PackageID              *int64   `json:"package_id"`
-	PackageName            string   `json:"package_name,omitempty"`
-	TrafficLimitGB         float64  `json:"traffic_limit_gb,omitempty"`
-	TrafficUsed            int64    `json:"traffic_used,omitempty"`
-	TrafficLimit           int64    `json:"traffic_limit,omitempty"`
-	TrafficMultiplier      int64    `json:"traffic_multiplier,omitempty"` // 套餐流量倍率(oneway=1/twoway=2),供首页按用户流量列表换算计费流量
-	IsOverLimit            bool     `json:"is_over_limit"`
-	IsReset                bool     `json:"is_reset"`
-	ResetDay               int      `json:"reset_day"`
-	NodeTrafficResetPeriod string   `json:"node_traffic_reset_period"`
-	PackageEndDate         *string  `json:"package_end_date,omitempty"`
-	SpeedLimitMbps         float64  `json:"speed_limit_mbps"`
-	DeviceLimit            int      `json:"device_limit"`
-	SpeedLimitOverride     *float64 `json:"speed_limit_override"`
-	DeviceLimitOverride    *int     `json:"device_limit_override"`
+	CreatedAt              time.Time `json:"created_at"`
+	Username               string    `json:"username"`
+	Email                  string    `json:"email"`
+	Nickname               string    `json:"nickname"`
+	Avatar                 string    `json:"avatar_url"`
+	Role                   string    `json:"role"`
+	IsActive               bool      `json:"is_active"`
+	Remark                 string    `json:"remark"`
+	AuthorizationMode      string    `json:"authorization_mode"`
+	PackageID              *int64    `json:"package_id"`
+	PackageName            string    `json:"package_name,omitempty"`
+	TrafficLimitGB         float64   `json:"traffic_limit_gb,omitempty"`
+	TrafficUsed            int64     `json:"traffic_used,omitempty"`
+	TrafficLimit           int64     `json:"traffic_limit,omitempty"`
+	TrafficMultiplier      int64     `json:"traffic_multiplier,omitempty"` // 套餐流量倍率(oneway=1/twoway=2),供首页按用户流量列表换算计费流量
+	IsOverLimit            bool      `json:"is_over_limit"`
+	IsReset                bool      `json:"is_reset"`
+	ResetDay               int       `json:"reset_day"`
+	NodeTrafficResetPeriod string    `json:"node_traffic_reset_period"`
+	PackageEndDate         *string   `json:"package_end_date,omitempty"`
+	SpeedLimitMbps         float64   `json:"speed_limit_mbps"`
+	DeviceLimit            int       `json:"device_limit"`
+	SpeedLimitOverride     *float64  `json:"speed_limit_override"`
+	DeviceLimitOverride    *int      `json:"device_limit_override"`
 	// nil=继承套餐,0=显式不限,>0=用户覆盖;TrafficLimit 是已解析后的有效值。
 	TrafficLimitOverrideGB    *float64          `json:"traffic_limit_override_gb"`
 	NodeSpeedLimitOverrides   map[int64]float64 `json:"node_speed_limit_overrides,omitempty"`
@@ -95,79 +97,87 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 
-		pkgMap := make(map[int64]storage.Package)
-		packages, _ := repo.ListPackages(r.Context())
-		for _, p := range packages {
-			pkgMap[p.ID] = p
-		}
-
-		trafficMap, _ := repo.ListUserBillableTraffic(r.Context())
-
-		// 一次性查所有用户短码,避免列表循环里逐个 query(N+1)。
-		shortCodeMap, _ := repo.ListUserShortCodeInfo(r.Context())
-
-		entries := make([]userEntry, 0, len(users))
-		for _, user := range users {
-			scInfo := shortCodeMap[user.Username]
-			authorizationMode := user.AuthorizationMode
-			// package_id is the durable source of truth during legacy and
-			// in-flight migrations; never expose a stale custom mode to the UI.
-			if user.PackageID > 0 {
-				authorizationMode = storage.AuthorizationModePackage
-			}
-			entry := userEntry{
-				Username:            user.Username,
-				Email:               user.Email,
-				Nickname:            user.Nickname,
-				Avatar:              user.AvatarURL,
-				Role:                user.Role,
-				IsActive:            user.IsActive,
-				Remark:              user.Remark,
-				AuthorizationMode:   authorizationMode,
-				UserShortCode:       scInfo.UserShortCode,
-				CustomUserShortCode: scInfo.CustomUserShortCode,
-			}
-			// Aggregate traffic and speed are retired. Device and per-node
-			// values remain valid detailed overrides in either authorization mode.
-			entry.DeviceLimitOverride = user.DeviceLimitOverride
-			entry.NodeSpeedLimitOverrides = user.NodeSpeedLimitOverrides
-			entry.NodeTrafficLimitOverrides = user.NodeTrafficLimitOverrides
-			entry.NodeDeviceLimitOverrides = user.NodeDeviceLimitOverrides
-			if user.PackageID > 0 {
-				pid := user.PackageID
-				entry.PackageID = &pid
-				var pkgPtr *storage.Package
-				if pkg, ok := pkgMap[pid]; ok {
-					pkgCopy := pkg
-					pkgPtr = &pkgCopy
-					entry.PackageName = pkg.Name
-					entry.SpeedLimitMbps = pkg.SpeedLimitMbps
-					entry.DeviceLimit = pkg.DeviceLimit
-				}
-				entry.TrafficLimit = resolveTrafficLimitBytes(&user, pkgPtr)
-				entry.TrafficLimitGB = float64(entry.TrafficLimit) / userTrafficLimitBytesPerGB
-				used := trafficMap[user.Username]
-				if pkg, ok := pkgMap[pid]; ok {
-					entry.TrafficMultiplier = pkg.TrafficMultiplier()
-				}
-				entry.TrafficUsed = used
-				if trafficLimitExceeded(entry.TrafficUsed, entry.TrafficLimit) {
-					entry.IsOverLimit = true
-				}
-				entry.IsReset = user.IsReset
-				entry.ResetDay = user.ResetDay
-				entry.NodeTrafficResetPeriod = user.NodeTrafficResetPeriod
-				if user.PackageEndDate != nil {
-					s := user.PackageEndDate.Format("2006-01-02")
-					entry.PackageEndDate = &s
-				}
-			}
-			entries = append(entries, entry)
-		}
+		entries := buildUserEntries(r.Context(), repo, users)
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"users": entries})
 	})
+}
+
+func buildUserEntries(ctx context.Context, repo *storage.TrafficRepository, users []storage.User) []userEntry {
+	pkgMap := make(map[int64]storage.Package)
+	packages, _ := repo.ListPackages(ctx)
+	for _, p := range packages {
+		pkgMap[p.ID] = p
+	}
+
+	trafficMap, _ := repo.ListUserBillableTraffic(ctx)
+
+	// 一次性查所有用户短码,避免列表循环里逐个 query(N+1)。
+	shortCodeMap, _ := repo.ListUserShortCodeInfo(ctx)
+
+	entries := make([]userEntry, 0, len(users))
+	for _, user := range users {
+		scInfo := shortCodeMap[user.Username]
+		authorizationMode := user.AuthorizationMode
+		// package_id is the durable source of truth during legacy and
+		// in-flight migrations; never expose a stale custom mode to the UI.
+		if user.PackageID > 0 {
+			authorizationMode = storage.AuthorizationModePackage
+		}
+		entry := userEntry{
+			Username:            user.Username,
+			CreatedAt:           user.CreatedAt,
+			TrafficUsed:         trafficMap[user.Username],
+			Email:               user.Email,
+			Nickname:            user.Nickname,
+			Avatar:              user.AvatarURL,
+			Role:                user.Role,
+			IsActive:            user.IsActive,
+			Remark:              user.Remark,
+			AuthorizationMode:   authorizationMode,
+			UserShortCode:       scInfo.UserShortCode,
+			CustomUserShortCode: scInfo.CustomUserShortCode,
+		}
+		// Aggregate traffic and speed are retired. Device and per-node
+		// values remain valid detailed overrides in either authorization mode.
+		entry.DeviceLimitOverride = user.DeviceLimitOverride
+		entry.NodeSpeedLimitOverrides = user.NodeSpeedLimitOverrides
+		entry.NodeTrafficLimitOverrides = user.NodeTrafficLimitOverrides
+		entry.NodeDeviceLimitOverrides = user.NodeDeviceLimitOverrides
+		if user.PackageID > 0 {
+			pid := user.PackageID
+			entry.PackageID = &pid
+			var pkgPtr *storage.Package
+			if pkg, ok := pkgMap[pid]; ok {
+				pkgCopy := pkg
+				pkgPtr = &pkgCopy
+				entry.PackageName = pkg.Name
+				entry.SpeedLimitMbps = pkg.SpeedLimitMbps
+				entry.DeviceLimit = pkg.DeviceLimit
+			}
+			entry.TrafficLimit = resolveTrafficLimitBytes(&user, pkgPtr)
+			entry.TrafficLimitGB = float64(entry.TrafficLimit) / userTrafficLimitBytesPerGB
+			used := trafficMap[user.Username]
+			if pkg, ok := pkgMap[pid]; ok {
+				entry.TrafficMultiplier = pkg.TrafficMultiplier()
+			}
+			entry.TrafficUsed = used
+			if trafficLimitExceeded(entry.TrafficUsed, entry.TrafficLimit) {
+				entry.IsOverLimit = true
+			}
+			entry.IsReset = user.IsReset
+			entry.ResetDay = user.ResetDay
+			entry.NodeTrafficResetPeriod = user.NodeTrafficResetPeriod
+			if user.PackageEndDate != nil {
+				s := user.PackageEndDate.Format("2006-01-02")
+				entry.PackageEndDate = &s
+			}
+		}
+		entries = append(entries, entry)
+	}
+
+	return entries
 }
 
 // NewUserStatusHandler 切换 user.is_active。

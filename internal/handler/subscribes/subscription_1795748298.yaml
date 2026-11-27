@@ -1,0 +1,7 @@
+proxies:
+  - name: "🇯🇵 Tokyo-Local-01"
+    type: ss
+    server: 5.5.5.5
+    port: 8388
+    cipher: aes-128-gcm
+    password: test

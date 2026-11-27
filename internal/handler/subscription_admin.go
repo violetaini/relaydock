@@ -423,6 +423,15 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 
 		// 从上下文中获取用户名
 		username := auth.UsernameFromContext(r.Context())
+		if auth.IsGlobalAPIToken(r.Context()) {
+			var err error
+			username, err = repo.FindActiveAdminUsername(r.Context())
+			if err != nil || username == "" {
+				writeError(w, http.StatusServiceUnavailable, errors.New("管理员账号不可用"))
+				return
+			}
+		}
+
 		if username == "" {
 			writeError(w, http.StatusUnauthorized, errors.New("username not found in context"))
 			return
@@ -435,6 +444,11 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 
+		assignmentSources, err := repo.SubscriptionAssignmentSources(r.Context(), username)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 		var files []storage.SubscribeFile
 
 		// 管理员用户可以查看所有订阅
@@ -504,16 +518,20 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 		_ = user // role 字段不再用于此处的短码逻辑(保留 user 变量供其他地方使用)
 
 		type item struct {
-			ID              int64     `json:"id"`
-			Name            string    `json:"name"`
-			Description     string    `json:"description"`
-			Filename        string    `json:"filename"`
-			Type            string    `json:"type"`
-			CanDelete       bool      `json:"can_delete"`
-			FileShortCode   string    `json:"file_short_code,omitempty"`
-			CustomShortCode string    `json:"custom_short_code,omitempty"`
-			UpdatedAt       time.Time `json:"updated_at"`
-			LatestVersion   int64     `json:"latest_version,omitempty"`
+			ID               int64     `json:"id"`
+			Name             string    `json:"name"`
+			Description      string    `json:"description"`
+			Filename         string    `json:"filename"`
+			Type             string    `json:"type"`
+			CanDelete        bool      `json:"can_delete"`
+			CanManage        bool      `json:"can_manage"`
+			Kind             string    `json:"kind"`
+			AccessSource     string    `json:"access_source"`
+			AvailableClients []string  `json:"available_clients,omitempty"`
+			FileShortCode    string    `json:"file_short_code,omitempty"`
+			CustomShortCode  string    `json:"custom_short_code,omitempty"`
+			UpdatedAt        time.Time `json:"updated_at"`
+			LatestVersion    int64     `json:"latest_version,omitempty"`
 		}
 
 		payload := make([]item, 0, len(files))
@@ -530,17 +548,39 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 				customShortCode = file.CustomShortCode
 			}
 
+			accessSource := "assigned"
+			if file.CreatedBy == username {
+				accessSource = "owned"
+			} else if file.Type == "package" || assignmentSources[file.ID] == "package" {
+				accessSource = "package"
+			} else if user.Role == storage.RoleAdmin {
+				accessSource = "managed"
+			}
+			availableClients := []string{}
+			if file.Generation != nil {
+				seenClients := map[string]bool{}
+				for _, out := range file.Generation.Outputs {
+					if out.Client != "" && !seenClients[out.Client] {
+						availableClients = append(availableClients, out.Client)
+						seenClients[out.Client] = true
+					}
+				}
+			}
 			payload = append(payload, item{
-				ID:              file.ID,
-				Name:            file.Name,
-				Description:     file.Description,
-				Filename:        file.Filename,
-				Type:            file.Type,
-				CanDelete:       file.ID > 0 && (user.Role == storage.RoleAdmin || file.CreatedBy == username),
-				FileShortCode:   fileShortCode,
-				CustomShortCode: customShortCode,
-				UpdatedAt:       file.UpdatedAt,
-				LatestVersion:   latestVersion,
+				ID:               file.ID,
+				CanManage:        file.ID > 0 && (user.Role == storage.RoleAdmin || file.CreatedBy == username),
+				Kind:             subscriptionKind(file),
+				AccessSource:     accessSource,
+				AvailableClients: availableClients,
+				Name:             file.Name,
+				Description:      file.Description,
+				Filename:         file.Filename,
+				Type:             file.Type,
+				CanDelete:        file.ID > 0 && (user.Role == storage.RoleAdmin || file.CreatedBy == username),
+				FileShortCode:    fileShortCode,
+				CustomShortCode:  customShortCode,
+				UpdatedAt:        file.UpdatedAt,
+				LatestVersion:    latestVersion,
 			})
 		}
 

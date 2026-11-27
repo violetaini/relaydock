@@ -887,6 +887,9 @@ func (h *ServiceAuthorizationHandler) applyCustomDesired(ctx context.Context, us
 		return nil, nil, err
 	}
 	for _, item := range fixed {
+		if !managementGrantInScope(ctx, "node", item.Grant.NodeID) {
+			continue
+		}
 		if item.Grant.SourceType != storage.GrantSourceManual || item.Source.DesiredState != storage.ManagedDesiredActive {
 			continue
 		}
@@ -907,6 +910,9 @@ func (h *ServiceAuthorizationHandler) applyCustomDesired(ctx context.Context, us
 		return cleanupWarnings, provisionWarnings, err
 	}
 	for _, grant := range servers {
+		if !managementGrantInScope(ctx, "server", grant.ServerID) {
+			continue
+		}
 		if grant.SourceType != storage.GrantSourceManual || !grant.Enabled {
 			continue
 		}
@@ -929,6 +935,9 @@ func (h *ServiceAuthorizationHandler) applyCustomDesired(ctx context.Context, us
 		return cleanupWarnings, provisionWarnings, err
 	}
 	for _, grant := range tunnels {
+		if !managementGrantInScope(ctx, "forwarding", grant.TunnelID) {
+			continue
+		}
 		if grant.SourceType != storage.GrantSourceManual || !grant.Enabled {
 			continue
 		}
@@ -947,6 +956,9 @@ func (h *ServiceAuthorizationHandler) applyCustomDesired(ctx context.Context, us
 	}
 
 	for _, desired := range *request.FixedNodeGrants {
+		if !managementGrantInScope(ctx, "node", desired.NodeID) {
+			continue
+		}
 		item, _, upsertErr := h.repo.UpsertManualUserNodeGrant(ctx, username, desired.NodeID, desired.ExpiresAt, actor)
 		if upsertErr != nil {
 			return cleanupWarnings, provisionWarnings, upsertErr
@@ -962,9 +974,15 @@ func (h *ServiceAuthorizationHandler) applyCustomDesired(ctx context.Context, us
 	}
 	serverExisting := make(map[int64]storage.UserServerGrant, len(servers))
 	for _, grant := range servers {
+		if !managementGrantInScope(ctx, "server", grant.ServerID) {
+			continue
+		}
 		serverExisting[grant.ServerID] = grant
 	}
 	for _, desired := range *request.ServerGrants {
+		if !managementGrantInScope(ctx, "server", desired.ServerID) {
+			continue
+		}
 		model := storage.UserServerGrant{
 			Username: username, ServerID: desired.ServerID, Enabled: true, StartsAt: desired.StartsAt.UTC(), ExpiresAt: desired.ExpiresAt,
 			MaxActiveNodes: desired.MaxActiveNodes, SpeedLimitMbps: desired.SpeedLimitMbps,
@@ -995,9 +1013,15 @@ func (h *ServiceAuthorizationHandler) applyCustomDesired(ctx context.Context, us
 	}
 	tunnelExisting := make(map[int64]storage.UserTunnelGrant, len(tunnels))
 	for _, grant := range tunnels {
+		if !managementGrantInScope(ctx, "forwarding", grant.TunnelID) {
+			continue
+		}
 		tunnelExisting[grant.TunnelID] = grant
 	}
 	for _, desired := range *request.ForwardingGrants {
+		if !managementGrantInScope(ctx, "forwarding", desired.TunnelID) {
+			continue
+		}
 		billingMode := desired.BillingModeOverride
 		model := storage.UserTunnelGrant{
 			Username: username, TunnelID: desired.TunnelID, Enabled: true, StartsAt: desired.StartsAt.UTC(), ExpiresAt: desired.ExpiresAt,
