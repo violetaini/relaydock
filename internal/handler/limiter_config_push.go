@@ -319,6 +319,10 @@ func (p *LimiterConfigPusher) buildManagedLimiterLimits(ctx context.Context, ser
 }
 
 func resolveLimit(user *storage.User, pkg *storage.Package, nodeID, parentID int64) (speedMbps float64, deviceLimit int) {
+	return resolveLimitWithSubscriptions(user, pkg, nil, nodeID, parentID)
+}
+
+func resolveLimitWithSubscriptions(user *storage.User, pkg *storage.Package, subNodeMap map[int64][]int64, nodeID, parentID int64) (speedMbps float64, deviceLimit int) {
 	// 限速
 	switch {
 	case user != nil && nodeID > 0:
@@ -334,6 +338,10 @@ func resolveLimit(user *storage.User, pkg *storage.Package, nodeID, parentID int
 		}
 		if pkg != nil {
 			if v, ok := pkg.SpeedLimitMbpsForNode(nodeID, &parentID); ok {
+				speedMbps = v
+				break
+			}
+			if v, ok := pkg.SubscribeSpeedLimitForNode(nodeID, &parentID, subNodeMap); ok {
 				speedMbps = v
 				break
 			}
@@ -359,6 +367,10 @@ func resolveLimit(user *storage.User, pkg *storage.Package, nodeID, parentID int
 		}
 		if pkg != nil {
 			if v, ok := pkg.DeviceLimitForNode(nodeID, &parentID); ok {
+				deviceLimit = v
+				break
+			}
+			if v, ok := pkg.SubscribeDeviceLimitForNode(nodeID, &parentID, subNodeMap); ok {
 				deviceLimit = v
 				break
 			}
@@ -399,10 +411,11 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		subaccs, _ = p.repo.ListActiveSubaccountsByServerName(ctx, serverName)
 	}
 
-	// 预加载 inbound_tag → node(主账号走 physical,routed 子账号走 routed)
-	// 同 tag 上可能同时有 physical + routed,所以用两张 map 分流。
-	physicalByTag := make(map[string]storage.InboundNodeRef)
-	routedByTag := make(map[string]storage.InboundNodeRef)
+	// 预加载 inbound_tag → nodes(主账号走 physical,routed 子账号走 routed)
+	// 同 tag 上可能同时有多个 physical node 或多个 routed node,必须按列表和 exact nodeID 保留,
+	// 防止同端口不同节点/不同套餐限速被后者覆盖。
+	physicalRefsByTag := make(map[string][]storage.InboundNodeRef)
+	routedRefsByID := make(map[int64]storage.InboundNodeRef)
 	allInboundTags := make(map[string]struct{})
 	nodeRefsLoaded := false
 	if serverName != "" {
@@ -415,13 +428,18 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 				}
 				allInboundTags[tag] = struct{}{}
 				if r.NodeType == "routed" {
-					routedByTag[tag] = r
+					routedRefsByID[r.NodeID] = r
 				} else {
-					physicalByTag[tag] = r
+					physicalRefsByTag[tag] = append(physicalRefsByTag[tag], r)
 				}
+			}
+			for tag, list := range physicalRefsByTag {
+				sort.Slice(list, func(i, j int) bool { return list[i].NodeID < list[j].NodeID })
+				physicalRefsByTag[tag] = list
 			}
 		}
 	}
+	userFixedNodeCache := make(map[string]map[int64]bool)
 
 	usernames := make(map[string]bool)
 	for _, c := range configs {
@@ -439,6 +457,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 	pendingDisableUsers := make(map[string]bool)
 	overLimitUsers := make(map[string]bool)
 	pkgCache := make(map[int64]*storage.Package)
+	pkgSubNodeCache := make(map[int64]map[int64][]int64)
 	pkgQuotaByUser := make(map[string]PackageQuotaState)
 
 	for username := range usernames {
@@ -640,22 +659,94 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if user.AuthorizationMode == storage.AuthorizationModePackage && user.PackageID > 0 {
 			pkg = pkgCache[user.PackageID]
 		}
-		ref := physicalByTag[c.InboundTag] // 不存在时 NodeID=0,resolveLimit 容错
-		nodeTrafficDenied := (hasPackageAccess && (pkgQuotaByUser[c.Username].NodeModuleOver || pkgQuotaByUser[c.Username].SubscribeNodeDenied[ref.NodeID])) ||
-			((hasPackageAccess || hasDirectAccess) && userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[c.Username], ref.NodeID))
-		speedMbps, deviceLimit := float64(0), 0
-		physicalNodeID := ref.NodeID
+		var subMap map[int64][]int64
+		if pkg != nil && len(pkg.SubscribeFileIDs) > 0 &&
+			(len(pkg.SubscribeSpeedLimits) > 0 || len(pkg.SubscribeDeviceLimits) > 0 || len(physicalRefsByTag[c.InboundTag]) > 1) {
+			if _, ok := pkgSubNodeCache[pkg.ID]; !ok {
+				m, _ := p.repo.GetPackageSubscribeNodeMap(ctx, pkg.SubscribeFileIDs)
+				pkgSubNodeCache[pkg.ID] = m
+			}
+			subMap = pkgSubNodeCache[pkg.ID]
+		}
+		tagRefs := physicalRefsByTag[c.InboundTag]
 		managedLimit, hasManagedLimit := managedLimits[managedLimiterKey{username: c.Username, inboundTag: c.InboundTag}]
+		evalRefs := tagRefs
+		if len(tagRefs) > 1 {
+			allowedNodeIDs := make(map[int64]bool)
+			if hasManagedAccess && hasManagedLimit && managedLimit.nodeID > 0 {
+				allowedNodeIDs[managedLimit.nodeID] = true
+			}
+			if hasPackageAccess && pkg != nil {
+				for _, nid := range pkg.Nodes {
+					if nid > 0 {
+						allowedNodeIDs[nid] = true
+					}
+				}
+				for _, nodeIDs := range subMap {
+					for _, nid := range nodeIDs {
+						if nid > 0 {
+							allowedNodeIDs[nid] = true
+						}
+					}
+				}
+			}
+			if hasDirectAccess {
+				fixedSet, cached := userFixedNodeCache[c.Username]
+				if !cached {
+					fixedSet = make(map[int64]bool)
+					if grants, gErr := p.repo.ListUserNodeGrants(ctx, c.Username); gErr == nil {
+						for _, g := range grants {
+							if g.Grant.NodeID > 0 {
+								fixedSet[g.Grant.NodeID] = true
+							}
+						}
+					}
+					userFixedNodeCache[c.Username] = fixedSet
+				}
+				for nid := range fixedSet {
+					allowedNodeIDs[nid] = true
+				}
+			}
+			var matched []storage.InboundNodeRef
+			for _, ref := range tagRefs {
+				if allowedNodeIDs[ref.NodeID] {
+					matched = append(matched, ref)
+				}
+			}
+			if len(matched) > 0 {
+				evalRefs = matched
+			}
+		}
+		if len(evalRefs) == 0 {
+			evalRefs = []storage.InboundNodeRef{{}}
+		}
+		physicalNodeID := evalRefs[0].NodeID
+		nodeTrafficDenied := false
+		speedMbps, deviceLimit := float64(0), 0
 		if hasManagedAccess && hasManagedLimit {
 			speedMbps, deviceLimit = managedLimit.speedMbps, managedLimit.connectionLimit
 			physicalNodeID = managedLimit.nodeID
 			if hasPackageAccess {
-				packageSpeed, packageDevices := resolveLimit(user, pkg, ref.NodeID, ref.ParentID)
-				speedMbps = strictestPositiveFloat(speedMbps, packageSpeed)
-				deviceLimit = strictestPositiveInt(deviceLimit, packageDevices)
+				for _, ref := range evalRefs {
+					if (pkgQuotaByUser[c.Username].NodeModuleOver || pkgQuotaByUser[c.Username].SubscribeNodeDenied[ref.NodeID]) ||
+						userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[c.Username], ref.NodeID) {
+						nodeTrafficDenied = true
+					}
+					packageSpeed, packageDevices := resolveLimitWithSubscriptions(user, pkg, subMap, ref.NodeID, ref.ParentID)
+					speedMbps = strictestPositiveFloat(speedMbps, packageSpeed)
+					deviceLimit = strictestPositiveInt(deviceLimit, packageDevices)
+				}
 			}
 		} else if hasPackageAccess || hasDirectAccess {
-			speedMbps, deviceLimit = resolveLimit(user, pkg, ref.NodeID, ref.ParentID)
+			for _, ref := range evalRefs {
+				if (hasPackageAccess && (pkgQuotaByUser[c.Username].NodeModuleOver || pkgQuotaByUser[c.Username].SubscribeNodeDenied[ref.NodeID])) ||
+					userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[c.Username], ref.NodeID) {
+					nodeTrafficDenied = true
+				}
+				nodeSpeed, nodeDevices := resolveLimitWithSubscriptions(user, pkg, subMap, ref.NodeID, ref.ParentID)
+				speedMbps = strictestPositiveFloat(speedMbps, nodeSpeed)
+				deviceLimit = strictestPositiveInt(deviceLimit, nodeDevices)
+			}
 		} else if !hasDeletionResidual && !hasDisableResidual && !hasOverLimitPackageResidual && !hasManagedRevocationResidual &&
 			!hasWireGuardCredentialResidual {
 			// A desired source can briefly outlive its grant state until the
@@ -718,9 +809,26 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if user.AuthorizationMode == storage.AuthorizationModePackage && user.PackageID > 0 {
 			pkg = pkgCache[user.PackageID]
 		}
-		ref := routedByTag[sa.InboundTag]
-		speedMbps, deviceLimit := resolveLimit(user, pkg, ref.NodeID, ref.ParentID)
-		nodeTrafficDenied := (pkg != nil && (pkgQuotaByUser[sa.Username].NodeModuleOver || pkgQuotaByUser[sa.Username].SubscribeNodeDenied[ref.NodeID])) ||
+		ref, hasRoutedRef := routedRefsByID[sa.RoutedNodeID]
+		if !hasRoutedRef {
+			ref = storage.InboundNodeRef{
+				InboundTag: sa.InboundTag,
+				NodeID:     sa.RoutedNodeID,
+				ParentID:   sa.ParentNodeID,
+				NodeType:   "routed",
+			}
+		}
+		var subMap map[int64][]int64
+		if pkg != nil && (len(pkg.SubscribeSpeedLimits) > 0 || len(pkg.SubscribeDeviceLimits) > 0) && len(pkg.SubscribeFileIDs) > 0 {
+			if _, ok := pkgSubNodeCache[pkg.ID]; !ok {
+				m, _ := p.repo.GetPackageSubscribeNodeMap(ctx, pkg.SubscribeFileIDs)
+				pkgSubNodeCache[pkg.ID] = m
+			}
+			subMap = pkgSubNodeCache[pkg.ID]
+		}
+		speedMbps, deviceLimit := resolveLimitWithSubscriptions(user, pkg, subMap, ref.NodeID, ref.ParentID)
+		packageExpired := user.AuthorizationMode == storage.AuthorizationModePackage && !packageAssignmentActive(*user, now)
+		nodeTrafficDenied := (!packageExpired && pkg != nil && (pkgQuotaByUser[sa.Username].NodeModuleOver || pkgQuotaByUser[sa.Username].SubscribeNodeDenied[ref.NodeID])) ||
 			userNodeTrafficExceeded(user, pkg, nodeTrafficUsage[sa.Username], ref.NodeID)
 		var speedBytes uint64
 		if speedMbps > 0 {
@@ -731,7 +839,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		// removal are acknowledged. The row is intentionally still returned by
 		// the repository while revoke_pending=1 so a checked snapshot can replace
 		// the prior normal bucket instead of silently dropping it.
-		subaccountDenied := !user.IsActive || overLimitUsers[sa.Username] || sa.RevokePending || nodeTrafficDenied ||
+		subaccountDenied := !user.IsActive || overLimitUsers[sa.Username] || sa.RevokePending || nodeTrafficDenied || packageExpired ||
 			pendingDisableUsers[sa.Username] || pendingDeletionUsers[sa.Username]
 		if subaccountDenied {
 			speedBytes = revocationResidualDenySpeedBytes
@@ -768,10 +876,21 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if users == nil {
 			users = []WSUserLimitInfo{}
 		}
-		var rules []storage.AutoSpeedLimitRule
+		pkgIDs := make([]int64, 0, len(tagPkgIDs[tag]))
 		for pkgID := range tagPkgIDs[tag] {
+			pkgIDs = append(pkgIDs, pkgID)
+		}
+		sort.Slice(pkgIDs, func(i, j int) bool { return pkgIDs[i] < pkgIDs[j] })
+		var rules []storage.AutoSpeedLimitRule
+		seenRules := make(map[storage.AutoSpeedLimitRule]bool)
+		for _, pkgID := range pkgIDs {
 			if pkg, ok := pkgCache[pkgID]; ok && len(pkg.AutoSpeedRules) > 0 {
-				rules = append(rules, pkg.AutoSpeedRules...)
+				for _, r := range pkg.AutoSpeedRules {
+					if !seenRules[r] {
+						seenRules[r] = true
+						rules = append(rules, r)
+					}
+				}
 			}
 		}
 		peerAddresses := make([]string, 0, len(tagWireGuardPeers[tag]))
@@ -1295,6 +1414,53 @@ func (p *LimiterConfigPusher) pushViaHTTPChecked(ctx context.Context, server *st
 	return nil
 }
 
+func (p *LimiterConfigPusher) collectServerIDsForUser(ctx context.Context, username string, strict bool) ([]int64, error) {
+	configs, err := p.repo.GetUserInboundConfigs(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	serverIDs := make(map[int64]bool)
+	for _, c := range configs {
+		if c.ServerID > 0 {
+			serverIDs[c.ServerID] = true
+		}
+	}
+	// 只有 routed 子账号、没有物理 inbound 的用户,上面查不到 server —— 补上子账号所在 server。
+	if subIDs, err := p.repo.ListServerIDsForUserSubaccounts(ctx, username); err == nil {
+		for _, sid := range subIDs {
+			if sid > 0 {
+				serverIDs[sid] = true
+			}
+		}
+	} else if strict {
+		return nil, err
+	}
+	if grants, err := p.repo.ListUserServerGrants(ctx, username); err == nil {
+		for _, grant := range grants {
+			if grant.ServerID > 0 {
+				serverIDs[grant.ServerID] = true
+			}
+		}
+	} else if strict {
+		return nil, err
+	}
+	if forwards, err := p.repo.ListUserForwards(ctx, username); err == nil {
+		for _, forward := range forwards {
+			if len(forward.Hops) > 0 && forward.Hops[0].ServerID > 0 {
+				serverIDs[forward.Hops[0].ServerID] = true
+			}
+		}
+	} else if strict {
+		return nil, err
+	}
+	ordered := make([]int64, 0, len(serverIDs))
+	for sid := range serverIDs {
+		ordered = append(ordered, sid)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	return ordered, nil
+}
+
 func (p *LimiterConfigPusher) PushToAllServersForPackage(ctx context.Context, packageID int64) {
 	if p.capabilityManager != nil && !p.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
 		return
@@ -1304,27 +1470,26 @@ func (p *LimiterConfigPusher) PushToAllServersForPackage(ctx context.Context, pa
 		return
 	}
 
-	serverIDs := make(map[int64]bool)
+	serverIDSet := make(map[int64]bool)
 	for _, u := range users {
 		if u.PackageID != packageID {
 			continue
 		}
-		configs, err := p.repo.GetUserInboundConfigs(ctx, u.Username)
+		userServers, err := p.collectServerIDsForUser(ctx, u.Username, false)
 		if err != nil {
 			continue
 		}
-		for _, c := range configs {
-			serverIDs[c.ServerID] = true
-		}
-		// 同 PushToAllServersForUser:补上该用户 routed 子账号所在 server,避免 routed-only 用户漏推。
-		if subIDs, err := p.repo.ListServerIDsForUserSubaccounts(ctx, u.Username); err == nil {
-			for _, id := range subIDs {
-				serverIDs[id] = true
-			}
+		for _, sid := range userServers {
+			serverIDSet[sid] = true
 		}
 	}
 
-	for sid := range serverIDs {
+	ordered := make([]int64, 0, len(serverIDSet))
+	for sid := range serverIDSet {
+		ordered = append(ordered, sid)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	for _, sid := range ordered {
 		p.PushToServer(ctx, sid)
 	}
 }
@@ -1333,24 +1498,11 @@ func (p *LimiterConfigPusher) PushToAllServersForUser(ctx context.Context, usern
 	if p.capabilityManager != nil && !p.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
 		return
 	}
-	configs, err := p.repo.GetUserInboundConfigs(ctx, username)
+	ordered, err := p.collectServerIDsForUser(ctx, username, false)
 	if err != nil {
 		return
 	}
-
-	serverIDs := make(map[int64]bool)
-	for _, c := range configs {
-		serverIDs[c.ServerID] = true
-	}
-	// 只有 routed 子账号、没有物理 inbound 的用户,上面查不到 server —— 补上子账号所在 server,
-	// 否则这些用户在用户管理/套餐里设的限速对该 server 永不下发。
-	if subIDs, err := p.repo.ListServerIDsForUserSubaccounts(ctx, username); err == nil {
-		for _, id := range subIDs {
-			serverIDs[id] = true
-		}
-	}
-
-	for sid := range serverIDs {
+	for _, sid := range ordered {
 		p.PushToServer(ctx, sid)
 	}
 }
@@ -1364,26 +1516,10 @@ func (p *LimiterConfigPusher) PushToAllServersForUserChecked(ctx context.Context
 	if p.capabilityManager != nil && !p.capabilityManager.HasFeature(capabilities.FeatureLimiter) {
 		return errors.New("limiter capability is unavailable")
 	}
-	configs, err := p.repo.GetUserInboundConfigs(ctx, username)
+	ordered, err := p.collectServerIDsForUser(ctx, username, true)
 	if err != nil {
 		return err
 	}
-	serverIDs := make(map[int64]bool)
-	for _, config := range configs {
-		serverIDs[config.ServerID] = true
-	}
-	if subIDs, err := p.repo.ListServerIDsForUserSubaccounts(ctx, username); err == nil {
-		for _, serverID := range subIDs {
-			serverIDs[serverID] = true
-		}
-	} else {
-		return err
-	}
-	ordered := make([]int64, 0, len(serverIDs))
-	for serverID := range serverIDs {
-		ordered = append(ordered, serverID)
-	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
 	var joined error
 	for _, serverID := range ordered {
 		if err := p.PushToServerChecked(ctx, serverID); err != nil {

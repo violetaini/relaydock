@@ -313,32 +313,32 @@ func NormalizeNodeTrafficResetPeriod(value string) (string, error) {
 // directly, while server and forwarding entries materialize as source-tracked
 // grants when the package is assigned to a user.
 type Package struct {
-	ID                     int64             `json:"id"`
-	Name                   string            `json:"name"`
-	Description            string            `json:"description"`
-	TrafficLimitGB                    float64           `json:"traffic_limit_gb"`                       // 套餐总流量限制 (GB)，0=不限
-	TrafficLimitBytes                 int64             `json:"-"`                                      // 套餐总流量限制（字节）
-	NodeModuleTrafficLimitGB          float64           `json:"node_module_traffic_limit_gb"`           // 固定节点模块总流量限制 (GB)，0=不限
-	NodeModuleTrafficLimitBytes       int64             `json:"-"`                                      // 固定节点模块总流量限制（字节）
-	ServerModuleTrafficLimitGB        float64           `json:"server_module_traffic_limit_gb"`         // 服务器授权模块总流量限制 (GB)，0=不限
-	ServerModuleTrafficLimitBytes     int64             `json:"-"`                                      // 服务器授权模块总流量限制（字节）
-	ForwardingModuleTrafficLimitGB    float64           `json:"forwarding_module_traffic_limit_gb"`     // 转发线路模块总流量限制 (GB)，0=不限
-	ForwardingModuleTrafficLimitBytes int64             `json:"-"`                                      // 转发线路模块总流量限制（字节）
-	SubscribeModuleTrafficLimitGB     float64           `json:"subscribe_module_traffic_limit_gb"`      // 关联订阅模块总流量限制 (GB)，0=不限
-	SubscribeModuleTrafficLimitBytes  int64             `json:"-"`                                      // 关联订阅模块总流量限制（字节）
-	CycleDays              int               `json:"cycle_days"`                 // 包裹持续时间（天）
-	IsReset                bool              `json:"is_reset"`                   // 是否启用固定节点流量定期重置
-	ResetDay               int               `json:"reset_day"`                  // 重置的月份日期 (1-31)
-	NodeTrafficResetPeriod string            `json:"node_traffic_reset_period"`  // monthly / quarterly / yearly
-	Nodes                  []int64           `json:"nodes"`                      // 关联节点 ID
-	SubscribeFileIDs       []int64           `json:"subscribe_file_ids,omitempty"` // 关联订阅 ID
-	SubscribeMultipliers   map[int64]float64 `json:"subscribe_multipliers,omitempty"`   // subscribe_id → 倍率
-	SubscribeSpeedLimits   map[int64]float64 `json:"subscribe_speed_limits,omitempty"`  // subscribe_id → 限速 (Mbps)
-	SubscribeTrafficLimits map[int64]float64 `json:"subscribe_traffic_limits,omitempty"` // subscribe_id → 流量额度 (GB)
-	SubscribeDeviceLimits  map[int64]int     `json:"subscribe_device_limits,omitempty"`  // subscribe_id → 设备数限制
-	NodeMultipliers        map[int64]float64 `json:"node_multipliers,omitempty"` // node_id → 倍率;遗留套餐为 nil = 全部按 1
-	SpeedLimitMbps         float64           `json:"speed_limit_mbps"`           // 限速 (Mbps)，0=不限
-	DeviceLimit            int               `json:"device_limit"`               // 设备数限制，0=不限
+	ID                                int64             `json:"id"`
+	Name                              string            `json:"name"`
+	Description                       string            `json:"description"`
+	TrafficLimitGB                    float64           `json:"traffic_limit_gb"`                   // 套餐总流量限制 (GB)，0=不限
+	TrafficLimitBytes                 int64             `json:"-"`                                  // 套餐总流量限制（字节）
+	NodeModuleTrafficLimitGB          float64           `json:"node_module_traffic_limit_gb"`       // 固定节点模块总流量限制 (GB)，0=不限
+	NodeModuleTrafficLimitBytes       int64             `json:"-"`                                  // 固定节点模块总流量限制（字节）
+	ServerModuleTrafficLimitGB        float64           `json:"server_module_traffic_limit_gb"`     // 服务器授权模块总流量限制 (GB)，0=不限
+	ServerModuleTrafficLimitBytes     int64             `json:"-"`                                  // 服务器授权模块总流量限制（字节）
+	ForwardingModuleTrafficLimitGB    float64           `json:"forwarding_module_traffic_limit_gb"` // 转发线路模块总流量限制 (GB)，0=不限
+	ForwardingModuleTrafficLimitBytes int64             `json:"-"`                                  // 转发线路模块总流量限制（字节）
+	SubscribeModuleTrafficLimitGB     float64           `json:"subscribe_module_traffic_limit_gb"`  // 关联订阅模块总流量限制 (GB)，0=不限
+	SubscribeModuleTrafficLimitBytes  int64             `json:"-"`                                  // 关联订阅模块总流量限制（字节）
+	CycleDays                         int               `json:"cycle_days"`                         // 包裹持续时间（天）
+	IsReset                           bool              `json:"is_reset"`                           // 是否启用固定节点流量定期重置
+	ResetDay                          int               `json:"reset_day"`                          // 重置的月份日期 (1-31)
+	NodeTrafficResetPeriod            string            `json:"node_traffic_reset_period"`          // monthly / quarterly / yearly
+	Nodes                             []int64           `json:"nodes"`                              // 关联节点 ID
+	SubscribeFileIDs                  []int64           `json:"subscribe_file_ids,omitempty"`       // 关联订阅 ID
+	SubscribeMultipliers              map[int64]float64 `json:"subscribe_multipliers,omitempty"`    // subscribe_id → 倍率
+	SubscribeSpeedLimits              map[int64]float64 `json:"subscribe_speed_limits,omitempty"`   // subscribe_id → 限速 (Mbps)
+	SubscribeTrafficLimits            map[int64]float64 `json:"subscribe_traffic_limits,omitempty"` // subscribe_id → 流量额度 (GB)
+	SubscribeDeviceLimits             map[int64]int     `json:"subscribe_device_limits,omitempty"`  // subscribe_id → 设备数限制
+	NodeMultipliers                   map[int64]float64 `json:"node_multipliers,omitempty"`         // node_id → 倍率;遗留套餐为 nil = 全部按 1
+	SpeedLimitMbps                    float64           `json:"speed_limit_mbps"`                   // 限速 (Mbps)，0=不限
+	DeviceLimit                       int               `json:"device_limit"`                       // 设备数限制，0=不限
 	// 套餐级 per-node 限速覆盖。map 含 key 即生效:0 = 显式不限速,>0 = 该值;不含 key = 不限速。
 	NodeSpeedLimits map[int64]float64 `json:"node_speed_limits,omitempty"`
 	// 套餐固定节点独立流量额度，单位 GB。0/缺省均表示该节点不限流量；
@@ -6493,6 +6493,45 @@ func (r *TrafficRepository) GetUserSubscriptionIDs(ctx context.Context, username
 	return ids, nil
 }
 
+// GetEffectiveUserSubscriptionIDs returns manual subscription assignments plus
+// package-sourced assignments only when activePackageID matches a currently
+// valid package assignment.
+func (r *TrafficRepository) GetEffectiveUserSubscriptionIDs(ctx context.Context, username string, activePackageID int64) ([]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return nil, errors.New("username is required")
+	}
+	const stmt = `
+		SELECT us.subscription_id
+		FROM user_subscriptions us
+		INNER JOIN subscribe_files sf ON us.subscription_id = sf.id
+		WHERE us.username = ?
+		  AND (COALESCE(us.source_type, 'manual') != 'package' OR (? > 0 AND us.source_package_id = ?))
+		ORDER BY us.created_at ASC
+	`
+	rows, err := r.db.QueryContext(ctx, stmt, username, activePackageID, activePackageID)
+	if err != nil {
+		return nil, fmt.Errorf("get effective user subscription IDs: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan effective subscription ID: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate effective subscription IDs: %w", err)
+	}
+	return ids, nil
+}
+
 // 使用提供的列表替换用户的所有订阅。
 // UserShortCodeInfo 用户短码信息。
 type UserShortCodeInfo struct {
@@ -10203,17 +10242,19 @@ func (r *TrafficRepository) ListSubaccountsByRoutedNode(ctx context.Context, rou
 }
 
 // ListActiveSubaccountsByServerName 用于 limiter 下发:列出某 server 上所有 active 子账号
-// 以及其挂的 inbound_tag(继承自父物理节点)。需要 JOIN nodes 表拿 inbound 信息。
+// 以及其挂的 inbound_tag(继承自父物理节点)和 routed/parent 节点 ID。
 type ActiveSubaccountForLimiter struct {
 	Username      string
 	Email         string
 	InboundTag    string
+	RoutedNodeID  int64
+	ParentNodeID  int64
 	RevokePending bool
 }
 
 func (r *TrafficRepository) ListActiveSubaccountsByServerName(ctx context.Context, serverName string) ([]ActiveSubaccountForLimiter, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT sa.username, sa.email, COALESCE(n.inbound_tag, ''), sa.revoke_pending
+		SELECT sa.username, sa.email, COALESCE(n.inbound_tag, ''), sa.routed_node_id, COALESCE(n.parent_node_id, 0), sa.revoke_pending
 		FROM user_subaccounts sa
 		INNER JOIN nodes n ON sa.routed_node_id = n.id
 		WHERE (sa.is_active = 1 OR sa.revoke_pending = 1 OR sa.activation_pending = 1)
@@ -10227,7 +10268,7 @@ func (r *TrafficRepository) ListActiveSubaccountsByServerName(ctx context.Contex
 	for rows.Next() {
 		var a ActiveSubaccountForLimiter
 		var pending int
-		if err := rows.Scan(&a.Username, &a.Email, &a.InboundTag, &pending); err != nil {
+		if err := rows.Scan(&a.Username, &a.Email, &a.InboundTag, &a.RoutedNodeID, &a.ParentNodeID, &pending); err != nil {
 			return nil, err
 		}
 		a.RevokePending = pending == 1
@@ -10425,7 +10466,8 @@ type UserTrafficBilling struct {
 }
 
 type trafficBillingUser struct {
-	packageID int64
+	packageID         int64
+	authorizationMode string
 }
 
 type trafficBillingNode struct {
@@ -10434,8 +10476,10 @@ type trafficBillingNode struct {
 }
 
 type trafficBillingPackage struct {
-	trafficMode     string
-	nodeMultipliers map[int64]float64
+	trafficMode          string
+	nodeMultipliers      map[int64]float64
+	subscribeFileIDs     []int64
+	subscribeMultipliers map[int64]float64
 }
 
 type trafficBillingSnapshot struct {
@@ -10446,6 +10490,7 @@ type trafficBillingSnapshot struct {
 	usersByEmail  map[string]string
 	usernames     []string
 	packages      map[int64]trafficBillingPackage
+	subNodeMap    map[int64][]int64
 	physicalByTag map[string]int64
 }
 
@@ -10548,9 +10593,12 @@ func (s *trafficBillingSnapshot) resolve(email string) UserTrafficBilling {
 			if pkg.trafficMode == "twoway" {
 				multiplier *= 2
 			}
-			if configured, ok := pkg.nodeMultipliers[nodeID]; nodeID > 0 && ok && configured > 0 {
-				multiplier *= configured
+			pkgHelper := Package{
+				NodeMultipliers:      pkg.nodeMultipliers,
+				SubscribeFileIDs:     pkg.subscribeFileIDs,
+				SubscribeMultipliers: pkg.subscribeMultipliers,
 			}
+			multiplier *= pkgHelper.MultiplierForNodeWithSubscriptions(nodeID, s.subNodeMap)
 		}
 	}
 	return UserTrafficBilling{Username: username, Multiplier: normalizeTrafficBillingMultiplier(multiplier)}
@@ -10576,18 +10624,18 @@ func (r *TrafficRepository) buildTrafficBillingSnapshot(ctx context.Context, ser
 		}
 	}
 
-	rows, err := r.db.QueryContext(ctx, `SELECT username, COALESCE(email, ''), COALESCE(package_id, 0) FROM users`)
+	rows, err := r.db.QueryContext(ctx, `SELECT username, COALESCE(email, ''), COALESCE(package_id, 0), COALESCE(authorization_mode, '') FROM users`)
 	if err != nil {
 		return nil, fmt.Errorf("list billing users: %w", err)
 	}
 	for rows.Next() {
-		var username, email string
+		var username, email, authorizationMode string
 		var packageID int64
-		if err := rows.Scan(&username, &email, &packageID); err != nil {
+		if err := rows.Scan(&username, &email, &packageID, &authorizationMode); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan billing user: %w", err)
 		}
-		snapshot.users[username] = trafficBillingUser{packageID: packageID}
+		snapshot.users[username] = trafficBillingUser{packageID: packageID, authorizationMode: authorizationMode}
 		snapshot.usernames = append(snapshot.usernames, username)
 		if email != "" {
 			snapshot.usersByEmail[email] = username
@@ -10600,24 +10648,43 @@ func (r *TrafficRepository) buildTrafficBillingSnapshot(ctx context.Context, ser
 	rows.Close()
 	sort.Slice(snapshot.usernames, func(i, j int) bool { return len(snapshot.usernames[i]) > len(snapshot.usernames[j]) })
 
-	rows, err = r.db.QueryContext(ctx, `SELECT id, COALESCE(traffic_mode, 'oneway'), COALESCE(node_multipliers, '{}') FROM packages`)
+	rows, err = r.db.QueryContext(ctx, `SELECT id, COALESCE(traffic_mode, 'oneway'), COALESCE(node_multipliers, '{}'), COALESCE(subscribe_file_ids, '[]'), COALESCE(subscribe_multipliers, '{}') FROM packages`)
 	if err != nil {
 		return nil, fmt.Errorf("list billing packages: %w", err)
 	}
+	var allSubIDs []int64
+	seenSubIDs := make(map[int64]bool)
 	for rows.Next() {
 		var id int64
-		var mode, multipliersJSON string
-		if err := rows.Scan(&id, &mode, &multipliersJSON); err != nil {
+		var mode, multipliersJSON, subIDsJSON, subMultipliersJSON string
+		if err := rows.Scan(&id, &mode, &multipliersJSON, &subIDsJSON, &subMultipliersJSON); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan billing package: %w", err)
 		}
-		pkg := trafficBillingPackage{trafficMode: mode, nodeMultipliers: map[int64]float64{}}
+		pkg := trafficBillingPackage{
+			trafficMode:          mode,
+			nodeMultipliers:      map[int64]float64{},
+			subscribeMultipliers: map[int64]float64{},
+		}
 		_ = json.Unmarshal([]byte(multipliersJSON), &pkg.nodeMultipliers)
+		_ = json.Unmarshal([]byte(subIDsJSON), &pkg.subscribeFileIDs)
+		_ = json.Unmarshal([]byte(subMultipliersJSON), &pkg.subscribeMultipliers)
+		for _, subID := range pkg.subscribeFileIDs {
+			if subID > 0 && !seenSubIDs[subID] {
+				seenSubIDs[subID] = true
+				allSubIDs = append(allSubIDs, subID)
+			}
+		}
 		snapshot.packages[id] = pkg
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return nil, fmt.Errorf("iterate billing packages: %w", err)
+	}
+	rows.Close()
+
+	if len(allSubIDs) > 0 {
+		snapshot.subNodeMap, _ = r.GetPackageSubscribeNodeMap(ctx, allSubIDs)
 	}
 	rows.Close()
 
@@ -11045,8 +11112,12 @@ func (r *TrafficRepository) GetUserWeightedTraffic(ctx context.Context, username
 	}
 
 	// 套餐空 / 无倍率配置 → 直接用 user_traffic(按 username 聚合,等价于全 1)
-	if pkg == nil || len(pkg.NodeMultipliers) == 0 {
+	if pkg == nil || (len(pkg.NodeMultipliers) == 0 && len(pkg.SubscribeMultipliers) == 0) {
 		return r.GetUserTotalTraffic(ctx, username)
+	}
+	var weightedSubNodeMap map[int64][]int64
+	if len(pkg.SubscribeMultipliers) > 0 && len(pkg.SubscribeFileIDs) > 0 {
+		weightedSubNodeMap, _ = r.GetPackageSubscribeNodeMap(ctx, pkg.SubscribeFileIDs)
 	}
 
 	// 预加载:server_id → server.name(反查主账号节点用)
@@ -11134,7 +11205,7 @@ func (r *TrafficRepository) GetUserWeightedTraffic(ctx context.Context, username
 
 		// 子账号路径(routed):每个 routed 节点用它自己的倍率(独立,不再回退父/根节点)。
 		if nid, ok := subaccNodeID[email]; ok {
-			weighted += float64(bytes) * pkg.MultiplierForNode(nid)
+			weighted += float64(bytes) * pkg.MultiplierForNodeWithSubscriptions(nid, weightedSubNodeMap)
 			continue
 		}
 
@@ -11144,7 +11215,7 @@ func (r *TrafficRepository) GetUserWeightedTraffic(ctx context.Context, username
 			srvName := serverNames[serverID]
 			if srvName != "" {
 				if nid, ok := nodeByServerTag[srvName+"\x00"+tag]; ok {
-					weighted += float64(bytes) * pkg.MultiplierForNode(nid)
+					weighted += float64(bytes) * pkg.MultiplierForNodeWithSubscriptions(nid, weightedSubNodeMap)
 					continue
 				}
 			}
@@ -11189,6 +11260,11 @@ func (r *TrafficRepository) GetUserNodeTraffic(ctx context.Context, username str
 	}
 	if len(allowed) == 0 {
 		return usage, nil
+	}
+
+	var subNodeMap map[int64][]int64
+	if pkg != nil && len(pkg.SubscribeMultipliers) > 0 && len(pkg.SubscribeFileIDs) > 0 {
+		subNodeMap, _ = r.GetPackageSubscribeNodeMap(ctx, pkg.SubscribeFileIDs)
 	}
 
 	serverNames := make(map[int64]string)
@@ -11293,7 +11369,7 @@ WHERE email = ?
 		}
 		if pkg != nil && initialized == 0 {
 			multiplier := 1.0
-			multiplier = pkg.MultiplierForNode(nodeID) * float64(pkg.TrafficMultiplier())
+			multiplier = pkg.MultiplierForNodeWithSubscriptions(nodeID, subNodeMap) * float64(pkg.TrafficMultiplier())
 			bytes = billTrafficBytes(rawBytes, multiplier)
 		}
 		usage[nodeID] = saturatingTrafficAdd(usage[nodeID], bytes)

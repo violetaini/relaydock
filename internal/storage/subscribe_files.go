@@ -479,6 +479,7 @@ func (r *TrafficRepository) UpdateSubscribeFile(ctx context.Context, file Subscr
 		}
 		return SubscribeFile{}, ErrSubscribeFileChanged
 	}
+	r.invalidateTrafficBillingCache()
 	return r.GetSubscribeFileByID(ctx, file.ID)
 }
 
@@ -692,7 +693,11 @@ func (r *TrafficRepository) DeleteSubscribeFile(ctx context.Context, id int64, e
 			return fmt.Errorf("delete subscribe rule versions: %w", err)
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	r.invalidateTrafficBillingCache()
+	return nil
 }
 
 func (r *TrafficRepository) ReorderSubscribeFiles(ctx context.Context, ids []int64) error {

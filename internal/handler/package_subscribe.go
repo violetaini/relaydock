@@ -46,6 +46,10 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if !user.IsActive {
+		writeError(w, http.StatusForbidden, errors.New("账号已停用"))
+		return
+	}
 
 	if user.PackageID == 0 && user.Role == storage.RoleAdmin {
 		h.serveAllNodes(w, r, user)
@@ -83,7 +87,19 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 			pkg = nil
 		}
 	}
-	if pkg == nil && len(managedNodeIDs) == 0 && len(directNodeIDs) == 0 {
+	var pkgQuota PackageQuotaState
+	if pkg != nil {
+		var quotaErr error
+		pkgQuota, quotaErr = evaluatePackageQuotaState(r.Context(), h.repo, &user, pkg)
+		if quotaErr != nil {
+			writeError(w, http.StatusInternalServerError, quotaErr)
+			return
+		}
+		if pkgQuota.PackageOver {
+			packageActive = false
+		}
+	}
+	if !packageActive && len(managedNodeIDs) == 0 && len(directNodeIDs) == 0 {
 		writeError(w, http.StatusNotFound, errors.New("无有效套餐或授权节点"))
 		return
 	}
@@ -105,17 +121,46 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	var subNodeMap map[int64][]int64
+	var subNodes []int64
+	if packageActive && pkg != nil && len(pkg.SubscribeFileIDs) > 0 {
+		subNodeMap, subNodes = h.repo.GetPackageSubscribeNodeMap(r.Context(), pkg.SubscribeFileIDs)
+	}
+
+	manualDirectSet := make(map[int64]bool, len(directNodeIDs))
+	for _, id := range directNodeIDs {
+		manualDirectSet[id] = true
+	}
+	managedSet := make(map[int64]bool, len(managedNodeIDs))
+	for _, id := range managedNodeIDs {
+		managedSet[id] = true
+	}
+	packageFixedSet := make(map[int64]bool)
+	if packageActive && pkg != nil {
+		for _, id := range pkg.Nodes {
+			packageFixedSet[id] = true
+		}
+	}
+
 	// 按用户 node_order 重排 pkg.Nodes。
 	// 用户拖过节点顺序 → settings.NodeOrder 非空 → 按其位置排;
 	// 没拖过 → fallback 用 admin 的顺序(过滤掉用户没绑的节点) — 跟 /api/user/config GET 一致。
 	// nodeOrder 中没有的节点(套餐里新加的)排到最末,保持 pkg.Nodes 原顺序。
 	orderedNodeIDs := make([]int64, 0, len(managedNodeIDs))
 	seenNodeIDs := make(map[int64]bool)
-	if pkg != nil {
+	if packageActive && pkg != nil {
 		for _, nodeID := range orderPackageNodes(r.Context(), h.repo, username, pkg.Nodes) {
 			if !seenNodeIDs[nodeID] {
 				orderedNodeIDs = append(orderedNodeIDs, nodeID)
 				seenNodeIDs[nodeID] = true
+			}
+		}
+		if !pkgQuota.SubscribeModuleOver {
+			for _, nodeID := range subNodes {
+				if !seenNodeIDs[nodeID] {
+					orderedNodeIDs = append(orderedNodeIDs, nodeID)
+					seenNodeIDs[nodeID] = true
+				}
 			}
 		}
 	}
@@ -132,9 +177,25 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	var nodeTrafficUsage map[int64]int64
+	if len(orderedNodeIDs) > 0 && len(effectiveNodeTrafficLimits(&user, pkg)) > 0 {
+		if usage, usageErr := h.repo.GetUserNodeTraffic(r.Context(), username, orderedNodeIDs, pkg); usageErr == nil {
+			nodeTrafficUsage = usage
+		}
+	}
+
 	// Load nodes from package
 	var proxies []map[string]any
 	for _, nodeID := range orderedNodeIDs {
+		isNonPackageGrant := manualDirectSet[nodeID] || (managedSet[nodeID] && user.AuthorizationMode != storage.AuthorizationModePackage)
+		if !isNonPackageGrant {
+			if pkgQuota.PackageOver || (packageFixedSet[nodeID] && pkgQuota.NodeModuleOver) || pkgQuota.SubscribeNodeDenied[nodeID] {
+				continue
+			}
+		}
+		if userNodeTrafficExceeded(&user, pkg, nodeTrafficUsage, nodeID) {
+			continue
+		}
 		node, err := h.repo.GetNodeByID(r.Context(), nodeID)
 		if err != nil || !packageSubscriptionNodeEligible(r.Context(), h.repo, node) {
 			continue
@@ -142,7 +203,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		// routed 节点:克隆父 inbound 的 clash 模板,替换 uuid 为该用户子账号 uuid + 节点名
 		if node.NodeType == "routed" {
 			if proxyConfig, ok := buildRoutedProxyForUser(r.Context(), h.repo, node, username); ok {
-				recordRename(applyMultiplierPrefix(proxyConfig, node, renderPackage, &sysCfg))
+				recordRename(applyMultiplierPrefixWithSubscriptions(proxyConfig, node, renderPackage, subNodeMap, &sysCfg))
 				proxies = append(proxies, proxyConfig)
 			}
 			continue
@@ -158,21 +219,25 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		if !applyUserCredentials(proxyConfig, node, credMap) {
 			continue
 		}
-		recordRename(applyMultiplierPrefix(proxyConfig, node, renderPackage, &sysCfg))
+		recordRename(applyMultiplierPrefixWithSubscriptions(proxyConfig, node, renderPackage, subNodeMap, &sysCfg))
 		proxies = append(proxies, proxyConfig)
 	}
 
-	// 追加用户私有路由出站(routed_owner='user' && username=<creator>):不依赖套餐分配,
-	// 创建者一人独享。其 routed 子账号 email 已通过 user_subaccounts 维护,buildRoutedProxyForUser
-	// 复用同一套替换 uuid 逻辑。
-	if userRouted, err := h.repo.ListUserRoutedOutbounds(r.Context(), username); err == nil {
-		for _, n := range userRouted {
-			if !n.Enabled {
-				continue
-			}
-			if proxyConfig, ok := buildRoutedProxyForUser(r.Context(), h.repo, n.Node, username); ok {
-				recordRename(applyMultiplierPrefix(proxyConfig, n.Node, renderPackage, &sysCfg))
-				proxies = append(proxies, proxyConfig)
+	// 追加用户私有路由出站(routed_owner='user' && username=<creator>):仅在用户有效且未触发套餐停用/节点模块超限时下发。
+	includeUserRouted := user.IsActive && (user.AuthorizationMode != storage.AuthorizationModePackage || (packageActive && !pkgQuota.PackageOver && !pkgQuota.NodeModuleOver))
+	if includeUserRouted {
+		if userRouted, err := h.repo.ListUserRoutedOutbounds(r.Context(), username); err == nil {
+			for _, n := range userRouted {
+				if !n.Enabled {
+					continue
+				}
+				if userNodeTrafficExceeded(&user, pkg, nodeTrafficUsage, n.Node.ID) {
+					continue
+				}
+				if proxyConfig, ok := buildRoutedProxyForUser(r.Context(), h.repo, n.Node, username); ok {
+					recordRename(applyMultiplierPrefixWithSubscriptions(proxyConfig, n.Node, renderPackage, subNodeMap, &sysCfg))
+					proxies = append(proxies, proxyConfig)
+				}
 			}
 		}
 	}
@@ -625,10 +690,14 @@ func rewriteProxyGroupRefs(data []byte, rename map[string]string) ([]byte, error
 //   - 前缀左右分隔符由 SystemConfig.NodeNameMultiplierLeft / Right 决定,默认 「」
 //   - 返回 (oldName, newName, true) 给调用方收集 renameMap,后续要同步 proxy-groups 引用
 func applyMultiplierPrefix(proxy map[string]any, node storage.Node, pkg *storage.Package, cfg *storage.SystemConfig) (string, string, bool) {
+	return applyMultiplierPrefixWithSubscriptions(proxy, node, pkg, nil, cfg)
+}
+
+func applyMultiplierPrefixWithSubscriptions(proxy map[string]any, node storage.Node, pkg *storage.Package, subNodeMap map[int64][]int64, cfg *storage.SystemConfig) (string, string, bool) {
 	if proxy == nil || cfg == nil || pkg == nil || !cfg.NodeNameMultiplierPrefixEnabled {
 		return "", "", false
 	}
-	mult := pkg.MultiplierForNode(node.ID)
+	mult := pkg.MultiplierForNodeWithSubscriptions(node.ID, subNodeMap)
 	if mult == 1.0 {
 		return "", "", false
 	}

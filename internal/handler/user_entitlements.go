@@ -44,7 +44,21 @@ func effectivePackageAssignment(ctx context.Context, repo *storage.TrafficReposi
 	if err != nil {
 		return false, fmt.Errorf("resolve package traffic state: %w", err)
 	}
-	return !overLimit, nil
+	if overLimit {
+		return false, nil
+	}
+	pkg, err := repo.GetPackage(ctx, user.PackageID)
+	if err != nil {
+		return false, fmt.Errorf("resolve package traffic quota: %w", err)
+	}
+	if pkg == nil {
+		return false, nil
+	}
+	pkgQuota, err := evaluatePackageQuotaState(ctx, repo, &user, pkg)
+	if err != nil {
+		return false, fmt.Errorf("evaluate package quota state: %w", err)
+	}
+	return !pkgQuota.PackageOver, nil
 }
 
 func authorizationSourceMatches(user storage.User, packageActive bool, sourceType string, sourcePackageID *int64) bool {
@@ -96,7 +110,43 @@ func ResolveEffectiveUserNodeIDs(ctx context.Context, repo *storage.TrafficRepos
 			return nil, fmt.Errorf("resolve package nodes: %w", packageErr)
 		}
 		if pkg != nil {
-			add(pkg.Nodes...)
+			pkgQuota, quotaErr := evaluatePackageQuotaState(ctx, repo, &user, pkg)
+			if quotaErr != nil {
+				return nil, fmt.Errorf("evaluate package quota: %w", quotaErr)
+			}
+			if !pkgQuota.PackageOver && !pkgQuota.NodeModuleOver {
+				candidateSet := make(map[int64]bool, len(pkg.Nodes))
+				candidates := make([]int64, 0, len(pkg.Nodes))
+				for _, id := range pkg.Nodes {
+					if id > 0 && !candidateSet[id] {
+						candidateSet[id] = true
+						candidates = append(candidates, id)
+					}
+				}
+				if len(pkg.SubscribeFileIDs) > 0 && !pkgQuota.SubscribeModuleOver {
+					_, subNodes := repo.GetPackageSubscribeNodeMap(ctx, pkg.SubscribeFileIDs)
+					for _, id := range subNodes {
+						if id > 0 && !candidateSet[id] {
+							candidateSet[id] = true
+							candidates = append(candidates, id)
+						}
+					}
+				}
+				var usage map[int64]int64
+				if len(candidates) > 0 && len(effectiveNodeTrafficLimits(&user, pkg)) > 0 {
+					var usageErr error
+					usage, usageErr = repo.GetUserNodeTraffic(ctx, username, candidates, pkg)
+					if usageErr != nil {
+						return nil, fmt.Errorf("load package node traffic: %w", usageErr)
+					}
+				}
+				for _, id := range candidates {
+					if pkgQuota.SubscribeNodeDenied[id] || userNodeTrafficExceeded(&user, pkg, usage, id) {
+						continue
+					}
+					add(id)
+				}
+			}
 		}
 	}
 
@@ -147,9 +197,29 @@ func ResolveUserServiceEntitlements(ctx context.Context, repo *storage.TrafficRe
 	if err != nil {
 		return entitlements, err
 	}
-	assignedSubscriptions, err := repo.GetUserSubscriptionIDs(ctx, username)
+	activePackageIDForSubs := int64(0)
+	if packageActive {
+		activePackageIDForSubs = user.PackageID
+	}
+	assignedSubscriptions, err := repo.GetEffectiveUserSubscriptionIDs(ctx, username, activePackageIDForSubs)
 	if err != nil {
 		return entitlements, fmt.Errorf("resolve assigned subscriptions: %w", err)
+	}
+	pkgCache := make(map[int64]*storage.Package)
+	quotaCache := make(map[string]PackageQuotaState)
+	if packageActive && user.AuthorizationMode == storage.AuthorizationModePackage && len(assignedSubscriptions) > 0 {
+		quota := resolveUserPackageQuotaCached(ctx, repo, &user, pkgCache, quotaCache)
+		subTypes, typeErr := repo.SubscriptionAssignmentSources(ctx, username)
+		if typeErr == nil {
+			filtered := assignedSubscriptions[:0]
+			for _, subID := range assignedSubscriptions {
+				if subTypes[subID] == storage.GrantSourcePackage && (quota.PackageOver || quota.SubscribeModuleOver || quota.SubscribeOver[subID]) {
+					continue
+				}
+				filtered = append(filtered, subID)
+			}
+			assignedSubscriptions = filtered
+		}
 	}
 	entitlements.Subscription = packageActive || len(assignedSubscriptions) > 0
 
@@ -157,13 +227,7 @@ func ResolveUserServiceEntitlements(ctx context.Context, repo *storage.TrafficRe
 	if err != nil {
 		return entitlements, err
 	}
-	pkgCache := make(map[int64]*storage.Package)
-	quotaCache := make(map[string]PackageQuotaState)
-	var nodeModuleOver bool
-	if user.AuthorizationMode == storage.AuthorizationModePackage && packageActive {
-		nodeModuleOver = resolveUserPackageQuotaCached(ctx, repo, &user, pkgCache, quotaCache).NodeModuleOver
-	}
-	entitlements.Nodes = len(nodeIDs) > 0 && !nodeModuleOver
+	entitlements.Nodes = len(nodeIDs) > 0
 
 	serverGrants, err := repo.ListUserServerGrants(ctx, username)
 	if err != nil {

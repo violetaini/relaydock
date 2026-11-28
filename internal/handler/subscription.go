@@ -85,6 +85,43 @@ rules:
 socks-port: 7891
 `
 
+const quotaExhaustedYAML = `mixed-port: 7890
+allow-lan: true
+bind-address: '*'
+mode: rule
+log-level: info
+proxies:
+  - name: ⚠️ 套餐流量已用尽
+    type: ss
+    server: test.example.com.cn
+    port: 443
+    password: J6h6sFZp0Xxv7M8K2RZ6nN8c8ZxQpJZcQ4M2YVtPZ5Q=
+    cipher: 2022-blake3-chacha20-poly1305
+  - name: ⚠️ 请联系管理员续费或充值
+    type: ss
+    server: test.example.com.cn
+    port: 443
+    password: J6h6sFZp0Xxv7M8K2RZ6nN8c8ZxQpJZcQ4M2YVtPZ5Q=
+    cipher: 2022-blake3-chacha20-poly1305
+proxy-groups:
+  - name: 🚀 节点选择
+    type: select
+    proxies:
+      - ⚠️ 套餐流量已用尽
+      - ⚠️ 请联系管理员续费或充值
+rules:
+  - MATCH,DIRECT
+`
+
+func containsInt64(items []int64, target int64) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
 const tokenInvalidFilename = "token_invalid.yaml"
 
 // 令牌无效标志的上下文键
@@ -259,8 +296,8 @@ func (h *SubscriptionHandler) authorizeSubscriptionAccess(ctx context.Context, u
 	if user.Role == storage.RoleAdmin {
 		return nil
 	}
-	if subscribeFile.Type == storage.SubscribeTypePackage &&
-		(user.AuthorizationMode != storage.AuthorizationModePackage || user.PackageID <= 0) {
+	packageActive := packageAssignmentActive(user, time.Now().UTC())
+	if subscribeFile.Type == storage.SubscribeTypePackage && !packageActive {
 		return errSubscriptionAccessForbidden
 	}
 	// Legacy subscription_links without a subscribe_files row have no owner or
@@ -271,7 +308,11 @@ func (h *SubscriptionHandler) authorizeSubscriptionAccess(ctx context.Context, u
 	if strings.TrimSpace(subscribeFile.CreatedBy) == username {
 		return nil
 	}
-	ids, err := h.repo.GetUserSubscriptionIDs(ctx, username)
+	activePackageID := int64(0)
+	if packageActive {
+		activePackageID = user.PackageID
+	}
+	ids, err := h.repo.GetEffectiveUserSubscriptionIDs(ctx, username, activePackageID)
 	if err != nil {
 		return fmt.Errorf("load subscription assignments: %w", err)
 	}
@@ -420,6 +461,21 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 				writeError(w, http.StatusInternalServerError, err)
 			}
 			return
+		}
+	}
+	if h.repo != nil && username != "" && !userIsAdmin(r.Context(), h.repo, username) {
+		if viewerUser, uErr := h.repo.GetUser(r.Context(), username); uErr == nil && viewerUser.AuthorizationMode == storage.AuthorizationModePackage && viewerUser.PackageID > 0 {
+			if packageAssignmentActive(viewerUser, time.Now().UTC()) {
+				if pkg, pErr := h.repo.GetPackage(r.Context(), viewerUser.PackageID); pErr == nil && pkg != nil {
+					if pkgQuota, qErr := evaluatePackageQuotaState(r.Context(), h.repo, &viewerUser, pkg); qErr == nil {
+						isPkgSub := hasSubscribeFile && subscribeFile.ID > 0 && containsInt64(pkg.SubscribeFileIDs, subscribeFile.ID)
+						if pkgQuota.PackageOver || (isPkgSub && (pkgQuota.SubscribeModuleOver || pkgQuota.SubscribeOver[subscribeFile.ID])) {
+							h.serveQuotaExhaustedResponse(w, r)
+							return
+						}
+					}
+				}
+			}
 		}
 	}
 	logger.Info("[⏱️ 耗时监测] 文件查找完成", "step", "file_lookup", "duration_ms", time.Since(stepStart).Milliseconds(), "filename", filename)
@@ -1282,6 +1338,44 @@ func (h *SubscriptionHandler) subscriptionNodeProxies(ctx context.Context, subsc
 		credMap = buildUserCredMapForCreator(ctx, h.repo, creator)
 	}
 
+	var quotaPkg *storage.Package
+	var quotaUserObj storage.User
+	var pkgQuota PackageQuotaState
+	var nodeQuotaUsage map[int64]int64
+	var manualDirectNodes map[int64]bool
+	quotaSubject := ""
+	if viewer, _ := ctx.Value(subscriptionViewerKey{}).(string); viewer != "" && !userIsAdmin(ctx, h.repo, viewer) {
+		quotaSubject = viewer
+	} else if userScoped {
+		quotaSubject = creator
+	}
+	if quotaSubject != "" {
+		if u, uErr := h.repo.GetUser(ctx, quotaSubject); uErr == nil {
+			quotaUserObj = u
+			if directIDs, dErr := h.repo.ListEffectiveDirectNodeIDs(ctx, quotaSubject, time.Now().UTC()); dErr == nil && len(directIDs) > 0 {
+				manualDirectNodes = make(map[int64]bool, len(directIDs))
+				for _, id := range directIDs {
+					manualDirectNodes[id] = true
+				}
+			}
+			if u.AuthorizationMode == storage.AuthorizationModePackage && u.PackageID > 0 && packageAssignmentActive(u, time.Now().UTC()) {
+				if p, pErr := h.repo.GetPackage(ctx, u.PackageID); pErr == nil && p != nil {
+					quotaPkg = p
+					pkgQuota, _ = evaluatePackageQuotaState(ctx, h.repo, &u, p)
+				}
+			}
+			if limits := effectiveNodeTrafficLimits(&u, quotaPkg); len(limits) > 0 {
+				nodeIDs := make([]int64, 0, len(nodes))
+				for _, n := range nodes {
+					nodeIDs = append(nodeIDs, n.ID)
+				}
+				if len(nodeIDs) > 0 {
+					nodeQuotaUsage, _ = h.repo.GetUserNodeTraffic(ctx, quotaSubject, nodeIDs, quotaPkg)
+				}
+			}
+		}
+	}
+
 	var proxies []map[string]any
 	for _, node := range nodes {
 		if viewer, _ := ctx.Value(subscriptionViewerKey{}).(string); viewer != "" && !userIsAdmin(ctx, h.repo, viewer) {
@@ -1297,6 +1391,14 @@ func (h *SubscriptionHandler) subscriptionNodeProxies(ctx context.Context, subsc
 		}
 		if hasTagFilter && !node.HasAnyTag(selectedTagsMap) {
 			continue
+		}
+		if quotaSubject != "" {
+			if !manualDirectNodes[node.ID] && (pkgQuota.PackageOver || pkgQuota.NodeModuleOver || pkgQuota.SubscribeNodeDenied[node.ID]) {
+				continue
+			}
+			if userNodeTrafficExceeded(&quotaUserObj, quotaPkg, nodeQuotaUsage, node.ID) {
+				continue
+			}
 		}
 		var proxyConfig map[string]any
 		if userScoped && node.NodeType == "routed" {
@@ -1649,8 +1751,14 @@ func (h *SubscriptionHandler) loadTokenInvalidContent() []byte {
 
 // 通过客户端类型转换提供令牌无效 YAML 内容
 func (h *SubscriptionHandler) serveTokenInvalidResponse(w http.ResponseWriter, r *http.Request) {
-	data := h.loadTokenInvalidContent()
+	h.serveNoticeResponse(w, r, h.loadTokenInvalidContent(), "Token已失效", "[Token Invalid] 返回Token失效响应")
+}
 
+func (h *SubscriptionHandler) serveQuotaExhaustedResponse(w http.ResponseWriter, r *http.Request) {
+	h.serveNoticeResponse(w, r, []byte(quotaExhaustedYAML), "套餐流量已用尽", "[Subscription] 返回套餐流量已用尽响应")
+}
+
+func (h *SubscriptionHandler) serveNoticeResponse(w http.ResponseWriter, r *http.Request, data []byte, title, logLabel string) {
 	// 根据参数t的类型调用substore的转换代码
 	clientType := strings.TrimSpace(r.URL.Query().Get("t"))
 	contentType := "text/yaml; charset=utf-8"
@@ -1695,7 +1803,7 @@ func (h *SubscriptionHandler) serveTokenInvalidResponse(w http.ResponseWriter, r
 		}
 	}
 
-	attachmentName := url.PathEscape("Token已失效" + ext)
+	attachmentName := url.PathEscape(title + ext)
 
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("profile-update-interval", "24")
@@ -1705,7 +1813,7 @@ func (h *SubscriptionHandler) serveTokenInvalidResponse(w http.ResponseWriter, r
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 
-	logger.Info("[Token Invalid] 返回Token失效响应", "client_type", clientType)
+	logger.Info(logLabel, "client_type", clientType)
 }
 
 func (h *SubscriptionHandler) runPostFetchScript(ctx context.Context, script string, yamlData []byte) ([]byte, error) {

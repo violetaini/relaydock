@@ -154,34 +154,34 @@ func requirePackageForwardingSpeedCapabilities(ctx context.Context, repo *storag
 }
 
 type createPackageRequest struct {
-	Name                   string                           `json:"name"`
-	Description            string                           `json:"description"`
+	Name                           string                           `json:"name"`
+	Description                    string                           `json:"description"`
 	TrafficLimitGB                 float64                          `json:"traffic_limit_gb"`
 	NodeModuleTrafficLimitGB       float64                          `json:"node_module_traffic_limit_gb"`
 	ServerModuleTrafficLimitGB     float64                          `json:"server_module_traffic_limit_gb"`
 	ForwardingModuleTrafficLimitGB float64                          `json:"forwarding_module_traffic_limit_gb"`
 	SubscribeModuleTrafficLimitGB  float64                          `json:"subscribe_module_traffic_limit_gb"`
 	CycleDays                      int                              `json:"cycle_days"`
-	IsReset                bool                             `json:"is_reset"`
-	ResetDay               int                              `json:"reset_day"`
-	NodeTrafficResetPeriod string                           `json:"node_traffic_reset_period"`
-	Nodes                  []int64                          `json:"nodes"`
-	SubscribeFileIDs       []int64                          `json:"subscribe_file_ids"`
-	SubscribeMultipliers   map[int64]float64                `json:"subscribe_multipliers"`
-	SubscribeSpeedLimits   map[int64]float64                `json:"subscribe_speed_limits"`
-	SubscribeTrafficLimits map[int64]float64                `json:"subscribe_traffic_limits"`
-	SubscribeDeviceLimits  map[int64]int                    `json:"subscribe_device_limits"`
-	NodeMultipliers        map[int64]float64                `json:"node_multipliers"`    // node_id → 倍率
-	NodeSpeedLimits        map[int64]float64                `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeTrafficLimits      map[int64]float64                `json:"node_traffic_limits"` // 套餐固定节点独立流量额度 (GB);0/缺省=不限
-	NodeDeviceLimits       map[int64]int                    `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
-	SpeedLimitMbps         float64                          `json:"speed_limit_mbps"`
-	DeviceLimit            int                              `json:"device_limit"`
-	AutoSpeedRules         []storage.AutoSpeedLimitRule     `json:"auto_speed_rules"`
-	ServerGrants           []storage.PackageServerGrant     `json:"server_grants"`
-	ForwardingGrants       []storage.PackageForwardingGrant `json:"forwarding_grants"`
-	TrafficMode            string                           `json:"traffic_mode"`
-	TemplateFilename       string                           `json:"template_filename"` // 空 = 走系统默认
+	IsReset                        bool                             `json:"is_reset"`
+	ResetDay                       int                              `json:"reset_day"`
+	NodeTrafficResetPeriod         string                           `json:"node_traffic_reset_period"`
+	Nodes                          []int64                          `json:"nodes"`
+	SubscribeFileIDs               []int64                          `json:"subscribe_file_ids"`
+	SubscribeMultipliers           map[int64]float64                `json:"subscribe_multipliers"`
+	SubscribeSpeedLimits           map[int64]float64                `json:"subscribe_speed_limits"`
+	SubscribeTrafficLimits         map[int64]float64                `json:"subscribe_traffic_limits"`
+	SubscribeDeviceLimits          map[int64]int                    `json:"subscribe_device_limits"`
+	NodeMultipliers                map[int64]float64                `json:"node_multipliers"`    // node_id → 倍率
+	NodeSpeedLimits                map[int64]float64                `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeTrafficLimits              map[int64]float64                `json:"node_traffic_limits"` // 套餐固定节点独立流量额度 (GB);0/缺省=不限
+	NodeDeviceLimits               map[int64]int                    `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	SpeedLimitMbps                 float64                          `json:"speed_limit_mbps"`
+	DeviceLimit                    int                              `json:"device_limit"`
+	AutoSpeedRules                 []storage.AutoSpeedLimitRule     `json:"auto_speed_rules"`
+	ServerGrants                   []storage.PackageServerGrant     `json:"server_grants"`
+	ForwardingGrants               []storage.PackageForwardingGrant `json:"forwarding_grants"`
+	TrafficMode                    string                           `json:"traffic_mode"`
+	TemplateFilename               string                           `json:"template_filename"` // 空 = 走系统默认
 }
 
 // validatePackageTemplateFilename 非空时校验 rule_templates 下文件存在。空字符串直接通过(表示用系统默认)。
@@ -384,26 +384,26 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		ForwardingModuleTrafficLimitGB: req.ForwardingModuleTrafficLimitGB,
 		SubscribeModuleTrafficLimitGB:  req.SubscribeModuleTrafficLimitGB,
 		CycleDays:                      req.CycleDays,
-		IsReset:                req.IsReset,
-		ResetDay:               req.ResetDay,
-		NodeTrafficResetPeriod: resetPeriod,
-		Nodes:                  nodes,
-		SubscribeFileIDs:       req.SubscribeFileIDs,
-		SubscribeMultipliers:   req.SubscribeMultipliers,
-		SubscribeSpeedLimits:   req.SubscribeSpeedLimits,
-		SubscribeTrafficLimits: req.SubscribeTrafficLimits,
-		SubscribeDeviceLimits:  req.SubscribeDeviceLimits,
-		NodeMultipliers:        req.NodeMultipliers,
-		NodeSpeedLimits:        req.NodeSpeedLimits,
-		NodeTrafficLimits:      req.NodeTrafficLimits,
-		NodeDeviceLimits:       req.NodeDeviceLimits,
-		SpeedLimitMbps:         0,
-		DeviceLimit:            req.DeviceLimit,
-		AutoSpeedRules:         []storage.AutoSpeedLimitRule{},
-		ServerGrants:           req.ServerGrants,
-		ForwardingGrants:       req.ForwardingGrants,
-		TrafficMode:            trafficMode,
-		TemplateFilename:       strings.TrimSpace(req.TemplateFilename),
+		IsReset:                        req.IsReset,
+		ResetDay:                       req.ResetDay,
+		NodeTrafficResetPeriod:         resetPeriod,
+		Nodes:                          nodes,
+		SubscribeFileIDs:               req.SubscribeFileIDs,
+		SubscribeMultipliers:           req.SubscribeMultipliers,
+		SubscribeSpeedLimits:           req.SubscribeSpeedLimits,
+		SubscribeTrafficLimits:         req.SubscribeTrafficLimits,
+		SubscribeDeviceLimits:          req.SubscribeDeviceLimits,
+		NodeMultipliers:                req.NodeMultipliers,
+		NodeSpeedLimits:                req.NodeSpeedLimits,
+		NodeTrafficLimits:              req.NodeTrafficLimits,
+		NodeDeviceLimits:               req.NodeDeviceLimits,
+		SpeedLimitMbps:                 0,
+		DeviceLimit:                    req.DeviceLimit,
+		AutoSpeedRules:                 []storage.AutoSpeedLimitRule{},
+		ServerGrants:                   req.ServerGrants,
+		ForwardingGrants:               req.ForwardingGrants,
+		TrafficMode:                    trafficMode,
+		TemplateFilename:               strings.TrimSpace(req.TemplateFilename),
 	}
 	if err := requirePackageForwardingSpeedCapabilities(r.Context(), h.repo, h.pusher, pkg.ForwardingGrants); err != nil {
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
@@ -569,35 +569,35 @@ func reconcilePackageForwardingGrants(ctx context.Context, repo *storage.Traffic
 }
 
 type updatePackageRequest struct {
-	ID                     int64                            `json:"id"`
-	Name                   string                           `json:"name"`
-	Description            string                           `json:"description"`
+	ID                             int64                            `json:"id"`
+	Name                           string                           `json:"name"`
+	Description                    string                           `json:"description"`
 	TrafficLimitGB                 float64                          `json:"traffic_limit_gb"`
 	NodeModuleTrafficLimitGB       float64                          `json:"node_module_traffic_limit_gb"`
 	ServerModuleTrafficLimitGB     float64                          `json:"server_module_traffic_limit_gb"`
 	ForwardingModuleTrafficLimitGB float64                          `json:"forwarding_module_traffic_limit_gb"`
 	SubscribeModuleTrafficLimitGB  float64                          `json:"subscribe_module_traffic_limit_gb"`
 	CycleDays                      int                              `json:"cycle_days"`
-	IsReset                *bool                            `json:"is_reset"`  // 指针:请求未携带时保留库中旧值,不按零值覆盖
-	ResetDay               *int                             `json:"reset_day"` // 同上
-	NodeTrafficResetPeriod *string                          `json:"node_traffic_reset_period"`
-	Nodes                  []int64                          `json:"nodes"`
-	SubscribeFileIDs       []int64                          `json:"subscribe_file_ids"`
-	SubscribeMultipliers   map[int64]float64                `json:"subscribe_multipliers"`
-	SubscribeSpeedLimits   map[int64]float64                `json:"subscribe_speed_limits"`
-	SubscribeTrafficLimits map[int64]float64                `json:"subscribe_traffic_limits"`
-	SubscribeDeviceLimits  map[int64]int                    `json:"subscribe_device_limits"`
-	NodeMultipliers        map[int64]float64                `json:"node_multipliers"`    // node_id → 倍率
-	NodeSpeedLimits        map[int64]float64                `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeTrafficLimits      map[int64]float64                `json:"node_traffic_limits"` // 套餐固定节点独立流量额度 (GB);0/缺省=不限
-	NodeDeviceLimits       map[int64]int                    `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
-	SpeedLimitMbps         float64                          `json:"speed_limit_mbps"`
-	DeviceLimit            int                              `json:"device_limit"`
-	AutoSpeedRules         []storage.AutoSpeedLimitRule     `json:"auto_speed_rules"`
-	ServerGrants           []storage.PackageServerGrant     `json:"server_grants"`
-	ForwardingGrants       []storage.PackageForwardingGrant `json:"forwarding_grants"`
-	TrafficMode            string                           `json:"traffic_mode"`
-	TemplateFilename       string                           `json:"template_filename"` // 空 = 走系统默认
+	IsReset                        *bool                            `json:"is_reset"`  // 指针:请求未携带时保留库中旧值,不按零值覆盖
+	ResetDay                       *int                             `json:"reset_day"` // 同上
+	NodeTrafficResetPeriod         *string                          `json:"node_traffic_reset_period"`
+	Nodes                          []int64                          `json:"nodes"`
+	SubscribeFileIDs               []int64                          `json:"subscribe_file_ids"`
+	SubscribeMultipliers           map[int64]float64                `json:"subscribe_multipliers"`
+	SubscribeSpeedLimits           map[int64]float64                `json:"subscribe_speed_limits"`
+	SubscribeTrafficLimits         map[int64]float64                `json:"subscribe_traffic_limits"`
+	SubscribeDeviceLimits          map[int64]int                    `json:"subscribe_device_limits"`
+	NodeMultipliers                map[int64]float64                `json:"node_multipliers"`    // node_id → 倍率
+	NodeSpeedLimits                map[int64]float64                `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeTrafficLimits              map[int64]float64                `json:"node_traffic_limits"` // 套餐固定节点独立流量额度 (GB);0/缺省=不限
+	NodeDeviceLimits               map[int64]int                    `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	SpeedLimitMbps                 float64                          `json:"speed_limit_mbps"`
+	DeviceLimit                    int                              `json:"device_limit"`
+	AutoSpeedRules                 []storage.AutoSpeedLimitRule     `json:"auto_speed_rules"`
+	ServerGrants                   []storage.PackageServerGrant     `json:"server_grants"`
+	ForwardingGrants               []storage.PackageForwardingGrant `json:"forwarding_grants"`
+	TrafficMode                    string                           `json:"traffic_mode"`
+	TemplateFilename               string                           `json:"template_filename"` // 空 = 走系统默认
 }
 
 func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -718,26 +718,26 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		ForwardingModuleTrafficLimitGB: req.ForwardingModuleTrafficLimitGB,
 		SubscribeModuleTrafficLimitGB:  req.SubscribeModuleTrafficLimitGB,
 		CycleDays:                      req.CycleDays,
-		IsReset:                isReset,
-		ResetDay:               resetDay,
-		NodeTrafficResetPeriod: resetPeriod,
-		Nodes:                  nodes,
-		SubscribeFileIDs:       req.SubscribeFileIDs,
-		SubscribeMultipliers:   req.SubscribeMultipliers,
-		SubscribeSpeedLimits:   req.SubscribeSpeedLimits,
-		SubscribeTrafficLimits: req.SubscribeTrafficLimits,
-		SubscribeDeviceLimits:  req.SubscribeDeviceLimits,
-		NodeMultipliers:        req.NodeMultipliers,
-		NodeSpeedLimits:        req.NodeSpeedLimits,
-		NodeTrafficLimits:      req.NodeTrafficLimits,
-		NodeDeviceLimits:       req.NodeDeviceLimits,
-		SpeedLimitMbps:         0,
-		DeviceLimit:            req.DeviceLimit,
-		AutoSpeedRules:         []storage.AutoSpeedLimitRule{},
-		ServerGrants:           req.ServerGrants,
-		ForwardingGrants:       req.ForwardingGrants,
-		TrafficMode:            trafficMode,
-		TemplateFilename:       strings.TrimSpace(req.TemplateFilename),
+		IsReset:                        isReset,
+		ResetDay:                       resetDay,
+		NodeTrafficResetPeriod:         resetPeriod,
+		Nodes:                          nodes,
+		SubscribeFileIDs:               req.SubscribeFileIDs,
+		SubscribeMultipliers:           req.SubscribeMultipliers,
+		SubscribeSpeedLimits:           req.SubscribeSpeedLimits,
+		SubscribeTrafficLimits:         req.SubscribeTrafficLimits,
+		SubscribeDeviceLimits:          req.SubscribeDeviceLimits,
+		NodeMultipliers:                req.NodeMultipliers,
+		NodeSpeedLimits:                req.NodeSpeedLimits,
+		NodeTrafficLimits:              req.NodeTrafficLimits,
+		NodeDeviceLimits:               req.NodeDeviceLimits,
+		SpeedLimitMbps:                 0,
+		DeviceLimit:                    req.DeviceLimit,
+		AutoSpeedRules:                 []storage.AutoSpeedLimitRule{},
+		ServerGrants:                   req.ServerGrants,
+		ForwardingGrants:               req.ForwardingGrants,
+		TrafficMode:                    trafficMode,
+		TemplateFilename:               strings.TrimSpace(req.TemplateFilename),
 	}
 	if err := requirePackageForwardingSpeedCapabilities(packageCtx, h.repo, h.pusher, pkg.ForwardingGrants); err != nil {
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
@@ -800,9 +800,6 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	for username, warnings := range h.finishPackageTemplateRevocations(updateCtx, revocationPlans) {
 		bundleWarnings[username] = append(bundleWarnings[username], warnings...)
 	}
-	if h.pusher != nil {
-		go h.pusher.PushToAllServersForPackage(context.Background(), req.ID)
-	}
 	helper := &ServiceAuthorizationHandler{repo: h.repo, managed: h.managed, forwarding: h.forwarding}
 	for _, user := range boundUsers {
 		if user.PackageID != req.ID {
@@ -824,6 +821,9 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		if reconcileErr := reconcilePackageForwardingGrants(updateCtx, h.repo, h.forwarding, user.Username, req.ID); reconcileErr != nil {
 			bundleWarnings[user.Username] = append(bundleWarnings[user.Username], reconcileErr.Error())
 		}
+	}
+	if h.pusher != nil {
+		go h.pusher.PushToAllServersForPackage(context.Background(), req.ID)
 	}
 
 	// 异步同步 xray 用户凭据：对比新旧节点差异，为绑定此套餐的用户添加/移除入站配置

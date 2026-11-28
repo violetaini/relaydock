@@ -377,6 +377,9 @@ func (h *UserNodesHandler) validateNodeAccess(ctx context.Context, username stri
 	if err != nil {
 		return storage.Node{}, 0, fmt.Errorf("获取用户失败")
 	}
+	if !user.IsActive {
+		return storage.Node{}, 0, fmt.Errorf("账号已停用")
+	}
 	found := false
 	packageAllowed := packageAssignmentActive(user, time.Now())
 	if packageAllowed {
@@ -386,10 +389,25 @@ func (h *UserNodesHandler) validateNodeAccess(ctx context.Context, username stri
 	}
 	if packageAllowed {
 		if pkg, packageErr := h.repo.GetPackage(ctx, user.PackageID); packageErr == nil && pkg != nil {
-			for _, nid := range pkg.Nodes {
-				if nid == nodeID {
-					found = true
-					break
+			pkgQuota, quotaErr := evaluatePackageQuotaState(ctx, h.repo, &user, pkg)
+			if quotaErr == nil && !pkgQuota.PackageOver && !pkgQuota.NodeModuleOver && !pkgQuota.SubscribeNodeDenied[nodeID] {
+				usage, usageErr := h.repo.GetUserNodeTraffic(ctx, username, []int64{nodeID}, pkg)
+				if usageErr == nil && !userNodeTrafficExceeded(&user, pkg, usage, nodeID) {
+					for _, nid := range pkg.Nodes {
+						if nid == nodeID {
+							found = true
+							break
+						}
+					}
+					if !found && len(pkg.SubscribeFileIDs) > 0 {
+						_, subNodeIDs := h.repo.GetPackageSubscribeNodeMap(ctx, pkg.SubscribeFileIDs)
+						for _, nid := range subNodeIDs {
+							if nid == nodeID {
+								found = true
+								break
+							}
+						}
+					}
 				}
 			}
 		}
@@ -589,4 +607,3 @@ func (h *UserNodesHandler) HandlePublicNodes(w http.ResponseWriter, r *http.Requ
 		"nodes":   list,
 	})
 }
-

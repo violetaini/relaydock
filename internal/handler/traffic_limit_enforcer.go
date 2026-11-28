@@ -28,7 +28,9 @@ func NewTrafficLimitEnforcer(repo *storage.TrafficRepository, remoteManage *Remo
 
 func nodeQuotaState(user *storage.User, pkg *storage.Package, usage map[int64]int64, pkgQuota PackageQuotaState) string {
 	limits := effectiveNodeTrafficLimits(user, pkg)
-	if len(limits) == 0 && !pkgQuota.NodeModuleOver && !pkgQuota.SubscribeModuleOver && len(pkgQuota.SubscribeNodeDenied) == 0 {
+	if len(limits) == 0 && !pkgQuota.PackageOver && !pkgQuota.NodeModuleOver &&
+		!pkgQuota.SubscribeModuleOver && !pkgQuota.ServerModuleOver && !pkgQuota.ForwardingModuleOver &&
+		len(pkgQuota.SubscribeNodeDenied) == 0 {
 		return ""
 	}
 	ids := make([]int64, 0, len(limits))
@@ -37,11 +39,20 @@ func nodeQuotaState(user *storage.User, pkg *storage.Package, usage map[int64]in
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	var state strings.Builder
+	if pkgQuota.PackageOver {
+		state.WriteString("pkg:1;")
+	}
 	if pkgQuota.NodeModuleOver {
 		state.WriteString("module:1;")
 	}
 	if pkgQuota.SubscribeModuleOver {
 		state.WriteString("submodule:1;")
+	}
+	if pkgQuota.ServerModuleOver {
+		state.WriteString("srvmodule:1;")
+	}
+	if pkgQuota.ForwardingModuleOver {
+		state.WriteString("fwdmodule:1;")
 	}
 	if len(pkgQuota.SubscribeNodeDenied) > 0 {
 		subDeniedIDs := make([]int64, 0, len(pkgQuota.SubscribeNodeDenied))
@@ -80,7 +91,9 @@ func (e *TrafficLimitEnforcer) refreshNodeQuotas(ctx context.Context, user stora
 		return
 	}
 	limits := effectiveNodeTrafficLimits(&user, pkg)
-	hasQuota := len(limits) > 0 || pkgQuota.PackageLimitBytes > 0 || pkgQuota.NodeModuleLimitBytes > 0
+	hasSubQuota := pkgQuota.SubscribeModuleLimitBytes > 0 || (pkg != nil && hasNonZeroLimit(pkg.SubscribeTrafficLimits))
+	hasQuota := len(limits) > 0 || pkgQuota.PackageLimitBytes > 0 || pkgQuota.NodeModuleLimitBytes > 0 ||
+		hasSubQuota || pkgQuota.ServerModuleLimitBytes > 0 || pkgQuota.ForwardingModuleLimitBytes > 0
 	usage := map[int64]int64{}
 	if len(limits) > 0 {
 		nodeIDs := make([]int64, 0, len(limits))

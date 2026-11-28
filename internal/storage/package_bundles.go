@@ -256,6 +256,17 @@ func (r *TrafficRepository) GetPackageSubscribeNodeMap(ctx context.Context, subI
 func (r *TrafficRepository) collectSubscribeFilePanelNodeIDs(ctx context.Context, sub SubscribeFile) []int64 {
 	var collected []int64
 	seenNodes := make(map[int64]bool)
+	var allNodes []Node
+	allNodesLoaded := false
+	loadAllNodes := func() []Node {
+		if !allNodesLoaded {
+			allNodesLoaded = true
+			if list, err := r.ListAllNodes(ctx); err == nil {
+				allNodes = list
+			}
+		}
+		return allNodes
+	}
 	addNodes := func(ids []int64) {
 		for _, id := range ids {
 			if id <= 0 || seenNodes[id] {
@@ -271,18 +282,151 @@ func (r *TrafficRepository) collectSubscribeFilePanelNodeIDs(ctx context.Context
 			}
 		}
 	}
-	addNodes(sub.SelectedNodeIDs)
+	addFileNodes := func(sf SubscribeFile) {
+		if len(sf.SelectedNodeIDs) > 0 {
+			addNodes(sf.SelectedNodeIDs)
+			return
+		}
+		if len(sf.SelectedTags) == 0 {
+			return
+		}
+		tagSet := make(map[string]bool, len(sf.SelectedTags))
+		for _, tag := range sf.SelectedTags {
+			if t := strings.TrimSpace(tag); t != "" {
+				tagSet[t] = true
+			}
+		}
+		if len(tagSet) == 0 {
+			return
+		}
+		var matched []int64
+		for _, node := range loadAllNodes() {
+			if node.HasAnyTag(tagSet) {
+				matched = append(matched, node.ID)
+			}
+		}
+		addNodes(matched)
+	}
+	addFileNodes(sub)
 	if sub.Generation != nil {
 		for _, srcID := range sub.Generation.SourceIDs {
-			if srcID <= 0 {
+			if srcID <= 0 || srcID == sub.ID {
 				continue
 			}
 			if srcFile, err := r.GetSubscribeFileByID(ctx, srcID); err == nil {
-				addNodes(srcFile.SelectedNodeIDs)
+				addFileNodes(srcFile)
 			}
 		}
 	}
 	return collected
+}
+
+func packageSubscribeContainsNode(subNodeMap map[int64][]int64, subID, nodeID int64) bool {
+	if nodeID <= 0 {
+		return false
+	}
+	for _, id := range subNodeMap[subID] {
+		if id == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+// MultiplierForNodeWithSubscriptions resolves the node billing multiplier,
+// preferring an explicit per-node setting in NodeMultipliers and falling back
+// to the highest configured multiplier among package-linked subscriptions
+// that contain the node.
+func (p *Package) MultiplierForNodeWithSubscriptions(nodeID int64, subNodeMap map[int64][]int64) float64 {
+	if p == nil {
+		return 1.0
+	}
+	if m, ok := p.NodeMultipliers[nodeID]; ok && m > 0 {
+		return m
+	}
+	if len(p.SubscribeMultipliers) == 0 || len(subNodeMap) == 0 {
+		return 1.0
+	}
+	best := 0.0
+	for _, subID := range p.SubscribeFileIDs {
+		if m, ok := p.SubscribeMultipliers[subID]; ok && m > 0 && packageSubscribeContainsNode(subNodeMap, subID, nodeID) {
+			if m > best {
+				best = m
+			}
+		}
+	}
+	if best > 0 {
+		return best
+	}
+	return 1.0
+}
+
+// SubscribeSpeedLimitForNode resolves the speed limit from package-linked
+// subscriptions containing nodeID (or its parentNodeID). When multiple linked
+// subscriptions specify positive limits, the lowest positive limit wins.
+func (p *Package) SubscribeSpeedLimitForNode(nodeID int64, parentNodeID *int64, subNodeMap map[int64][]int64) (float64, bool) {
+	if p == nil || len(p.SubscribeSpeedLimits) == 0 || len(subNodeMap) == 0 {
+		return 0, false
+	}
+	check := func(target int64) (float64, bool) {
+		if target <= 0 {
+			return 0, false
+		}
+		found := false
+		minPositive := 0.0
+		for _, subID := range p.SubscribeFileIDs {
+			v, ok := p.SubscribeSpeedLimits[subID]
+			if !ok || !packageSubscribeContainsNode(subNodeMap, subID, target) {
+				continue
+			}
+			found = true
+			if v > 0 && (minPositive == 0 || v < minPositive) {
+				minPositive = v
+			}
+		}
+		return minPositive, found
+	}
+	if v, ok := check(nodeID); ok {
+		return v, true
+	}
+	if parentNodeID != nil && *parentNodeID > 0 {
+		return check(*parentNodeID)
+	}
+	return 0, false
+}
+
+// SubscribeDeviceLimitForNode resolves the device limit from package-linked
+// subscriptions containing nodeID (or its parentNodeID). When multiple linked
+// subscriptions specify positive limits, the lowest positive limit wins.
+func (p *Package) SubscribeDeviceLimitForNode(nodeID int64, parentNodeID *int64, subNodeMap map[int64][]int64) (int, bool) {
+	if p == nil || len(p.SubscribeDeviceLimits) == 0 || len(subNodeMap) == 0 {
+		return 0, false
+	}
+	check := func(target int64) (int, bool) {
+		if target <= 0 {
+			return 0, false
+		}
+		found := false
+		minPositive := 0
+		for _, subID := range p.SubscribeFileIDs {
+			v, ok := p.SubscribeDeviceLimits[subID]
+			if !ok || !packageSubscribeContainsNode(subNodeMap, subID, target) {
+				continue
+			}
+			found = true
+			if v > 0 && (minPositive == 0 || v < minPositive) {
+				minPositive = v
+			}
+		}
+		return minPositive, found
+	}
+	if v, ok := check(nodeID); ok {
+		return v, true
+	}
+	if parentNodeID != nil && *parentNodeID > 0 {
+		return check(*parentNodeID)
+	}
+	return 0, false
 }
 
 func packageGrantWarning(kind string, resourceID int64) string {
